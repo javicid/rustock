@@ -182,9 +182,8 @@ impl SyncService {
             if blocks_behind > 0 {
                 let count = blocks_behind.min(100) as u32;
                 let msg = self.manager.create_headers_request(head_hash, count);
-                
                 info!(target: "rustock::sync", "Requesting {} headers from best peer {:?} (#{} -> #{})", count, peer_id, head_header.number, head_header.number + count as u64);
-                self.peer_store.send_to_peer(&peer_id, msg).await;
+                let _sent = self.peer_store.send_to_peer(&peer_id, msg).await;
             }
         }
         

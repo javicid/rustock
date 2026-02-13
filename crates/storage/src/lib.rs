@@ -47,6 +47,11 @@ impl BlockStore {
 
     pub fn put_header(&self, header: &Header) -> Result<()> {
         let hash = header.hash();
+        self.put_header_with_hash(hash, header)
+    }
+
+    /// Stores a header under an explicit hash key (useful for genesis with non-standard RLP).
+    pub fn put_header_with_hash(&self, hash: B256, header: &Header) -> Result<()> {
         let mut buf = Vec::new();
         header.encode(&mut buf);
         

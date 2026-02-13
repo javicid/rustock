@@ -208,7 +208,10 @@ impl ECIES {
         })
     }
 
-    pub fn encrypt(receiver_pub: &B512, msg: &[u8], shared_info: Option<&[u8]>) -> Result<Vec<u8>> {
+    /// Encrypts a message using ECIES.
+    /// `s1` is additional KDF data (typically None for EIP-8).
+    /// `s2` is additional HMAC data (typically the 2-byte size prefix for EIP-8).
+    pub fn encrypt(receiver_pub: &B512, msg: &[u8], s1: Option<&[u8]>, s2: Option<&[u8]>) -> Result<Vec<u8>> {
         let mut rng = k256::elliptic_curve::rand_core::OsRng;
         let ephemeral_sk = SecretKey::random(&mut rng);
         let ephemeral_pk = ephemeral_sk.public_key();
@@ -228,12 +231,12 @@ impl ECIES {
         let z = shared_secret.raw_secret_bytes();
         
         // KDF (Concat KDF NIST SP 800-56A)
-        // Order: counter || shared || other
+        // Order: counter || z || s1
         let mut kdf_bytes = vec![0u8; 32];
         let mut hasher = Sha256::new();
         hasher.update(&1u32.to_be_bytes()); // counter = 1
         hasher.update(&z[..]);
-        if let Some(info) = shared_info {
+        if let Some(info) = s1 {
             hasher.update(info);
         }
         kdf_bytes.copy_from_slice(&hasher.finalize());
@@ -255,11 +258,11 @@ impl ECIES {
         let mut ciphertext = msg.to_vec();
         cipher.apply_keystream(&mut ciphertext);
 
-        // HMAC
+        // HMAC (uses s2 as additional authenticated data)
         let mut hmac = HmacSha256::new_from_slice(&mac_key)?;
         hmac.update(&iv);
         hmac.update(&ciphertext);
-        if let Some(info) = shared_info {
+        if let Some(info) = s2 {
             hmac.update(info);
         }
         let mac = hmac.finalize().into_bytes();
@@ -275,7 +278,10 @@ impl ECIES {
         Ok(out)
     }
 
-    pub fn decrypt(my_sk: &SecretKey, data: &[u8], shared_info: Option<&[u8]>) -> Result<Vec<u8>> {
+    /// Decrypts an ECIES-encrypted message.
+    /// `s1` is additional KDF data (typically None for EIP-8).
+    /// `s2` is additional HMAC data (typically the 2-byte size prefix for EIP-8).
+    pub fn decrypt(my_sk: &SecretKey, data: &[u8], s1: Option<&[u8]>, s2: Option<&[u8]>) -> Result<Vec<u8>> {
         if data.len() < 65 + 16 + 32 {
             return Err(anyhow::anyhow!("Data too short for ECIES decrypt"));
         }
@@ -296,12 +302,12 @@ impl ECIES {
         );
         let z = shared_secret.raw_secret_bytes();
 
-        // KDF
+        // KDF (uses s1 as additional data)
         let mut kdf_bytes = vec![0u8; 32];
         let mut hasher = Sha256::new();
         hasher.update(&1u32.to_be_bytes());
         hasher.update(&z[..]);
-        if let Some(info) = shared_info {
+        if let Some(info) = s1 {
             hasher.update(info);
         }
         kdf_bytes.copy_from_slice(&hasher.finalize());
@@ -315,11 +321,11 @@ impl ECIES {
         hasher.update(mac_key_raw);
         mac_key.copy_from_slice(&hasher.finalize());
 
-        // Verify HMAC
+        // Verify HMAC (uses s2 as additional authenticated data)
         let mut hmac = HmacSha256::new_from_slice(&mac_key)?;
         hmac.update(iv);
         hmac.update(ciphertext);
-        if let Some(info) = shared_info {
+        if let Some(info) = s2 {
             hmac.update(info);
         }
         hmac.verify_slice(provided_mac).context("HMAC verification failed")?;
@@ -351,8 +357,8 @@ mod tests {
         let msg = b"Hello RLPx!";
         let shared_info = Some(b"RSK-V1");
         
-        let encrypted = ECIES::encrypt(&pk, msg, shared_info.map(|s| s.as_slice())).unwrap();
-        let decrypted = ECIES::decrypt(&sk, &encrypted, shared_info.map(|s| s.as_slice())).unwrap();
+        let encrypted = ECIES::encrypt(&pk, msg, None, shared_info.map(|s| s.as_slice())).unwrap();
+        let decrypted = ECIES::decrypt(&sk, &encrypted, None, shared_info.map(|s| s.as_slice())).unwrap();
         
         assert_eq!(msg, decrypted.as_slice());
     }

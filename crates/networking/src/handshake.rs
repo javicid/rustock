@@ -131,7 +131,7 @@ impl Handshake {
     where S: SinkExt<P2pMessage, Error = anyhow::Error> + Unpin
     {
         let status = EthStatus {
-            protocol_version: 0x3f,
+            protocol_version: 0x3e, // RSK protocol version V62
             network_id: config.network_id,
             total_difficulty: config.total_difficulty,
             best_hash: config.best_hash,

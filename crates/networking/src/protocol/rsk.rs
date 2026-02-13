@@ -1,6 +1,7 @@
 use alloy_rlp::{Decodable, Encodable, RlpDecodable, RlpEncodable, Header as RlpHeader};
 use alloy_primitives::{B256, U256};
 use rustock_core::Header;
+use super::rlp_compat::{decode_u8_lenient, decode_u64_lenient, decode_u256_lenient, decode_u32_lenient};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RskStatus {
@@ -40,7 +41,7 @@ impl Decodable for RskStatus {
         let mut body = &buf[..header.payload_length];
         *buf = &buf[header.payload_length..];
 
-        let best_block_number = u64::decode(&mut body)?;
+        let best_block_number = decode_u64_lenient(&mut body)?;
         let best_block_hash = B256::decode(&mut body)?;
 
         let mut status = Self {
@@ -52,7 +53,7 @@ impl Decodable for RskStatus {
 
         if !body.is_empty() {
             status.best_block_parent_hash = Some(B256::decode(&mut body)?);
-            status.total_difficulty = Some(U256::decode(&mut body)?);
+            status.total_difficulty = Some(decode_u256_lenient(&mut body)?);
         }
 
         Ok(status)
@@ -213,7 +214,7 @@ impl Decodable for RskMessage {
         let h2 = RlpHeader::decode(&mut b1)?;
         let mut b2 = &b1[..h2.payload_length];
 
-        let type_byte = u8::decode(&mut b2)?;
+        let type_byte = decode_u8_lenient(&mut b2)?;
         
         // Next is the body_blob (RLP String)
         let body_h = RlpHeader::decode(&mut b2)?;
@@ -226,7 +227,7 @@ impl Decodable for RskMessage {
             1 => {
                 let list_h = RlpHeader::decode(&mut body_params)?;
                 let mut list_body = &body_params[..list_h.payload_length];
-                let best_block_number = u64::decode(&mut list_body)?;
+                let best_block_number = decode_u64_lenient(&mut list_body)?;
                 let best_block_hash = B256::decode(&mut list_body)?;
                 let mut status = RskStatus {
                     best_block_number,
@@ -236,19 +237,19 @@ impl Decodable for RskMessage {
                 };
                 if !list_body.is_empty() {
                     status.best_block_parent_hash = Some(B256::decode(&mut list_body)?);
-                    status.total_difficulty = Some(U256::decode(&mut list_body)?);
+                    status.total_difficulty = Some(decode_u256_lenient(&mut list_body)?);
                 }
                 RskSubMessage::Status(status)
             }
             9 => {
                 let list_h = RlpHeader::decode(&mut body_params)?;
                 let mut list_body = &body_params[..list_h.payload_length];
-                let id = u64::decode(&mut list_body)?;
+                let id = decode_u64_lenient(&mut list_body)?;
                 
                 let query_h = RlpHeader::decode(&mut list_body)?;
                 let mut query_body = &list_body[..query_h.payload_length];
                 let hash = B256::decode(&mut query_body)?;
-                let count = u32::decode(&mut query_body)?;
+                let count = decode_u32_lenient(&mut query_body)?;
 
                 RskSubMessage::BlockHeadersRequest(BlockHeadersRequest {
                     id,
@@ -258,7 +259,7 @@ impl Decodable for RskMessage {
             10 => {
                 let list_h = RlpHeader::decode(&mut body_params)?;
                 let mut list_body = &body_params[..list_h.payload_length];
-                let id = u64::decode(&mut list_body)?;
+                let id = decode_u64_lenient(&mut list_body)?;
 
                 let outer_h = RlpHeader::decode(&mut list_body)?;
                 let mut outer_body = &list_body[..outer_h.payload_length];

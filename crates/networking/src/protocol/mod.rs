@@ -1,6 +1,7 @@
 pub mod p2p;
 pub mod eth;
 pub mod rsk;
+pub mod rlp_compat;
 
 pub use p2p::{HelloMessage, P2pMessage, Capability, PeerInfo, P2P_VERSION, P2pHandler};
 pub use eth::EthStatus;

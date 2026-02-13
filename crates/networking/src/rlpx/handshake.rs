@@ -46,7 +46,7 @@ impl RLPxHandshake {
         let encrypted_size = (padded.len() + overhead) as u16;
         let prefix_bytes = encrypted_size.to_be_bytes();
         
-        let encrypted_auth_init = ECIES::encrypt(&self.remote_pk, &padded, Some(&prefix_bytes))?;
+        let encrypted_auth_init = ECIES::encrypt(&self.remote_pk, &padded, None, Some(&prefix_bytes))?;
         
         let mut packet = Vec::new();
         packet.extend_from_slice(&prefix_bytes);
@@ -64,7 +64,7 @@ impl RLPxHandshake {
         self.stream.read_exact(&mut encrypted_resp).await?;
         
         let my_sk_key = SecretKey::from_slice(&self.config.secret_key)?;
-        let resp_packet = ECIES::decrypt(&my_sk_key, &encrypted_resp, Some(&prefix))?;
+        let resp_packet = ECIES::decrypt(&my_sk_key, &encrypted_resp, None, Some(&prefix))?;
         let auth_resp = AuthResponse::decode(&mut &resp_packet[..])?;
 
         let secrets = ECIES::agree_secret(
@@ -102,7 +102,7 @@ impl RLPxHandshake {
         self.stream.read_exact(&mut encrypted_auth).await?;
 
         let initiate_packet = [prefix.as_slice(), encrypted_auth.as_slice()].concat();
-        let auth_packet = ECIES::decrypt(&my_sk, &encrypted_auth, Some(&prefix))?;
+        let auth_packet = ECIES::decrypt(&my_sk, &encrypted_auth, None, Some(&prefix))?;
         let auth_init = AuthInitiate::decode(&mut &auth_packet[..])?;
 
         // 2. Send AuthResponse
@@ -125,7 +125,7 @@ impl RLPxHandshake {
         let encrypted_size = (padded.len() + overhead) as u16;
         let resp_prefix = encrypted_size.to_be_bytes();
 
-        let encrypted_auth_resp = ECIES::encrypt(&auth_init.public_key, &padded, Some(&resp_prefix))?;
+        let encrypted_auth_resp = ECIES::encrypt(&auth_init.public_key, &padded, None, Some(&resp_prefix))?;
         let response_packet = [resp_prefix.as_slice(), encrypted_auth_resp.as_slice()].concat();
 
         self.stream.write_all(&response_packet).await?;

@@ -129,29 +129,41 @@ fn setup_genesis(store: &BlockStore, _network_id: u64) -> Result<B256> {
         return Ok(head);
     }
 
+    // Well-known genesis hashes (from rskj reference)
+    let known_genesis_hash: Option<B256> = match _network_id {
+        30 => Some("0xf88529d4ab262c0f4d042e9d8d3f2472848eaafe1a9b7213f57617eb40a9f9e0".parse().unwrap()),
+        31 => Some("0xcabb7fbe562a6e2e1a8d8df0f4f8b19c4a76c22fe1e6b9a1dc45a0e4d8e0e2c4".parse().unwrap()),
+        _ => None,
+    };
+
+    // EMPTY_LIST_HASH = keccak256(RLP([])) = keccak256([0xc0])
+    let empty_list_hash: B256 = "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347".parse().unwrap();
+    // EMPTY_TRIE_HASH = keccak256(RLP.encodeElement([])) = keccak256([0x80])
+    let empty_trie_hash: B256 = "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421".parse().unwrap();
+
     let genesis = if _network_id == 30 {
-        // RSK Mainnet
+        // RSK Mainnet (matching rskj rsk-mainnet.json)
         Header {
             parent_hash: B256::ZERO,
-            ommers_hash: B256::ZERO,
-            beneficiary: Address::ZERO,
+            ommers_hash: empty_list_hash,
+            beneficiary: "0x3333333333333333333333333333333333333333".parse().unwrap(),
             state_root: "0x9fa70f12726ac738640a86754741bb3f5680520ccc7e6ae9d95ace566a67fe01".parse().unwrap(),
-            transactions_root: B256::ZERO,
-            receipts_root: B256::ZERO,
+            transactions_root: empty_trie_hash,
+            receipts_root: empty_trie_hash,
             logs_bloom: Default::default(),
             difficulty: U256::from(0x00100000), 
             number: 0,
             gas_limit: U256::from(0x67c280),
             gas_used: 0,
-            timestamp: 1514861040, 
+            timestamp: 0x5a4af5b0, // 1514862000 
             extra_data: Bytes::from_static(&hex_literal::hex!("486170707920426974636f696e20446179212030332f4a616e2f32303138202d2052534b20746563686e6f6c6f6779206174207468652073657276696365206f6620736f6369657479")),
             paid_fees: U256::ZERO,
             minimum_gas_price: U256::from(0x0AE85BC0),
             uncle_count: 0,
             umm_root: None,
-            bitcoin_merged_mining_header: None,
-            bitcoin_merged_mining_merkle_proof: None,
-            bitcoin_merged_mining_coinbase_transaction: None,
+            bitcoin_merged_mining_header: Some(Bytes::from_static(&[0x00])),
+            bitcoin_merged_mining_merkle_proof: Some(Bytes::from_static(&[0x00])),
+            bitcoin_merged_mining_coinbase_transaction: Some(Bytes::from_static(&[0x00])),
         }
     } else if _network_id == 31 {
         // RSK Testnet (Orchid)
@@ -203,8 +215,13 @@ fn setup_genesis(store: &BlockStore, _network_id: u64) -> Result<B256> {
         }
     };
 
-    let hash = genesis.hash();
-    store.update_head(&genesis, genesis.difficulty)?;
+    // Use the known genesis hash for mainnet/testnet (Java's GenesisHeader has special
+    // RLP encoding for difficulty with leading zeros that differs from standard encoding).
+    let hash = known_genesis_hash.unwrap_or_else(|| genesis.hash());
+    store.put_header_with_hash(hash, &genesis)?;
+    store.put_total_difficulty(hash, genesis.difficulty)?;
+    store.put_canonical_hash(0, hash)?;
+    store.set_head(hash)?;
     Ok(hash)
 }
 

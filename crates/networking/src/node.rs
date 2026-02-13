@@ -70,7 +70,6 @@ impl Node {
             if let Err(e) = table_lock.load(&discovery_path) {
                 debug!(target: "rustock::net", "Failed to load discovery table: {:?}", e);
             }
-            
             // Add bootnodes
             for enode in &self.config.bootnodes {
                 if let Err(e) = table_lock.add_enode(enode) {
