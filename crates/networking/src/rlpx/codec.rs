@@ -23,18 +23,21 @@ impl Decoder for RLPxCodec {
     type Error = anyhow::Error;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>> {
-        match self.frame_codec.decode_frame(src)? {
-            Some((protocol_id, payload)) => {
+        match self.frame_codec.decode_frame(src) {
+            Err(e) => return Err(e),
+            Ok(None) => return Ok(None),
+            Ok(Some((protocol_id, payload))) => {
                 // Prepend protocol_id to payload to satisfy P2pMessage::decode
                 let mut data = Vec::with_capacity(payload.len() + 1);
                 data.push(protocol_id);
                 data.extend_from_slice(&payload);
                 
                 let mut ptr = &data[..];
-                let msg = P2pMessage::decode(&mut ptr)?;
-                Ok(Some(msg))
+                match P2pMessage::decode(&mut ptr) {
+                    Ok(msg) => Ok(Some(msg)),
+                    Err(e) => Err(anyhow::anyhow!("{}", e)),
+                }
             }
-            None => Ok(None),
         }
     }
 }

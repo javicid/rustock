@@ -18,10 +18,6 @@ impl Decoder for P2pCodec {
             return Ok(None);
         }
 
-        // We need at least the ID and the RLP header to know the length
-        // P2pMessage RLP is encoded as: [ID] [RLP_PAYLOAD]
-        // But the alloy_rlp Decodable for P2pMessage actually handles the ID.
-        
         let mut data = &src[..];
         match P2pMessage::decode(&mut data) {
             Ok(msg) => {

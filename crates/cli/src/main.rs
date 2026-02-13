@@ -108,15 +108,15 @@ async fn main() -> Result<()> {
 
     let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
     let sync_manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let sync_service = Arc::new(SyncService::new(sync_manager.clone(), peer_store.clone()));
     let mut node = Node::with_peer_store(node_config, peer_store.clone());
     
     // Add Sync Handler
-    let sync_handler = Arc::new(SyncHandler::new(sync_manager.clone()));
+    let sync_handler = Arc::new(SyncHandler::new(sync_manager.clone(), sync_service.clone()));
     node.add_handler(sync_handler);
 
     // 6. Start Sync Service
-    let sync_service = SyncService::new(sync_manager, peer_store);
-    tokio::spawn(sync_service.start());
+    tokio::spawn(sync_service.clone().start());
 
     // 7. Start Node
     node.start().await?;
@@ -151,6 +151,7 @@ fn setup_genesis(store: &BlockStore, _network_id: u64) -> Result<B256> {
             transactions_root: empty_trie_hash,
             receipts_root: empty_trie_hash,
             logs_bloom: Default::default(),
+            extension_data: None,
             difficulty: U256::from(0x00100000), 
             number: 0,
             gas_limit: U256::from(0x67c280),
@@ -175,6 +176,7 @@ fn setup_genesis(store: &BlockStore, _network_id: u64) -> Result<B256> {
             transactions_root: B256::ZERO,
             receipts_root: B256::ZERO,
             logs_bloom: Default::default(),
+            extension_data: None,
             difficulty: U256::from(0x00100000), 
             number: 0,
             gas_limit: U256::from(0x4c4b40),
@@ -199,6 +201,7 @@ fn setup_genesis(store: &BlockStore, _network_id: u64) -> Result<B256> {
             transactions_root: B256::ZERO,
             receipts_root: B256::ZERO,
             logs_bloom: Default::default(),
+            extension_data: None,
             difficulty: U256::from(0x20000),
             number: 0,
             gas_limit: U256::from(10_000_000),

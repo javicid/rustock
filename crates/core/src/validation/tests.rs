@@ -17,6 +17,7 @@ fn create_dummy_header(number: u64, timestamp: u64, parent_hash: B256) -> Header
         transactions_root: B256::ZERO,
         receipts_root: B256::ZERO,
         logs_bloom: Default::default(),
+        extension_data: None,
         difficulty: U256::ZERO,
         number,
         gas_limit: U256::from(10_000_000),

@@ -91,6 +91,8 @@ pub enum RskSubMessage {
     Status(RskStatus),
     BlockHeadersRequest(BlockHeadersRequest),
     BlockHeadersResponse(BlockHeadersResponse),
+    /// An RSK message type we don't need to handle (e.g. Transactions, NewBlockHashes, etc.)
+    Unknown(u8),
 }
 
 impl RskSubMessage {
@@ -99,6 +101,7 @@ impl RskSubMessage {
             RskSubMessage::Status(_) => RskMessageType::Status,
             RskSubMessage::BlockHeadersRequest(_) => RskMessageType::BlockHeadersRequest,
             RskSubMessage::BlockHeadersResponse(_) => RskMessageType::BlockHeadersResponse,
+            RskSubMessage::Unknown(_) => RskMessageType::Status, // Not used for encoding
         }
     }
 
@@ -156,6 +159,9 @@ impl RskSubMessage {
 
                 RlpHeader { list: true, payload_length: params.len() }.encode(out);
                 out.extend_from_slice(&params);
+            }
+            RskSubMessage::Unknown(_) => {
+                // Unknown messages are not encoded/sent
             }
         }
     }
@@ -273,7 +279,10 @@ impl Decodable for RskMessage {
                 }
                 RskSubMessage::BlockHeadersResponse(BlockHeadersResponse { id, headers })
             }
-            _ => return Err(alloy_rlp::Error::Custom("Unknown RSK message type")),
+            other => {
+                // Skip unknown message types gracefully (Transactions, NewBlockHashes, etc.)
+                RskSubMessage::Unknown(other)
+            }
         };
 
         Ok(RskMessage { sub_message })

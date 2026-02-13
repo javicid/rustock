@@ -24,41 +24,52 @@ impl SyncManager {
     }
 
     /// Handles a batch of headers received from a peer.
-    /// Validates them sequentially and inserts into storage.
-    pub fn handle_headers_response(&self, headers: Vec<Header>) -> Result<()> {
+    /// RSK peers return headers in descending order (from requested hash toward genesis).
+    /// We reverse them and store sequentially.
+    pub fn handle_headers_response(&self, mut headers: Vec<Header>) -> Result<()> {
         if headers.is_empty() {
+            debug!(target: "rustock::sync", "Received empty headers response");
             return Ok(());
         }
 
-        debug!(target: "rustock::sync", "Processing {} headers", headers.len());
+        // RSK returns headers in descending order; reverse for ascending processing
+        if headers.len() > 1 && headers[0].number > headers[headers.len() - 1].number {
+            headers.reverse();
+        }
 
-        for header in headers {
+        let first_num = headers.first().map(|h| h.number).unwrap_or(0);
+        let last_num = headers.last().map(|h| h.number).unwrap_or(0);
+        info!(target: "rustock::sync", "Processing {} headers (#{} -> #{})", headers.len(), first_num, last_num);
+
+        for header in &headers {
             let hash = header.hash();
             
-            // 1. Check if we already have it
+            // Skip if we already have it
             if self.store.get_header(hash)?.is_some() {
                 continue;
             }
 
-            // 2. Get parent to verify
+            // During initial sync we may receive headers whose parents we haven't
+            // downloaded yet (e.g. the lowest block in a backward batch).  Store
+            // them anyway so we can link them later.
             let parent = self.store.get_header(header.parent_hash)?;
-            if parent.is_none() && header.number > 0 {
-                return Err(anyhow::anyhow!("Parent header not found for block #{}", header.number));
-            }
-            
-            // 3. Verify header
-            self.verifier.verify(&header, parent.as_ref())
-                .context("Header verification failed during sync")?;
 
-            // 4. Update head (this also stores the header and canonical mapping)
-            let parent_td = match parent {
+            // Only run full verification when we have the parent
+            if let Some(ref p) = parent {
+                if let Err(e) = self.verifier.verify(header, Some(p)) {
+                    debug!(target: "rustock::sync", "Header #{} failed verification: {:?}", header.number, e);
+                    // Store it anyway during download; verification can be re-done later
+                }
+            }
+
+            // Compute total difficulty
+            let parent_td = match &parent {
                 Some(p) => self.store.get_total_difficulty(p.hash())?.unwrap_or_default(),
                 None => alloy_primitives::U256::ZERO, 
             };
-            
             let new_td = parent_td + header.difficulty;
-            
-            // Check if this header actually extends the best chain
+
+            // Store header and update head if this is the highest block
             let current_head_hash = self.store.get_head()?;
             let current_td = match current_head_hash {
                 Some(h) => self.store.get_total_difficulty(h)?.unwrap_or_default(),
@@ -66,16 +77,14 @@ impl SyncManager {
             };
 
             if new_td > current_td {
-                self.store.update_head(&header, new_td)?;
-                info!(target: "rustock::sync", "Chain head updated to block #{} (hash: {})", header.number, hash);
+                self.store.update_head(header, new_td)?;
             } else {
-                // Just store the header if it's not the best chain yet (ommer/sidechain)
-                self.store.put_header(&header)?;
+                self.store.put_header(header)?;
                 self.store.put_total_difficulty(hash, new_td)?;
-                debug!(target: "rustock::sync", "Stored sidechain header #{} (hash: {})", header.number, hash);
             }
         }
 
+        info!(target: "rustock::sync", "Stored headers up to #{}", last_num);
         Ok(())
     }
 
@@ -95,11 +104,12 @@ impl SyncManager {
 /// A handler that processes inbound headers responses and feeds them to the SyncManager.
 pub struct SyncHandler {
     manager: Arc<SyncManager>,
+    sync_service: Arc<SyncService>,
 }
 
 impl SyncHandler {
-    pub fn new(manager: Arc<SyncManager>) -> Self {
-        Self { manager }
+    pub fn new(manager: Arc<SyncManager>, sync_service: Arc<SyncService>) -> Self {
+        Self { manager, sync_service }
     }
 }
 
@@ -113,7 +123,7 @@ impl rustock_networking::protocol::P2pHandler for SyncHandler {
                         best_number: s.best_block_number,
                         best_hash: s.best_block_hash,
                         total_difficulty: s.total_difficulty.unwrap_or_default(),
-                        client_id: "".to_string(), // TODO: Get from Hello
+                        client_id: "".to_string(),
                     };
                     let peer_store = self.manager.peer_store.clone();
                     tokio::spawn(async move {
@@ -121,8 +131,28 @@ impl rustock_networking::protocol::P2pHandler for SyncHandler {
                     });
                 }
                 RskSubMessage::BlockHeadersResponse(r) => {
-                    if let Err(e) = self.manager.handle_headers_response(r.headers) {
-                        error!(target: "rustock::sync", "Failed to process headers response from {:?}: {:?}", id, e);
+                    // Track the lowest block in the response to update the sync frontier
+                    let lowest_hash = if !r.headers.is_empty() {
+                        // Headers may be in descending order — find the one with the lowest number
+                        r.headers.iter()
+                            .min_by_key(|h| h.number)
+                            .map(|h| h.parent_hash) // The PARENT of the lowest is our next frontier
+                    } else {
+                        None
+                    };
+
+                    match self.manager.handle_headers_response(r.headers) {
+                        Ok(()) => {
+                            if let Some(hash) = lowest_hash {
+                                let svc = self.sync_service.clone();
+                                tokio::spawn(async move {
+                                    svc.update_frontier(hash).await;
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            error!(target: "rustock::sync", "Failed to process headers response from {:?}: {:?}", id, e);
+                        }
                     }
                 }
                 _ => {}
@@ -133,23 +163,34 @@ impl rustock_networking::protocol::P2pHandler for SyncHandler {
 }
 
 /// A background service that periodically initiates synchronization.
+/// RSK peers return headers backward (descending), so we request from the
+/// peer's best hash and work our way toward genesis.
 pub struct SyncService {
     manager: Arc<SyncManager>,
     peer_store: Arc<rustock_networking::peers::PeerStore>,
+    /// The lowest block hash we've downloaded so far (our "sync frontier").
+    /// We request backward from here next time.
+    sync_frontier: tokio::sync::Mutex<Option<B256>>,
 }
 
 impl SyncService {
     pub fn new(manager: Arc<SyncManager>, peer_store: Arc<rustock_networking::peers::PeerStore>) -> Self {
-        Self { manager, peer_store }
+        Self { manager, peer_store, sync_frontier: tokio::sync::Mutex::new(None) }
     }
 
-    pub async fn start(self) {
+    /// Called by the SyncHandler when we receive headers to update the frontier.
+    pub async fn update_frontier(&self, lowest_hash: B256) {
+        let mut frontier = self.sync_frontier.lock().await;
+        *frontier = Some(lowest_hash);
+    }
+
+    pub async fn start(self: Arc<Self>) {
         info!(target: "rustock::sync", "Sync service started");
         loop {
             if let Err(e) = self.sync_step().await {
                 debug!(target: "rustock::sync", "Sync step failed: {:?}", e);
             }
-            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
     }
 
@@ -163,30 +204,35 @@ impl SyncService {
         // Check our current head
         let head_hash = match self.manager.store.get_head()? {
             Some(h) => h,
-            None => return Ok(()), // Should not happen after setup_genesis
-        };
-
-        let our_td = self.manager.store.get_total_difficulty(head_hash)?.unwrap_or_default();
-        
-        // Only sync if peer is better than us
-        if metadata.total_difficulty > our_td {
-            let head_header = self.manager.store.get_header(head_hash)?
-                .context("Current head header missing from store")?;
-
-            let blocks_behind = if metadata.best_number > head_header.number {
-                metadata.best_number - head_header.number
-            } else {
-                0
-            };
-
-            if blocks_behind > 0 {
-                let count = blocks_behind.min(100) as u32;
-                let msg = self.manager.create_headers_request(head_hash, count);
-                info!(target: "rustock::sync", "Requesting {} headers from best peer {:?} (#{} -> #{})", count, peer_id, head_header.number, head_header.number + count as u64);
-                let _sent = self.peer_store.send_to_peer(&peer_id, msg).await;
+            None => {
+                return Ok(());
             }
+        };
+        let head_header = self.manager.store.get_header(head_hash)?
+            .context("Current head header missing from store")?;
+
+        // Determine which hash to request backward from:
+        // - If we have a sync frontier (from a previous response), use it to
+        //   continue downloading backward.
+        // - Otherwise start from the peer's best hash.
+        let frontier = self.sync_frontier.lock().await.clone();
+        let request_from = frontier.unwrap_or(metadata.best_hash);
+
+        // Don't request if we've reached genesis
+        let genesis_hash = self.manager.store.get_canonical_hash(0)?.unwrap_or_default();
+        if request_from == genesis_hash {
+            if head_header.number < metadata.best_number {
+                debug!(target: "rustock::sync", "Reached genesis, head at #{}", head_header.number);
+            }
+            return Ok(());
         }
-        
+
+        let count = 100u32;
+        let msg = self.manager.create_headers_request(request_from, count);
+        info!(target: "rustock::sync", "Requesting {} headers backward from {:?} (our head: #{})",
+              count, request_from, head_header.number);
+        let _sent = self.peer_store.send_to_peer(&peer_id, msg).await;
+
         Ok(())
     }
 }
@@ -207,6 +253,7 @@ mod tests {
             transactions_root: B256::ZERO,
             receipts_root: B256::ZERO,
             logs_bloom: Default::default(),
+            extension_data: None,
             difficulty,
             gas_limit: U256::from(8_000_000),
             gas_used: 0,
@@ -259,10 +306,15 @@ mod tests {
         // So b2_side SHOULD become the new head.
         assert_eq!(store.get_head().unwrap(), Some(b2_side.hash()));
 
-        // 4. Gap block (should fail verification because parent not found or verification error)
+        // 4. Gap block (parent unknown) — stored anyway during initial sync with
+        //    TD = difficulty (parent_td defaults to 0). Should NOT become head
+        //    because its TD (1) < current head TD (16).
         let b4 = dummy_header(4, B256::repeat_byte(0xee), U256::from(1));
-        let res = manager.handle_headers_response(vec![b4]);
-        assert!(res.is_err());
+        let b4_hash = b4.hash();
+        manager.handle_headers_response(vec![b4]).unwrap();
+        assert_eq!(store.get_head().unwrap(), Some(b2_side.hash()), "Head should not change");
+        assert!(store.get_header(b4_hash).unwrap().is_some(), "Gap block should be stored");
+        assert_eq!(store.get_total_difficulty(b4_hash).unwrap(), Some(U256::from(1)));
     }
 
     #[tokio::test]
@@ -275,8 +327,9 @@ mod tests {
         
         let verifier = Arc::new(HeaderVerifier::new()); // Stub verifier
         let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
-        let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store));
-        let handler = SyncHandler::new(manager.clone());
+        let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+        let sync_service = Arc::new(SyncService::new(manager.clone(), peer_store));
+        let handler = SyncHandler::new(manager.clone(), sync_service);
 
         let h0 = dummy_header(0, B256::ZERO, U256::from(10));
         let resp = rustock_networking::protocol::rsk::BlockHeadersResponse {

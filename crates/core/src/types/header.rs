@@ -1,6 +1,7 @@
 use alloy_primitives::{Address, Bloom, B256, U256, Bytes};
 use alloy_rlp::Encodable;
 use serde::{Deserialize, Serialize};
+use crate::rlp_compat::{decode_u64_lenient, decode_u256_lenient};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Header {
@@ -11,6 +12,9 @@ pub struct Header {
     pub transactions_root: B256,
     pub receipts_root: B256,
     pub logs_bloom: Bloom,
+    /// Compressed extension data (RSKIP-351 V1/V2). When present, `logs_bloom`
+    /// is set to default and this field contains `RLP([version, hash])`.
+    pub extension_data: Option<Bytes>,
     pub difficulty: U256,
     pub number: u64,
     pub gas_limit: U256,
@@ -91,23 +95,49 @@ impl alloy_rlp::Decodable for Header {
         let mut body = &buf[..h.payload_length];
         *buf = &buf[h.payload_length..];
 
+        let parent_hash = B256::decode(&mut body)?;
+        let ommers_hash = B256::decode(&mut body)?;
+        let beneficiary = Address::decode(&mut body)?;
+        let state_root = B256::decode(&mut body)?;
+        let transactions_root = B256::decode(&mut body)?;
+        let receipts_root = B256::decode(&mut body)?;
+
+        // Field 6: logs bloom (256 bytes) OR compressed extension data (shorter).
+        // Peek at the RLP header to determine which one.
+        let (logs_bloom, extension_data) = {
+            let rlp_h = alloy_rlp::Header::decode(&mut &body[..])?;
+            if !rlp_h.list && rlp_h.payload_length == 256 {
+                // Standard logs bloom (256 bytes)
+                (Bloom::decode(&mut body)?, None)
+            } else {
+                // Compressed extension data (V1/V2 RSKIP-351).
+                // Could be an RLP list or string — read the raw bytes either way.
+                let before = body;
+                let total_len = rlp_h.length() + rlp_h.payload_length;
+                let raw = Bytes::copy_from_slice(&before[..total_len]);
+                body = &body[total_len..];
+                (Bloom::default(), Some(raw))
+            }
+        };
+
         let mut header = Self {
-            parent_hash: B256::decode(&mut body)?,
-            ommers_hash: B256::decode(&mut body)?,
-            beneficiary: Address::decode(&mut body)?,
-            state_root: B256::decode(&mut body)?,
-            transactions_root: B256::decode(&mut body)?,
-            receipts_root: B256::decode(&mut body)?,
-            logs_bloom: Bloom::decode(&mut body)?,
-            difficulty: U256::decode(&mut body)?,
-            number: u64::decode(&mut body)?,
-            gas_limit: U256::decode(&mut body)?,
-            gas_used: u64::decode(&mut body)?,
-            timestamp: u64::decode(&mut body)?,
+            parent_hash,
+            ommers_hash,
+            beneficiary,
+            state_root,
+            transactions_root,
+            receipts_root,
+            logs_bloom,
+            extension_data,
+            difficulty: decode_u256_lenient(&mut body)?,
+            number: decode_u64_lenient(&mut body)?,
+            gas_limit: decode_u256_lenient(&mut body)?,
+            gas_used: decode_u64_lenient(&mut body)?,
+            timestamp: decode_u64_lenient(&mut body)?,
             extra_data: Bytes::decode(&mut body)?,
-            paid_fees: U256::decode(&mut body)?,
-            minimum_gas_price: U256::decode(&mut body)?,
-            uncle_count: u64::decode(&mut body)?,
+            paid_fees: decode_u256_lenient(&mut body)?,
+            minimum_gas_price: decode_u256_lenient(&mut body)?,
+            uncle_count: decode_u64_lenient(&mut body)?,
             umm_root: None,
             bitcoin_merged_mining_header: None,
             bitcoin_merged_mining_merkle_proof: None,
@@ -199,6 +229,7 @@ mod tests {
             transactions_root: B256::repeat_byte(0x55),
             receipts_root: B256::repeat_byte(0x66),
             logs_bloom: Bloom::repeat_byte(0x77),
+            extension_data: None,
             difficulty: U256::from(1234567),
             number: 42,
             gas_limit: U256::from(10_000_000),

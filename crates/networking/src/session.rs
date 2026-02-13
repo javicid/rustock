@@ -55,7 +55,13 @@ impl PeerSession {
                     self.framed.send(P2pMessage::Ping).await?;
                 }
                 Some(msg_res) = self.framed.next() => {
-                    let msg: P2pMessage = msg_res?;
+                    let msg = match msg_res {
+                        Ok(m) => m,
+                        Err(e) => {
+                            debug!(target: "rustock::net", "Decode error from {:?}: {:?}, skipping", self.peer_id, e);
+                            continue; // Skip decode errors instead of crashing the session
+                        }
+                    };
                     trace!(target: "rustock::net", "Inbound message from {:?}: {:?}", self.peer_id, msg);
                     
                     match &msg {
