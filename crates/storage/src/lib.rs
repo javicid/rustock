@@ -103,6 +103,13 @@ impl BlockStore {
         }
     }
 
+    /// Checks if a block header exists in the store by hash.
+    pub fn has_block(&self, hash: B256) -> Result<bool> {
+        Ok(self.db.get_cf(self.cf(CF_HEADERS)?, hash.as_slice())
+            .context("Failed to check header existence")?
+            .is_some())
+    }
+
     // --- Head Operations ---
 
     pub fn set_head(&self, hash: B256) -> Result<()> {

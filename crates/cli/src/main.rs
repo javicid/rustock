@@ -108,15 +108,17 @@ async fn main() -> Result<()> {
 
     let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
     let sync_manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
-    let sync_service = Arc::new(SyncService::new(sync_manager.clone(), peer_store.clone()));
+
+    // Create event channel for sync handler → service communication
+    let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let sync_handler = Arc::new(SyncHandler::new(sync_manager.clone(), event_tx));
+    let sync_service = SyncService::new(sync_manager.clone(), peer_store.clone(), event_rx);
+
     let mut node = Node::with_peer_store(node_config, peer_store.clone());
-    
-    // Add Sync Handler
-    let sync_handler = Arc::new(SyncHandler::new(sync_manager.clone(), sync_service.clone()));
     node.add_handler(sync_handler);
 
-    // 6. Start Sync Service
-    tokio::spawn(sync_service.clone().start());
+    // 6. Start Sync Service (skeleton-based forward sync)
+    tokio::spawn(sync_service.start());
 
     // 7. Start Node
     node.start().await?;
