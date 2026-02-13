@@ -1,0 +1,14 @@
+[package]
+name = "rustock-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+alloy-primitives = { version = "1.5.4", features = ["serde", "rlp"] }
+alloy-rlp = { version = "0.3.13", features = ["derive"] }
+anyhow = "1.0.100"
+bitcoin = "0.32.8"
+hex = "0.4.3"
+serde = { version = "1.0.228", features = ["derive"] }
+sha2 = "0.10.9"
+thiserror = "2.0.18"
