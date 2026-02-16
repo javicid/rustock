@@ -4,8 +4,9 @@ use rustock_storage::BlockStore;
 use rustock_networking::protocol::{
     BlockHeadersQuery, BlockHeadersRequest, P2pMessage, RskMessage, RskSubMessage,
 };
-use alloy_primitives::B256;
+use alloy_primitives::{B256, U256};
 use anyhow::Result;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{info, debug};
 
@@ -34,7 +35,7 @@ impl SyncManager {
 
     /// Handles a batch of headers received from a peer.
     /// RSK peers return headers in descending order (from requested hash toward genesis).
-    /// We reverse them and store sequentially.
+    /// We reverse them, validate, and store in a single atomic RocksDB WriteBatch.
     pub fn handle_headers_response(&self, mut headers: Vec<Header>) -> Result<()> {
         if headers.is_empty() {
             debug!(target: "rustock::sync", "Received empty headers response");
@@ -56,70 +57,72 @@ impl SyncManager {
             last_num
         );
 
-        let mut stored = 0u64;
+        // Read current head TD once (instead of per-header)
+        let current_head_hash = self.store.get_head()?;
+        let current_td = match current_head_hash {
+            Some(h) => self.store.get_total_difficulty(h)?.unwrap_or_default(),
+            None => U256::ZERO,
+        };
+
+        // Local cache for headers validated in this batch but not yet committed.
+        // Needed so that header N+1 can find header N as its parent.
+        let mut pending: HashMap<B256, (&Header, U256)> = HashMap::new();
+        let mut validated: Vec<(&Header, U256)> = Vec::with_capacity(headers.len());
         let mut skipped = 0u64;
 
         for header in &headers {
             let hash = header.hash();
 
-            // Skip if we already have it
-            if self.store.get_header(hash)?.is_some() {
+            // Skip if we already have it (in store or pending batch)
+            if pending.contains_key(&hash) || self.store.get_header(hash)?.is_some() {
                 continue;
             }
 
-            // During initial sync we may receive headers whose parents we haven't
-            // downloaded yet (e.g. the lowest block in a backward batch).  Store
-            // them tentatively so we can link them later.  Only the very first
-            // header in each ascending batch should hit this path.
-            let parent = self.store.get_header(header.parent_hash)?;
+            // Look up parent: first in pending batch, then in store
+            let parent_from_pending = pending.get(&header.parent_hash).map(|(h, _)| *h);
+            let parent_from_store;
+            let parent: Option<&Header> = if let Some(p) = parent_from_pending {
+                Some(p)
+            } else {
+                parent_from_store = self.store.get_header(header.parent_hash)?;
+                parent_from_store.as_ref()
+            };
 
             // When we have the parent, run full verification and reject on failure.
-            if let Some(ref p) = parent {
+            if let Some(p) = parent {
                 if let Err(e) = self.verifier.verify(header, Some(p)) {
                     debug!(
                         target: "rustock::sync",
                         "Header #{} ({:?}) failed verification, skipping: {:?}",
-                        header.number,
-                        hash,
-                        e
+                        header.number, hash, e
                     );
                     skipped += 1;
                     continue;
                 }
             }
 
-            // Compute total difficulty.
-            // For the parent TD lookup, use the hash that was used to find the parent
-            // in the store (header.parent_hash), NOT parent.hash() — they may differ
-            // for the genesis block whose canonical hash comes from Java's non-standard
-            // RLP encoding.
-            let parent_td = match &parent {
-                Some(_) => self
-                    .store
-                    .get_total_difficulty(header.parent_hash)?
-                    .unwrap_or_default(),
-                None => alloy_primitives::U256::ZERO,
+            // Compute total difficulty: check pending batch first, then store
+            let parent_td = if parent.is_some() {
+                if let Some((_, td)) = pending.get(&header.parent_hash) {
+                    *td
+                } else {
+                    self.store
+                        .get_total_difficulty(header.parent_hash)?
+                        .unwrap_or_default()
+                }
+            } else {
+                U256::ZERO
             };
             let new_td = parent_td + header.difficulty;
 
-            // Store header and update head if this is the highest-TD block
-            let current_head_hash = self.store.get_head()?;
-            let current_td = match current_head_hash {
-                Some(h) => self
-                    .store
-                    .get_total_difficulty(h)?
-                    .unwrap_or_default(),
-                None => alloy_primitives::U256::ZERO,
-            };
-
-            if new_td > current_td {
-                self.store.update_head(header, new_td)?;
-            } else {
-                self.store.put_header(header)?;
-                self.store.put_total_difficulty(hash, new_td)?;
-            }
-            stored += 1;
+            pending.insert(hash, (header, new_td));
+            validated.push((header, new_td));
         }
+
+        let stored = validated.len() as u64;
+
+        // Commit all validated headers in a single atomic batch
+        self.store.store_headers_batch(&validated, current_head_hash, current_td)?;
 
         if skipped > 0 {
             info!(

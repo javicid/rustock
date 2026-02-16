@@ -10,6 +10,7 @@ pub use handler::SyncHandler;
 pub use manager::SyncManager;
 pub use service::SyncService;
 pub use state::SyncState;
+pub use state::PeerChunkTracker;
 
 // Re-exports for tests (use super::*)
 #[cfg(test)]
@@ -339,8 +340,8 @@ mod tests {
         service.on_skeleton_response(skeleton).await;
 
         match &service.state {
-            SyncState::DownloadingHeaders { next_chunk_index, skeleton, .. } => {
-                assert_eq!(*next_chunk_index, 1);
+            SyncState::DownloadingHeaders { tracker, skeleton, .. } => {
+                assert_eq!(tracker.next_to_process, 1);
                 assert_eq!(skeleton.len(), 3);
             }
             _ => panic!("Expected DownloadingHeaders, got {:?}", service.state),
@@ -393,7 +394,7 @@ mod tests {
         let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let mut service = SyncService::new(manager, peer_store, event_rx);
+        let mut service = SyncService::new(manager, peer_store.clone(), event_rx);
 
         // Build headers
         let b1 = dummy_header(1, genesis_hash, U256::from(1));
@@ -409,27 +410,38 @@ mod tests {
         ];
 
         let peer = B512::repeat_byte(0x01);
+        // Register the peer so fill_pipeline can find it
+        let (tx, _rx) = mpsc::unbounded_channel();
+        peer_store.add_peer(peer, tx).await;
+
+        let mut tracker = PeerChunkTracker::new(skeleton.len());
+        // Simulate: chunk 1 assigned to peer, chunk 2 assigned to peer
+        let c1 = tracker.next_assignment().unwrap();
+        tracker.record_sent(peer, c1);
+        let c2 = tracker.next_assignment().unwrap();
+        tracker.record_sent(peer, c2);
+
         service.state = SyncState::DownloadingHeaders {
-            peer,
             peer_best: 4,
             skeleton: skeleton.clone(),
             connection_point: 0,
-            next_chunk_index: 1,
+            tracker,
+            pending_next_skeleton: None,
         };
 
         // Chunk 1: headers for blocks 1-2 (descending from b2)
-        service.on_headers_response(vec![b2.clone(), b1.clone()]).await;
+        service.on_headers_response(peer, vec![b2.clone(), b1.clone()]).await;
 
-        // Should advance to chunk 2
+        // Should still be in DownloadingHeaders (chunk 2 pending)
         match &service.state {
-            SyncState::DownloadingHeaders { next_chunk_index, .. } => {
-                assert_eq!(*next_chunk_index, 2);
+            SyncState::DownloadingHeaders { tracker, .. } => {
+                assert_eq!(tracker.next_to_process, 2);
             }
-            _ => panic!("Expected DownloadingHeaders with next_chunk=2, got {:?}", service.state),
+            _ => panic!("Expected DownloadingHeaders with next_to_process=2, got {:?}", service.state),
         }
 
         // Chunk 2: headers for blocks 3-4 (descending from b4)
-        service.on_headers_response(vec![b4.clone(), b3.clone()]).await;
+        service.on_headers_response(peer, vec![b4.clone(), b3.clone()]).await;
 
         // All chunks done and we're at peer_best → Idle
         assert!(matches!(service.state, SyncState::Idle),
@@ -588,7 +600,7 @@ mod tests {
         let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let mut service = SyncService::new(manager, peer_store, event_rx);
+        let mut service = SyncService::new(manager, peer_store.clone(), event_rx);
 
         let skeleton = vec![
             BlockIdentifier { hash: genesis_hash, number: 0 },
@@ -596,15 +608,30 @@ mod tests {
             BlockIdentifier { hash: b4.hash(), number: 4 },
         ];
         let peer = B512::repeat_byte(0x01);
+        // Register the peer so the service can find it for the next skeleton
+        let (tx, _rx) = mpsc::unbounded_channel();
+        peer_store.add_peer(peer, tx).await;
+        peer_store.update_metadata(&peer, rustock_networking::peers::PeerMetadata {
+            best_number: 10000,
+            total_difficulty: U256::from(10000),
+            ..Default::default()
+        }).await;
+
+        // Set up tracker: chunks 1 already processed, chunk 2 in flight
+        let mut tracker = PeerChunkTracker::new(skeleton.len());
+        tracker.next_to_assign = 3; // all assigned
+        tracker.next_to_process = 2; // chunk 1 already done
+        tracker.record_sent(peer, 2); // chunk 2 in flight from peer
+
         service.state = SyncState::DownloadingHeaders {
-            peer,
             peer_best: 10000,
             skeleton,
             connection_point: 0,
-            next_chunk_index: 2,
+            tracker,
+            pending_next_skeleton: None,
         };
 
-        service.on_headers_response(vec![b4.clone(), b3.clone()]).await;
+        service.on_headers_response(peer, vec![b4.clone(), b3.clone()]).await;
 
         match &service.state {
             SyncState::DownloadingSkeleton { connection_point, .. } => {

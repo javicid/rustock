@@ -146,6 +146,59 @@ impl BlockStore {
         
         Ok(())
     }
+
+    /// Atomically stores a batch of validated headers along with their total
+    /// difficulties, and updates the chain head if appropriate.
+    ///
+    /// Each entry is `(header, total_difficulty)`.  The caller must have
+    /// already validated the headers and computed the TDs.
+    ///
+    /// Returns the hash of the new head (if it changed) or the existing head.
+    pub fn store_headers_batch(
+        &self,
+        entries: &[(&Header, U256)],
+        current_head_hash: Option<B256>,
+        current_td: U256,
+    ) -> Result<Option<B256>> {
+        use rocksdb::WriteBatch;
+
+        if entries.is_empty() {
+            return Ok(current_head_hash);
+        }
+
+        let cf_headers = self.cf(CF_HEADERS)?;
+        let cf_td = self.cf(CF_TD)?;
+        let cf_numbers = self.cf(CF_NUMBERS)?;
+
+        let mut batch = WriteBatch::default();
+        let mut best_hash = current_head_hash;
+        let mut best_td = current_td;
+
+        for &(header, td) in entries {
+            let hash = header.hash();
+
+            // Encode header
+            let mut header_buf = Vec::new();
+            header.encode(&mut header_buf);
+            batch.put_cf(cf_headers, hash.as_slice(), &header_buf);
+
+            // Encode TD
+            let mut td_buf = Vec::new();
+            td.encode(&mut td_buf);
+            batch.put_cf(cf_td, hash.as_slice(), &td_buf);
+
+            // Update head tracking if this block has higher TD
+            if td > best_td {
+                best_td = td;
+                best_hash = Some(hash);
+                batch.put(KEY_HEAD, hash.as_slice());
+                batch.put_cf(cf_numbers, header.number.to_be_bytes(), hash.as_slice());
+            }
+        }
+
+        self.db.write(batch).context("Failed to write header batch")?;
+        Ok(best_hash)
+    }
 }
 
 // Keeping basic Block support for backward compatibility/future use
