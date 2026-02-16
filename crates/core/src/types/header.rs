@@ -238,12 +238,11 @@ impl Header {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{Address, B256, U256, Bytes};
+    use alloy_primitives::{Address, B256, U256, Bytes, keccak256};
     use alloy_rlp::{Decodable, Encodable};
 
-    #[test]
-    fn test_header_rlp_roundtrip() {
-        let header = Header {
+    fn standard_test_header() -> Header {
+        Header {
             parent_hash: B256::repeat_byte(0x11),
             ommers_hash: B256::repeat_byte(0x22),
             beneficiary: Address::repeat_byte(0x33),
@@ -266,7 +265,12 @@ mod tests {
             bitcoin_merged_mining_merkle_proof: Some(Bytes::from("proof")),
             bitcoin_merged_mining_coinbase_transaction: Some(Bytes::from("coinbase")),
             cached_hash: None,
-        };
+        }
+    }
+
+    #[test]
+    fn test_header_rlp_roundtrip() {
+        let header = standard_test_header();
 
         // Encode
         let mut buffer = Vec::new();
@@ -281,5 +285,52 @@ mod tests {
         // Hash check (just to ensure it doesn't panic)
         let hash = header.hash();
         assert_ne!(hash, B256::ZERO);
+    }
+
+    #[test]
+    fn test_decode_with_hash_caches_hash() {
+        let header = standard_test_header();
+        let mut bytes = Vec::new();
+        header.encode(&mut bytes);
+
+        let mut slice = bytes.as_slice();
+        let decoded = Header::decode_with_hash(&mut slice).expect("decode failed");
+
+        assert!(decoded.cached_hash.is_some());
+        assert_eq!(decoded.hash(), decoded.cached_hash.unwrap());
+        // For canonical encoding, cached hash equals keccak256(original bytes)
+        assert_eq!(decoded.cached_hash.unwrap(), keccak256(&bytes));
+    }
+
+    #[test]
+    fn test_cached_hash_overrides_computed() {
+        let mut header = standard_test_header();
+        header.cached_hash = Some(B256::repeat_byte(0xAB));
+
+        assert_eq!(header.hash(), B256::repeat_byte(0xAB));
+    }
+
+    #[test]
+    fn test_hash_without_cache_computes_from_rlp() {
+        let header = standard_test_header();
+        assert_eq!(header.cached_hash, None);
+
+        let hash1 = header.hash();
+        assert_ne!(hash1, B256::ZERO);
+
+        let hash2 = header.hash();
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_decode_with_hash_differs_from_noncanonical() {
+        let header = standard_test_header();
+        let mut bytes = Vec::new();
+        header.encode(&mut bytes);
+
+        let mut slice = bytes.as_slice();
+        let decoded = Header::decode_with_hash(&mut slice).expect("decode failed");
+
+        assert_eq!(decoded.cached_hash.unwrap(), keccak256(&bytes));
     }
 }

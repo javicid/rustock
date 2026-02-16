@@ -976,4 +976,178 @@ mod tests {
 
         drop(event_tx);
     }
+
+    #[tokio::test]
+    async fn test_try_start_sync_when_behind_peer() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+        let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+        store.update_head(&genesis, U256::from(1)).unwrap();
+
+        let verifier = Arc::new(HeaderVerifier::new());
+        let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+
+        let peer_id = B512::repeat_byte(0x01);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        peer_store.add_peer(peer_id, tx).await;
+        peer_store.update_metadata(&peer_id, rustock_networking::peers::PeerMetadata {
+            best_number: 1000,
+            total_difficulty: U256::from(1000),
+            ..Default::default()
+        }).await;
+
+        let manager = Arc::new(SyncManager::new(store, verifier, peer_store.clone()));
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let mut service = SyncService::new(manager, peer_store, event_rx);
+
+        service.try_start_sync().await;
+
+        match &service.state {
+            SyncState::FindingConnectionPoint { peer_best, .. } => {
+                assert_eq!(*peer_best, 1000);
+            }
+            _ => panic!("Expected FindingConnectionPoint, got {:?}", service.state),
+        }
+
+        drop(event_tx);
+    }
+
+    #[tokio::test]
+    async fn test_try_start_sync_already_synced() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+        let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+        store.update_head(&genesis, U256::from(1)).unwrap();
+
+        let verifier = Arc::new(HeaderVerifier::new());
+        let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+
+        let peer_id = B512::repeat_byte(0x01);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        peer_store.add_peer(peer_id, tx).await;
+        peer_store.update_metadata(&peer_id, rustock_networking::peers::PeerMetadata {
+            best_number: 0,
+            total_difficulty: U256::from(1),
+            ..Default::default()
+        }).await;
+
+        let manager = Arc::new(SyncManager::new(store, verifier, peer_store.clone()));
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let mut service = SyncService::new(manager, peer_store, event_rx);
+
+        service.try_start_sync().await;
+
+        assert!(matches!(service.state, SyncState::Idle),
+            "Expected Idle when already synced, got {:?}", service.state);
+
+        drop(event_tx);
+    }
+
+    #[tokio::test]
+    async fn test_timeout_resets_to_idle() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+        let verifier = Arc::new(HeaderVerifier::new());
+        let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+        let manager = Arc::new(SyncManager::new(store, verifier, peer_store.clone()));
+
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let mut service = SyncService::new(manager, peer_store, event_rx);
+
+        let peer = B512::repeat_byte(0x01);
+        service.state = SyncState::FindingConnectionPoint {
+            peer,
+            peer_best: 1000,
+            start: 0,
+            end: 1000,
+        };
+        service.last_progress = Instant::now() - Duration::from_secs(60);
+
+        service.on_tick().await;
+
+        assert!(matches!(service.state, SyncState::Idle),
+            "Expected Idle after timeout, got {:?}", service.state);
+
+        drop(event_tx);
+    }
+
+    #[tokio::test]
+    async fn test_descending_headers_reversed() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+        let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+        let genesis_hash = genesis.hash();
+        store.update_head(&genesis, U256::from(1)).unwrap();
+
+        let verifier = Arc::new(HeaderVerifier::new());
+        let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+        let manager = SyncManager::new(store.clone(), verifier, peer_store);
+
+        let b1 = dummy_header(1, genesis_hash, U256::from(1));
+        let b2 = dummy_header(2, b1.hash(), U256::from(1));
+        let b3 = dummy_header(3, b2.hash(), U256::from(1));
+
+        manager.handle_headers_response(vec![b3.clone(), b2.clone(), b1.clone()]).unwrap();
+
+        assert!(store.get_header(b1.hash()).unwrap().is_some());
+        assert!(store.get_header(b2.hash()).unwrap().is_some());
+        assert!(store.get_header(b3.hash()).unwrap().is_some());
+        assert_eq!(store.get_head().unwrap(), Some(b3.hash()));
+    }
+
+    #[tokio::test]
+    async fn test_skeleton_round_transitions_to_next_skeleton() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+        let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+        let genesis_hash = genesis.hash();
+        store.update_head(&genesis, U256::from(1)).unwrap();
+
+        let b1 = dummy_header(1, genesis_hash, U256::from(1));
+        let b2 = dummy_header(2, b1.hash(), U256::from(1));
+        let b3 = dummy_header(3, b2.hash(), U256::from(1));
+        let b4 = dummy_header(4, b3.hash(), U256::from(1));
+
+        store.put_header(&b1).unwrap();
+        store.put_header(&b2).unwrap();
+        store.put_total_difficulty(b1.hash(), U256::from(2)).unwrap();
+        store.put_total_difficulty(b2.hash(), U256::from(3)).unwrap();
+        store.update_head(&b2, U256::from(3)).unwrap();
+
+        let verifier = Arc::new(HeaderVerifier::new());
+        let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+        let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let mut service = SyncService::new(manager, peer_store, event_rx);
+
+        let skeleton = vec![
+            BlockIdentifier { hash: genesis_hash, number: 0 },
+            BlockIdentifier { hash: b2.hash(), number: 2 },
+            BlockIdentifier { hash: b4.hash(), number: 4 },
+        ];
+        let peer = B512::repeat_byte(0x01);
+        service.state = SyncState::DownloadingHeaders {
+            peer,
+            peer_best: 10000,
+            skeleton,
+            connection_point: 0,
+            next_chunk_index: 2,
+        };
+
+        service.on_headers_response(vec![b4.clone(), b3.clone()]).await;
+
+        match &service.state {
+            SyncState::DownloadingSkeleton { connection_point, .. } => {
+                assert_eq!(*connection_point, 4, "Should request next skeleton from our head");
+            }
+            _ => panic!("Expected DownloadingSkeleton after completing last chunk, got {:?}", service.state),
+        }
+
+        drop(event_tx);
+    }
 }

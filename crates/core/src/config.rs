@@ -95,3 +95,50 @@ impl ChainConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::U256;
+
+    #[test]
+    fn test_mainnet_activation_heights() {
+        let heights = ActivationHeights::mainnet();
+        assert_eq!(heights.orchid, 729_000);
+        assert_eq!(heights.papyrus200, 2_392_700);
+    }
+
+    #[test]
+    fn test_testnet_activation_heights() {
+        let heights = ActivationHeights::testnet();
+        assert_eq!(heights.orchid, 0);
+        assert_eq!(heights.papyrus200, 0);
+    }
+
+    #[test]
+    fn test_regtest_activation_heights() {
+        let heights = ActivationHeights::regtest();
+        assert_eq!(heights.orchid, 0);
+        assert_eq!(heights.papyrus200, u64::MAX);
+    }
+
+    #[test]
+    fn test_mainnet_chain_config() {
+        let config = ChainConfig::mainnet();
+        assert_eq!(config.chain_id, 30);
+        assert_eq!(config.network_id, 775);
+        assert_eq!(config.duration_limit, 14);
+        assert_eq!(config.difficulty_divisor, U256::from(50));
+        assert_eq!(config.min_difficulty, U256::from(7_000_000_000_000_000u64));
+    }
+
+    #[test]
+    fn test_regtest_chain_config() {
+        let config = ChainConfig::regtest();
+        assert_eq!(config.chain_id, 33);
+        assert_eq!(config.network_id, 33);
+        assert_eq!(config.duration_limit, 10);
+        assert_eq!(config.difficulty_divisor, U256::from(2048));
+        assert_eq!(config.min_difficulty, U256::from(1));
+    }
+}

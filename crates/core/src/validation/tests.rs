@@ -255,3 +255,98 @@ fn test_merged_mining_rule_wrong_tag() {
     let res = rule.validate(&header);
     assert!(matches!(res, Err(ValidationError::BitcoinCoinbaseTagInvalid)));
 }
+
+// --- Difficulty rule tests (mainnet) ---
+
+#[test]
+fn test_difficulty_min_floor_clamping() {
+    let config = crate::config::ChainConfig::mainnet();
+    let rule = DifficultyRule { config: config.clone() };
+
+    let min_difficulty = U256::from(7_000_000_000_000_000u64); // 7e15
+    let mut parent = create_dummy_header(99, 1000, B256::ZERO);
+    parent.difficulty = min_difficulty;
+
+    // Slow block: delta = 30s (> 14s duration_limit)
+    let mut header = create_dummy_header(100, 1030, parent.hash());
+    header.difficulty = min_difficulty;
+
+    assert!(rule.validate_with_parent(&header, &parent).is_ok());
+}
+
+#[test]
+fn test_difficulty_ten_minute_reset() {
+    let config = crate::config::ChainConfig::mainnet();
+    let rule = DifficultyRule { config: config.clone() };
+
+    let min_difficulty = U256::from(7_000_000_000_000_000u64);
+    let mut parent = create_dummy_header(99, 1000, B256::ZERO);
+    parent.difficulty = U256::from(100_000_000_000_000_000u64); // 1e17
+
+    // Delta = 700s (> 600s) -> 10-min reset to min_difficulty (before orchid)
+    let mut header = create_dummy_header(100, 1700, parent.hash());
+    header.difficulty = min_difficulty;
+
+    assert!(rule.validate_with_parent(&header, &parent).is_ok());
+}
+
+#[test]
+fn test_difficulty_ten_minute_reset_disabled_after_orchid() {
+    let config = crate::config::ChainConfig::mainnet();
+    let rule = DifficultyRule { config: config.clone() };
+
+    let mut parent = create_dummy_header(799_999, 1000, B256::ZERO);
+    parent.difficulty = U256::from(100_000_000_000_000_000u64); // 1e17
+
+    // Delta = 700s, but orchid active -> no 10-min reset. Slow block with divisor 50.
+    // Expected = parent - parent/50 = 98_000_000_000_000_000
+    let expected = U256::from(98_000_000_000_000_000u64);
+    let mut header = create_dummy_header(800_000, 1700, parent.hash());
+    header.difficulty = expected;
+
+    assert!(rule.validate_with_parent(&header, &parent).is_ok());
+}
+
+#[test]
+fn test_difficulty_rskip156_divisor_change() {
+    let config = crate::config::ChainConfig::mainnet();
+    let rule = DifficultyRule { config: config.clone() };
+
+    let mut parent = create_dummy_header(2_499_999, 1000, B256::ZERO);
+    parent.difficulty = U256::from(100_000_000_000_000_000u64); // 1e17
+
+    // Fast block, papyrus200 active -> divisor 400
+    // Expected = parent + parent/400 = 100_250_000_000_000_000
+    let expected = U256::from(100_250_000_000_000_000u64);
+    let mut header = create_dummy_header(2_500_000, 1005, parent.hash());
+    header.difficulty = expected;
+
+    assert!(rule.validate_with_parent(&header, &parent).is_ok());
+}
+
+#[test]
+fn test_merged_mining_skipped_before_orchid() {
+    let config = crate::config::ChainConfig::mainnet();
+    let rule = MergedMiningRule { config };
+
+    // Header at block 100 (before orchid=729,000) with NO bitcoin merged mining fields
+    let mut header = create_dummy_header(100, 1000, B256::ZERO);
+    header.difficulty = U256::from(7_000_000_000_000_000u64);
+    // bitcoin_merged_mining_* are None by default in create_dummy_header
+
+    assert!(rule.validate(&header).is_ok());
+}
+
+#[test]
+fn test_merged_mining_required_after_orchid() {
+    let config = crate::config::ChainConfig::mainnet();
+    let rule = MergedMiningRule { config };
+
+    // Header at block 800_000 (after orchid) with NO bitcoin merged mining fields
+    let mut header = create_dummy_header(800_000, 1000, B256::ZERO);
+    header.difficulty = U256::from(7_000_000_000_000_000u64);
+    // bitcoin_merged_mining_* are None by default
+
+    let res = rule.validate(&header);
+    assert!(res.is_err());
+}

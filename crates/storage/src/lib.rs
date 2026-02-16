@@ -245,4 +245,43 @@ mod tests {
         assert_eq!(store.get_total_difficulty(hash).unwrap(), Some(td));
         assert_eq!(store.get_head().unwrap(), Some(hash));
     }
+
+    #[test]
+    fn test_put_header_with_hash() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        let header = dummy_header(1);
+        let custom_hash = B256::repeat_byte(0xAA);
+
+        store.put_header_with_hash(custom_hash, &header).unwrap();
+
+        assert!(store.get_header(custom_hash).unwrap().is_some());
+        assert!(store.get_header(header.hash()).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_has_block() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        let header = dummy_header(1);
+        store.put_header(&header).unwrap();
+
+        assert!(store.has_block(header.hash()).unwrap());
+        assert!(!store.has_block(B256::repeat_byte(0xFF)).unwrap());
+    }
+
+    #[test]
+    fn test_put_header_with_hash_for_genesis() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        let genesis = dummy_header(0);
+        let known_hash = B256::repeat_byte(0x42);
+        let td = U256::from(1000);
+
+        store.put_header_with_hash(known_hash, &genesis).unwrap();
+        store.put_total_difficulty(known_hash, td).unwrap();
+
+        assert_eq!(store.get_header(known_hash).unwrap().unwrap(), genesis);
+        assert_eq!(store.get_total_difficulty(known_hash).unwrap(), Some(td));
+    }
 }

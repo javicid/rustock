@@ -97,8 +97,74 @@ impl PeerStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::B512;
+    use alloy_primitives::{B256, B512, U256};
     use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn test_get_best_peer_by_total_difficulty() {
+        let store = PeerStore::new();
+        let peer_a = B512::repeat_byte(0x0a);
+        let peer_b = B512::repeat_byte(0x0b);
+        let (tx_a, _rx_a) = mpsc::unbounded_channel();
+        let (tx_b, _rx_b) = mpsc::unbounded_channel();
+
+        store.add_peer(peer_a, tx_a).await;
+        store.add_peer(peer_b, tx_b).await;
+
+        store.update_metadata(&peer_a, PeerMetadata {
+            total_difficulty: U256::from(100),
+            best_number: 10,
+            ..Default::default()
+        }).await;
+        store.update_metadata(&peer_b, PeerMetadata {
+            total_difficulty: U256::from(200),
+            best_number: 20,
+            ..Default::default()
+        }).await;
+
+        let best = store.get_best_peer().await.unwrap();
+        assert_eq!(best.0, peer_b, "peer B has higher TD");
+
+        store.update_metadata(&peer_a, PeerMetadata {
+            total_difficulty: U256::from(300),
+            best_number: 10,
+            ..Default::default()
+        }).await;
+
+        let best = store.get_best_peer().await.unwrap();
+        assert_eq!(best.0, peer_a, "peer A now has higher TD");
+    }
+
+    #[tokio::test]
+    async fn test_get_best_peer_empty() {
+        let store = PeerStore::new();
+        assert!(store.get_best_peer().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_update_and_get_metadata() {
+        let store = PeerStore::new();
+        let peer_id = B512::repeat_byte(0x01);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        store.add_peer(peer_id, tx).await;
+
+        let metadata = PeerMetadata {
+            best_number: 42,
+            best_hash: B256::repeat_byte(0x11),
+            total_difficulty: U256::from(999),
+            client_id: "test".to_string(),
+        };
+        store.update_metadata(&peer_id, metadata.clone()).await;
+
+        let retrieved = store.get_metadata(&peer_id).await.unwrap();
+        assert_eq!(retrieved.best_number, 42);
+        assert_eq!(retrieved.best_hash, B256::repeat_byte(0x11));
+        assert_eq!(retrieved.total_difficulty, U256::from(999));
+        assert_eq!(retrieved.client_id, "test");
+
+        let unknown = B512::repeat_byte(0xff);
+        assert!(store.get_metadata(&unknown).await.is_none());
+    }
 
     #[tokio::test]
     async fn test_peer_store_flow() {
