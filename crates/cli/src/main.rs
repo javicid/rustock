@@ -8,7 +8,8 @@ use rustock_sync::{SyncManager, SyncHandler, SyncService};
 use std::sync::Arc;
 use alloy_primitives::{B256, U256, Address, Bytes};
 use anyhow::{Result, Context};
-use tracing::{info, Level};
+use tracing::info;
+use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -28,17 +29,25 @@ struct Args {
     /// Secret key for the P2P node (hex). If not provided, a random one will be used.
     #[arg(long)]
     secret_key: Option<String>,
+
+    /// Log level: trace, debug, info, warn, error.
+    /// Can also use RUST_LOG-style directives, e.g. "info,rustock_sync=debug".
+    #[arg(long, default_value = "info")]
+    log_level: String,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = Args::parse();
+
     // 1. Initialize Logging
+    // RUST_LOG env var takes precedence; otherwise use --log-level CLI arg.
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(&args.log_level));
     tracing_subscriber::fmt()
-        .with_max_level(Level::DEBUG)
+        .with_env_filter(filter)
         .with_target(false)
         .init();
-
-    let args = Args::parse();
     info!("Starting Rustock Light Client on port {}...", args.port);
 
     // 2. Initialize Storage
