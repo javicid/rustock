@@ -7,6 +7,7 @@ use bitcoin::block::Header as BtcHeader;
 use bitcoin::transaction::{Transaction as BtcTransaction, TxOut, TxIn, OutPoint, Version};
 use bitcoin::hashes::Hash;
 use bitcoin::script::PushBytes;
+use std::sync::Arc;
 
 fn create_dummy_header(number: u64, timestamp: u64, parent_hash: B256) -> Header {
     Header {
@@ -37,7 +38,7 @@ fn create_dummy_header(number: u64, timestamp: u64, parent_hash: B256) -> Header
 
 /// Helper to build valid Merged Mining proof data for testing.
 fn build_mm_proof(header: &Header, btc_bits: u32, rsk_tag_hash: Option<B256>) -> (Bytes, Bytes, Bytes) {
-    let rsk_tag_hash = rsk_tag_hash.unwrap_or_else(|| header.get_hash_for_merged_mining());
+    let rsk_tag_hash = rsk_tag_hash.unwrap_or_else(|| header.hash_for_merged_mining());
     let mut rsk_tag = b"RSKBLOCK:".to_vec();
     rsk_tag.extend_from_slice(rsk_tag_hash.as_slice());
     
@@ -157,8 +158,8 @@ fn test_header_verifier() {
 
 #[test]
 fn test_difficulty_rule() {
-    let config = crate::config::ChainConfig::regtest();
-    let rule = DifficultyRule { config: config.clone() };
+    let config = Arc::new(crate::config::ChainConfig::regtest());
+    let rule = DifficultyRule { config };
     
     let mut parent = create_dummy_header(10, 1000, B256::ZERO);
     parent.difficulty = U256::from(20480);
@@ -176,7 +177,7 @@ fn test_difficulty_rule() {
 
 #[test]
 fn test_gas_limit_rule() {
-    let config = crate::config::ChainConfig::regtest();
+    let config = Arc::new(crate::config::ChainConfig::regtest());
     let rule = BlockParentGasLimitRule { config };
     
     let mut parent = create_dummy_header(10, 1000, B256::ZERO);
@@ -195,7 +196,7 @@ fn test_gas_limit_rule() {
 
 #[test]
 fn test_merged_mining_rule_success() {
-    let config = crate::config::ChainConfig::regtest();
+    let config = Arc::new(crate::config::ChainConfig::regtest());
     let rule = MergedMiningRule { config };
     let mut header = create_dummy_header(10, 1000, B256::ZERO);
     header.difficulty = U256::from(1);
@@ -210,7 +211,7 @@ fn test_merged_mining_rule_success() {
 
 #[test]
 fn test_merged_mining_rule_invalid_pow() {
-    let config = crate::config::ChainConfig::regtest();
+    let config = Arc::new(crate::config::ChainConfig::regtest());
     let rule = MergedMiningRule { config };
     let mut header = create_dummy_header(10, 1000, B256::ZERO);
     header.difficulty = U256::MAX; 
@@ -226,7 +227,7 @@ fn test_merged_mining_rule_invalid_pow() {
 
 #[test]
 fn test_merged_mining_rule_invalid_merkle() {
-    let config = crate::config::ChainConfig::regtest();
+    let config = Arc::new(crate::config::ChainConfig::regtest());
     let rule = MergedMiningRule { config };
     let mut header = create_dummy_header(10, 1000, B256::ZERO);
     header.difficulty = U256::from(1);
@@ -237,12 +238,12 @@ fn test_merged_mining_rule_invalid_merkle() {
     header.bitcoin_merged_mining_merkle_proof = Some(Bytes::from(vec![0u8; 64])); 
     
     let res = rule.validate(&header);
-    assert!(matches!(res, Err(ValidationError::BitcoinMerkleProofInvalid)));
+    assert!(matches!(res, Err(ValidationError::BitcoinMerkleProofDecodeError)));
 }
 
 #[test]
 fn test_merged_mining_rule_wrong_tag() {
-    let config = crate::config::ChainConfig::regtest();
+    let config = Arc::new(crate::config::ChainConfig::regtest());
     let rule = MergedMiningRule { config };
     let mut header = create_dummy_header(10, 1000, B256::ZERO);
     header.difficulty = U256::from(1);
@@ -260,8 +261,8 @@ fn test_merged_mining_rule_wrong_tag() {
 
 #[test]
 fn test_difficulty_min_floor_clamping() {
-    let config = crate::config::ChainConfig::mainnet();
-    let rule = DifficultyRule { config: config.clone() };
+    let config = Arc::new(crate::config::ChainConfig::mainnet());
+    let rule = DifficultyRule { config };
 
     let min_difficulty = U256::from(7_000_000_000_000_000u64); // 7e15
     let mut parent = create_dummy_header(99, 1000, B256::ZERO);
@@ -276,8 +277,8 @@ fn test_difficulty_min_floor_clamping() {
 
 #[test]
 fn test_difficulty_ten_minute_reset() {
-    let config = crate::config::ChainConfig::mainnet();
-    let rule = DifficultyRule { config: config.clone() };
+    let config = Arc::new(crate::config::ChainConfig::mainnet());
+    let rule = DifficultyRule { config };
 
     let min_difficulty = U256::from(7_000_000_000_000_000u64);
     let mut parent = create_dummy_header(99, 1000, B256::ZERO);
@@ -292,8 +293,8 @@ fn test_difficulty_ten_minute_reset() {
 
 #[test]
 fn test_difficulty_ten_minute_reset_disabled_after_orchid() {
-    let config = crate::config::ChainConfig::mainnet();
-    let rule = DifficultyRule { config: config.clone() };
+    let config = Arc::new(crate::config::ChainConfig::mainnet());
+    let rule = DifficultyRule { config };
 
     let mut parent = create_dummy_header(799_999, 1000, B256::ZERO);
     parent.difficulty = U256::from(100_000_000_000_000_000u64); // 1e17
@@ -309,8 +310,8 @@ fn test_difficulty_ten_minute_reset_disabled_after_orchid() {
 
 #[test]
 fn test_difficulty_rskip156_divisor_change() {
-    let config = crate::config::ChainConfig::mainnet();
-    let rule = DifficultyRule { config: config.clone() };
+    let config = Arc::new(crate::config::ChainConfig::mainnet());
+    let rule = DifficultyRule { config };
 
     let mut parent = create_dummy_header(2_499_999, 1000, B256::ZERO);
     parent.difficulty = U256::from(100_000_000_000_000_000u64); // 1e17
@@ -326,7 +327,7 @@ fn test_difficulty_rskip156_divisor_change() {
 
 #[test]
 fn test_merged_mining_skipped_before_orchid() {
-    let config = crate::config::ChainConfig::mainnet();
+    let config = Arc::new(crate::config::ChainConfig::mainnet());
     let rule = MergedMiningRule { config };
 
     // Header at block 100 (before orchid=729,000) with NO bitcoin merged mining fields
@@ -339,7 +340,7 @@ fn test_merged_mining_skipped_before_orchid() {
 
 #[test]
 fn test_merged_mining_required_after_orchid() {
-    let config = crate::config::ChainConfig::mainnet();
+    let config = Arc::new(crate::config::ChainConfig::mainnet());
     let rule = MergedMiningRule { config };
 
     // Header at block 800_000 (after orchid) with NO bitcoin merged mining fields

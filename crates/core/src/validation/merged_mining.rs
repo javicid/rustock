@@ -3,7 +3,7 @@ use crate::types::header::Header;
 use crate::config::ChainConfig;
 
 pub struct MergedMiningRule {
-    pub config: ChainConfig,
+    pub config: std::sync::Arc<ChainConfig>,
 }
 
 impl HeaderValidator for MergedMiningRule {
@@ -24,33 +24,27 @@ impl HeaderValidator for MergedMiningRule {
 
         // 0. Decode fields
         let btc_header_bytes = header.bitcoin_merged_mining_header.as_ref()
-            .ok_or(ValidationError::BitcoinPowInvalid { hash: B256::ZERO, target: U256::ZERO })?;
+            .ok_or(ValidationError::BitcoinHeaderDecodeError)?;
         let mut reader = &btc_header_bytes[..];
         let btc_header: BtcHeader = Decodable::consensus_decode(&mut reader)
-            .map_err(|_| ValidationError::BitcoinPowInvalid { 
-                hash: B256::ZERO, 
-                target: U256::ZERO 
-            })?;
+            .map_err(|_| ValidationError::BitcoinHeaderDecodeError)?;
 
         let coinbase_tx_bytes = header.bitcoin_merged_mining_coinbase_transaction.as_ref()
-            .ok_or(ValidationError::BitcoinCoinbaseTagInvalid)?;
+            .ok_or(ValidationError::BitcoinCoinbaseDecodeError)?;
         let mut reader = &coinbase_tx_bytes[..];
         let coinbase_tx: BtcTransaction = Decodable::consensus_decode(&mut reader)
-            .map_err(|_| ValidationError::BitcoinCoinbaseTagInvalid)?;
+            .map_err(|_| ValidationError::BitcoinCoinbaseDecodeError)?;
 
         let merkle_proof_bytes = header.bitcoin_merged_mining_merkle_proof.as_ref()
-            .ok_or(ValidationError::BitcoinMerkleProofInvalid)?;
+            .ok_or(ValidationError::BitcoinMerkleProofDecodeError)?;
         let mut reader = &merkle_proof_bytes[..];
         let merkle_proof: MerkleBlock = Decodable::consensus_decode(&mut reader)
-            .map_err(|_| ValidationError::BitcoinMerkleProofInvalid)?;
+            .map_err(|_| ValidationError::BitcoinMerkleProofDecodeError)?;
 
         // 1. Check Bitcoin Header PoW vs RSK Difficulty
         let difficulty = header.difficulty;
         if difficulty.is_zero() {
-             return Err(ValidationError::DifficultyMismatch { 
-                 expected: U256::ZERO, 
-                 got: difficulty 
-             });
+             return Err(ValidationError::DifficultyZero);
         }
 
         let target = if difficulty > U256::MAX {
@@ -94,7 +88,7 @@ impl HeaderValidator for MergedMiningRule {
         }
 
         // 3. Verify RSK Tag in Coinbase
-        let rsk_hash = header.get_hash_for_merged_mining();
+        let rsk_hash = header.hash_for_merged_mining();
         let expected_tag = ["RSKBLOCK:".as_bytes(), rsk_hash.as_slice()].concat();
 
         let found = coinbase_tx.output.iter().any(|output| {

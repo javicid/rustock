@@ -67,8 +67,17 @@ impl Node {
         // Load existing nodes
         {
             let mut table_lock = table.lock().await;
-            if let Err(e) = table_lock.load(&discovery_path) {
-                debug!(target: "rustock::net", "Failed to load discovery table: {:?}", e);
+            if discovery_path.exists() {
+                match tokio::fs::read(&discovery_path).await {
+                    Ok(data) => {
+                        if let Err(e) = table_lock.decode_and_add(&data) {
+                            debug!(target: "rustock::net", "Failed to decode discovery table: {:?}", e);
+                        }
+                    }
+                    Err(e) => {
+                        debug!(target: "rustock::net", "Failed to read discovery table: {:?}", e);
+                    }
+                }
             }
             // Add bootnodes
             for enode in &self.config.bootnodes {
@@ -106,8 +115,8 @@ impl Node {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-                let table_lock = table_save.lock().await;
-                if let Err(e) = table_lock.save(&discovery_path) {
+                let data = table_save.lock().await.encode();
+                if let Err(e) = tokio::fs::write(&discovery_path, data).await {
                     error!(target: "rustock::net", "Failed to save discovery table: {:?}", e);
                 }
             }
@@ -142,6 +151,40 @@ impl Node {
 
 use tokio::sync::mpsc;
 use crate::session::PeerSession;
+use crate::protocol::rsk::RskStatus;
+
+/// Registers a peer and runs a session. Shared by incoming and outbound connection paths.
+pub(crate) async fn register_and_run_session(
+    peer_id: B512,
+    rsk_status: RskStatus,
+    framed: tokio_util::codec::Framed<TcpStream, crate::handshake::HandshakeCodec>,
+    handlers: Vec<Arc<dyn P2pHandler>>,
+    peer_store: Arc<PeerStore>,
+) -> Result<()> {
+    let (tx, rx) = mpsc::unbounded_channel();
+
+    if !peer_store.add_peer(peer_id, tx).await {
+        debug!(target: "rustock::net", "Peer already connected: {:?}", peer_id);
+        return Ok(());
+    }
+
+    let metadata = crate::peers::PeerMetadata {
+        best_number: rsk_status.best_block_number,
+        best_hash: rsk_status.best_block_hash,
+        total_difficulty: rsk_status.total_difficulty.unwrap_or_default(),
+        client_id: String::new(),
+    };
+    peer_store.update_metadata(&peer_id, metadata).await;
+
+    let mut session = PeerSession::from_framed(peer_id, framed, rx);
+    for handler in handlers {
+        session.add_handler(handler);
+    }
+
+    let res = session.run().await;
+    peer_store.remove_peer(&peer_id).await;
+    res
+}
 
 /// Handles an incoming connection by performing a handshake and starting a session.
 pub async fn handle_incoming(
@@ -152,33 +195,7 @@ pub async fn handle_incoming(
 ) -> Result<()> {
     let handshake = Handshake::new(stream, config, None);
     let (peer_id, rsk_status, framed) = handshake.run().await?;
-    
-    let (tx, rx) = mpsc::unbounded_channel();
-    
-    // Check if peer is already connected
-    if !peer_store.add_peer(peer_id, tx).await {
-        debug!(target: "rustock::net", "Incoming connection from already connected peer: {:?}", peer_id);
-        return Ok(());
-    }
-
-    // Initialize metadata
-    let metadata = crate::peers::PeerMetadata {
-        best_number: rsk_status.best_block_number,
-        best_hash: rsk_status.best_block_hash,
-        total_difficulty: rsk_status.total_difficulty.unwrap_or_default(),
-        client_id: "".to_string(), // TODO: Get from Hello
-    };
-    peer_store.update_metadata(&peer_id, metadata).await;
-
-    let mut session = PeerSession::from_framed(peer_id, framed, rx);
-    for handler in handlers {
-        session.add_handler(handler);
-    }
-    
-    let res = session.run().await;
-    
-    peer_store.remove_peer(&peer_id).await;
-    res
+    register_and_run_session(peer_id, rsk_status, framed, handlers, peer_store).await
 }
 
 #[cfg(test)]

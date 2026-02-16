@@ -192,7 +192,7 @@ impl Header {
 
     /// Computes the hash used in the Bitcoin coinbase transaction for merged mining.
     /// This hash excludes the Bitcoin-specific fields themselves.
-    pub fn get_hash_for_merged_mining(&self) -> B256 {
+    pub fn hash_for_merged_mining(&self) -> B256 {
         let mut out = Vec::new();
         
         // Manual RLP list encoding for the "base" header fields

@@ -1,4 +1,4 @@
-use crate::node::NodeConfig;
+use crate::node::{NodeConfig, register_and_run_session};
 use crate::discovery::table::NodeTable;
 use crate::protocol::P2pHandler;
 use crate::handshake::Handshake;
@@ -9,8 +9,6 @@ use tokio::time::{sleep, Duration};
 use tracing::{info, debug};
 use tokio::net::TcpStream;
 use std::net::SocketAddr;
-use tokio::sync::mpsc;
-use crate::session::PeerSession;
 
 /// Service that proactively initiates connections to peers discovered in the network.
 pub struct OutboundConnector {
@@ -69,28 +67,10 @@ impl OutboundConnector {
                                     let handshake = Handshake::new(stream, config, Some(remote_id));
                                     match tokio::time::timeout(Duration::from_secs(5), handshake.run()).await {
                                         Ok(Ok((peer_id, rsk_status, framed))) => {
-                                            let (tx, rx) = mpsc::unbounded_channel();
-                                            if peer_store.add_peer(peer_id, tx).await {
-                                                info!(target: "rustock::net", "Outbound handshake successful: {:?}", peer_id);
-                                                
-                                                // Initialize metadata
-                                                let metadata = crate::peers::PeerMetadata {
-                                                    best_number: rsk_status.best_block_number,
-                                                    best_hash: rsk_status.best_block_hash,
-                                                    total_difficulty: rsk_status.total_difficulty.unwrap_or_default(),
-                                                    client_id: "".to_string(), // TODO: Get from Hello
-                                                };
-                                                peer_store.update_metadata(&peer_id, metadata).await;
-
-                                                let mut session = PeerSession::from_framed(peer_id, framed, rx);
-                                                for handler in handlers {
-                                                    session.add_handler(handler);
-                                                }
-                                                let _ = session.run().await;
-                                                peer_store.remove_peer(&peer_id).await;
-                                            } else {
-                                                debug!(target: "rustock::net", "Outbound handshake finished but peer already connected: {:?}", peer_id);
-                                            }
+                                            info!(target: "rustock::net", "Outbound handshake successful: {:?}", peer_id);
+                                            let _ = register_and_run_session(
+                                                peer_id, rsk_status, framed, handlers, peer_store,
+                                            ).await;
                                         }
                                         Ok(Err(e)) => {
                                             debug!(target: "rustock::net", "Outbound handshake failed for {}: {:?}", addr, e);

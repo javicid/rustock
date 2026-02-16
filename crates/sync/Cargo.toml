@@ -7,13 +7,13 @@ edition = "2021"
 rustock-core = { version = "0.1.0", path = "../core" }
 rustock-storage = { version = "0.1.0", path = "../storage" }
 rustock-networking = { version = "0.1.0", path = "../networking" }
-tokio = { version = "1.0", features = ["full"] }
-tracing = "0.1.44"
-anyhow = "1.0.100"
-alloy-primitives = { version = "1.5.4", features = ["serde", "rlp"] }
-alloy-rlp = { version = "0.3.13", features = ["derive"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+alloy-primitives = { workspace = true }
+alloy-rlp = { workspace = true }
 futures = "0.3.31"
-rand = "0.9.2"
+rand = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3.25.0"
+tempfile = { workspace = true }

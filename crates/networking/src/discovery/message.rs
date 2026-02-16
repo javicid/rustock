@@ -127,7 +127,7 @@ impl DiscoveryPacket {
         packet
     }
 
-    pub fn create(payload: DiscoveryPayload, key: &SigningKey) -> Self {
+    pub fn create(payload: DiscoveryPayload, key: &SigningKey) -> anyhow::Result<Self> {
         let msg_type = payload.msg_type();
         let mut data = Vec::new();
         payload.encode(&mut data);
@@ -138,7 +138,8 @@ impl DiscoveryPacket {
 
         let sig_hash = Keccak256::digest(&sig_payload);
         
-        let (signature_bytes, recovery_id) = key.sign_prehash_recoverable(&sig_hash).expect("Signing failed");
+        let (signature_bytes, recovery_id) = key.sign_prehash_recoverable(&sig_hash)
+            .map_err(|e| anyhow::anyhow!("Signing failed: {:?}", e))?;
         let mut signature = [0u8; 65];
         signature[..64].copy_from_slice(&signature_bytes.to_bytes());
         signature[64] = recovery_id.to_byte();
@@ -150,12 +151,12 @@ impl DiscoveryPacket {
         
         let mdc = B256::from_slice(&Keccak256::digest(&mdc_payload));
 
-        Self {
+        Ok(Self {
             mdc,
             signature,
             msg_type,
             payload,
-        }
+        })
     }
 
     pub fn recover_id(&self) -> anyhow::Result<B512> {
@@ -241,7 +242,7 @@ mod tests {
         };
 
         let payload = DiscoveryPayload::Ping(ping);
-        let packet = DiscoveryPacket::create(payload, &key);
+        let packet = DiscoveryPacket::create(payload, &key).unwrap();
         let encoded = packet.encode();
         
         let decoded = DiscoveryPacket::decode(&encoded).unwrap();

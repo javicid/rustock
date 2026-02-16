@@ -1,6 +1,12 @@
 use super::{HeaderValidator, ParentHeaderValidator, ValidationError};
 use crate::types::header::Header;
+use alloy_primitives::U256;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Converts a U256 gas limit to u64, returning an error on overflow.
+fn gas_limit_as_u64(gas_limit: U256) -> Result<u64, ValidationError> {
+    gas_limit.try_into().map_err(|_| ValidationError::GasLimitOverflow)
+}
 
 pub struct BlockNumberRule;
 impl ParentHeaderValidator for BlockNumberRule {
@@ -21,8 +27,8 @@ impl ParentHeaderValidator for ParentHashRule {
         let parent_hash = parent.hash();
         if header.parent_hash != parent_hash {
             return Err(ValidationError::ParentHashMismatch {
-                expected: format!("{:?}", parent_hash),
-                got: format!("{:?}", header.parent_hash),
+                expected: parent_hash,
+                got: header.parent_hash,
             });
         }
         Ok(())
@@ -30,7 +36,7 @@ impl ParentHeaderValidator for ParentHashRule {
 }
 
 pub struct TimestampRule {
-    pub max_future_offset: u64,
+    max_future_offset: u64,
 }
 
 impl TimestampRule {
@@ -43,7 +49,7 @@ impl HeaderValidator for TimestampRule {
     fn validate(&self, header: &Header) -> Result<(), ValidationError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards")
+            .map_err(|_| ValidationError::SystemTimeError)?
             .as_secs();
             
         if header.timestamp > now + self.max_future_offset {
@@ -72,7 +78,7 @@ impl ParentHeaderValidator for TimestampRule {
 pub struct GasUsedRule;
 impl HeaderValidator for GasUsedRule {
     fn validate(&self, header: &Header) -> Result<(), ValidationError> {
-        let gas_limit: u64 = header.gas_limit.try_into().unwrap_or(u64::MAX);
+        let gas_limit = gas_limit_as_u64(header.gas_limit)?;
         if header.gas_used > gas_limit {
             return Err(ValidationError::GasUsedExceedsLimit {
                 used: header.gas_used,
@@ -90,7 +96,7 @@ pub struct GasLimitBoundsRule {
 
 impl HeaderValidator for GasLimitBoundsRule {
     fn validate(&self, header: &Header) -> Result<(), ValidationError> {
-        let gas_limit: u64 = header.gas_limit.try_into().unwrap_or(u64::MAX);
+        let gas_limit = gas_limit_as_u64(header.gas_limit)?;
         if gas_limit < self.min_gas_limit || gas_limit > self.max_gas_limit {
             return Err(ValidationError::GasLimitOutOfBounds {
                 min: self.min_gas_limit,
@@ -103,13 +109,13 @@ impl HeaderValidator for GasLimitBoundsRule {
 }
 
 pub struct BlockParentGasLimitRule {
-    pub config: crate::config::ChainConfig,
+    pub config: std::sync::Arc<crate::config::ChainConfig>,
 }
 
 impl ParentHeaderValidator for BlockParentGasLimitRule {
     fn validate_with_parent(&self, header: &Header, parent: &Header) -> Result<(), ValidationError> {
-        let limit: u64 = header.gas_limit.try_into().unwrap_or(u64::MAX);
-        let parent_limit: u64 = parent.gas_limit.try_into().unwrap_or(u64::MAX);
+        let limit = gas_limit_as_u64(header.gas_limit)?;
+        let parent_limit = gas_limit_as_u64(parent.gas_limit)?;
         let divisor = self.config.gas_limit_bound_divisor;
         let delta = parent_limit / divisor;
         

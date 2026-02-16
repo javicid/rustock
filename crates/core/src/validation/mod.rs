@@ -8,7 +8,7 @@ pub enum ValidationError {
     InvalidBlockNumber { expected: u64, got: u64 },
     
     #[error("Parent hash mismatch: expected {expected}, got {got}")]
-    ParentHashMismatch { expected: String, got: String },
+    ParentHashMismatch { expected: B256, got: B256 },
     
     #[error("Timestamp is in the future: current {current}, got {got}")]
     TimestampInFuture { current: u64, got: u64 },
@@ -16,8 +16,14 @@ pub enum ValidationError {
     #[error("Timestamp is older than parent: parent {parent}, got {got}")]
     TimestampOlderThanParent { parent: u64, got: u64 },
 
+    #[error("Failed to read system time")]
+    SystemTimeError,
+
     #[error("Gas used {used} exceeds gas limit {limit}")]
     GasUsedExceedsLimit { used: u64, limit: u64 },
+
+    #[error("Gas limit overflows u64")]
+    GasLimitOverflow,
 
     #[error("Gas limit {got} out of bounds: [{min}, {max}]")]
     GasLimitOutOfBounds { min: u64, max: u64, got: u64 },
@@ -28,8 +34,17 @@ pub enum ValidationError {
     #[error("Difficulty mismatch: expected {expected}, got {got}")]
     DifficultyMismatch { expected: U256, got: U256 },
 
-    #[error("Missing merged mining fields")]
-    MissingMergedMiningFields,
+    #[error("Difficulty is zero")]
+    DifficultyZero,
+
+    #[error("Failed to decode Bitcoin block header")]
+    BitcoinHeaderDecodeError,
+
+    #[error("Failed to decode Bitcoin coinbase transaction")]
+    BitcoinCoinbaseDecodeError,
+
+    #[error("Failed to decode Bitcoin merkle proof")]
+    BitcoinMerkleProofDecodeError,
 
     #[error("Bitcoin Proof of Work invalid: hash {hash} exceeds target {target}")]
     BitcoinPowInvalid { hash: B256, target: U256 },
@@ -49,10 +64,10 @@ pub trait ParentHeaderValidator: Send + Sync {
     fn validate_with_parent(&self, header: &Header, parent: &Header) -> Result<(), ValidationError>;
 }
 
-/// Orchestrator to run multiple validation rules
+/// Orchestrator to run multiple validation rules.
 pub struct HeaderVerifier {
-    pub static_rules: Vec<Box<dyn HeaderValidator>>,
-    pub parent_rules: Vec<Box<dyn ParentHeaderValidator>>,
+    static_rules: Vec<Box<dyn HeaderValidator>>,
+    parent_rules: Vec<Box<dyn ParentHeaderValidator>>,
 }
 
 impl Default for HeaderVerifier {
@@ -77,7 +92,7 @@ impl HeaderVerifier {
     /// rule would break for the genesis block, whose canonical hash is derived
     /// from Java's non-canonical RLP encoding (leading zeros in difficulty)
     /// and cannot be reproduced by our standard `Header::hash()`.
-    pub fn default_rsk(config: crate::config::ChainConfig) -> Self {
+    pub fn default_rsk(config: std::sync::Arc<crate::config::ChainConfig>) -> Self {
         Self::new()
             .with_static_rule(GasUsedRule)
             .with_static_rule(GasLimitBoundsRule { 

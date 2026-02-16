@@ -17,10 +17,6 @@ struct Args {
     #[arg(short, long, default_value_t = 30303)]
     port: u16,
 
-    /// RPC Port (Not yet implemented)
-    #[arg(long, default_value_t = 4444)]
-    rpc_port: u16,
-
     /// Data directory
     #[arg(short, long, default_value = "./data")]
     data_dir: String,
@@ -58,6 +54,7 @@ async fn main() -> Result<()> {
         31 => ChainConfig::testnet(),
         _ => ChainConfig::regtest(),
     };
+    let config = Arc::new(config);
     let verifier = Arc::new(HeaderVerifier::default_rsk(config.clone()));
     
     // 5. Setup Networking

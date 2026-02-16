@@ -61,27 +61,22 @@ impl NodeTable {
         nodes
     }
 
-    /// Saves the table to a file using RLP encoding.
-    pub fn save(&self, path: &std::path::Path) -> anyhow::Result<()> {
+    /// Serializes the table to RLP bytes.
+    pub fn encode(&self) -> Vec<u8> {
         use alloy_rlp::Encodable;
         let nodes = self.get_all_nodes();
         let mut buf = Vec::new();
         nodes.encode(&mut buf);
-        std::fs::write(path, buf)?;
-        Ok(())
+        buf
     }
 
-    /// Loads nodes into the table from an RLP-encoded file.
-    pub fn load(&mut self, path: &std::path::Path) -> anyhow::Result<()> {
+    /// Loads nodes from RLP-encoded bytes.
+    pub fn decode_and_add(&mut self, data: &[u8]) -> anyhow::Result<()> {
         use alloy_rlp::Decodable;
-        if !path.exists() {
-            return Ok(());
-        }
-        let data = std::fs::read(path)?;
-        let mut ptr = &data[..];
+        let mut ptr = data;
         let nodes = Vec::<DiscoveryNode>::decode(&mut ptr)
             .map_err(|e| anyhow::anyhow!("Failed to decode nodes: {:?}", e))?;
-        
+
         for node in nodes {
             self.add_node(node);
         }

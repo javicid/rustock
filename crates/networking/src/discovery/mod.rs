@@ -90,7 +90,7 @@ impl DiscoveryService {
             message_id: Uuid::new_v4().to_string(),
             network_id: self.network_id,
         });
-        let packet = DiscoveryPacket::create(payload, &self.key);
+        let packet = DiscoveryPacket::create(payload, &self.key)?;
         self.socket.send_to(&packet.encode(), to).await?;
         Ok(())
     }
@@ -102,7 +102,7 @@ impl DiscoveryService {
             message_id: Uuid::new_v4().to_string(),
             network_id: self.network_id,
         });
-        let packet = DiscoveryPacket::create(payload, &self.key);
+        let packet = DiscoveryPacket::create(payload, &self.key)?;
         self.socket.send_to(&packet.encode(), to).await?;
         Ok(())
     }
@@ -154,7 +154,7 @@ impl DiscoveryService {
             network_id: self.network_id,
         });
         
-        let packet = DiscoveryPacket::create(payload, &self.key);
+        let packet = DiscoveryPacket::create(payload, &self.key)?;
         self.socket.send_to(&packet.encode(), to).await?;
         Ok(())
     }
@@ -166,7 +166,7 @@ impl DiscoveryService {
             network_id: self.network_id,
         });
         
-        let packet = DiscoveryPacket::create(payload, &self.key);
+        let packet = DiscoveryPacket::create(payload, &self.key)?;
         self.socket.send_to(&packet.encode(), to).await?;
         Ok(())
     }

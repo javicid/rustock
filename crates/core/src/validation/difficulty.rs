@@ -9,7 +9,7 @@ const RSKIP156_DIFFICULTY_DIVISOR: U256 = U256::from_limbs([400, 0, 0, 0]);
 const TEN_MINUTES: u64 = 600;
 
 pub struct DifficultyRule {
-    pub config: crate::config::ChainConfig,
+    pub config: std::sync::Arc<crate::config::ChainConfig>,
 }
 
 impl ParentHeaderValidator for DifficultyRule {

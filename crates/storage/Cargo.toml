@@ -4,13 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-rustock-core = { path = "../core" }
+rustock-core = { version = "0.1.0", path = "../core" }
 rocksdb = "0.22.0"
-# We need anyhow for error handling as DB operations fail often
-anyhow = "1.0"
-# We need this to encode keys/values
-alloy-rlp = "0.3.13"
-alloy-primitives = { version = "1.5.4", features = ["rlp"] }
+anyhow = { workspace = true }
+alloy-rlp = { workspace = true }
+alloy-primitives = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3.24.0"
+tempfile = { workspace = true }

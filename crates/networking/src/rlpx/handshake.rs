@@ -78,7 +78,7 @@ impl RLPxHandshake {
         )?;
 
         let frame_codec = FrameCodec::new(secrets);
-        Ok((auth_resp.public_key, frame_codec, self.stream))
+        Ok((self.remote_pk, frame_codec, self.stream))
     }
 
     pub async fn run_responder(mut self) -> Result<(B512, FrameCodec, TcpStream)> {
@@ -211,10 +211,11 @@ mod tests {
         });
 
         let (res1, res2) = tokio::join!(client_task, server_task);
-        let (_remote_ephemeral_pk, mut client_codec, _client_stream) = res1.unwrap().unwrap();
+        let (responder_static_pk, mut client_codec, _client_stream) = res1.unwrap().unwrap();
         let (initiator_static_pk, mut server_codec, _server_stream) = res2.unwrap().unwrap();
         
         assert_eq!(initiator_static_pk, pk1);
+        assert_eq!(responder_static_pk, pk2);
 
         // Test that encryption/decryption works after handshake
         let msg = b"PING";
