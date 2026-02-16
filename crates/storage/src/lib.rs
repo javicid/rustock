@@ -337,4 +337,104 @@ mod tests {
         assert_eq!(store.get_header(known_hash).unwrap().unwrap(), genesis);
         assert_eq!(store.get_total_difficulty(known_hash).unwrap(), Some(td));
     }
+
+    // --- store_headers_batch tests ---
+
+    fn dummy_header_with_difficulty(number: u64, difficulty: u64) -> Header {
+        let mut h = dummy_header(number);
+        h.difficulty = U256::from(difficulty);
+        h
+    }
+
+    #[test]
+    fn test_store_headers_batch_empty() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+
+        let result = store
+            .store_headers_batch(&[], None, U256::ZERO)
+            .unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_store_headers_batch_single_entry() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+
+        let h = dummy_header_with_difficulty(1, 10);
+        let td = U256::from(10);
+        let entries = vec![(&h, td)];
+
+        let new_head = store
+            .store_headers_batch(&entries, None, U256::ZERO)
+            .unwrap();
+
+        // TD(10) > current TD(0), so head should be updated
+        assert_eq!(new_head, Some(h.hash()));
+        assert!(store.get_header(h.hash()).unwrap().is_some());
+        assert_eq!(store.get_total_difficulty(h.hash()).unwrap(), Some(td));
+        assert_eq!(store.get_head().unwrap(), Some(h.hash()));
+        assert_eq!(store.get_canonical_hash(1).unwrap(), Some(h.hash()));
+    }
+
+    #[test]
+    fn test_store_headers_batch_multiple_ascending_td() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+
+        let h1 = dummy_header_with_difficulty(1, 5);
+        let h2 = dummy_header_with_difficulty(2, 5);
+        let h3 = dummy_header_with_difficulty(3, 5);
+        let entries = vec![
+            (&h1, U256::from(5)),
+            (&h2, U256::from(10)),
+            (&h3, U256::from(15)),
+        ];
+
+        let new_head = store
+            .store_headers_batch(&entries, None, U256::ZERO)
+            .unwrap();
+
+        // h3 has the highest TD, so it should be the head
+        assert_eq!(new_head, Some(h3.hash()));
+        assert_eq!(store.get_head().unwrap(), Some(h3.hash()));
+        assert_eq!(store.get_canonical_hash(3).unwrap(), Some(h3.hash()));
+
+        // All headers should be retrievable
+        assert!(store.get_header(h1.hash()).unwrap().is_some());
+        assert!(store.get_header(h2.hash()).unwrap().is_some());
+        assert!(store.get_header(h3.hash()).unwrap().is_some());
+
+        // All TDs should be stored
+        assert_eq!(store.get_total_difficulty(h1.hash()).unwrap(), Some(U256::from(5)));
+        assert_eq!(store.get_total_difficulty(h3.hash()).unwrap(), Some(U256::from(15)));
+    }
+
+    #[test]
+    fn test_store_headers_batch_does_not_lower_head() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+
+        // Set up existing head with TD=100
+        let existing = dummy_header_with_difficulty(50, 100);
+        store.update_head(&existing, U256::from(100)).unwrap();
+        let existing_hash = existing.hash();
+
+        // Batch with lower TD should not change head
+        let h = dummy_header_with_difficulty(1, 5);
+        let entries = vec![(&h, U256::from(5))];
+
+        let result = store
+            .store_headers_batch(&entries, Some(existing_hash), U256::from(100))
+            .unwrap();
+
+        // Head should remain unchanged
+        assert_eq!(result, Some(existing_hash));
+        assert_eq!(store.get_head().unwrap(), Some(existing_hash));
+
+        // But the header should still be stored
+        assert!(store.get_header(h.hash()).unwrap().is_some());
+        assert_eq!(store.get_total_difficulty(h.hash()).unwrap(), Some(U256::from(5)));
+    }
 }

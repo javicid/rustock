@@ -31,9 +31,18 @@ impl OutboundConnector {
     }
 
     /// Starts the outbound connection loop.
+    ///
+    /// Uses aggressive intervals (5s) for the first few cycles to fill
+    /// the peer table quickly, then settles to 30s.
     pub async fn start(self) {
         info!(target: "rustock::net", "Outbound connector started (target outbound: {})", self.max_outbound);
-        
+
+        const FAST_INTERVAL: Duration = Duration::from_secs(5);
+        const NORMAL_INTERVAL: Duration = Duration::from_secs(30);
+        const FAST_CYCLES: u32 = 6;
+
+        let mut cycle = 0u32;
+
         loop {
             let current_count = self.peer_store.count().await;
             if current_count < self.max_outbound {
@@ -90,8 +99,10 @@ impl OutboundConnector {
                     }
                 }
             }
-            
-            sleep(Duration::from_secs(30)).await;
+
+            let interval = if cycle < FAST_CYCLES { FAST_INTERVAL } else { NORMAL_INTERVAL };
+            sleep(interval).await;
+            cycle = cycle.saturating_add(1);
         }
     }
 

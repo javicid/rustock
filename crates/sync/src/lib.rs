@@ -642,4 +642,189 @@ mod tests {
 
         drop(event_tx);
     }
+
+    // -- PeerChunkTracker tests -----------------------------------------------
+
+    #[test]
+    fn test_tracker_new_starts_at_chunk_1() {
+        let tracker = PeerChunkTracker::new(5);
+        assert_eq!(tracker.next_to_assign, 1);
+        assert_eq!(tracker.next_to_process, 1);
+        assert_eq!(tracker.total_chunks, 5);
+        assert!(!tracker.is_complete());
+    }
+
+    #[test]
+    fn test_tracker_assignment_sequence() {
+        let mut tracker = PeerChunkTracker::new(4); // chunks 1, 2, 3
+
+        assert_eq!(tracker.next_assignment(), Some(1));
+        assert_eq!(tracker.next_assignment(), Some(2));
+        assert_eq!(tracker.next_assignment(), Some(3));
+        assert_eq!(tracker.next_assignment(), None); // all assigned
+        assert_eq!(tracker.next_assignment(), None); // still None
+    }
+
+    #[test]
+    fn test_tracker_record_and_identify_response() {
+        let mut tracker = PeerChunkTracker::new(5);
+        let peer_a = B512::repeat_byte(0x0A);
+        let peer_b = B512::repeat_byte(0x0B);
+
+        tracker.record_sent(peer_a, 1);
+        tracker.record_sent(peer_a, 2);
+        tracker.record_sent(peer_b, 3);
+
+        // Responses come back in FIFO order per peer
+        assert_eq!(tracker.identify_response(&peer_a), Some(1));
+        assert_eq!(tracker.identify_response(&peer_b), Some(3));
+        assert_eq!(tracker.identify_response(&peer_a), Some(2));
+
+        // No more in flight
+        assert_eq!(tracker.identify_response(&peer_a), None);
+        assert_eq!(tracker.identify_response(&peer_b), None);
+    }
+
+    #[test]
+    fn test_tracker_identify_unknown_peer() {
+        let mut tracker = PeerChunkTracker::new(3);
+        let unknown = B512::repeat_byte(0xFF);
+        assert_eq!(tracker.identify_response(&unknown), None);
+    }
+
+    #[test]
+    fn test_tracker_drain_ready_in_order() {
+        let mut tracker = PeerChunkTracker::new(5);
+        // Simulate: chunks 1, 2, 3, 4 all buffered
+        tracker.buffer_response(1, vec![]);
+        tracker.buffer_response(2, vec![]);
+        tracker.buffer_response(3, vec![]);
+        tracker.buffer_response(4, vec![]);
+
+        let ready = tracker.drain_ready();
+        assert_eq!(ready.len(), 4);
+        assert_eq!(ready[0].0, 1);
+        assert_eq!(ready[1].0, 2);
+        assert_eq!(ready[2].0, 3);
+        assert_eq!(ready[3].0, 4);
+        assert!(tracker.is_complete());
+    }
+
+    #[test]
+    fn test_tracker_drain_ready_out_of_order() {
+        let mut tracker = PeerChunkTracker::new(5);
+
+        // Chunk 3 arrives first — can't process yet
+        tracker.buffer_response(3, vec![]);
+        let ready = tracker.drain_ready();
+        assert!(ready.is_empty());
+        assert_eq!(tracker.next_to_process, 1);
+
+        // Chunk 2 arrives — still can't process (waiting for 1)
+        tracker.buffer_response(2, vec![]);
+        let ready = tracker.drain_ready();
+        assert!(ready.is_empty());
+
+        // Chunk 1 arrives — now process 1, 2, 3 consecutively
+        tracker.buffer_response(1, vec![]);
+        let ready = tracker.drain_ready();
+        assert_eq!(ready.len(), 3);
+        assert_eq!(ready[0].0, 1);
+        assert_eq!(ready[1].0, 2);
+        assert_eq!(ready[2].0, 3);
+        assert_eq!(tracker.next_to_process, 4);
+
+        // Chunk 4 arrives — immediately ready
+        tracker.buffer_response(4, vec![]);
+        let ready = tracker.drain_ready();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].0, 4);
+        assert!(tracker.is_complete());
+    }
+
+    #[test]
+    fn test_tracker_peer_capacity() {
+        let mut tracker = PeerChunkTracker::new(20);
+        let peer = B512::repeat_byte(0x01);
+
+        // Fresh peer has full capacity
+        assert_eq!(tracker.peer_capacity(&peer), 4); // PIPELINE_DEPTH
+
+        // Fill up the pipeline
+        tracker.record_sent(peer, 1);
+        assert_eq!(tracker.peer_capacity(&peer), 3);
+        tracker.record_sent(peer, 2);
+        assert_eq!(tracker.peer_capacity(&peer), 2);
+        tracker.record_sent(peer, 3);
+        assert_eq!(tracker.peer_capacity(&peer), 1);
+        tracker.record_sent(peer, 4);
+        assert_eq!(tracker.peer_capacity(&peer), 0);
+
+        // Completing a response frees capacity
+        tracker.identify_response(&peer);
+        assert_eq!(tracker.peer_capacity(&peer), 1);
+    }
+
+    #[test]
+    fn test_tracker_handle_peer_disconnect() {
+        let mut tracker = PeerChunkTracker::new(10);
+        let peer_a = B512::repeat_byte(0x0A);
+        let peer_b = B512::repeat_byte(0x0B);
+
+        // Assign chunks: peer_a gets 1,2,3 — peer_b gets 4,5,6
+        for i in 1..=3 {
+            tracker.record_sent(peer_a, i);
+        }
+        for i in 4..=6 {
+            tracker.record_sent(peer_b, i);
+        }
+        tracker.next_to_assign = 7;
+
+        // Chunk 1 already processed
+        tracker.next_to_process = 2;
+
+        // Peer A disconnects — chunks 2, 3 should be reassigned
+        tracker.handle_peer_disconnect(&peer_a);
+
+        // next_to_assign should be reset to min(2, 3) = 2
+        assert_eq!(tracker.next_to_assign, 2);
+
+        // peer_a should have no in-flight
+        assert!(tracker.in_flight.get(&peer_a).is_none());
+
+        // peer_b should be unaffected
+        assert_eq!(tracker.in_flight.get(&peer_b).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn test_tracker_disconnect_with_buffered_chunk() {
+        let mut tracker = PeerChunkTracker::new(6);
+        let peer = B512::repeat_byte(0x01);
+
+        tracker.record_sent(peer, 1);
+        tracker.record_sent(peer, 2);
+        tracker.record_sent(peer, 3);
+        tracker.next_to_assign = 4;
+
+        // Chunk 2 already buffered (response received but not processed)
+        tracker.buffer_response(2, vec![]);
+
+        // Peer disconnects — only chunks 1 and 3 need reassignment (2 is buffered)
+        tracker.handle_peer_disconnect(&peer);
+
+        // next_to_assign should be 1 (the minimum un-buffered, un-processed chunk)
+        assert_eq!(tracker.next_to_assign, 1);
+    }
+
+    #[test]
+    fn test_tracker_is_complete() {
+        let mut tracker = PeerChunkTracker::new(3); // chunks 1, 2
+        assert!(!tracker.is_complete());
+
+        tracker.next_to_process = 2;
+        assert!(!tracker.is_complete());
+
+        tracker.next_to_process = 3;
+        assert!(tracker.is_complete());
+    }
 }

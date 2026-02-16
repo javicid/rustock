@@ -10,17 +10,33 @@ use table::NodeTable;
 use alloy_primitives::B512;
 use k256::ecdsa::SigningKey;
 use anyhow::Result;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{info, debug, warn, error};
 
 /// Service for node discovery using UDP based on RSK protocol.
+///
+/// rskj requires a full Ping/Pong bonding handshake before responding
+/// to FindNode requests. The sequence is:
+///   1. We send Ping → peer
+///   2. Peer replies with Pong, and also sends us a Ping
+///   3. We reply to their Ping with Pong
+///   4. Peer adds us to their `establishedConnections`
+///   5. Now peer will respond to our FindNode with Neighbors
+///
+/// We track peers that have sent us a Ping (to whom we replied with Pong)
+/// as "bonded", and only send FindNode to those peers.
 pub struct DiscoveryService {
     socket: UdpSocket,
     key: SigningKey,
     table: Arc<Mutex<NodeTable>>,
+    /// Peers that have completed the bonding handshake (received their Ping,
+    /// sent our Pong). Stored as socket addresses since we might not know
+    /// the node ID at discovery time.
+    bonded: Mutex<HashSet<std::net::SocketAddr>>,
     network_id: u32,
-    _local_node: DiscoveryNode,
+    local_node: DiscoveryNode,
 }
 
 impl DiscoveryService {
@@ -36,14 +52,15 @@ impl DiscoveryService {
             socket,
             key,
             table,
+            bonded: Mutex::new(HashSet::new()),
             network_id,
-            _local_node: local_node,
+            local_node,
         })
     }
 
     /// Starts the UDP service loop for processing discovery packets.
     pub async fn start(self: Arc<Self>) {
-        let mut buf = [0u8; 4096]; // Larger than Ethernet MTU to handle large Neighbors packets
+        let mut buf = [0u8; 4096];
         
         info!(target: "rustock::discovery", "Discovery service started");
         
@@ -66,25 +83,40 @@ impl DiscoveryService {
         // Background discovery loop
         loop {
             let nodes = self.table.lock().await.get_all_nodes();
-            for node in nodes {
+            let bonded = self.bonded.lock().await;
+
+            debug!(
+                target: "rustock::discovery",
+                "Discovery loop: {} nodes in table, {} bonded",
+                nodes.len(),
+                bonded.len()
+            );
+
+            for node in &nodes {
                 if let Some(ip) = crate::utils::bytes_to_ip(&node.ip) {
                     let socket_addr = std::net::SocketAddr::new(ip, node.udp_port);
                     let _ = self.send_ping(socket_addr).await;
-                    let _ = self.send_find_node(self._local_node.id, socket_addr).await;
+                    if bonded.contains(&socket_addr) {
+                        let _ = self.send_find_node(self.local_node.id, socket_addr).await;
+                    }
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            drop(bonded);
+
+            // Use 15s interval to keep the node table fresh. The bonding
+            // and FindNode flow needs multiple rounds: first we Ping, then
+            // they Ping us back, then we send FindNode on the next cycle.
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
         }
     }
-
 
     async fn send_ping(&self, to: std::net::SocketAddr) -> Result<()> {
         use uuid::Uuid;
         let payload = DiscoveryPayload::Ping(message::PingMessage {
             from: DiscoveryEndpoint {
-                ip: self._local_node.ip.clone(),
-                udp_port: self._local_node.udp_port,
-                tcp_port: self._local_node.tcp_port,
+                ip: self.local_node.ip.clone(),
+                udp_port: self.local_node.udp_port,
+                tcp_port: self.local_node.tcp_port,
             },
             to: self.addr_to_endpoint(to),
             message_id: Uuid::new_v4().to_string(),
@@ -113,6 +145,7 @@ impl DiscoveryService {
         match &packet.payload {
             DiscoveryPayload::Ping(ping) => {
                 debug!(target: "rustock::discovery", "Received Ping from {}", addr);
+                // Reply with Pong to complete bonding from the remote's perspective
                 self.send_pong(ping.message_id.clone(), addr).await?;
                 
                 let node = DiscoveryNode {
@@ -122,6 +155,23 @@ impl DiscoveryService {
                     id: packet.recover_id()?,
                 };
                 self.table.lock().await.add_node(node);
+
+                // Mark this peer as bonded — we replied with Pong, so the
+                // remote will accept our FindNode after processing our Pong.
+                let newly_bonded = self.bonded.lock().await.insert(addr);
+                if newly_bonded {
+                    info!(
+                        target: "rustock::discovery",
+                        "Bonded with peer at {}, sending FindNode",
+                        addr
+                    );
+                    // Small delay to let the remote process our Pong before
+                    // we send FindNode. rskj adds us to establishedConnections
+                    // upon receiving our Pong; without this delay, FindNode
+                    // may arrive before Pong is processed.
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    let _ = self.send_find_node(self.local_node.id, addr).await;
+                }
             }
             DiscoveryPayload::Pong(_) => {
                 debug!(target: "rustock::discovery", "Received Pong from {}", addr);
@@ -132,9 +182,15 @@ impl DiscoveryService {
                 self.send_neighbors(find.message_id.clone(), closest, addr).await?;
             }
             DiscoveryPayload::Neighbors(neighbors) => {
-                debug!(target: "rustock::discovery", "Received {} neighbors from {}", neighbors.nodes.len(), addr);
+                info!(
+                    target: "rustock::discovery",
+                    "Received {} neighbors from {}",
+                    neighbors.nodes.len(),
+                    addr
+                );
+                let mut table = self.table.lock().await;
                 for node in &neighbors.nodes {
-                    self.table.lock().await.add_node(node.clone());
+                    table.add_node(node.clone());
                 }
             }
         }
@@ -145,9 +201,9 @@ impl DiscoveryService {
     async fn send_pong(&self, message_id: String, to: std::net::SocketAddr) -> Result<()> {
         let payload = DiscoveryPayload::Pong(PongMessage {
             from: DiscoveryEndpoint {
-                ip: self._local_node.ip.clone(),
-                udp_port: self._local_node.udp_port,
-                tcp_port: self._local_node.tcp_port,
+                ip: self.local_node.ip.clone(),
+                udp_port: self.local_node.udp_port,
+                tcp_port: self.local_node.tcp_port,
             },
             to: self.addr_to_endpoint(to),
             message_id,

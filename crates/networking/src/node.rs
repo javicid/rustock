@@ -1,5 +1,5 @@
 use tokio::net::{TcpListener, TcpStream};
-use crate::protocol::P2pHandler;
+use crate::protocol::{P2pHandler, P2pMessage};
 use crate::handshake::Handshake;
 use crate::peers::PeerStore;
 use alloy_primitives::{B512, B256, U256};
@@ -122,23 +122,28 @@ impl Node {
             }
         });
 
-        // 2. Start Outbound Connector
+        // 2. Register peer exchange handler (GetPeers / Peers)
+        let peer_exchange = Arc::new(crate::peer_exchange::PeerExchangeHandler::new(table.clone()));
+        let mut all_handlers = vec![peer_exchange as Arc<dyn P2pHandler>];
+        all_handlers.extend(self.handlers.clone());
+
+        // 3. Start Outbound Connector
         let outbound = crate::outbound::OutboundConnector::new(
             self.config.clone(),
             table.clone(),
             self.peer_store.clone(),
-            self.handlers.clone(),
+            all_handlers.clone(),
             10, // Max outbound connections
         );
         tokio::spawn(outbound.start());
 
-        // 3. Start Accept Loop
+        // 4. Start Accept Loop
         loop {
             let (stream, peer_addr) = listener.accept().await?;
             debug!(target: "rustock::net", "New connection from: {}", peer_addr);
             
             let config = self.config.clone();
-            let handlers = self.handlers.clone();
+            let handlers = all_handlers.clone();
             let peer_store = self.peer_store.clone();
             tokio::spawn(async move {
                 if let Err(e) = handle_incoming(stream, config, handlers, peer_store).await {
@@ -180,6 +185,9 @@ pub(crate) async fn register_and_run_session(
     for handler in handlers {
         session.add_handler(handler);
     }
+
+    // Request peer list immediately after connecting
+    peer_store.send_to_peer(&peer_id, P2pMessage::GetPeers).await;
 
     let res = session.run().await;
     peer_store.remove_peer(&peer_id).await;
