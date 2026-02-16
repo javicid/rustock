@@ -65,25 +65,103 @@ See `crates/networking/src/rlpx/frame.rs`:
 
 ---
 
-## 2. Non-Canonical RLP Integer Encoding
+## 2. Non-Canonical RLP Integer Encoding & Header Hash Incompatibility
 
 **Source**: Java's `BigInteger.toByteArray()`
 
-Java's `BigInteger` serialization includes a leading zero byte for positive
-values whose most significant bit is set (sign extension). For example, the
-value `0x80` is encoded as `[0x00, 0x80]` rather than `[0x80]`.
+### The problem
 
-Standard RLP decoders (including `alloy_rlp`) reject these as non-canonical.
-Lenient decoders in `crates/networking/src/protocol/rlp_compat.rs` strip
-leading zeros before parsing:
+Java's `BigInteger` uses two's-complement representation. `toByteArray()`
+includes a **leading `0x00` byte** for positive values whose most significant
+bit is set, to preserve the sign:
 
-- `decode_u8_lenient`
-- `decode_u32_lenient`
-- `decode_u64_lenient`
-- `decode_u256_lenient`
+```
+BigInteger(127).toByteArray()  → [0x7F]           // MSB < 0x80, no padding
+BigInteger(128).toByteArray()  → [0x00, 0x80]     // MSB = 0x80, sign byte added
+BigInteger(256).toByteArray()  → [0x01, 0x00]     // MSB < 0x80, no padding
+BigInteger(32768).toByteArray()→ [0x00, 0x80, 0x00]// MSB = 0x80, sign byte added
+```
 
-These are used wherever integer fields arrive from the Java node (block
-headers, status messages, request IDs, etc.).
+The original `ethereumj` (from which `rskj` is forked) passes
+`BigInteger.toByteArray()` directly to `RLP.encodeElement()` for integer fields
+like `difficulty`, `gasLimit`, `paidFees`, and `minimumGasPrice`. This violates
+the canonical RLP specification (Ethereum Yellow Paper), which requires integers
+to use their minimal byte representation with **no** leading zeros.
+
+**This is a Java language characteristic, not a deliberate design decision.**
+The `BigInteger` sign-byte behavior is baked into the JVM, and the original
+ethereumj authors simply used the natural serialization without stripping
+leading zeros. The rskj node inherited this behavior.
+
+### Consequences
+
+1. **Decoding**: Standard RLP decoders (including `alloy_rlp`) reject these
+   non-canonical integers. Lenient decoders are needed on the receiving side.
+
+2. **Header hashing**: The hash of a block header is `keccak256(RLP(header))`.
+   Because Java encodes some integer fields with an extra byte, the RLP output
+   differs from canonical encoding. **Re-encoding a decoded header in Rust
+   produces different bytes and therefore a different hash.** This is
+   value-dependent: blocks whose `difficulty` happens to be `0x80XXXX...` are
+   affected, while `0x7FXXXX...` is not.
+
+3. **Chain breaks**: When block N+1 stores `parent_hash = java_hash(block_N)`,
+   but our store indexes block N under `rust_hash(block_N)`, the parent lookup
+   fails. This causes total-difficulty chains to break and the head to stop
+   advancing.
+
+### Rust mitigations
+
+**Lenient decoding** (`crates/networking/src/protocol/rlp_compat.rs`):
+
+- `decode_u8_lenient`, `decode_u32_lenient`, `decode_u64_lenient`,
+  `decode_u256_lenient`
+- Strip leading zeros before parsing. Used wherever integer fields arrive from
+  the Java node (block headers, status messages, request IDs, etc.).
+
+**Cached hash from original bytes** (`crates/core/src/types/header.rs`):
+
+- `Header` carries an optional `cached_hash: Option<B256>` field.
+- `Header::decode_with_hash()` computes `keccak256` over the **original RLP
+  bytes** received from the peer (before decoding and re-encoding), and stores
+  the result in `cached_hash`.
+- `Header::hash()` returns `cached_hash` when present, falling back to
+  `keccak256(self.encode())` for locally-constructed headers.
+- The network message decoder (`crates/networking/src/protocol/rsk.rs`) uses
+  `decode_with_hash` for all `BlockHeadersResponse` payloads.
+
+This is the same approach used by production Ethereum clients (Geth, Reth):
+cache the hash from wire bytes rather than recomputing from re-encoded data.
+It decouples hash identity from encoding, making the client resilient to any
+encoding differences across implementations.
+
+**ParentHashRule omission** (`crates/core/src/validation/mod.rs`):
+
+The `ParentHashRule` (which re-derives the parent's hash via `parent.hash()`)
+is intentionally excluded from the default verifier. During sync, parent-hash
+consistency is already guaranteed by the store lookup: we find the parent by
+`header.parent_hash`, so a successful lookup proves the hash matches. This
+avoids the need to reproduce Java's exact encoding for the parent.
+
+### Why not make Rust encoding match Java?
+
+We considered implementing a "Java-compatible" RLP encoder, but decided against
+it:
+
+- **Value-dependent**: the extra byte only appears when MSB ≥ `0x80`. We would
+  need to replicate this quirk for every field that Java encodes via
+  `BigInteger`, which is fragile and hard to verify.
+- **Not all fields use BigInteger**: Java encodes some fields as `long`, some
+  as raw bytes, some as `BigInteger`. Matching the exact per-field behavior
+  requires tracking rskj's internal type choices.
+- **Violates the RLP spec**: non-canonical encoding would break interop with
+  standard Ethereum tooling and libraries (`alloy-rlp`, `ssz`, etc.).
+- **Fragile over time**: if rskj changes how it encodes a field, our mimicry
+  would silently break.
+
+The cached-hash approach is more robust: it works for all headers, all values,
+and all future protocol versions, without requiring byte-level encoding
+compatibility.
 
 ---
 
@@ -228,6 +306,61 @@ See `crates/sync/src/lib.rs`:
 - `SyncHandler` forwards inbound messages to `SyncService` via an mpsc channel
 - `SyncService::start()` runs the event loop (timer ticks + channel events)
 - `SyncManager::handle_headers_response()` validates and stores each chunk
+
+---
+
+## 7. Hardfork-Gated Validation Rules
+
+**Source**: `rskj/.../config/blockchain/upgrades/ActivationConfig.java`,
+`rskj/.../config/Constants.java`
+
+Several consensus rules are activated at specific block heights (hardforks).
+Applying them to blocks before their activation height causes false rejections
+during sync.
+
+### Activation heights (mainnet)
+
+| Hardfork | Block | Relevant RSKIPs |
+|----------|-------|-----------------|
+| Orchid | 729,000 | RSKIP92 (merged mining PoW), RSKIP97 (no 10-min reset), RSKIP98 (no fallback mining) |
+| Papyrus200 | 2,392,700 | RSKIP156 (difficulty divisor 50 → 400) |
+
+### Merged mining (RSKIP92/98)
+
+Before Orchid, RSK allowed "fallback mining" without proper Bitcoin merged
+mining fields. The `MergedMiningRule` in `crates/core/src/validation/merged_mining.rs`
+skips validation for blocks below `activation_heights.orchid`.
+
+After Orchid, the rule validates:
+1. Bitcoin header PoW against RSK difficulty target
+2. Merkle proof linking coinbase to Bitcoin header
+3. RSK tag (`RSKBLOCK:` + hash) in coinbase outputs
+
+### Difficulty calculation
+
+The `DifficultyRule` in `crates/core/src/validation/difficulty.rs` applies
+three hardfork-gated behaviors matching `rskj/.../core/DifficultyCalculator.java`:
+
+1. **Minimum difficulty floor**: `max(minDifficulty, fromParent)`. Mainnet
+   minimum is `7,000,000,000,000,000` (7e15), derived from
+   `FALLBACK_MINING_DIFFICULTY / 2 = 14e15 / 2`. This prevents difficulty
+   from dropping below the floor during slow-block periods.
+
+2. **10-minute reset** (pre-RSKIP97, before block 729,000): if
+   `header.timestamp ≥ parent.timestamp + 600`, difficulty resets to minimum.
+   This allowed recovery from mining stalls before Orchid.
+
+3. **RSKIP156 divisor change** (from block 2,392,700): difficulty divisor
+   increases from 50 to 400, making difficulty adjustments smoother. Note:
+   regtest is explicitly excluded from this change in rskj
+   (`getChainId() != REGTEST_CHAIN_ID`).
+
+### Rust implementation
+
+`ChainConfig` in `crates/core/src/config.rs` includes an `ActivationHeights`
+struct with `orchid` and `papyrus200` fields. Both `MergedMiningRule` and
+`DifficultyRule` check `header.number` against these heights before applying
+hardfork-specific logic.
 
 ---
 

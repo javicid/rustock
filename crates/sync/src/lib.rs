@@ -131,9 +131,13 @@ impl SyncManager {
                 }
             }
 
-            // Compute total difficulty
+            // Compute total difficulty.
+            // For the parent TD lookup, use the hash that was used to find the parent
+            // in the store (header.parent_hash), NOT parent.hash() — they may differ
+            // for the genesis block whose canonical hash comes from Java's non-standard
+            // RLP encoding.
             let parent_td = match &parent {
-                Some(p) => self.store.get_total_difficulty(p.hash())?.unwrap_or_default(),
+                Some(_) => self.store.get_total_difficulty(header.parent_hash)?.unwrap_or_default(),
                 None => alloy_primitives::U256::ZERO,
             };
             let new_td = parent_td + header.difficulty;
@@ -591,6 +595,7 @@ mod tests {
             bitcoin_merged_mining_header: None,
             bitcoin_merged_mining_merkle_proof: None,
             bitcoin_merged_mining_coinbase_transaction: None,
+            cached_hash: None,
         }
     }
 

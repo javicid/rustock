@@ -167,6 +167,7 @@ fn setup_genesis(store: &BlockStore, _network_id: u64) -> Result<B256> {
             bitcoin_merged_mining_header: Some(Bytes::from_static(&[0x00])),
             bitcoin_merged_mining_merkle_proof: Some(Bytes::from_static(&[0x00])),
             bitcoin_merged_mining_coinbase_transaction: Some(Bytes::from_static(&[0x00])),
+            cached_hash: None,
         }
     } else if _network_id == 31 {
         // RSK Testnet (Orchid)
@@ -192,6 +193,7 @@ fn setup_genesis(store: &BlockStore, _network_id: u64) -> Result<B256> {
             bitcoin_merged_mining_header: None,
             bitcoin_merged_mining_merkle_proof: None,
             bitcoin_merged_mining_coinbase_transaction: None,
+            cached_hash: None,
         }
     } else {
         // Regtest / Default
@@ -217,6 +219,7 @@ fn setup_genesis(store: &BlockStore, _network_id: u64) -> Result<B256> {
             bitcoin_merged_mining_header: None,
             bitcoin_merged_mining_merkle_proof: None,
             bitcoin_merged_mining_coinbase_transaction: None,
+            cached_hash: None,
         }
     };
 

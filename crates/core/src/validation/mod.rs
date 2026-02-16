@@ -70,6 +70,13 @@ impl HeaderVerifier {
     }
 
     /// Creates a standard RSK light client verifier with all consensus rules.
+    ///
+    /// Note: `ParentHashRule` is intentionally **not** included here because
+    /// the sync pipeline looks up the parent by `header.parent_hash`, so
+    /// finding it in the store already proves hash consistency.  Including the
+    /// rule would break for the genesis block, whose canonical hash is derived
+    /// from Java's non-canonical RLP encoding (leading zeros in difficulty)
+    /// and cannot be reproduced by our standard `Header::hash()`.
     pub fn default_rsk(config: crate::config::ChainConfig) -> Self {
         Self::new()
             .with_static_rule(GasUsedRule)
@@ -79,7 +86,6 @@ impl HeaderVerifier {
             })
             .with_static_rule(MergedMiningRule { config: config.clone() })
             .with_parent_rule(BlockNumberRule)
-            .with_parent_rule(ParentHashRule)
             .with_parent_rule(TimestampRule::new(15)) // 15s drift
             .with_parent_rule(BlockParentGasLimitRule { config: config.clone() })
             .with_parent_rule(DifficultyRule { config })

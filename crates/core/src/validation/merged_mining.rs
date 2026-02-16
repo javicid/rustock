@@ -15,6 +15,13 @@ impl HeaderValidator for MergedMiningRule {
         use bitcoin::hashes::Hash;
         use alloy_primitives::{B256, U256};
 
+        // Skip merged mining PoW validation for blocks before the orchid
+        // hardfork (RSKIP92/98). Before orchid, fallback mining without
+        // proper merged mining fields was allowed.
+        if header.number < self.config.activation_heights.orchid {
+            return Ok(());
+        }
+
         // 0. Decode fields
         let btc_header_bytes = header.bitcoin_merged_mining_header.as_ref()
             .ok_or(ValidationError::BitcoinPowInvalid { hash: B256::ZERO, target: U256::ZERO })?;

@@ -49,6 +49,7 @@ mod tests {
             bitcoin_merged_mining_header: None,
             bitcoin_merged_mining_merkle_proof: None,
             bitcoin_merged_mining_coinbase_transaction: None,
+            cached_hash: None,
         };
 
         let tx = Transaction {

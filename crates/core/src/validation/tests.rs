@@ -31,6 +31,7 @@ fn create_dummy_header(number: u64, timestamp: u64, parent_hash: B256) -> Header
         bitcoin_merged_mining_header: None,
         bitcoin_merged_mining_merkle_proof: None,
         bitcoin_merged_mining_coinbase_transaction: None,
+        cached_hash: None,
     }
 }
 

@@ -398,7 +398,7 @@ impl Decodable for RskMessage {
 
                 let mut headers = Vec::new();
                 while !inner_body.is_empty() {
-                    headers.push(Header::decode(&mut inner_body)?);
+                    headers.push(Header::decode_with_hash(&mut inner_body)?);
                 }
                 RskSubMessage::BlockHeadersResponse(BlockHeadersResponse { id, headers })
             }

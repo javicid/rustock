@@ -32,6 +32,13 @@ pub struct Header {
     pub bitcoin_merged_mining_header: Option<Bytes>,
     pub bitcoin_merged_mining_merkle_proof: Option<Bytes>,
     pub bitcoin_merged_mining_coinbase_transaction: Option<Bytes>,
+
+    /// Hash computed from the original RLP bytes received from the peer.
+    /// Java's RLP encoding may differ from Rust's canonical encoding (e.g.
+    /// leading zeros in BigInteger values), so we cache the hash at decode
+    /// time instead of recomputing it from re-encoded bytes.
+    #[serde(skip)]
+    pub cached_hash: Option<B256>,
 }
 
 impl Encodable for Header {
@@ -142,6 +149,7 @@ impl alloy_rlp::Decodable for Header {
             bitcoin_merged_mining_header: None,
             bitcoin_merged_mining_merkle_proof: None,
             bitcoin_merged_mining_coinbase_transaction: None,
+            cached_hash: None,
         };
 
         if !body.is_empty() {
@@ -163,9 +171,23 @@ impl alloy_rlp::Decodable for Header {
 
 impl Header {
     pub fn hash(&self) -> B256 {
+        if let Some(h) = self.cached_hash {
+            return h;
+        }
         let mut buffer = Vec::new();
         self.encode(&mut buffer);
         alloy_primitives::keccak256(&buffer)
+    }
+
+    /// Decode a header from RLP bytes and compute the hash from those original
+    /// bytes (before our re-encoding potentially changes them).
+    pub fn decode_with_hash(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
+        use alloy_rlp::Decodable;
+        let original = *buf;
+        let mut header = <Self as Decodable>::decode(buf)?;
+        let consumed = original.len() - buf.len();
+        header.cached_hash = Some(alloy_primitives::keccak256(&original[..consumed]));
+        Ok(header)
     }
 
     /// Computes the hash used in the Bitcoin coinbase transaction for merged mining.
@@ -243,6 +265,7 @@ mod tests {
             bitcoin_merged_mining_header: Some(Bytes::from("btc_header")),
             bitcoin_merged_mining_merkle_proof: Some(Bytes::from("proof")),
             bitcoin_merged_mining_coinbase_transaction: Some(Bytes::from("coinbase")),
+            cached_hash: None,
         };
 
         // Encode
