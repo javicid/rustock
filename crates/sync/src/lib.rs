@@ -62,6 +62,7 @@ mod tests {
             bitcoin_merged_mining_merkle_proof: None,
             bitcoin_merged_mining_coinbase_transaction: None,
             cached_hash: None,
+            cached_hash_for_merged_mining: None,
         }
     }
 
@@ -480,11 +481,14 @@ mod tests {
 
         service.try_start_sync().await;
 
+        // After the connection-point search was removed (we use head directly),
+        // try_start_sync goes straight to DownloadingSkeleton.
         match &service.state {
-            SyncState::FindingConnectionPoint { peer_best, .. } => {
+            SyncState::DownloadingSkeleton { peer_best, connection_point, .. } => {
                 assert_eq!(*peer_best, 1000);
+                assert_eq!(*connection_point, 0); // head is at genesis (block 0)
             }
-            _ => panic!("Expected FindingConnectionPoint, got {:?}", service.state),
+            _ => panic!("Expected DownloadingSkeleton, got {:?}", service.state),
         }
 
         drop(event_tx);

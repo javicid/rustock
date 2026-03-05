@@ -6,7 +6,7 @@ use rustock_networking::protocol::{
 };
 use alloy_primitives::{B256, U256};
 use anyhow::Result;
-use std::collections::HashMap;
+// HashMap no longer needed — sequential TD propagation replaces hash-based parent lookup
 use std::sync::Arc;
 use tracing::{info, debug};
 
@@ -64,65 +64,125 @@ impl SyncManager {
             None => U256::ZERO,
         };
 
-        // Local cache for headers validated in this batch but not yet committed.
-        // Needed so that header N+1 can find header N as its parent.
-        let mut pending: HashMap<B256, (&Header, U256)> = HashMap::new();
+        // Track the previous header's TD by position for sequential propagation.
+        // Java's RLP encoding may differ from our canonical encoding, so
+        // header.hash() can produce a different value than what the next
+        // header's parent_hash field contains.  Hash-based parent lookup in
+        // `pending` would then fail.  Since headers in a chunk are always in
+        // ascending block-number order and form a chain, we propagate TD by
+        // position: header[i+1]'s parent TD is header[i]'s TD.
+        let mut prev_in_chunk: Option<(&Header, U256)> = None;
         let mut validated: Vec<(&Header, U256)> = Vec::with_capacity(headers.len());
         let mut skipped = 0u64;
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
         for header in &headers {
-            let hash = header.hash();
-
-            // Skip if we already have it (in store or pending batch)
-            if pending.contains_key(&hash) || self.store.get_header(hash)?.is_some() {
+            // Skip duplicates within this batch (by block number)
+            if !seen.insert(header.number) {
                 continue;
             }
 
-            // Look up parent: first in pending batch, then in store
-            let parent_from_pending = pending.get(&header.parent_hash).map(|(h, _)| *h);
-            let parent_from_store;
-            let parent: Option<&Header> = if let Some(p) = parent_from_pending {
-                Some(p)
-            } else {
-                parent_from_store = self.store.get_header(header.parent_hash)?;
-                parent_from_store.as_ref()
-            };
+            let hash = header.hash();
+            let already_stored = self.store.get_header(hash)?.is_some();
 
-            // When we have the parent, run full verification and reject on failure.
-            if let Some(p) = parent {
-                if let Err(e) = self.verifier.verify(header, Some(p)) {
-                    debug!(
-                        target: "rustock::sync",
-                        "Header #{} ({:?}) failed verification, skipping: {:?}",
-                        header.number, hash, e
-                    );
-                    skipped += 1;
-                    continue;
+            // Determine parent header and TD:
+            // 1) Sequential from the previous header in this chunk (most common)
+            // 2) Fall back to store lookup by parent_hash (for the first header)
+            #[allow(unused_assignments)]
+            let mut parent_from_store: Option<Header> = None;
+            let parent_ref: Option<&Header>;
+            let parent_td: U256;
+
+            if let Some((prev_hdr, prev_td)) = prev_in_chunk {
+                if header.number == prev_hdr.number + 1 {
+                    parent_ref = Some(prev_hdr);
+                    parent_td = prev_td;
+                } else {
+                    // Non-sequential — fall back to store lookup
+                    parent_from_store = self.store.get_header(header.parent_hash)?;
+                    if parent_from_store.is_some() {
+                        parent_ref = parent_from_store.as_ref();
+                        parent_td = self.store
+                            .get_total_difficulty(header.parent_hash)?
+                            .unwrap_or_default();
+                    } else if header.number > 0 {
+                        let parent_number = header.number - 1;
+                        if let Some(canonical_hash) = self.store.get_canonical_hash(parent_number)? {
+                            parent_from_store = self.store.get_header(canonical_hash)?;
+                            parent_ref = parent_from_store.as_ref();
+                            parent_td = if parent_ref.is_some() {
+                                self.store.get_total_difficulty(canonical_hash)?.unwrap_or_default()
+                            } else {
+                                U256::ZERO
+                            };
+                        } else {
+                            parent_ref = None;
+                            parent_td = U256::ZERO;
+                        }
+                    } else {
+                        parent_ref = None;
+                        parent_td = U256::ZERO;
+                    }
+                }
+            } else {
+                // First header in the chunk — look up parent from store.
+                // Try by parent_hash first; if not found (Java non-canonical RLP
+                // hash mismatch), fall back to canonical number → hash lookup.
+                parent_from_store = self.store.get_header(header.parent_hash)?;
+                if parent_from_store.is_some() {
+                    parent_ref = parent_from_store.as_ref();
+                    parent_td = self.store
+                        .get_total_difficulty(header.parent_hash)?
+                        .unwrap_or_default();
+                } else if header.number > 0 {
+                    // Fall back: look up parent by block number
+                    let parent_number = header.number - 1;
+                    if let Some(canonical_hash) = self.store.get_canonical_hash(parent_number)? {
+                        parent_from_store = self.store.get_header(canonical_hash)?;
+                        parent_ref = parent_from_store.as_ref();
+                        parent_td = if parent_ref.is_some() {
+                            self.store.get_total_difficulty(canonical_hash)?.unwrap_or_default()
+                        } else {
+                            U256::ZERO
+                        };
+                    } else {
+                        parent_ref = None;
+                        parent_td = U256::ZERO;
+                    }
+                } else {
+                    parent_ref = None;
+                    parent_td = U256::ZERO;
                 }
             }
 
-            // Compute total difficulty: check pending batch first, then store
-            let parent_td = if parent.is_some() {
-                if let Some((_, td)) = pending.get(&header.parent_hash) {
-                    *td
-                } else {
-                    self.store
-                        .get_total_difficulty(header.parent_hash)?
-                        .unwrap_or_default()
-                }
-            } else {
-                U256::ZERO
-            };
             let new_td = parent_td + header.difficulty;
 
-            pending.insert(hash, (header, new_td));
+            // For NEW headers with a known parent, run full verification.
+            // Already-stored headers skip verification (they were validated on first store).
+            if !already_stored {
+                if let Some(p) = parent_ref {
+                    if let Err(e) = self.verifier.verify(header, Some(p)) {
+                        info!(
+                            target: "rustock::sync",
+                            "Header #{} ({:?}) failed verification: {:?}",
+                            header.number, hash, e
+                        );
+                        skipped += 1;
+                        // Still propagate TD to the next header in the chunk
+                        prev_in_chunk = Some((header, new_td));
+                        continue;
+                    }
+                }
+            }
+
+            prev_in_chunk = Some((header, new_td));
             validated.push((header, new_td));
         }
 
         let stored = validated.len() as u64;
 
         // Commit all validated headers in a single atomic batch
-        self.store.store_headers_batch(&validated, current_head_hash, current_td)?;
+        let _new_head = self.store.store_headers_batch(&validated, current_head_hash, current_td)?;
 
         if skipped > 0 {
             info!(

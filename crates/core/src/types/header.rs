@@ -39,6 +39,12 @@ pub struct Header {
     /// time instead of recomputing it from re-encoded bytes.
     #[serde(skip)]
     pub cached_hash: Option<B256>,
+
+    /// Merged mining hash computed from the original RLP bytes (base fields
+    /// only, excluding bitcoin mining fields). Cached at decode time for the
+    /// same Java RLP compatibility reasons as `cached_hash`.
+    #[serde(skip)]
+    pub cached_hash_for_merged_mining: Option<B256>,
 }
 
 impl Encodable for Header {
@@ -112,16 +118,17 @@ impl alloy_rlp::Decodable for Header {
         // Field 6: logs bloom (256 bytes) OR compressed extension data (shorter).
         // Peek at the RLP header to determine which one.
         let (logs_bloom, extension_data) = {
-            let rlp_h = alloy_rlp::Header::decode(&mut &body[..])?;
+            let mut peek = body;
+            let rlp_h = alloy_rlp::Header::decode(&mut peek)?;
             if !rlp_h.list && rlp_h.payload_length == 256 {
                 // Standard logs bloom (256 bytes)
                 (Bloom::decode(&mut body)?, None)
             } else {
                 // Compressed extension data (V1/V2 RSKIP-351).
                 // Could be an RLP list or string — read the raw bytes either way.
-                let before = body;
-                let total_len = rlp_h.length() + rlp_h.payload_length;
-                let raw = Bytes::copy_from_slice(&before[..total_len]);
+                let header_len = body.len() - peek.len();
+                let total_len = header_len + rlp_h.payload_length;
+                let raw = Bytes::copy_from_slice(&body[..total_len]);
                 body = &body[total_len..];
                 (Bloom::default(), Some(raw))
             }
@@ -150,9 +157,30 @@ impl alloy_rlp::Decodable for Header {
             bitcoin_merged_mining_merkle_proof: None,
             bitcoin_merged_mining_coinbase_transaction: None,
             cached_hash: None,
+            cached_hash_for_merged_mining: None,
         };
 
-        if !body.is_empty() {
+        // Count remaining RLP items to distinguish header format:
+        //   3 items → V0: btc_header, btc_merkle_proof, btc_coinbase_tx
+        //   4 items → V1 (RSKIP-153/Hop): umm_root, btc_header, btc_merkle_proof, btc_coinbase_tx
+        //   0-2     → partial (pre-orchid blocks without full mining data)
+        let remaining_items = {
+            let mut count = 0usize;
+            let mut rest = body;
+            while !rest.is_empty() {
+                let mut temp = rest;
+                if let Ok(h) = alloy_rlp::Header::decode(&mut temp) {
+                    if h.payload_length > temp.len() { break; }
+                    rest = &temp[h.payload_length..];
+                    count += 1;
+                } else {
+                    break;
+                }
+            }
+            count
+        };
+
+        if remaining_items >= 4 {
             header.umm_root = Some(Bytes::decode(&mut body)?);
         }
         if !body.is_empty() {
@@ -187,16 +215,93 @@ impl Header {
         let mut header = <Self as Decodable>::decode(buf)?;
         let consumed = original.len() - buf.len();
         header.cached_hash = Some(alloy_primitives::keccak256(&original[..consumed]));
+
+        // Compute merged mining hash from original RLP bytes.
+        // Three cases depending on ummRoot presence:
+        //   - ummRoot absent (peer omitted it): hash fields 0-15 only
+        //   - ummRoot present but empty: hash fields 0-16 (single keccak256)
+        //   - ummRoot present and non-empty (UMM): double-hash
+        //       keccak256( keccak256(RLP_LIST(fields_0_16))[0:20] ++ ummRoot )
+        let mut parse = &original[..consumed];
+        if let Ok(list_h) = alloy_rlp::Header::decode(&mut parse) {
+            let body = &parse[..list_h.payload_length];
+            let mut cursor = body;
+            for _ in 0..16 {
+                if cursor.is_empty() { break; }
+                let mut temp = cursor;
+                if let Ok(item_h) = alloy_rlp::Header::decode(&mut temp) {
+                    if item_h.payload_length > temp.len() { break; }
+                    cursor = &temp[item_h.payload_length..];
+                } else {
+                    break;
+                }
+            }
+            let mm_end = body.len() - cursor.len();
+
+            let has_umm_root = header.umm_root.is_some();
+            let is_umm_block = header.umm_root.as_ref().map_or(false, |u| !u.is_empty());
+
+            let mm_hash = if has_umm_root {
+                // ummRoot is present in the RLP — include it in the hash payload.
+                // The miner included ummRoot when encoding for the merged mining
+                // hash, so we must do the same regardless of whether ummRoot is
+                // empty or non-empty.
+                let mut mm_end_with_umm = mm_end;
+                if !cursor.is_empty() {
+                    let mut temp = cursor;
+                    if let Ok(item_h) = alloy_rlp::Header::decode(&mut temp) {
+                        if item_h.payload_length <= temp.len() {
+                            let header_len = cursor.len() - temp.len();
+                            mm_end_with_umm += header_len + item_h.payload_length;
+                        }
+                    }
+                }
+                let mm_payload = &body[..mm_end_with_umm];
+                let mm_list_h = alloy_rlp::Header { list: true, payload_length: mm_payload.len() };
+                let mut mm_buf = Vec::with_capacity(mm_list_h.length() + mm_payload.len());
+                mm_list_h.encode(&mut mm_buf);
+                mm_buf.extend_from_slice(mm_payload);
+
+                if is_umm_block {
+                    // Non-empty ummRoot: apply UMM double-hash
+                    let umm_bytes = header.umm_root.as_ref().unwrap();
+                    let base = alloy_primitives::keccak256(&mm_buf);
+                    let mut input = Vec::with_capacity(20 + umm_bytes.len());
+                    input.extend_from_slice(&base.as_slice()[..20]);
+                    input.extend_from_slice(umm_bytes.as_ref());
+                    alloy_primitives::keccak256(&input)
+                } else {
+                    // Empty ummRoot present: single hash of fields 0-16
+                    alloy_primitives::keccak256(&mm_buf)
+                }
+            } else {
+                // No ummRoot in the RLP at all: hash of fields 0-15 only
+                let mm_payload = &body[..mm_end];
+                let mm_list_h = alloy_rlp::Header { list: true, payload_length: mm_payload.len() };
+                let mut mm_buf = Vec::with_capacity(mm_list_h.length() + mm_payload.len());
+                mm_list_h.encode(&mut mm_buf);
+                mm_buf.extend_from_slice(mm_payload);
+                alloy_primitives::keccak256(&mm_buf)
+            };
+
+            header.cached_hash_for_merged_mining = Some(mm_hash);
+        }
+
         Ok(header)
     }
 
-    /// Computes the hash used in the Bitcoin coinbase transaction for merged mining.
-    /// This hash excludes the Bitcoin-specific fields themselves.
+    /// Returns the hash used in the Bitcoin coinbase transaction for merged mining.
+    /// Prefers the cached value computed from original (Java) RLP bytes at decode
+    /// time; falls back to re-encoding with Rust RLP for programmatically built
+    /// headers (e.g., in tests).
     pub fn hash_for_merged_mining(&self) -> B256 {
-        let mut out = Vec::new();
-        
-        // Manual RLP list encoding for the "base" header fields
-        // Order must match rskj's getEncoded(false, false, true)
+        if let Some(h) = self.cached_hash_for_merged_mining {
+            return h;
+        }
+
+        let has_umm_root = self.umm_root.is_some();
+        let is_umm_block = self.umm_root.as_ref().map_or(false, |u| !u.is_empty());
+
         let mut list_fields: Vec<Vec<u8>> = vec![
             alloy_rlp::encode(self.parent_hash),
             alloy_rlp::encode(self.ommers_hash),
@@ -216,12 +321,11 @@ impl Header {
             alloy_rlp::encode(self.uncle_count),
         ];
 
-        if let Some(umm) = &self.umm_root {
-            list_fields.push(alloy_rlp::encode(umm.as_ref()));
+        if has_umm_root {
+            list_fields.push(alloy_rlp::encode(self.umm_root.as_ref().unwrap().as_ref()));
         }
 
-        // TODO: Handle RSKIP-351 versions and other extra fields if any
-        
+        let mut out = Vec::new();
         let payload_len = list_fields.iter().map(|f| f.len()).sum::<usize>();
         let rlp_header = alloy_rlp::Header {
             list: true,
@@ -231,7 +335,18 @@ impl Header {
         for field in list_fields {
             out.extend_from_slice(&field);
         }
-        alloy_primitives::keccak256(&out)
+
+        let base_hash = alloy_primitives::keccak256(&out);
+
+        if is_umm_block {
+            let umm_bytes = self.umm_root.as_ref().unwrap();
+            let mut input = Vec::with_capacity(20 + umm_bytes.len());
+            input.extend_from_slice(&base_hash.as_slice()[..20]);
+            input.extend_from_slice(umm_bytes.as_ref());
+            alloy_primitives::keccak256(&input)
+        } else {
+            base_hash
+        }
     }
 }
 
@@ -265,6 +380,7 @@ mod tests {
             bitcoin_merged_mining_merkle_proof: Some(Bytes::from("proof")),
             bitcoin_merged_mining_coinbase_transaction: Some(Bytes::from("coinbase")),
             cached_hash: None,
+            cached_hash_for_merged_mining: None,
         }
     }
 

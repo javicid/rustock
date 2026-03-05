@@ -34,6 +34,11 @@ struct Args {
     /// Can also use RUST_LOG-style directives, e.g. "info,rustock_sync=debug".
     #[arg(long, default_value = "info")]
     log_level: String,
+
+    /// Log to stdout instead of a file. By default logs are written to
+    /// <data-dir>/rustock.log with automatic daily rotation.
+    #[arg(long, default_value_t = false)]
+    log_to_stdout: bool,
 }
 
 #[tokio::main]
@@ -44,10 +49,35 @@ async fn main() -> Result<()> {
     // RUST_LOG env var takes precedence; otherwise use --log-level CLI arg.
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(&args.log_level));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .init();
+
+    // Ensure data directory exists before setting up file logging
+    std::fs::create_dir_all(&args.data_dir).context("Failed to create data directory")?;
+
+    let _guard = if args.log_to_stdout {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .init();
+        None
+    } else {
+        let file_appender = tracing_appender::rolling::daily(&args.data_dir, "rustock.log");
+        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .with_ansi(false)
+            .with_writer(non_blocking)
+            .init();
+
+        let log_path = std::path::Path::new(&args.data_dir).join("rustock.log");
+        eprintln!("Logging to {}", log_path.display());
+        eprintln!("Use --log-to-stdout to log to the console instead.");
+        eprintln!("Tail the log: tail -f {}", log_path.display());
+
+        Some(guard)
+    };
+
     info!("Starting Rustock Light Client on port {}...", args.port);
 
     // 2. Initialize Storage
@@ -97,6 +127,15 @@ async fn main() -> Result<()> {
     let encoded_point = verifying_key.to_encoded_point(false);
     let node_id = alloy_primitives::B512::from_slice(&encoded_point.as_bytes()[1..]);
     
+    // Resolve actual head hash and TD for the handshake status message.
+    // On first run these equal genesis; on restart they reflect sync progress.
+    let (best_hash, best_td) = if let Some(head_hash) = store.get_head()? {
+        let td = store.get_total_difficulty(head_hash)?.unwrap_or(U256::ZERO);
+        (head_hash, td)
+    } else {
+        (genesis_hash, U256::ZERO)
+    };
+
     let node_config = NodeConfig {
         client_id: "Rustock/0.1.0".to_string(),
         listen_port: args.port,
@@ -104,8 +143,8 @@ async fn main() -> Result<()> {
         chain_id: config.chain_id,
         network_id: config.network_id,
         genesis_hash,
-        best_hash: genesis_hash,
-        total_difficulty: U256::ZERO, // Will be updated from store later if needed
+        best_hash,
+        total_difficulty: best_td,
         bootnodes: get_bootnodes(config.chain_id as u64),
         secret_key: secret_key_bytes,
         discovery_port: args.port + 1,
@@ -133,8 +172,11 @@ async fn main() -> Result<()> {
 }
 
 fn setup_genesis(store: &BlockStore, _network_id: u64) -> Result<B256> {
-    if let Some(head) = store.get_head()? {
-        return Ok(head);
+    // If the store already has data, return the real genesis hash (block 0),
+    // NOT the head hash. The head hash is a different block and would cause
+    // genesis mismatch during the ETH/RSK handshake with peers.
+    if let Some(genesis) = store.get_canonical_hash(0)? {
+        return Ok(genesis);
     }
 
     // Well-known genesis hashes (from rskj reference)
@@ -174,6 +216,7 @@ fn setup_genesis(store: &BlockStore, _network_id: u64) -> Result<B256> {
             bitcoin_merged_mining_merkle_proof: Some(Bytes::from_static(&[0x00])),
             bitcoin_merged_mining_coinbase_transaction: Some(Bytes::from_static(&[0x00])),
             cached_hash: None,
+            cached_hash_for_merged_mining: None,
         }
     } else if _network_id == 31 {
         // RSK Testnet (Orchid)
@@ -200,6 +243,7 @@ fn setup_genesis(store: &BlockStore, _network_id: u64) -> Result<B256> {
             bitcoin_merged_mining_merkle_proof: None,
             bitcoin_merged_mining_coinbase_transaction: None,
             cached_hash: None,
+            cached_hash_for_merged_mining: None,
         }
     } else {
         // Regtest / Default
@@ -226,6 +270,7 @@ fn setup_genesis(store: &BlockStore, _network_id: u64) -> Result<B256> {
             bitcoin_merged_mining_merkle_proof: None,
             bitcoin_merged_mining_coinbase_transaction: None,
             cached_hash: None,
+            cached_hash_for_merged_mining: None,
         }
     };
 

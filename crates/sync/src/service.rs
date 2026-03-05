@@ -41,6 +41,11 @@ pub struct SyncService {
     event_rx: mpsc::UnboundedReceiver<SyncEvent>,
     pub(crate) state: SyncState,
     pub(crate) last_progress: Instant,
+    /// Progress tracking
+    sync_started_at: Option<Instant>,
+    sync_start_block: u64,
+    last_report_at: Instant,
+    last_report_block: u64,
 }
 
 impl SyncService {
@@ -49,12 +54,17 @@ impl SyncService {
         peer_store: Arc<rustock_networking::peers::PeerStore>,
         event_rx: mpsc::UnboundedReceiver<SyncEvent>,
     ) -> Self {
+        let now = Instant::now();
         Self {
             manager,
             peer_store,
             event_rx,
             state: SyncState::Idle,
-            last_progress: Instant::now(),
+            last_progress: now,
+            sync_started_at: None,
+            sync_start_block: 0,
+            last_report_at: now,
+            last_report_block: 0,
         }
     }
 
@@ -96,8 +106,40 @@ impl SyncService {
                         std::mem::discriminant(&self.state)
                     );
                     self.state = SyncState::Idle;
+                } else {
+                    self.check_disconnected_peers().await;
+                    self.log_progress().await;
                 }
             }
+        }
+    }
+
+    /// Detect peers that disconnected while holding in-flight chunks and
+    /// reassign those chunks so the round can make progress.
+    async fn check_disconnected_peers(&mut self) {
+        if let SyncState::DownloadingHeaders { tracker, .. } = &mut self.state {
+            let tracked_peers: Vec<B512> = tracker.in_flight.keys().cloned().collect();
+            let mut any_removed = false;
+            for peer in tracked_peers {
+                if !self.peer_store.is_connected(&peer).await {
+                    let count = tracker.in_flight.get(&peer).map_or(0, |q| q.len());
+                    if count > 0 {
+                        debug!(
+                            target: "rustock::sync",
+                            "Peer {:?} disconnected with {} in-flight chunks, reassigning",
+                            &peer.0[..4], count
+                        );
+                        tracker.handle_peer_disconnect(&peer);
+                        any_removed = true;
+                    }
+                }
+            }
+            if any_removed {
+                self.last_progress = Instant::now();
+            }
+        }
+        if let SyncState::DownloadingHeaders { .. } = &self.state {
+            self.fill_pipeline().await;
         }
     }
 
@@ -124,18 +166,31 @@ impl SyncService {
 
         info!(
             target: "rustock::sync",
-            "Starting sync: our head #{}, peer best #{}",
-            head.number, metadata.best_number
+            "Starting sync: our head #{}, peer best #{} ({} blocks behind)",
+            head.number, metadata.best_number,
+            metadata.best_number - head.number
         );
 
-        self.state = SyncState::FindingConnectionPoint {
+        // Reset progress tracking for this sync session
+        self.sync_started_at = Some(Instant::now());
+        self.sync_start_block = head.number;
+        self.last_report_at = Instant::now();
+        self.last_report_block = head.number;
+
+        // Use the head block as the connection point directly.
+        // The head is the last block with a verified total difficulty chain.
+        // Skipping to a higher "connection point" (via binary search) could land
+        // on a stored block whose TD is incorrect from a previous interrupted sync,
+        // causing all subsequent chunks to inherit bad TDs and the head to never advance.
+        let cp = head.number;
+        info!(target: "rustock::sync", "Connection point: #{} (head)", cp);
+        self.state = SyncState::DownloadingSkeleton {
             peer: peer_id,
             peer_best: metadata.best_number,
-            start: 0,
-            end: metadata.best_number,
+            connection_point: cp,
         };
         self.last_progress = Instant::now();
-        self.send_connection_point_probe().await;
+        self.send_skeleton_request_to(&peer_id, cp).await;
     }
 
     async fn send_connection_point_probe(&self) {
@@ -173,11 +228,13 @@ impl SyncService {
         let height = skeleton[chunk_idx].number;
         let prev_height = skeleton[chunk_idx - 1].number;
         let prev_known = std::cmp::max(prev_height, connection_point);
-        let count = (height - prev_known) as u32;
 
-        if count == 0 {
+        // Skip chunks already covered by the connection point
+        if prev_known >= height {
             return;
         }
+
+        let count = (height - prev_known) as u32;
 
         info!(
             target: "rustock::sync",
@@ -394,15 +451,32 @@ impl SyncService {
                 mut tracker,
                 pending_next_skeleton,
             } => {
-                // Identify which chunk this response belongs to
-                let chunk_idx = tracker.identify_response(&peer);
+                // Match the response to a skeleton chunk by content, not FIFO order.
+                // Peers may return responses out of order, so FIFO identification
+                // would swap chunks and break the TD chain.
+                // The highest block number in the response should match a skeleton entry.
+                let chunk_idx = identify_chunk_by_content(&headers, &skeleton);
+
+                // Consume the FIFO entry for this peer regardless (keeps queue aligned)
+                let _ = tracker.identify_response(&peer);
+
                 match chunk_idx {
-                    Some(idx) => {
+                    Some(idx) if idx < tracker.total_chunks => {
                         tracker.buffer_response(idx, headers);
                     }
-                    None => {
-                        // Unknown peer response — just try to store
-                        let _ = self.manager.handle_headers_response(headers);
+                    _ => {
+                        // Response doesn't match any skeleton entry. This happens when
+                        // stale responses from previous skeleton rounds arrive during a
+                        // new round. Drop them — processing unordered headers with
+                        // potentially-corrupted store TDs can set the head to an
+                        // erroneously high TD, preventing legitimate chunks from advancing.
+                        warn!(
+                            target: "rustock::sync",
+                            "Dropped unmatched headers response ({} headers, blocks #{}-#{})",
+                            headers.len(),
+                            headers.iter().map(|h| h.number).min().unwrap_or(0),
+                            headers.iter().map(|h| h.number).max().unwrap_or(0),
+                        );
                         self.state = SyncState::DownloadingHeaders {
                             peer_best, skeleton, connection_point, tracker,
                             pending_next_skeleton,
@@ -431,25 +505,44 @@ impl SyncService {
                         // Check if we have a pre-fetched skeleton ready
                         if let Some(next_skel) = pending_next_skeleton {
                             if next_skel.len() >= 2 {
-                                info!(
-                                    target: "rustock::sync",
-                                    "Skeleton round complete (head #{}), using pre-fetched skeleton",
-                                    our_height
-                                );
-                                let chunks = std::cmp::min(
-                                    next_skel.len(),
-                                    MAX_SKELETON_CHUNKS + 1,
-                                );
-                                let new_tracker = PeerChunkTracker::new(chunks);
-                                self.state = SyncState::DownloadingHeaders {
-                                    peer_best,
-                                    skeleton: next_skel,
-                                    connection_point: our_height,
-                                    tracker: new_tracker,
-                                    pending_next_skeleton: None,
-                                };
-                                self.fill_pipeline().await;
-                                return;
+                                // Trim skeleton: find the last entry at or below our_height
+                                // to use as the new base. This avoids requesting chunks we
+                                // already have (the head advanced while we were downloading).
+                                let base_idx = next_skel
+                                    .iter()
+                                    .rposition(|b| b.number <= our_height)
+                                    .unwrap_or(0);
+                                let trimmed: Vec<BlockIdentifier> =
+                                    next_skel[base_idx..].to_vec();
+
+                                if trimmed.len() < 2 {
+                                    // Nothing useful left after trimming — request fresh
+                                    info!(
+                                        target: "rustock::sync",
+                                        "Pre-fetched skeleton fully consumed, requesting fresh one"
+                                    );
+                                } else {
+                                    info!(
+                                        target: "rustock::sync",
+                                        "Skeleton round complete (head #{}), using pre-fetched skeleton ({} entries after trim)",
+                                        our_height, trimmed.len()
+                                    );
+                                    let chunks = std::cmp::min(
+                                        trimmed.len(),
+                                        MAX_SKELETON_CHUNKS + 1,
+                                    );
+                                    let new_tracker = PeerChunkTracker::new(chunks);
+                                    self.state = SyncState::DownloadingHeaders {
+                                        peer_best,
+                                        skeleton: trimmed,
+                                        connection_point: our_height,
+                                        tracker: new_tracker,
+                                        pending_next_skeleton: None,
+                                    };
+                                    self.fill_pipeline().await;
+                                    return;
+                                }
+                                // trimmed too small — fall through to request fresh skeleton
                             }
                         }
                         info!(
@@ -501,5 +594,115 @@ impl SyncService {
             .and_then(|h| self.manager.store.get_header(h).ok().flatten())
             .map(|h| h.number)
             .unwrap_or(0)
+    }
+
+    /// Log sync progress: percentage, speed, ETA, peers.
+    async fn log_progress(&mut self) {
+        let peer_best = match &self.state {
+            SyncState::DownloadingHeaders { peer_best, .. } => *peer_best,
+            SyncState::DownloadingSkeleton { peer_best, .. } => *peer_best,
+            SyncState::FindingConnectionPoint { peer_best, .. } => *peer_best,
+            SyncState::Idle => return,
+        };
+
+        let current = self.our_head_number();
+        if current == 0 || peer_best == 0 {
+            return;
+        }
+
+        let now = Instant::now();
+
+        // Initialize sync tracking on first report
+        if self.sync_started_at.is_none() {
+            self.sync_started_at = Some(now);
+            self.sync_start_block = current;
+            self.last_report_at = now;
+            self.last_report_block = current;
+        }
+
+        let elapsed_since_report = now.duration_since(self.last_report_at).as_secs_f64();
+        if elapsed_since_report < 1.0 {
+            return;
+        }
+
+        // Recent speed (blocks/sec over last reporting interval)
+        let blocks_since_report = current.saturating_sub(self.last_report_block);
+        let recent_speed = blocks_since_report as f64 / elapsed_since_report;
+
+        // Overall speed (blocks/sec since sync started)
+        let total_elapsed = now
+            .duration_since(self.sync_started_at.unwrap_or(now))
+            .as_secs_f64();
+        let total_blocks = current.saturating_sub(self.sync_start_block);
+        let avg_speed = if total_elapsed > 0.0 {
+            total_blocks as f64 / total_elapsed
+        } else {
+            0.0
+        };
+
+        // Progress percentage
+        let pct = (current as f64 / peer_best as f64 * 100.0).min(100.0);
+
+        // ETA based on average speed
+        let remaining = peer_best.saturating_sub(current);
+        let eta = if avg_speed > 0.0 {
+            let secs = remaining as f64 / avg_speed;
+            format_duration(secs)
+        } else {
+            "unknown".to_string()
+        };
+
+        let peers = self.peer_store.get_peers().await.len();
+
+        let state_label = match &self.state {
+            SyncState::FindingConnectionPoint { .. } => "finding connection point",
+            SyncState::DownloadingSkeleton { .. } => "downloading skeleton",
+            SyncState::DownloadingHeaders { .. } => "downloading headers",
+            SyncState::Idle => "idle",
+        };
+
+        info!(
+            target: "rustock::sync",
+            "Sync progress: #{} / #{} ({:.2}%) | {:.0} blk/s (avg {:.0}) | ETA {} | {} peers | {}",
+            current, peer_best, pct,
+            recent_speed, avg_speed,
+            eta, peers, state_label
+        );
+
+        self.last_report_at = now;
+        self.last_report_block = current;
+    }
+}
+
+/// Identifies which skeleton chunk a headers response belongs to by examining
+/// the block numbers in the response.  The highest block number should match
+/// one of the skeleton entries, giving us the chunk index.
+fn identify_chunk_by_content(
+    headers: &[Header],
+    skeleton: &[BlockIdentifier],
+) -> Option<usize> {
+    if headers.is_empty() || skeleton.is_empty() {
+        return None;
+    }
+
+    // Find the highest block number in the response
+    let max_number = headers.iter().map(|h| h.number).max().unwrap();
+
+    // Find the skeleton entry whose number matches
+    skeleton
+        .iter()
+        .position(|entry| entry.number == max_number)
+}
+
+fn format_duration(secs: f64) -> String {
+    let secs = secs as u64;
+    if secs < 60 {
+        format!("{}s", secs)
+    } else if secs < 3600 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        let h = secs / 3600;
+        let m = (secs % 3600) / 60;
+        format!("{}h {}m", h, m)
     }
 }

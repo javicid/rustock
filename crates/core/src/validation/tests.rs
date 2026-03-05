@@ -2,11 +2,12 @@ use super::*;
 use crate::types::header::Header;
 use alloy_primitives::{Address, B256, U256, Bytes};
 use bitcoin::consensus::Encodable;
-use bitcoin::{MerkleBlock, ScriptBuf};
 use bitcoin::block::Header as BtcHeader;
 use bitcoin::transaction::{Transaction as BtcTransaction, TxOut, TxIn, OutPoint, Version};
 use bitcoin::hashes::Hash;
 use bitcoin::script::PushBytes;
+use bitcoin::ScriptBuf;
+use sha2::{Sha256, Digest};
 use std::sync::Arc;
 
 fn create_dummy_header(number: u64, timestamp: u64, parent_hash: B256) -> Header {
@@ -33,22 +34,26 @@ fn create_dummy_header(number: u64, timestamp: u64, parent_hash: B256) -> Header
         bitcoin_merged_mining_merkle_proof: None,
         bitcoin_merged_mining_coinbase_transaction: None,
         cached_hash: None,
+        cached_hash_for_merged_mining: None,
     }
 }
 
-/// Helper to build valid Merged Mining proof data for testing.
+/// Build a compressed coinbase with SHA-256 midstate.
+///
+/// Returns (btc_header_bytes, compressed_coinbase, rskip92_merkle_proof).
+/// For a single-transaction block the Merkle proof is empty.
 fn build_mm_proof(header: &Header, btc_bits: u32, rsk_tag_hash: Option<B256>) -> (Bytes, Bytes, Bytes) {
     let rsk_tag_hash = rsk_tag_hash.unwrap_or_else(|| header.hash_for_merged_mining());
     let mut rsk_tag = b"RSKBLOCK:".to_vec();
     rsk_tag.extend_from_slice(rsk_tag_hash.as_slice());
-    
+
     let pb: &PushBytes = rsk_tag.as_slice().try_into().unwrap();
     let coinbase_tx = BtcTransaction {
         version: Version::TWO,
         lock_time: bitcoin::absolute::LockTime::ZERO,
         input: vec![TxIn {
             previous_output: OutPoint::null(),
-            script_sig: ScriptBuf::new(), 
+            script_sig: ScriptBuf::new(),
             sequence: bitcoin::Sequence::MAX,
             witness: bitcoin::Witness::default(),
         }],
@@ -57,29 +62,48 @@ fn build_mm_proof(header: &Header, btc_bits: u32, rsk_tag_hash: Option<B256>) ->
             script_pubkey: ScriptBuf::new_op_return(pb),
         }],
     };
-    
+
     let mut coinbase_bytes = Vec::new();
     coinbase_tx.consensus_encode(&mut coinbase_bytes).unwrap();
+
+    // Build compressed coinbase: SHA-256 midstate of processed prefix + remaining tail.
+    // Use split_point = 0 so midstate is initial SHA-256 state and tail = full tx bytes.
+    let byte_count: u64 = 0;
+    let init_state: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    ];
+    let mut compressed = Vec::with_capacity(40 + coinbase_bytes.len());
+    compressed.extend_from_slice(&byte_count.to_be_bytes());
+    for &w in &init_state {
+        compressed.extend_from_slice(&w.to_be_bytes());
+    }
+    compressed.extend_from_slice(&coinbase_bytes);
+
+    // Coinbase txid = double-SHA256 of raw tx, byte-reversed.
+    let first_hash = Sha256::digest(&coinbase_bytes);
+    let txid_bytes = Sha256::digest(&first_hash);
+    let mut merkle_root_bytes = [0u8; 32];
+    merkle_root_bytes.copy_from_slice(&txid_bytes);
+    merkle_root_bytes.reverse();
+    let merkle_root = bitcoin::TxMerkleNode::from_byte_array(merkle_root_bytes);
 
     let btc_header = BtcHeader {
         version: bitcoin::block::Version::from_consensus(1),
         prev_blockhash: bitcoin::BlockHash::all_zeros(),
-        merkle_root: coinbase_tx.compute_txid().into(),
+        merkle_root,
         time: 1000,
-        bits: bitcoin::CompactTarget::from_consensus(btc_bits), 
+        bits: bitcoin::CompactTarget::from_consensus(btc_bits),
         nonce: 0,
     };
-    
+
     let mut btc_header_bytes = Vec::new();
     btc_header.consensus_encode(&mut btc_header_bytes).unwrap();
 
-    let txids = vec![coinbase_tx.compute_txid()];
-    let merkle_block = MerkleBlock::from_header_txids_with_predicate(&btc_header, &txids, |_| true);
-    
-    let mut merkle_bytes = Vec::new();
-    merkle_block.consensus_encode(&mut merkle_bytes).unwrap();
+    // Single-tx block: RSKIP92 proof is empty (no sibling hashes).
+    let merkle_proof = Bytes::new();
 
-    (Bytes::from(btc_header_bytes), Bytes::from(coinbase_bytes), Bytes::from(merkle_bytes))
+    (Bytes::from(btc_header_bytes), Bytes::from(compressed), merkle_proof)
 }
 
 #[test]
@@ -235,7 +259,8 @@ fn test_merged_mining_rule_invalid_merkle() {
     let (btc_h, btc_cb, _) = build_mm_proof(&header, 0x207fffff, None);
     header.bitcoin_merged_mining_header = Some(btc_h);
     header.bitcoin_merged_mining_coinbase_transaction = Some(btc_cb);
-    header.bitcoin_merged_mining_merkle_proof = Some(Bytes::from(vec![0u8; 64])); 
+    // Odd length (not multiple of 32) triggers decode error
+    header.bitcoin_merged_mining_merkle_proof = Some(Bytes::from(vec![0u8; 33]));
     
     let res = rule.validate(&header);
     assert!(matches!(res, Err(ValidationError::BitcoinMerkleProofDecodeError)));

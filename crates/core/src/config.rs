@@ -6,6 +6,8 @@ use alloy_primitives::U256;
 pub struct ActivationHeights {
     /// Orchid hardfork – enables RSKIP92/98 (merged mining PoW, no 10-min reset).
     pub orchid: u64,
+    /// Wasabi100 hardfork – enables RSKIP110 (fork detection data in merged mining hash).
+    pub wasabi100: u64,
     /// Papyrus200 hardfork – enables RSKIP156 (difficulty divisor 50 -> 400).
     pub papyrus200: u64,
 }
@@ -14,6 +16,7 @@ impl ActivationHeights {
     pub fn mainnet() -> Self {
         Self {
             orchid: 729_000,
+            wasabi100: 1_591_000,
             papyrus200: 2_392_700,
         }
     }
@@ -21,15 +24,15 @@ impl ActivationHeights {
     pub fn testnet() -> Self {
         Self {
             orchid: 0,
+            wasabi100: 0,
             papyrus200: 0,
         }
     }
 
     pub fn regtest() -> Self {
-        // Regtest: orchid is active from genesis, but RSKIP156 (papyrus200)
-        // is explicitly excluded for regtest in rskj (keeps divisor at 50).
         Self {
             orchid: 0,
+            wasabi100: 0,
             papyrus200: u64::MAX,
         }
     }
@@ -105,6 +108,7 @@ mod tests {
     fn test_mainnet_activation_heights() {
         let heights = ActivationHeights::mainnet();
         assert_eq!(heights.orchid, 729_000);
+        assert_eq!(heights.wasabi100, 1_591_000);
         assert_eq!(heights.papyrus200, 2_392_700);
     }
 
@@ -112,6 +116,7 @@ mod tests {
     fn test_testnet_activation_heights() {
         let heights = ActivationHeights::testnet();
         assert_eq!(heights.orchid, 0);
+        assert_eq!(heights.wasabi100, 0);
         assert_eq!(heights.papyrus200, 0);
     }
 
@@ -119,6 +124,7 @@ mod tests {
     fn test_regtest_activation_heights() {
         let heights = ActivationHeights::regtest();
         assert_eq!(heights.orchid, 0);
+        assert_eq!(heights.wasabi100, 0);
         assert_eq!(heights.papyrus200, u64::MAX);
     }
 

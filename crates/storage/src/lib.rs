@@ -187,12 +187,15 @@ impl BlockStore {
             td.encode(&mut td_buf);
             batch.put_cf(cf_td, hash.as_slice(), &td_buf);
 
+            // Always store canonical number → hash mapping for every header.
+            // This enables forward chain traversal (needed for TD repair).
+            batch.put_cf(cf_numbers, header.number.to_be_bytes(), hash.as_slice());
+
             // Update head tracking if this block has higher TD
             if td > best_td {
                 best_td = td;
                 best_hash = Some(hash);
                 batch.put(KEY_HEAD, hash.as_slice());
-                batch.put_cf(cf_numbers, header.number.to_be_bytes(), hash.as_slice());
             }
         }
 
@@ -252,6 +255,7 @@ mod tests {
             bitcoin_merged_mining_merkle_proof: None,
             bitcoin_merged_mining_coinbase_transaction: None,
             cached_hash: None,
+            cached_hash_for_merged_mining: None,
         }
     }
 
