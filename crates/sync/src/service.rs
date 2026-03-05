@@ -183,7 +183,7 @@ impl SyncService {
         // on a stored block whose TD is incorrect from a previous interrupted sync,
         // causing all subsequent chunks to inherit bad TDs and the head to never advance.
         let cp = head.number;
-        info!(target: "rustock::sync", "Connection point: #{} (head)", cp);
+        debug!(target: "rustock::sync", "Connection point: #{} (head)", cp);
         self.state = SyncState::DownloadingSkeleton {
             peer: peer_id,
             peer_best: metadata.best_number,
@@ -207,7 +207,7 @@ impl SyncService {
     }
 
     async fn send_skeleton_request_to(&self, peer: &B512, start: u64) {
-        info!(target: "rustock::sync", "Requesting skeleton from #{}", start);
+        debug!(target: "rustock::sync", "Requesting skeleton from #{}", start);
         let msg = create_skeleton_request(start);
         self.peer_store.send_to_peer(peer, msg).await;
     }
@@ -236,7 +236,7 @@ impl SyncService {
 
         let count = (height - prev_known) as u32;
 
-        info!(
+        debug!(
             target: "rustock::sync",
             "Requesting {} headers from #{} (chunk {}/{}) -> peer {:?}",
             count, height, chunk_idx, skeleton.len() - 1,
@@ -359,7 +359,7 @@ impl SyncService {
 
                 if new_end - new_start <= 1 {
                     let cp = new_start;
-                    info!(target: "rustock::sync", "Connection point found at #{}", cp);
+                    debug!(target: "rustock::sync", "Connection point found at #{}", cp);
                     self.state = SyncState::DownloadingSkeleton {
                         peer,
                         peer_best,
@@ -388,7 +388,7 @@ impl SyncService {
                 peer: _, peer_best, connection_point,
             } => {
                 if identifiers.len() < 2 {
-                    info!(
+                    debug!(
                         target: "rustock::sync",
                         "Skeleton too small ({} entries), sync appears complete",
                         identifiers.len()
@@ -397,7 +397,7 @@ impl SyncService {
                     return;
                 }
 
-                info!(
+                debug!(
                     target: "rustock::sync",
                     "Received skeleton with {} points (#{} -> #{})",
                     identifiers.len(),
@@ -517,12 +517,12 @@ impl SyncService {
 
                                 if trimmed.len() < 2 {
                                     // Nothing useful left after trimming — request fresh
-                                    info!(
+                                    debug!(
                                         target: "rustock::sync",
                                         "Pre-fetched skeleton fully consumed, requesting fresh one"
                                     );
                                 } else {
-                                    info!(
+                                    debug!(
                                         target: "rustock::sync",
                                         "Skeleton round complete (head #{}), using pre-fetched skeleton ({} entries after trim)",
                                         our_height, trimmed.len()
@@ -545,7 +545,7 @@ impl SyncService {
                                 // trimmed too small — fall through to request fresh skeleton
                             }
                         }
-                        info!(
+                        debug!(
                             target: "rustock::sync",
                             "Skeleton round complete (head #{}, peer #{}), requesting next skeleton",
                             our_height, peer_best

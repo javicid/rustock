@@ -104,7 +104,7 @@ impl OutboundConnector {
                                 let handshake = Handshake::new(stream, config, Some(remote_id));
                                 match tokio::time::timeout(Duration::from_secs(5), handshake.run()).await {
                                     Ok(Ok((peer_id, rsk_status, framed))) => {
-                                        info!(target: "rustock::net", "Outbound handshake successful: {:?}", &peer_id.as_slice()[..4]);
+                                        debug!(target: "rustock::net", "Outbound handshake successful: {:?}", &peer_id.as_slice()[..4]);
                                         let _ = register_and_run_session(
                                             peer_id, rsk_status, framed, handlers, peer_store,
                                         ).await;

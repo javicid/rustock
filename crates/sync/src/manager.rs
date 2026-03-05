@@ -8,7 +8,7 @@ use alloy_primitives::{B256, U256};
 use anyhow::Result;
 // HashMap no longer needed — sequential TD propagation replaces hash-based parent lookup
 use std::sync::Arc;
-use tracing::{info, debug};
+use tracing::{debug, warn};
 
 /// Maximum skeleton chunks to process per round (rskj default: 20).
 pub(crate) const MAX_SKELETON_CHUNKS: usize = 20;
@@ -49,7 +49,7 @@ impl SyncManager {
 
         let first_num = headers.first().map(|h| h.number).unwrap_or(0);
         let last_num = headers.last().map(|h| h.number).unwrap_or(0);
-        info!(
+        debug!(
             target: "rustock::sync",
             "Processing {} headers (#{} -> #{})",
             headers.len(),
@@ -162,7 +162,7 @@ impl SyncManager {
             if !already_stored {
                 if let Some(p) = parent_ref {
                     if let Err(e) = self.verifier.verify(header, Some(p)) {
-                        info!(
+                        warn!(
                             target: "rustock::sync",
                             "Header #{} ({:?}) failed verification: {:?}",
                             header.number, hash, e
@@ -185,13 +185,13 @@ impl SyncManager {
         let _new_head = self.store.store_headers_batch(&validated, current_head_hash, current_td)?;
 
         if skipped > 0 {
-            info!(
+            debug!(
                 target: "rustock::sync",
                 "Stored {} headers (#{} -> #{}), rejected {} invalid",
                 stored, first_num, last_num, skipped
             );
         } else {
-            info!(
+            debug!(
                 target: "rustock::sync",
                 "Stored {} headers (#{} -> #{})",
                 stored, first_num, last_num

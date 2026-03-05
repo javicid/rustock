@@ -160,7 +160,7 @@ impl DiscoveryService {
                 // remote will accept our FindNode after processing our Pong.
                 let newly_bonded = self.bonded.lock().await.insert(addr);
                 if newly_bonded {
-                    info!(
+                    debug!(
                         target: "rustock::discovery",
                         "Bonded with peer at {}, sending FindNode",
                         addr
@@ -182,7 +182,7 @@ impl DiscoveryService {
                 self.send_neighbors(find.message_id.clone(), closest, addr).await?;
             }
             DiscoveryPayload::Neighbors(neighbors) => {
-                info!(
+                debug!(
                     target: "rustock::discovery",
                     "Received {} neighbors from {}",
                     neighbors.nodes.len(),

@@ -4,7 +4,7 @@ use alloy_primitives::B512;
 use rustock_networking::protocol::{P2pHandler, P2pMessage, RskSubMessage};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::debug;
 
 /// Dispatches inbound messages to the state machine channel.
 pub struct SyncHandler {
@@ -23,7 +23,7 @@ impl P2pHandler for SyncHandler {
         if let P2pMessage::RskMessage(m) = msg {
             match m.sub_message {
                 RskSubMessage::Status(s) => {
-                    info!(
+                    debug!(
                         target: "rustock::sync",
                         "Received status from peer {:?}: #{} (TD: {:?})",
                         id,

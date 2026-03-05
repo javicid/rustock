@@ -5,7 +5,7 @@ use anyhow::{Result, Context};
 use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
 use futures::{StreamExt, SinkExt};
-use tracing::{info, debug};
+use tracing::debug;
 
 use crate::rlpx::{RLPxHandshake, RLPxCodec};
 use tokio_util::codec::{Decoder, Encoder};
@@ -120,7 +120,7 @@ impl Handshake {
             .context("Connection closed waiting for Hello")??;
         
         if let P2pMessage::Hello(peer_hello) = msg {
-            info!(target: "rustock::net", "P2P Handshake successful with peer: {}", peer_hello.client_id);
+            debug!(target: "rustock::net", "P2P Handshake successful with peer: {}", peer_hello.client_id);
             Ok(peer_hello.id)
         } else {
             Err(anyhow::anyhow!("Expected Hello, got {:?}", msg))
@@ -171,7 +171,7 @@ impl Handshake {
         
         if let P2pMessage::RskMessage(m) = rsk_msg {
             if let RskSubMessage::Status(s) = m.sub_message {
-                info!(target: "rustock::net", "RSK Handshake successful: peer at block {}", s.best_block_number);
+                debug!(target: "rustock::net", "RSK Handshake successful: peer at block {}", s.best_block_number);
                 Ok(s)
             } else {
                 Err(anyhow::anyhow!("Expected RskStatus, got {:?}", m.sub_message))
