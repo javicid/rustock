@@ -370,12 +370,12 @@ mod tests {
             connection_point: 0,
         };
 
-        // Skeleton with only 1 entry → too small → Idle
+        // Skeleton with only 1 entry → too small → Following
         service.on_skeleton_response(vec![
             BlockIdentifier { hash: B256::ZERO, number: 0 },
         ]).await;
 
-        assert!(matches!(service.state, SyncState::Idle));
+        assert!(matches!(service.state, SyncState::Following));
 
         drop(event_tx);
     }
@@ -444,9 +444,9 @@ mod tests {
         // Chunk 2: headers for blocks 3-4 (descending from b4)
         service.on_headers_response(peer, vec![b4.clone(), b3.clone()]).await;
 
-        // All chunks done and we're at peer_best → Idle
-        assert!(matches!(service.state, SyncState::Idle),
-            "Expected Idle after final chunk, got {:?}", service.state);
+        // All chunks done and we're at peer_best → Following
+        assert!(matches!(service.state, SyncState::Following),
+            "Expected Following after final chunk, got {:?}", service.state);
 
         // Verify all headers are stored
         assert!(store.get_header(b1.hash()).unwrap().is_some());
@@ -520,8 +520,8 @@ mod tests {
 
         service.try_start_sync().await;
 
-        assert!(matches!(service.state, SyncState::Idle),
-            "Expected Idle when already synced, got {:?}", service.state);
+        assert!(matches!(service.state, SyncState::Following),
+            "Expected Following when already synced, got {:?}", service.state);
 
         drop(event_tx);
     }
@@ -830,5 +830,279 @@ mod tests {
 
         tracker.next_to_process = 3;
         assert!(tracker.is_complete());
+    }
+
+    // -- Following mode / NewBlockHashes tests --------------------------------
+
+    #[tokio::test]
+    async fn test_small_gap_enters_following_mode() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+        let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+        store.update_head(&genesis, U256::from(1)).unwrap();
+
+        let verifier = Arc::new(HeaderVerifier::new());
+        let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+
+        let peer_id = B512::repeat_byte(0x01);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        peer_store.add_peer(peer_id, tx).await;
+        peer_store.update_metadata(&peer_id, rustock_networking::peers::PeerMetadata {
+            best_number: 10, // only 10 blocks behind (< 24)
+            total_difficulty: U256::from(10),
+            ..Default::default()
+        }).await;
+
+        let manager = Arc::new(SyncManager::new(store, verifier, peer_store.clone()));
+        let (_event_tx, event_rx) = mpsc::unbounded_channel();
+        let mut service = SyncService::new(manager, peer_store, event_rx);
+
+        service.try_start_sync().await;
+
+        assert!(matches!(service.state, SyncState::Following),
+            "Expected Following for small gap, got {:?}", service.state);
+    }
+
+    #[tokio::test]
+    async fn test_large_gap_enters_skeleton_sync() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+        let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+        store.update_head(&genesis, U256::from(1)).unwrap();
+
+        let verifier = Arc::new(HeaderVerifier::new());
+        let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+
+        let peer_id = B512::repeat_byte(0x01);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        peer_store.add_peer(peer_id, tx).await;
+        peer_store.update_metadata(&peer_id, rustock_networking::peers::PeerMetadata {
+            best_number: 100, // 100 blocks behind (> 24)
+            total_difficulty: U256::from(100),
+            ..Default::default()
+        }).await;
+
+        let manager = Arc::new(SyncManager::new(store, verifier, peer_store.clone()));
+        let (_event_tx, event_rx) = mpsc::unbounded_channel();
+        let mut service = SyncService::new(manager, peer_store, event_rx);
+
+        service.try_start_sync().await;
+
+        assert!(matches!(service.state, SyncState::DownloadingSkeleton { .. }),
+            "Expected DownloadingSkeleton for large gap, got {:?}", service.state);
+    }
+
+    #[tokio::test]
+    async fn test_new_block_hashes_ignored_during_sync() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+        let verifier = Arc::new(HeaderVerifier::new());
+        let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+        let manager = Arc::new(SyncManager::new(store, verifier, peer_store.clone()));
+
+        let (_event_tx, event_rx) = mpsc::unbounded_channel();
+        let mut service = SyncService::new(manager, peer_store, event_rx);
+
+        let peer = B512::repeat_byte(0x01);
+        service.state = SyncState::DownloadingSkeleton {
+            peer,
+            peer_best: 1000,
+            connection_point: 0,
+        };
+
+        // NewBlockHashes should be silently dropped
+        service.on_new_block_hashes(peer, vec![
+            BlockIdentifier { hash: B256::repeat_byte(0xaa), number: 1001 },
+        ]).await;
+
+        // State should be unchanged
+        assert!(matches!(service.state, SyncState::DownloadingSkeleton { .. }),
+            "State should remain DownloadingSkeleton, got {:?}", service.state);
+    }
+
+    #[tokio::test]
+    async fn test_new_block_hashes_processed_in_following_mode() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+        let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+        store.update_head(&genesis, U256::from(1)).unwrap();
+
+        let verifier = Arc::new(HeaderVerifier::new());
+        let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+
+        let peer = B512::repeat_byte(0x01);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        peer_store.add_peer(peer, tx).await;
+
+        let manager = Arc::new(SyncManager::new(store, verifier, peer_store.clone()));
+        let (_event_tx, event_rx) = mpsc::unbounded_channel();
+        let mut service = SyncService::new(manager, peer_store.clone(), event_rx);
+        service.state = SyncState::Following;
+
+        // Announce a new block
+        service.on_new_block_hashes(peer, vec![
+            BlockIdentifier { hash: B256::repeat_byte(0xbb), number: 1 },
+        ]).await;
+
+        // Should have sent a headers request to the peer
+        let msg = rx.try_recv();
+        assert!(msg.is_ok(), "Expected a headers request message to be sent");
+
+        // Peer metadata should be updated
+        let best = peer_store.get_best_peer().await;
+        assert!(best.is_some());
+        let (_, meta) = best.unwrap();
+        assert_eq!(meta.best_number, 1);
+    }
+
+    #[tokio::test]
+    async fn test_following_switches_to_sync_on_large_gap() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+        // Build a small chain so our_height > 0 (check_follow_gap returns early at 0)
+        let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+        let genesis_hash = genesis.hash();
+        store.update_head(&genesis, U256::from(1)).unwrap();
+
+        let b1 = dummy_header(1, genesis_hash, U256::from(1));
+        let b2 = dummy_header(2, b1.hash(), U256::from(1));
+        store.put_header(&b1).unwrap();
+        store.put_header(&b2).unwrap();
+        store.put_total_difficulty(b1.hash(), U256::from(2)).unwrap();
+        store.put_total_difficulty(b2.hash(), U256::from(3)).unwrap();
+        store.update_head(&b2, U256::from(3)).unwrap();
+
+        let verifier = Arc::new(HeaderVerifier::new());
+        let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+
+        let peer_id = B512::repeat_byte(0x01);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        peer_store.add_peer(peer_id, tx).await;
+        peer_store.update_metadata(&peer_id, rustock_networking::peers::PeerMetadata {
+            best_number: 200, // 198 blocks ahead (> 24)
+            total_difficulty: U256::from(200),
+            ..Default::default()
+        }).await;
+
+        let manager = Arc::new(SyncManager::new(store, verifier, peer_store.clone()));
+        let (_event_tx, event_rx) = mpsc::unbounded_channel();
+        let mut service = SyncService::new(manager, peer_store, event_rx);
+        service.state = SyncState::Following;
+
+        service.check_follow_gap().await;
+
+        assert!(matches!(service.state, SyncState::DownloadingSkeleton { .. }),
+            "Expected DownloadingSkeleton after large gap in Following, got {:?}", service.state);
+    }
+
+    #[tokio::test]
+    async fn test_following_stays_when_gap_small() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+        // Build a small chain so our_height > 0
+        let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+        let genesis_hash = genesis.hash();
+        store.update_head(&genesis, U256::from(1)).unwrap();
+
+        let b1 = dummy_header(1, genesis_hash, U256::from(1));
+        store.put_header(&b1).unwrap();
+        store.put_total_difficulty(b1.hash(), U256::from(2)).unwrap();
+        store.update_head(&b1, U256::from(2)).unwrap();
+
+        let verifier = Arc::new(HeaderVerifier::new());
+        let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+
+        let peer_id = B512::repeat_byte(0x01);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        peer_store.add_peer(peer_id, tx).await;
+        peer_store.update_metadata(&peer_id, rustock_networking::peers::PeerMetadata {
+            best_number: 5, // only 4 blocks ahead (< 24)
+            total_difficulty: U256::from(5),
+            ..Default::default()
+        }).await;
+
+        let manager = Arc::new(SyncManager::new(store, verifier, peer_store.clone()));
+        let (_event_tx, event_rx) = mpsc::unbounded_channel();
+        let mut service = SyncService::new(manager, peer_store, event_rx);
+        service.state = SyncState::Following;
+
+        service.check_follow_gap().await;
+
+        assert!(matches!(service.state, SyncState::Following),
+            "Expected Following to persist with small gap, got {:?}", service.state);
+    }
+
+    #[tokio::test]
+    async fn test_handler_forwards_new_block_hashes() {
+        use rustock_networking::protocol::{P2pMessage, RskMessage, RskSubMessage};
+        use rustock_networking::protocol::P2pHandler;
+
+        let dir = tempdir().unwrap();
+        let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+        let verifier = Arc::new(HeaderVerifier::new());
+        let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+        let manager = Arc::new(SyncManager::new(store, verifier, peer_store));
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let handler = SyncHandler::new(manager, event_tx);
+
+        let blocks = vec![
+            BlockIdentifier { hash: B256::repeat_byte(0x01), number: 100 },
+            BlockIdentifier { hash: B256::repeat_byte(0x02), number: 101 },
+        ];
+        let msg = P2pMessage::RskMessage(RskMessage::new(
+            RskSubMessage::NewBlockHashes(blocks),
+        ));
+
+        let resp = handler.handle_message(B512::repeat_byte(0xaa), msg);
+        assert!(resp.is_none());
+
+        match event_rx.try_recv().unwrap() {
+            SyncEvent::NewBlockHashes { peer, identifiers } => {
+                assert_eq!(peer, B512::repeat_byte(0xaa));
+                assert_eq!(identifiers.len(), 2);
+                assert_eq!(identifiers[0].number, 100);
+                assert_eq!(identifiers[1].number, 101);
+            }
+            other => panic!("Expected NewBlockHashes event, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_headers_response_in_following_mode() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+        let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+        let genesis_hash = genesis.hash();
+        store.update_head(&genesis, U256::from(1)).unwrap();
+
+        let verifier = Arc::new(HeaderVerifier::new());
+        let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+        let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+
+        let (_event_tx, event_rx) = mpsc::unbounded_channel();
+        let mut service = SyncService::new(manager, peer_store, event_rx);
+        service.state = SyncState::Following;
+
+        let b1 = dummy_header(1, genesis_hash, U256::from(1));
+        let b1_hash = b1.hash();
+        let peer = B512::repeat_byte(0x01);
+
+        // Simulate receiving a headers response while in Following mode
+        service.on_headers_response(peer, vec![b1]).await;
+
+        // State should remain Following
+        assert!(matches!(service.state, SyncState::Following),
+            "Expected Following after headers response, got {:?}", service.state);
+
+        // Header should be stored
+        assert!(store.get_header(b1_hash).unwrap().is_some());
+        assert_eq!(store.get_head().unwrap(), Some(b1_hash));
     }
 }

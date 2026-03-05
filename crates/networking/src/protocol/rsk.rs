@@ -118,6 +118,7 @@ pub struct SkeletonResponse {
 #[repr(u8)]
 pub enum RskMessageType {
     Status = 1,
+    NewBlockHashes = 6,
     BlockHashRequest = 8,
     BlockHeadersRequest = 9,
     BlockHeadersResponse = 10,
@@ -135,7 +136,8 @@ pub enum RskSubMessage {
     SkeletonRequest(SkeletonRequest),
     SkeletonResponse(SkeletonResponse),
     BlockHashResponse(BlockHashResponse),
-    /// An RSK message type we don't need to handle (e.g. Transactions, NewBlockHashes, etc.)
+    NewBlockHashes(Vec<BlockIdentifier>),
+    /// An RSK message type we don't need to handle (e.g. Transactions, etc.)
     Unknown(u8),
 }
 
@@ -149,6 +151,7 @@ impl RskSubMessage {
             RskSubMessage::SkeletonRequest(_) => RskMessageType::SkeletonRequest,
             RskSubMessage::SkeletonResponse(_) => RskMessageType::SkeletonResponse,
             RskSubMessage::BlockHashResponse(_) => RskMessageType::BlockHashResponse,
+            RskSubMessage::NewBlockHashes(_) => RskMessageType::NewBlockHashes,
             RskSubMessage::Unknown(_) => RskMessageType::Status, // Not used for encoding
         }
     }
@@ -283,8 +286,8 @@ impl RskSubMessage {
                 RlpHeader { list: true, payload_length: params.len() }.encode(out);
                 out.extend_from_slice(&params);
             }
-            RskSubMessage::Unknown(_) => {
-                // Unknown messages are not encoded/sent
+            RskSubMessage::NewBlockHashes(_) | RskSubMessage::Unknown(_) => {
+                // Receive-only messages are not encoded/sent
             }
         }
     }
@@ -462,8 +465,23 @@ impl Decodable for RskMessage {
 
                 RskSubMessage::BlockHashResponse(BlockHashResponse { id, hash })
             }
+            6 => {
+                // NewBlockHashes: RLP list of [hash, number] pairs
+                let list_h = RlpHeader::decode(&mut body_params)?;
+                let mut list_body = &body_params[..list_h.payload_length];
+                let mut identifiers = Vec::new();
+                while !list_body.is_empty() {
+                    let item_h = RlpHeader::decode(&mut list_body)?;
+                    let mut item_body = &list_body[..item_h.payload_length];
+                    list_body = &list_body[item_h.payload_length..];
+                    let hash = B256::decode(&mut item_body)?;
+                    let number = decode_u64_lenient(&mut item_body)?;
+                    identifiers.push(BlockIdentifier { hash, number });
+                }
+                RskSubMessage::NewBlockHashes(identifiers)
+            }
             other => {
-                // Skip unknown message types gracefully (Transactions, NewBlockHashes, etc.)
+                // Skip unknown message types gracefully (Transactions, etc.)
                 RskSubMessage::Unknown(other)
             }
         };

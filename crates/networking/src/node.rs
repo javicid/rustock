@@ -5,7 +5,7 @@ use crate::peers::PeerStore;
 use alloy_primitives::{B512, B256, U256};
 use anyhow::{Result, Context};
 use std::sync::Arc;
-use tracing::{info, error, debug};
+use tracing::{info, error, debug, trace};
 
 /// A P2P Node that manages incoming connections and peer handshakes.
 pub struct Node {
@@ -140,7 +140,7 @@ impl Node {
         // 4. Start Accept Loop
         loop {
             let (stream, peer_addr) = listener.accept().await?;
-            debug!(target: "rustock::net", "New connection from: {}", peer_addr);
+            trace!(target: "rustock::net", "New connection from: {}", peer_addr);
             
             let config = self.config.clone();
             let handlers = all_handlers.clone();
@@ -169,7 +169,7 @@ pub(crate) async fn register_and_run_session(
     let (tx, rx) = mpsc::unbounded_channel();
 
     if !peer_store.add_peer(peer_id, tx).await {
-        debug!(target: "rustock::net", "Peer already connected: {:?}", peer_id);
+        trace!(target: "rustock::net", "Peer already connected: {:?}", peer_id);
         return Ok(());
     }
 

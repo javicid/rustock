@@ -33,6 +33,9 @@ pub enum SyncState {
         /// Pre-fetched skeleton for the next round (Optimization 4).
         pending_next_skeleton: Option<Vec<BlockIdentifier>>,
     },
+    /// At or near the chain tip — listening for NewBlockHashes announcements
+    /// and fetching individual headers as they arrive.
+    Following,
 }
 
 impl Default for SyncState {

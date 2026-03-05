@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
-use tracing::{info, debug, warn};
+use tracing::{info, trace, warn};
 use tokio::net::TcpStream;
 
 /// Service that proactively initiates connections to peers discovered in the network.
@@ -62,7 +62,7 @@ impl OutboundConnector {
             // Attempt up to 3x needed, capped at available nodes.
             let attempt_limit = std::cmp::min(needed * 3, nodes.len());
 
-            debug!(
+            trace!(
                 target: "rustock::net",
                 "Outbound: {}/{} peers. Trying up to {} of {} discovered nodes",
                 current_count, self.max_outbound, attempt_limit, table_size
@@ -100,11 +100,11 @@ impl OutboundConnector {
                             TcpStream::connect(addr),
                         ).await {
                             Ok(Ok(stream)) => {
-                                debug!(target: "rustock::net", "TCP connected to outbound peer: {}", addr);
+                                trace!(target: "rustock::net", "TCP connected to outbound peer: {}", addr);
                                 let handshake = Handshake::new(stream, config, Some(remote_id));
                                 match tokio::time::timeout(Duration::from_secs(5), handshake.run()).await {
                                     Ok(Ok((peer_id, rsk_status, framed))) => {
-                                        debug!(target: "rustock::net", "Outbound handshake successful: {:?}", &peer_id.as_slice()[..4]);
+                                        trace!(target: "rustock::net", "Outbound handshake successful: {:?}", &peer_id.as_slice()[..4]);
                                         let _ = register_and_run_session(
                                             peer_id, rsk_status, framed, handlers, peer_store,
                                         ).await;
@@ -112,21 +112,21 @@ impl OutboundConnector {
                                         // it was a valid peer that may accept again later
                                     }
                                     Ok(Err(e)) => {
-                                        debug!(target: "rustock::net", "Outbound handshake failed for {}: {:?}", addr, e);
+                                        trace!(target: "rustock::net", "Outbound handshake failed for {}: {:?}", addr, e);
                                         failed_ref.lock().await.insert(addr);
                                     }
                                     Err(_) => {
-                                        debug!(target: "rustock::net", "Outbound handshake timed out for {}", addr);
+                                        trace!(target: "rustock::net", "Outbound handshake timed out for {}", addr);
                                         failed_ref.lock().await.insert(addr);
                                     }
                                 }
                             }
                             Ok(Err(e)) => {
-                                debug!(target: "rustock::net", "Failed to connect to outbound peer {}: {:?}", addr, e);
+                                trace!(target: "rustock::net", "Failed to connect to outbound peer {}: {:?}", addr, e);
                                 failed_ref.lock().await.insert(addr);
                             }
                             Err(_) => {
-                                debug!(target: "rustock::net", "TCP connect timed out for {}", addr);
+                                trace!(target: "rustock::net", "TCP connect timed out for {}", addr);
                                 failed_ref.lock().await.insert(addr);
                             }
                         }

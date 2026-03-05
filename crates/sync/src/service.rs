@@ -9,13 +9,18 @@ use alloy_primitives::{B256, B512};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tracing::{info, debug, warn, error};
+use tracing::{info, debug, trace, warn, error};
 
 /// Timeout for pending requests before resetting to Idle.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Interval between sync tick checks.
 const TICK_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Maximum block gap for follow mode. Gaps larger than this trigger skeleton
+/// sync; smaller gaps are handled by fetching individual headers.
+/// Matches RSKj's `longSyncLimit` (default 24).
+const LONG_SYNC_LIMIT: u64 = 24;
 
 fn create_block_hash_request(height: u64) -> P2pMessage {
     let req = BlockHashRequest {
@@ -98,6 +103,9 @@ impl SyncService {
             SyncState::Idle => {
                 self.try_start_sync().await;
             }
+            SyncState::Following => {
+                self.check_follow_gap().await;
+            }
             _ => {
                 if self.last_progress.elapsed() > REQUEST_TIMEOUT {
                     warn!(
@@ -143,7 +151,9 @@ impl SyncService {
         }
     }
 
-    /// If we're behind the best peer, initiate sync by finding the connection point.
+    /// If we're behind the best peer, initiate sync.
+    /// Small gaps (<= LONG_SYNC_LIMIT) enter Following mode;
+    /// large gaps use skeleton sync.
     pub(crate) async fn try_start_sync(&mut self) {
         let best_peer = self.peer_store.get_best_peer().await;
         let (peer_id, metadata) = match best_peer {
@@ -161,14 +171,25 @@ impl SyncService {
         };
 
         if head.number >= metadata.best_number {
+            self.state = SyncState::Following;
+            return;
+        }
+
+        let gap = metadata.best_number - head.number;
+
+        if gap <= LONG_SYNC_LIMIT {
+            info!(
+                target: "rustock::sync",
+                "Near tip ({} blocks behind), entering follow mode", gap
+            );
+            self.state = SyncState::Following;
             return;
         }
 
         info!(
             target: "rustock::sync",
             "Starting sync: our head #{}, peer best #{} ({} blocks behind)",
-            head.number, metadata.best_number,
-            metadata.best_number - head.number
+            head.number, metadata.best_number, gap
         );
 
         // Reset progress tracking for this sync session
@@ -177,11 +198,6 @@ impl SyncService {
         self.last_report_at = Instant::now();
         self.last_report_block = head.number;
 
-        // Use the head block as the connection point directly.
-        // The head is the last block with a verified total difficulty chain.
-        // Skipping to a higher "connection point" (via binary search) could land
-        // on a stored block whose TD is incorrect from a previous interrupted sync,
-        // causing all subsequent chunks to inherit bad TDs and the head to never advance.
         let cp = head.number;
         debug!(target: "rustock::sync", "Connection point: #{} (head)", cp);
         self.state = SyncState::DownloadingSkeleton {
@@ -236,7 +252,7 @@ impl SyncService {
 
         let count = (height - prev_known) as u32;
 
-        debug!(
+        trace!(
             target: "rustock::sync",
             "Requesting {} headers from #{} (chunk {}/{}) -> peer {:?}",
             count, height, chunk_idx, skeleton.len() - 1,
@@ -329,6 +345,9 @@ impl SyncService {
             SyncEvent::HeadersResponse { peer, headers } => {
                 self.on_headers_response(peer, headers).await;
             }
+            SyncEvent::NewBlockHashes { peer, identifiers } => {
+                self.on_new_block_hashes(peer, identifiers).await;
+            }
         }
     }
 
@@ -390,10 +409,10 @@ impl SyncService {
                 if identifiers.len() < 2 {
                     debug!(
                         target: "rustock::sync",
-                        "Skeleton too small ({} entries), sync appears complete",
+                        "Skeleton too small ({} entries), entering follow mode",
                         identifiers.len()
                     );
-                    self.state = SyncState::Idle;
+                    self.state = SyncState::Following;
                     return;
                 }
 
@@ -563,9 +582,9 @@ impl SyncService {
                     } else {
                         info!(
                             target: "rustock::sync",
-                            "Sync complete! Head at #{}", our_height
+                            "Sync complete! Head at #{}, entering follow mode", our_height
                         );
-                        // state is Idle from mem::take
+                        self.state = SyncState::Following;
                     }
                 } else {
                     // More chunks to go — restore state and refill pipeline
@@ -578,9 +597,85 @@ impl SyncService {
                 }
             }
             other => {
+                let is_following = matches!(other, SyncState::Following);
                 self.state = other;
+                let before = self.our_head_number();
                 let _ = self.manager.handle_headers_response(headers);
+                if is_following {
+                    let after = self.our_head_number();
+                    if after > before {
+                        info!(
+                            target: "rustock::sync",
+                            "New tip: #{}", after
+                        );
+                    }
+                }
             }
+        }
+    }
+
+    /// Handle NewBlockHashes: fetch announced headers we don't have yet.
+    /// Only active in Following state; ignored during skeleton sync.
+    pub(crate) async fn on_new_block_hashes(&mut self, peer: B512, identifiers: Vec<BlockIdentifier>) {
+        if !matches!(self.state, SyncState::Following) {
+            trace!(
+                target: "rustock::sync",
+                "Ignoring NewBlockHashes ({} entries) — sync in progress",
+                identifiers.len()
+            );
+            return;
+        }
+
+        let our_height = self.our_head_number();
+
+        for id in &identifiers {
+            if id.number <= our_height {
+                continue;
+            }
+
+            // Update peer metadata so try_start_sync sees the latest tip
+            let metadata = rustock_networking::peers::PeerMetadata {
+                best_number: id.number,
+                best_hash: id.hash,
+                total_difficulty: alloy_primitives::U256::ZERO,
+                client_id: String::new(),
+            };
+            self.peer_store.update_metadata(&peer, metadata).await;
+
+            // Request headers ending at this hash (count = gap from our head)
+            let count = (id.number - our_height) as u32;
+            trace!(
+                target: "rustock::sync",
+                "NewBlockHashes: requesting {} headers up to #{} from peer {:?}",
+                count, id.number, &peer.as_slice()[..4]
+            );
+            let msg = self.manager.create_headers_request(id.hash, count);
+            self.peer_store.send_to_peer(&peer, msg).await;
+        }
+    }
+
+    /// In Following state, periodically check if we've fallen too far behind
+    /// and need to switch back to skeleton sync.
+    pub(crate) async fn check_follow_gap(&mut self) {
+        let best_peer = self.peer_store.get_best_peer().await;
+        let (_, metadata) = match best_peer {
+            Some(p) => p,
+            None => return,
+        };
+
+        let our_height = self.our_head_number();
+        if our_height == 0 {
+            return;
+        }
+
+        if metadata.best_number > our_height + LONG_SYNC_LIMIT {
+            info!(
+                target: "rustock::sync",
+                "Fell behind by {} blocks, switching to skeleton sync",
+                metadata.best_number - our_height
+            );
+            self.state = SyncState::Idle;
+            self.try_start_sync().await;
         }
     }
 
@@ -602,7 +697,7 @@ impl SyncService {
             SyncState::DownloadingHeaders { peer_best, .. } => *peer_best,
             SyncState::DownloadingSkeleton { peer_best, .. } => *peer_best,
             SyncState::FindingConnectionPoint { peer_best, .. } => *peer_best,
-            SyncState::Idle => return,
+            SyncState::Idle | SyncState::Following => return,
         };
 
         let current = self.our_head_number();
@@ -659,6 +754,7 @@ impl SyncService {
             SyncState::DownloadingSkeleton { .. } => "downloading skeleton",
             SyncState::DownloadingHeaders { .. } => "downloading headers",
             SyncState::Idle => "idle",
+            SyncState::Following => "following",
         };
 
         info!(

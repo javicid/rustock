@@ -14,4 +14,8 @@ pub enum SyncEvent {
         peer: B512,
         headers: Vec<Header>,
     },
+    NewBlockHashes {
+        peer: B512,
+        identifiers: Vec<BlockIdentifier>,
+    },
 }

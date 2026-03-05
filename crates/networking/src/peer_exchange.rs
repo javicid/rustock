@@ -5,7 +5,7 @@ use crate::protocol::{P2pHandler, P2pMessage};
 use alloy_primitives::B512;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::debug;
+use tracing::trace;
 
 /// Maximum number of peers to return in a Peers response.
 const MAX_PEERS_RESPONSE: usize = 25;
@@ -38,7 +38,7 @@ impl P2pHandler for PeerExchangeHandler {
                         id: n.id,
                     })
                     .collect();
-                debug!(
+                trace!(
                     target: "rustock::net",
                     "Responding to GetPeers with {} peers",
                     peers.len()
@@ -59,7 +59,7 @@ impl P2pHandler for PeerExchangeHandler {
                             added += 1;
                         }
                     }
-                    debug!(
+                    trace!(
                         target: "rustock::net",
                         "Peer exchange: received {} peers, added {} new to discovery table",
                         peers.len(),

@@ -13,7 +13,7 @@ use anyhow::Result;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{info, debug, warn, error};
+use tracing::{info, debug, trace, warn, error};
 
 /// Service for node discovery using UDP based on RSK protocol.
 ///
@@ -85,7 +85,7 @@ impl DiscoveryService {
             let nodes = self.table.lock().await.get_all_nodes();
             let bonded = self.bonded.lock().await;
 
-            debug!(
+            trace!(
                 target: "rustock::discovery",
                 "Discovery loop: {} nodes in table, {} bonded",
                 nodes.len(),
@@ -144,7 +144,7 @@ impl DiscoveryService {
         
         match &packet.payload {
             DiscoveryPayload::Ping(ping) => {
-                debug!(target: "rustock::discovery", "Received Ping from {}", addr);
+                trace!(target: "rustock::discovery", "Received Ping from {}", addr);
                 // Reply with Pong to complete bonding from the remote's perspective
                 self.send_pong(ping.message_id.clone(), addr).await?;
                 
@@ -162,7 +162,7 @@ impl DiscoveryService {
                 if newly_bonded {
                     debug!(
                         target: "rustock::discovery",
-                        "Bonded with peer at {}, sending FindNode",
+                        "Bonded with new peer at {}",
                         addr
                     );
                     // Small delay to let the remote process our Pong before
@@ -174,15 +174,15 @@ impl DiscoveryService {
                 }
             }
             DiscoveryPayload::Pong(_) => {
-                debug!(target: "rustock::discovery", "Received Pong from {}", addr);
+                trace!(target: "rustock::discovery", "Received Pong from {}", addr);
             }
             DiscoveryPayload::FindNode(find) => {
-                debug!(target: "rustock::discovery", "Received FindNode from {}", addr);
+                trace!(target: "rustock::discovery", "Received FindNode from {}", addr);
                 let closest = self.table.lock().await.get_closest_nodes(&find.target, 16);
                 self.send_neighbors(find.message_id.clone(), closest, addr).await?;
             }
             DiscoveryPayload::Neighbors(neighbors) => {
-                debug!(
+                trace!(
                     target: "rustock::discovery",
                     "Received {} neighbors from {}",
                     neighbors.nodes.len(),

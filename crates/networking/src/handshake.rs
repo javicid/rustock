@@ -5,7 +5,7 @@ use anyhow::{Result, Context};
 use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
 use futures::{StreamExt, SinkExt};
-use tracing::debug;
+use tracing::trace;
 
 use crate::rlpx::{RLPxHandshake, RLPxCodec};
 use tokio_util::codec::{Decoder, Encoder};
@@ -59,7 +59,7 @@ impl Handshake {
         let remote_id = self.remote_id;
 
         if let Some(remote_pk) = remote_id {
-            debug!(target: "rustock::net", "Attempting RLPx handshake with {:?}", remote_pk);
+            trace!(target: "rustock::net", "Attempting RLPx handshake with {:?}", remote_pk);
             let rlpx = RLPxHandshake::new(stream, config.clone(), remote_pk);
             let (peer_id, frame_codec, stream) = rlpx.run_initiator().await.context("RLPx handshake failed")?;
             
@@ -120,7 +120,7 @@ impl Handshake {
             .context("Connection closed waiting for Hello")??;
         
         if let P2pMessage::Hello(peer_hello) = msg {
-            debug!(target: "rustock::net", "P2P Handshake successful with peer: {}", peer_hello.client_id);
+            trace!(target: "rustock::net", "P2P Handshake successful with peer: {}", peer_hello.client_id);
             Ok(peer_hello.id)
         } else {
             Err(anyhow::anyhow!("Expected Hello, got {:?}", msg))
@@ -160,7 +160,7 @@ impl Handshake {
             if s.genesis_hash != config.genesis_hash {
                 return Err(anyhow::anyhow!("Genesis hash mismatch: expected {:?}, got {:?}", config.genesis_hash, s.genesis_hash));
             }
-            debug!(target: "rustock::net", "Peer EthStatus: best_hash={:?}", s.best_hash);
+            trace!(target: "rustock::net", "Peer EthStatus: best_hash={:?}", s.best_hash);
         } else {
             return Err(anyhow::anyhow!("Expected EthStatus, got {:?}", eth_msg));
         }
@@ -171,7 +171,7 @@ impl Handshake {
         
         if let P2pMessage::RskMessage(m) = rsk_msg {
             if let RskSubMessage::Status(s) = m.sub_message {
-                debug!(target: "rustock::net", "RSK Handshake successful: peer at block {}", s.best_block_number);
+                trace!(target: "rustock::net", "RSK Handshake successful: peer at block {}", s.best_block_number);
                 Ok(s)
             } else {
                 Err(anyhow::anyhow!("Expected RskStatus, got {:?}", m.sub_message))

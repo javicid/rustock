@@ -8,7 +8,7 @@ use alloy_primitives::{B256, U256};
 use anyhow::Result;
 // HashMap no longer needed — sequential TD propagation replaces hash-based parent lookup
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 /// Maximum skeleton chunks to process per round (rskj default: 20).
 pub(crate) const MAX_SKELETON_CHUNKS: usize = 20;
@@ -38,7 +38,7 @@ impl SyncManager {
     /// We reverse them, validate, and store in a single atomic RocksDB WriteBatch.
     pub fn handle_headers_response(&self, mut headers: Vec<Header>) -> Result<()> {
         if headers.is_empty() {
-            debug!(target: "rustock::sync", "Received empty headers response");
+            trace!(target: "rustock::sync", "Received empty headers response");
             return Ok(());
         }
 
@@ -49,7 +49,7 @@ impl SyncManager {
 
         let first_num = headers.first().map(|h| h.number).unwrap_or(0);
         let last_num = headers.last().map(|h| h.number).unwrap_or(0);
-        debug!(
+        trace!(
             target: "rustock::sync",
             "Processing {} headers (#{} -> #{})",
             headers.len(),
@@ -191,7 +191,7 @@ impl SyncManager {
                 stored, first_num, last_num, skipped
             );
         } else {
-            debug!(
+            trace!(
                 target: "rustock::sync",
                 "Stored {} headers (#{} -> #{})",
                 stored, first_num, last_num
