@@ -38,6 +38,18 @@ struct Args {
     /// <data-dir>/rustock.log with automatic daily rotation.
     #[arg(long, default_value_t = false)]
     log_to_stdout: bool,
+
+    /// JSON-RPC server port
+    #[arg(long, default_value_t = 4444)]
+    rpc_port: u16,
+
+    /// JSON-RPC server bind address
+    #[arg(long, default_value = "127.0.0.1")]
+    rpc_host: String,
+
+    /// Disable the JSON-RPC server
+    #[arg(long, default_value_t = false)]
+    no_rpc: bool,
 }
 
 #[tokio::main]
@@ -156,6 +168,21 @@ async fn main() -> Result<()> {
     node.add_handler(sync_handler);
 
     tokio::spawn(sync_service.start());
+
+    if !args.no_rpc {
+        let rpc_state = rustock_rpc::server::RpcState {
+            store: store.clone(),
+            peer_store: peer_store.clone(),
+            config: config.clone(),
+        };
+        let rpc_host = args.rpc_host.clone();
+        let rpc_port = args.rpc_port;
+        tokio::spawn(async move {
+            if let Err(e) = rustock_rpc::server::start_rpc_server(&rpc_host, rpc_port, rpc_state).await {
+                tracing::error!("RPC server error: {}", e);
+            }
+        });
+    }
 
     node.start().await?;
 

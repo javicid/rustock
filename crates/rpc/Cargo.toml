@@ -1,21 +1,23 @@
 [package]
-name = "rustock-cli"
+name = "rustock-rpc"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 alloy-primitives = { workspace = true }
+alloy-rlp = { workspace = true }
 anyhow = { workspace = true }
-clap = { version = "4.5.58", features = ["derive"] }
-k256 = "0.13.4"
+axum = "0.8"
 rustock-core = { version = "0.1.0", path = "../core" }
 rustock-networking = { version = "0.1.0", path = "../networking" }
 rustock-storage = { version = "0.1.0", path = "../storage" }
-rustock-rpc = { version = "0.1.0", path = "../rpc" }
-rustock-sync = { version = "0.1.0", path = "../sync" }
+hex = "0.4"
+serde = { workspace = true }
+serde_json = "1"
+sha3 = "0.10"
 tokio = { workspace = true }
+tower-http = { version = "0.6", features = ["cors"] }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-rand = { workspace = true }
-hex = "0.4.3"
-tracing-appender = "0.2.4"
+
+[dev-dependencies]
+tempfile = { workspace = true }
