@@ -2,6 +2,8 @@
 
 A Rootstock (RSK) light client implementation in Rust. Rustock syncs and validates block headers from the RSK network using Bitcoin merged mining proofs, follows the chain tip in real time, and exposes an rskj-compatible JSON-RPC interface.
 
+> **Alpha software.** This project has been primarily coded by AI and has not yet undergone human code review or any security audit. Use at your own risk and do not rely on it for production workloads or anything involving real funds.
+
 ## Features
 
 - **Header sync**: Skeleton-based bulk sync with parallel chunk downloads across multiple peers, followed by real-time tip following via `NewBlockHashes`.
