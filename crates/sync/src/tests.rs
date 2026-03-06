@@ -1661,3 +1661,57 @@ async fn test_no_reorg_via_headers_response_lower_td() {
     assert!(store.get_header(b1.hash()).unwrap().is_some());
     assert!(store.get_header(b2.hash()).unwrap().is_some());
 }
+
+// ========== TxRelay tests ==========
+
+#[tokio::test]
+async fn test_tx_relay_filters_duplicates() {
+    use crate::tx_relay::TxRelay;
+    use rustock_networking::protocol::rsk::{RskMessage, RskSubMessage};
+    use rustock_networking::protocol::{P2pHandler, P2pMessage};
+    use alloy_primitives::Bytes;
+    use tokio::sync::mpsc;
+
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+
+    let peer_a = alloy_primitives::B512::repeat_byte(0x0a);
+    let peer_b = alloy_primitives::B512::repeat_byte(0x0b);
+    let (_tx_a, _rx_a) = mpsc::unbounded_channel();
+    let (tx_b, mut rx_b) = mpsc::unbounded_channel();
+    peer_store.add_peer(peer_a, _tx_a).await;
+    peer_store.add_peer(peer_b, tx_b).await;
+
+    let relay = TxRelay::new(peer_store);
+    let tx_data = Bytes::from(vec![0xde, 0xad, 0xbe, 0xef]);
+
+    let msg = P2pMessage::RskMessage(RskMessage::new(
+        RskSubMessage::Transactions(vec![tx_data.clone()]),
+    ));
+    relay.handle_message(peer_a, msg.clone());
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    assert!(rx_b.try_recv().is_ok(), "peer B should receive the tx");
+
+    relay.handle_message(peer_a, msg);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(rx_b.try_recv().is_err(), "duplicate should be suppressed");
+}
+
+#[tokio::test]
+async fn test_tx_relay_submit_transaction() {
+    use crate::tx_relay::TxRelay;
+    use alloy_primitives::Bytes;
+    use tokio::sync::mpsc;
+
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let peer_a = alloy_primitives::B512::repeat_byte(0x0a);
+    let (tx_a, mut rx_a) = mpsc::unbounded_channel();
+    peer_store.add_peer(peer_a, tx_a).await;
+
+    let relay = TxRelay::new(peer_store);
+    let raw = Bytes::from(vec![0xca, 0xfe]);
+    let hash = relay.submit_transaction(raw).await;
+
+    assert_ne!(hash, alloy_primitives::B256::ZERO);
+    assert!(rx_a.try_recv().is_ok(), "peer should receive broadcast");
+}

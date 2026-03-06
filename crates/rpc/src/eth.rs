@@ -1,10 +1,12 @@
 use crate::helpers::{
     parse_b256, parse_block_number, to_hex_u256, to_hex_u64, BlockResultDto,
 };
+use crate::server::TxSubmitter;
 use crate::types::*;
 use rustock_core::config::ChainConfig;
 use rustock_storage::BlockStore;
 use serde_json::{json, Value};
+use std::sync::Arc;
 
 pub fn eth_protocol_version(id: Value) -> JsonRpcResponse {
     JsonRpcResponse::success(id, json!("0x3e"))
@@ -199,4 +201,41 @@ fn build_block_dto(
     let header = store.get_header(hash).ok()??;
     let td = store.get_total_difficulty(hash).ok()?.unwrap_or_default();
     Some(BlockResultDto::from_header(&header, hash, td))
+}
+
+pub async fn eth_send_raw_transaction(
+    id: Value,
+    params: &Value,
+    tx_submitter: &Option<Arc<dyn TxSubmitter>>,
+) -> JsonRpcResponse {
+    let submitter = match tx_submitter {
+        Some(s) => s,
+        None => {
+            return JsonRpcResponse::error(
+                id,
+                METHOD_NOT_FOUND,
+                "Transaction relay not available",
+            );
+        }
+    };
+
+    let raw_hex = match params.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => {
+            return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing raw transaction hex");
+        }
+    };
+
+    let raw_hex = raw_hex.strip_prefix("0x").unwrap_or(raw_hex);
+    let raw_bytes = match hex::decode(raw_hex) {
+        Ok(b) => b,
+        Err(_) => {
+            return JsonRpcResponse::error(id, INVALID_PARAMS, "Invalid hex");
+        }
+    };
+
+    let tx_hash = submitter
+        .submit_transaction(alloy_primitives::Bytes::from(raw_bytes))
+        .await;
+    JsonRpcResponse::success(id, json!(format!("0x{:x}", tx_hash)))
 }

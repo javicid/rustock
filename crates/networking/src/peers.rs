@@ -92,6 +92,22 @@ impl PeerStore {
     pub async fn count(&self) -> usize {
         self.connected_peers.lock().await.len()
     }
+
+    /// Broadcasts a message to all connected peers except those in `exclude`.
+    /// Returns the number of peers the message was sent to.
+    pub async fn broadcast(&self, msg: P2pMessage, exclude: &[B512]) -> usize {
+        let peers = self.connected_peers.lock().await;
+        let mut sent = 0;
+        for (id, state) in peers.iter() {
+            if exclude.contains(id) {
+                continue;
+            }
+            if state.sender.send(msg.clone()).is_ok() {
+                sent += 1;
+            }
+        }
+        sent
+    }
 }
 
 #[cfg(test)]
@@ -198,5 +214,45 @@ mod tests {
         assert_eq!(store.count().await, 1);
         assert!(!store.is_connected(&id1).await);
         assert!(!store.send_to_peer(&id1, P2pMessage::Ping).await);
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_sends_to_all_except_excluded() {
+        let store = PeerStore::new();
+        let id1 = B512::repeat_byte(0x01);
+        let id2 = B512::repeat_byte(0x02);
+        let id3 = B512::repeat_byte(0x03);
+        let (tx1, mut rx1) = mpsc::unbounded_channel();
+        let (tx2, mut rx2) = mpsc::unbounded_channel();
+        let (tx3, mut rx3) = mpsc::unbounded_channel();
+
+        store.add_peer(id1, tx1).await;
+        store.add_peer(id2, tx2).await;
+        store.add_peer(id3, tx3).await;
+
+        let sent = store.broadcast(P2pMessage::Ping, &[id2]).await;
+        assert_eq!(sent, 2);
+
+        assert!(rx1.try_recv().is_ok());
+        assert!(rx2.try_recv().is_err());
+        assert!(rx3.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_empty_exclude() {
+        let store = PeerStore::new();
+        let id1 = B512::repeat_byte(0x01);
+        let id2 = B512::repeat_byte(0x02);
+        let (tx1, mut rx1) = mpsc::unbounded_channel();
+        let (tx2, mut rx2) = mpsc::unbounded_channel();
+
+        store.add_peer(id1, tx1).await;
+        store.add_peer(id2, tx2).await;
+
+        let sent = store.broadcast(P2pMessage::Ping, &[]).await;
+        assert_eq!(sent, 2);
+
+        assert!(rx1.try_recv().is_ok());
+        assert!(rx2.try_recv().is_ok());
     }
 }

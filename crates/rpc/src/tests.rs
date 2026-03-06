@@ -47,6 +47,7 @@ fn setup_state() -> (RpcState, tempfile::TempDir) {
         store,
         peer_store: Arc::new(PeerStore::new()),
         config: Arc::new(ChainConfig::mainnet()),
+        tx_submitter: None,
     };
     (state, tmp)
 }
@@ -405,4 +406,81 @@ async fn test_batch_dispatch() {
     assert_eq!(responses[0].result.as_ref().unwrap(), &json!("0x2a"));
     assert_eq!(responses[1].result.as_ref().unwrap(), &json!("Rustock/0.1.0"));
     assert!(responses[2].error.is_some());
+}
+
+// ========== eth_sendRawTransaction ==========
+
+#[tokio::test]
+async fn test_eth_send_raw_transaction_no_submitter() {
+    let (state, _tmp) = setup_state();
+    let req = make_request("eth_sendRawTransaction", json!(["0xdeadbeef"]));
+    let resp = dispatch_for_test(&state, req).await;
+    assert!(resp.error.is_some(), "Should error when tx_submitter is None");
+}
+
+#[tokio::test]
+async fn test_eth_send_raw_transaction_with_submitter() {
+    use crate::server::TxSubmitter;
+    use alloy_primitives::B256;
+    use sha3::Digest;
+
+    struct MockSubmitter;
+
+    #[async_trait::async_trait]
+    impl TxSubmitter for MockSubmitter {
+        async fn submit_transaction(&self, raw_tx: alloy_primitives::Bytes) -> B256 {
+            B256::from_slice(&sha3::Keccak256::digest(&raw_tx))
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(tmp.path()).unwrap());
+    let header = test_header(1);
+    store.update_head(&header, U256::from(1000)).unwrap();
+
+    let state = RpcState {
+        store,
+        peer_store: Arc::new(PeerStore::new()),
+        config: Arc::new(ChainConfig::mainnet()),
+        tx_submitter: Some(Arc::new(MockSubmitter)),
+    };
+
+    let req = make_request("eth_sendRawTransaction", json!(["0xdeadbeef"]));
+    let resp = dispatch_for_test(&state, req).await;
+    assert!(resp.error.is_none(), "Should succeed with a submitter");
+    let result = resp.result.unwrap();
+    let hash_str = result.as_str().unwrap();
+    assert!(hash_str.starts_with("0x"));
+    assert_eq!(hash_str.len(), 66);
+}
+
+#[tokio::test]
+async fn test_eth_send_raw_transaction_invalid_hex() {
+    use crate::server::TxSubmitter;
+    use alloy_primitives::B256;
+
+    struct MockSubmitter;
+
+    #[async_trait::async_trait]
+    impl TxSubmitter for MockSubmitter {
+        async fn submit_transaction(&self, _raw_tx: alloy_primitives::Bytes) -> B256 {
+            B256::ZERO
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(tmp.path()).unwrap());
+    let header = test_header(1);
+    store.update_head(&header, U256::from(1000)).unwrap();
+
+    let state = RpcState {
+        store,
+        peer_store: Arc::new(PeerStore::new()),
+        config: Arc::new(ChainConfig::mainnet()),
+        tx_submitter: Some(Arc::new(MockSubmitter)),
+    };
+
+    let req = make_request("eth_sendRawTransaction", json!(["0xZZZZ"]));
+    let resp = dispatch_for_test(&state, req).await;
+    assert!(resp.error.is_some(), "Should error on invalid hex");
 }

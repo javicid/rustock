@@ -3,12 +3,21 @@ use rustock_core::config::ChainConfig;
 use rustock_core::validation::HeaderVerifier;
 use rustock_storage::BlockStore;
 use rustock_networking::node::{Node, NodeConfig};
-use rustock_sync::{SyncManager, SyncHandler, SyncService};
+use rustock_sync::{SyncManager, SyncHandler, SyncService, TxRelay};
 use std::sync::Arc;
 use alloy_primitives::U256;
 use anyhow::{Result, Context};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
+
+struct TxRelaySubmitter(Arc<TxRelay>);
+
+#[async_trait::async_trait]
+impl rustock_rpc::server::TxSubmitter for TxRelaySubmitter {
+    async fn submit_transaction(&self, raw_tx: alloy_primitives::Bytes) -> alloy_primitives::B256 {
+        self.0.submit_transaction(raw_tx).await
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -170,8 +179,11 @@ async fn main() -> Result<()> {
     let sync_handler = Arc::new(SyncHandler::new(sync_manager.clone(), event_tx));
     let sync_service = SyncService::new(sync_manager.clone(), peer_store.clone(), event_rx);
 
+    let tx_relay = Arc::new(TxRelay::new(peer_store.clone()));
+
     let mut node = Node::with_peer_store(node_config, peer_store.clone());
     node.add_handler(sync_handler);
+    node.add_handler(tx_relay.clone());
 
     tokio::spawn(sync_service.start());
 
@@ -180,6 +192,7 @@ async fn main() -> Result<()> {
             store: store.clone(),
             peer_store: peer_store.clone(),
             config: config.clone(),
+            tx_submitter: Some(Arc::new(TxRelaySubmitter(tx_relay.clone()))),
         };
         let rpc_host = args.rpc_host.clone();
         let rpc_port = args.rpc_port;

@@ -17,12 +17,20 @@ use tracing::info;
 use crate::types::*;
 use crate::{eth, net, rsk, web3};
 
+/// Trait for submitting raw transactions, allowing the RPC layer to use
+/// the P2P relay without depending on the sync crate directly.
+#[async_trait::async_trait]
+pub trait TxSubmitter: Send + Sync {
+    async fn submit_transaction(&self, raw_tx: alloy_primitives::Bytes) -> alloy_primitives::B256;
+}
+
 /// Shared application state available to every RPC handler.
 #[derive(Clone)]
 pub struct RpcState {
     pub store: Arc<BlockStore>,
     pub peer_store: Arc<PeerStore>,
     pub config: Arc<ChainConfig>,
+    pub tx_submitter: Option<Arc<dyn TxSubmitter>>,
 }
 
 /// Starts the JSON-RPC HTTP server on the given host and port.
@@ -134,6 +142,8 @@ async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
         "rsk_getRawBlockHeaderByHash" => rsk::rsk_get_raw_block_header_by_hash(id, params, &state.store),
         "rsk_getRawBlockHeaderByNumber" => rsk::rsk_get_raw_block_header_by_number(id, params, &state.store),
 
+        "eth_sendRawTransaction" => eth::eth_send_raw_transaction(id, params, &state.tx_submitter).await,
+
         // -- unsupported methods (state, bodies, receipts, tx pool, etc.) --
         "eth_getBalance"
         | "eth_getStorageAt"
@@ -141,7 +151,6 @@ async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
         | "eth_getTransactionCount"
         | "eth_call"
         | "eth_estimateGas"
-        | "eth_sendRawTransaction"
         | "eth_sendTransaction"
         | "eth_getTransactionByHash"
         | "eth_getTransactionByBlockHashAndIndex"

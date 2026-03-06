@@ -7,6 +7,7 @@ edition = "2021"
 alloy-primitives = { workspace = true }
 alloy-rlp = { workspace = true }
 anyhow = { workspace = true }
+async-trait = "0.1"
 axum = "0.8"
 rustock-core = { version = "0.1.0", path = "../core" }
 rustock-networking = { version = "0.1.0", path = "../networking" }
@@ -20,4 +21,6 @@ tower-http = { version = "0.6", features = ["cors"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
+async-trait = "0.1"
+sha3 = "0.10"
 tempfile = { workspace = true }

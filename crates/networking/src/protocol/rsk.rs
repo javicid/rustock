@@ -1,5 +1,5 @@
 use alloy_rlp::{Decodable, Encodable, RlpDecodable, RlpEncodable, Header as RlpHeader};
-use alloy_primitives::{B256, U256};
+use alloy_primitives::{B256, Bytes, U256};
 use rustock_core::Header;
 use rustock_core::rlp_compat::{decode_u8_lenient, decode_u64_lenient, decode_u256_lenient, decode_u32_lenient};
 
@@ -119,6 +119,7 @@ pub struct SkeletonResponse {
 pub enum RskMessageType {
     Status = 1,
     NewBlockHashes = 6,
+    Transactions = 7,
     BlockHashRequest = 8,
     BlockHeadersRequest = 9,
     BlockHeadersResponse = 10,
@@ -137,7 +138,7 @@ pub enum RskSubMessage {
     SkeletonResponse(SkeletonResponse),
     BlockHashResponse(BlockHashResponse),
     NewBlockHashes(Vec<BlockIdentifier>),
-    /// An RSK message type we don't need to handle (e.g. Transactions, etc.)
+    Transactions(Vec<Bytes>),
     Unknown(u8),
 }
 
@@ -152,6 +153,7 @@ impl RskSubMessage {
             RskSubMessage::SkeletonResponse(_) => RskMessageType::SkeletonResponse,
             RskSubMessage::BlockHashResponse(_) => RskMessageType::BlockHashResponse,
             RskSubMessage::NewBlockHashes(_) => RskMessageType::NewBlockHashes,
+            RskSubMessage::Transactions(_) => RskMessageType::Transactions,
             RskSubMessage::Unknown(_) => RskMessageType::Status, // Not used for encoding
         }
     }
@@ -285,6 +287,15 @@ impl RskSubMessage {
 
                 RlpHeader { list: true, payload_length: params.len() }.encode(out);
                 out.extend_from_slice(&params);
+            }
+            RskSubMessage::Transactions(txs) => {
+                let mut txs_payload = Vec::new();
+                for tx in txs {
+                    RlpHeader { list: false, payload_length: tx.len() }.encode(&mut txs_payload);
+                    txs_payload.extend_from_slice(tx);
+                }
+                RlpHeader { list: true, payload_length: txs_payload.len() }.encode(out);
+                out.extend_from_slice(&txs_payload);
             }
             RskSubMessage::NewBlockHashes(_) | RskSubMessage::Unknown(_) => {
                 // Receive-only messages are not encoded/sent
@@ -480,8 +491,19 @@ impl Decodable for RskMessage {
                 }
                 RskSubMessage::NewBlockHashes(identifiers)
             }
+            7 => {
+                let list_h = RlpHeader::decode(&mut body_params)?;
+                let mut list_body = &body_params[..list_h.payload_length];
+                let mut txs = Vec::new();
+                while !list_body.is_empty() {
+                    let tx_h = RlpHeader::decode(&mut list_body)?;
+                    let tx_data = &list_body[..tx_h.payload_length];
+                    list_body = &list_body[tx_h.payload_length..];
+                    txs.push(Bytes::copy_from_slice(tx_data));
+                }
+                RskSubMessage::Transactions(txs)
+            }
             other => {
-                // Skip unknown message types gracefully (Transactions, etc.)
                 RskSubMessage::Unknown(other)
             }
         };
@@ -646,6 +668,46 @@ mod tests {
             assert_eq!(r.block_identifiers[2].number, 384);
         } else {
             panic!("Expected SkeletonResponse, got {:?}", decoded.sub_message);
+        }
+    }
+
+    #[test]
+    fn test_rsk_message_rlp_transactions() {
+        use alloy_primitives::Bytes;
+
+        let tx1 = Bytes::from(vec![0xf8, 0x65, 0x80, 0x01, 0x82, 0x52, 0x08]);
+        let tx2 = Bytes::from(vec![0xf8, 0x66, 0x01, 0x02, 0x83, 0x01, 0x00, 0x00]);
+        let msg = RskMessage::new(RskSubMessage::Transactions(vec![tx1.clone(), tx2.clone()]));
+
+        let mut buf = Vec::new();
+        msg.encode(&mut buf);
+
+        let mut decode_buf = buf.as_slice();
+        let decoded = RskMessage::decode(&mut decode_buf).unwrap();
+
+        if let RskSubMessage::Transactions(txs) = decoded.sub_message {
+            assert_eq!(txs.len(), 2);
+            assert_eq!(txs[0], tx1);
+            assert_eq!(txs[1], tx2);
+        } else {
+            panic!("Expected Transactions, got {:?}", decoded.sub_message);
+        }
+    }
+
+    #[test]
+    fn test_rsk_message_rlp_transactions_empty() {
+        let msg = RskMessage::new(RskSubMessage::Transactions(vec![]));
+
+        let mut buf = Vec::new();
+        msg.encode(&mut buf);
+
+        let mut decode_buf = buf.as_slice();
+        let decoded = RskMessage::decode(&mut decode_buf).unwrap();
+
+        if let RskSubMessage::Transactions(txs) = decoded.sub_message {
+            assert!(txs.is_empty());
+        } else {
+            panic!("Expected Transactions, got {:?}", decoded.sub_message);
         }
     }
 }
