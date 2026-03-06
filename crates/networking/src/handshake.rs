@@ -5,6 +5,7 @@ use anyhow::{Result, Context};
 use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
 use futures::{StreamExt, SinkExt};
+use alloy_primitives::B512;
 use tracing::trace;
 
 use crate::rlpx::{RLPxHandshake, RLPxCodec};
@@ -69,9 +70,14 @@ impl Handshake {
             let rsk_status = Self::p2p_handshake(&config, &mut framed).await?;
             Ok((peer_id, rsk_status, framed))
         } else {
-            // Placeholder for inbound or plain TCP
-            let mut framed = Framed::new(stream, HandshakeCodec::Plain(P2pCodec));
-            let (peer_id, rsk_status) = Self::p2p_handshake_inbound(&config, &mut framed).await?;
+            trace!(target: "rustock::net", "Awaiting inbound RLPx handshake");
+            let rlpx = RLPxHandshake::new(stream, config.clone(), B512::ZERO);
+            let (peer_id, frame_codec, stream) = rlpx.run_responder().await.context("Inbound RLPx handshake failed")?;
+
+            let codec = HandshakeCodec::RLPx(RLPxCodec::new(frame_codec));
+            let mut framed = Framed::new(stream, codec);
+
+            let (_, rsk_status) = Self::p2p_handshake_inbound(&config, &mut framed).await?;
             Ok((peer_id, rsk_status, framed))
         }
     }
@@ -186,13 +192,24 @@ impl Handshake {
 mod tests {
     use super::*;
     use alloy_primitives::{B512, B256, U256};
+    use k256::SecretKey;
+    use k256::elliptic_curve::sec1::ToEncodedPoint;
     use tokio::net::TcpListener;
-    
-    fn mock_config(genesis: B256) -> NodeConfig {
+
+    fn secret_to_public(sk_bytes: &[u8; 32]) -> B512 {
+        let sk = SecretKey::from_slice(sk_bytes).unwrap();
+        let pk_encoded = sk.public_key().to_encoded_point(false);
+        let mut pk_64 = [0u8; 64];
+        pk_64.copy_from_slice(&pk_encoded.as_bytes()[1..]);
+        B512::from_slice(&pk_64)
+    }
+
+    fn mock_config_with_key(genesis: B256, sk: [u8; 32]) -> NodeConfig {
+        let id = secret_to_public(&sk);
         NodeConfig {
             client_id: "test".to_string(),
             listen_port: 0,
-            id: B512::ZERO,
+            id,
             chain_id: 33,
             network_id: 33,
             genesis_hash: genesis,
@@ -200,10 +217,14 @@ mod tests {
             best_block_number: 0,
             total_difficulty: U256::ZERO,
             bootnodes: vec![],
-            secret_key: [0; 32],
+            secret_key: sk,
             discovery_port: 0,
             data_dir: ".".to_string(),
         }
+    }
+
+    fn mock_config(genesis: B256) -> NodeConfig {
+        mock_config_with_key(genesis, [0x11; 32])
     }
 
     #[tokio::test]
@@ -218,14 +239,10 @@ mod tests {
             let stream = TcpStream::connect(addr).await.unwrap();
             let config = mock_config(genesis1);
             let handshake = Handshake::new(stream, config.clone(), None);
-            // Send Hello
             let mut framed = tokio_util::codec::Framed::new(handshake.stream, HandshakeCodec::Plain(P2pCodec));
             Handshake::send_hello(&config, &mut framed).await.unwrap();
-            // Receive Hello
             let _ = Handshake::receive_hello(&mut framed).await.unwrap();
-            // Send Status
             Handshake::send_status(&config, &mut framed).await.unwrap();
-            // Should fail here
             Handshake::receive_status(&config, &mut framed).await
         });
 
@@ -233,25 +250,15 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             let config = mock_config(genesis2);
             let handshake = Handshake::new(stream, config.clone(), None);
-            // Receive Hello
             let mut framed = tokio_util::codec::Framed::new(handshake.stream, HandshakeCodec::Plain(P2pCodec));
             let _ = Handshake::receive_hello(&mut framed).await.unwrap();
-            // Send Hello
             Handshake::send_hello(&config, &mut framed).await.unwrap();
-            // Receive Status
             Handshake::receive_status(&config, &mut framed).await
         });
 
         let (res1, res2) = tokio::join!(client_task, server_task);
         let res1: Result<crate::protocol::RskStatus, anyhow::Error> = res1.unwrap();
         let res2: Result<crate::protocol::RskStatus, anyhow::Error> = res2.unwrap();
-        
-        if let Err(e) = &res1 {
-            println!("Res1 error: {:?}", e);
-        }
-        if let Err(e) = &res2 {
-            println!("Res2 error: {:?}", e);
-        }
         
         assert!(res1.is_err());
         assert!(res2.is_err());
@@ -261,5 +268,46 @@ mod tests {
         
         assert!(err1.contains("Genesis hash mismatch") || err1.contains("Connection closed") || err1.contains("Connection reset"));
         assert!(err2.contains("Genesis hash mismatch") || err2.contains("Connection closed") || err2.contains("Connection reset"));
+    }
+
+    /// Full end-to-end test: outbound initiator (RLPx) connects to inbound
+    /// responder (RLPx), both go through `Handshake::run()`.
+    #[tokio::test]
+    async fn test_inbound_rlpx_handshake() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let genesis = B256::repeat_byte(0xAA);
+        let sk_client: [u8; 32] = [0x11; 32];
+        let sk_server: [u8; 32] = [0x22; 32];
+        let pk_server = secret_to_public(&sk_server);
+        let pk_client = secret_to_public(&sk_client);
+
+        let client_config = mock_config_with_key(genesis, sk_client);
+        let server_config = mock_config_with_key(genesis, sk_server);
+
+        let client_task = tokio::spawn(async move {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let handshake = Handshake::new(stream, client_config, Some(pk_server));
+            handshake.run().await
+        });
+
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let handshake = Handshake::new(stream, server_config, None);
+            handshake.run().await
+        });
+
+        let (client_res, server_res) = tokio::join!(client_task, server_task);
+        let (client_peer_id, client_rsk_status, _) = client_res.unwrap().unwrap();
+        let (server_peer_id, server_rsk_status, _) = server_res.unwrap().unwrap();
+
+        // Each side should see the other's public key
+        assert_eq!(client_peer_id, pk_server);
+        assert_eq!(server_peer_id, pk_client);
+
+        // Both sides should have exchanged RSK status
+        assert_eq!(client_rsk_status.best_block_number, 0);
+        assert_eq!(server_rsk_status.best_block_number, 0);
     }
 }
