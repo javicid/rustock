@@ -1,6 +1,8 @@
 use crate::events::SyncEvent;
 use crate::manager::{SyncManager, MAX_SKELETON_CHUNKS};
-use crate::state::{PeerChunkTracker, SyncState};
+use crate::progress::SyncProgress;
+use crate::state::SyncState;
+use crate::tracker::PeerChunkTracker;
 use rustock_core::types::header::Header;
 use rustock_networking::protocol::{
     BlockHashRequest, BlockIdentifier, P2pMessage, RskMessage, RskSubMessage, SkeletonRequest,
@@ -46,11 +48,7 @@ pub struct SyncService {
     event_rx: mpsc::UnboundedReceiver<SyncEvent>,
     pub(crate) state: SyncState,
     pub(crate) last_progress: Instant,
-    /// Progress tracking
-    sync_started_at: Option<Instant>,
-    sync_start_block: u64,
-    last_report_at: Instant,
-    last_report_block: u64,
+    progress: SyncProgress,
 }
 
 impl SyncService {
@@ -59,17 +57,13 @@ impl SyncService {
         peer_store: Arc<rustock_networking::peers::PeerStore>,
         event_rx: mpsc::UnboundedReceiver<SyncEvent>,
     ) -> Self {
-        let now = Instant::now();
         Self {
             manager,
             peer_store,
             event_rx,
             state: SyncState::Idle,
-            last_progress: now,
-            sync_started_at: None,
-            sync_start_block: 0,
-            last_report_at: now,
-            last_report_block: 0,
+            last_progress: Instant::now(),
+            progress: SyncProgress::new(),
         }
     }
 
@@ -192,11 +186,7 @@ impl SyncService {
             head.number, metadata.best_number, gap
         );
 
-        // Reset progress tracking for this sync session
-        self.sync_started_at = Some(Instant::now());
-        self.sync_start_block = head.number;
-        self.last_report_at = Instant::now();
-        self.last_report_block = head.number;
+        self.progress.reset(head.number);
 
         let cp = head.number;
         debug!(target: "rustock::sync", "Connection point: #{} (head)", cp);
@@ -693,80 +683,9 @@ impl SyncService {
 
     /// Log sync progress: percentage, speed, ETA, peers.
     async fn log_progress(&mut self) {
-        let peer_best = match &self.state {
-            SyncState::DownloadingHeaders { peer_best, .. } => *peer_best,
-            SyncState::DownloadingSkeleton { peer_best, .. } => *peer_best,
-            SyncState::FindingConnectionPoint { peer_best, .. } => *peer_best,
-            SyncState::Idle | SyncState::Following => return,
-        };
-
         let current = self.our_head_number();
-        if current == 0 || peer_best == 0 {
-            return;
-        }
-
-        let now = Instant::now();
-
-        // Initialize sync tracking on first report
-        if self.sync_started_at.is_none() {
-            self.sync_started_at = Some(now);
-            self.sync_start_block = current;
-            self.last_report_at = now;
-            self.last_report_block = current;
-        }
-
-        let elapsed_since_report = now.duration_since(self.last_report_at).as_secs_f64();
-        if elapsed_since_report < 1.0 {
-            return;
-        }
-
-        // Recent speed (blocks/sec over last reporting interval)
-        let blocks_since_report = current.saturating_sub(self.last_report_block);
-        let recent_speed = blocks_since_report as f64 / elapsed_since_report;
-
-        // Overall speed (blocks/sec since sync started)
-        let total_elapsed = now
-            .duration_since(self.sync_started_at.unwrap_or(now))
-            .as_secs_f64();
-        let total_blocks = current.saturating_sub(self.sync_start_block);
-        let avg_speed = if total_elapsed > 0.0 {
-            total_blocks as f64 / total_elapsed
-        } else {
-            0.0
-        };
-
-        // Progress percentage
-        let pct = (current as f64 / peer_best as f64 * 100.0).min(100.0);
-
-        // ETA based on average speed
-        let remaining = peer_best.saturating_sub(current);
-        let eta = if avg_speed > 0.0 {
-            let secs = remaining as f64 / avg_speed;
-            format_duration(secs)
-        } else {
-            "unknown".to_string()
-        };
-
         let peers = self.peer_store.get_peers().await.len();
-
-        let state_label = match &self.state {
-            SyncState::FindingConnectionPoint { .. } => "finding connection point",
-            SyncState::DownloadingSkeleton { .. } => "downloading skeleton",
-            SyncState::DownloadingHeaders { .. } => "downloading headers",
-            SyncState::Idle => "idle",
-            SyncState::Following => "following",
-        };
-
-        info!(
-            target: "rustock::sync",
-            "Sync progress: #{} / #{} ({:.2}%) | {:.0} blk/s (avg {:.0}) | ETA {} | {} peers | {}",
-            current, peer_best, pct,
-            recent_speed, avg_speed,
-            eta, peers, state_label
-        );
-
-        self.last_report_at = now;
-        self.last_report_block = current;
+        self.progress.log(&self.state, current, peers);
     }
 }
 
@@ -790,15 +709,3 @@ fn identify_chunk_by_content(
         .position(|entry| entry.number == max_number)
 }
 
-fn format_duration(secs: f64) -> String {
-    let secs = secs as u64;
-    if secs < 60 {
-        format!("{}s", secs)
-    } else if secs < 3600 {
-        format!("{}m {}s", secs / 60, secs % 60)
-    } else {
-        let h = secs / 3600;
-        let m = (secs % 3600) / 60;
-        format!("{}h {}m", h, m)
-    }
-}

@@ -1,7 +1,7 @@
 use alloy_rlp::{Decodable, Encodable, RlpDecodable, RlpEncodable, Header as RlpHeader};
 use alloy_primitives::{B256, U256};
 use rustock_core::Header;
-use super::rlp_compat::{decode_u8_lenient, decode_u64_lenient, decode_u256_lenient, decode_u32_lenient};
+use rustock_core::rlp_compat::{decode_u8_lenient, decode_u64_lenient, decode_u256_lenient, decode_u32_lenient};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RskStatus {

@@ -9,6 +9,7 @@ alloy-rlp = { workspace = true }
 anyhow = { workspace = true }
 bitcoin = "0.32.8"
 hex = "0.4.3"
+hex-literal = "0.4.1"
 serde = { workspace = true }
 sha2 = "0.10.9"
 thiserror = { workspace = true }

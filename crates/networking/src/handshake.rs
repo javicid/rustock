@@ -140,7 +140,7 @@ impl Handshake {
         framed.send(P2pMessage::EthStatus(status)).await?;
         
         let rsk_status = RskStatus {
-            best_block_number: 0, // TODO: Use current best number from Store
+            best_block_number: config.best_block_number,
             best_block_hash: config.best_hash,
             best_block_parent_hash: None,
             total_difficulty: Some(config.total_difficulty),
@@ -197,6 +197,7 @@ mod tests {
             network_id: 33,
             genesis_hash: genesis,
             best_hash: genesis,
+            best_block_number: 0,
             total_difficulty: U256::ZERO,
             bootnodes: vec![],
             secret_key: [0; 32],

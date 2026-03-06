@@ -1,6 +1,6 @@
 use alloy_rlp::{Encodable, Decodable, Header as RlpHeader};
 use alloy_primitives::{B256, U256};
-use super::rlp_compat::{decode_u32_lenient, decode_u64_lenient, decode_u256_lenient};
+use rustock_core::rlp_compat::{decode_u32_lenient, decode_u64_lenient, decode_u256_lenient};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EthStatus {

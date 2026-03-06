@@ -15,7 +15,6 @@ rustock-sync = { version = "0.1.0", path = "../sync" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-hex-literal = "0.4.1"
 rand = { workspace = true }
 hex = "0.4.3"
 tracing-appender = "0.2.4"

@@ -166,6 +166,7 @@ mod tests {
             network_id: 33,
             genesis_hash: B256::ZERO,
             best_hash: B256::ZERO,
+            best_block_number: 0,
             total_difficulty: U256::ZERO,
             bootnodes: vec![],
             secret_key: sk,

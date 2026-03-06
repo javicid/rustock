@@ -24,6 +24,7 @@ pub struct NodeConfig {
     pub network_id: u64,
     pub genesis_hash: B256,
     pub best_hash: B256,
+    pub best_block_number: u64,
     pub total_difficulty: U256,
     pub bootnodes: Vec<String>,
     pub secret_key: [u8; 32],
@@ -53,45 +54,45 @@ impl Node {
         self.handlers.push(handler);
     }
 
-    /// Starts the P2P node listening on the configured port and starts discovery.
-    pub async fn start(&self) -> Result<()> {
-        let addr = format!("0.0.0.0:{}", self.config.listen_port);
-        let listener = TcpListener::bind(&addr).await.context("Failed to bind listener")?;
-        
-        info!(target: "rustock::net", "P2P node started on {}", addr);
-
-        // 1. Initialize Discovery
-        let table = Arc::new(tokio::sync::Mutex::from(crate::discovery::table::NodeTable::new(self.config.id)));
+    /// Initializes the discovery node table, loading persisted nodes and bootnodes.
+    async fn init_discovery_table(&self) -> Arc<tokio::sync::Mutex<crate::discovery::table::NodeTable>> {
+        let table = Arc::new(tokio::sync::Mutex::from(
+            crate::discovery::table::NodeTable::new(self.config.id),
+        ));
         let discovery_path = std::path::Path::new(&self.config.data_dir).join("discovery.rlp");
-        
-        // Load existing nodes
-        {
-            let mut table_lock = table.lock().await;
-            if discovery_path.exists() {
-                match tokio::fs::read(&discovery_path).await {
-                    Ok(data) => {
-                        if let Err(e) = table_lock.decode_and_add(&data) {
-                            debug!(target: "rustock::net", "Failed to decode discovery table: {:?}", e);
-                        }
-                    }
-                    Err(e) => {
-                        debug!(target: "rustock::net", "Failed to read discovery table: {:?}", e);
+
+        let mut table_lock = table.lock().await;
+        if discovery_path.exists() {
+            match tokio::fs::read(&discovery_path).await {
+                Ok(data) => {
+                    if let Err(e) = table_lock.decode_and_add(&data) {
+                        debug!(target: "rustock::net", "Failed to decode discovery table: {:?}", e);
                     }
                 }
-            }
-            // Add bootnodes
-            for enode in &self.config.bootnodes {
-                if let Err(e) = table_lock.add_enode(enode) {
-                    error!(target: "rustock::net", "Failed to add bootnode {}: {:?}", enode, e);
+                Err(e) => {
+                    debug!(target: "rustock::net", "Failed to read discovery table: {:?}", e);
                 }
             }
         }
+        for enode in &self.config.bootnodes {
+            if let Err(e) = table_lock.add_enode(enode) {
+                error!(target: "rustock::net", "Failed to add bootnode {}: {:?}", enode, e);
+            }
+        }
+        drop(table_lock);
+        table
+    }
 
+    /// Starts the UDP discovery service and returns the shared table handle.
+    async fn start_discovery(
+        &self,
+        table: Arc<tokio::sync::Mutex<crate::discovery::table::NodeTable>>,
+    ) -> Result<()> {
         let signing_key = k256::ecdsa::SigningKey::from_slice(&self.config.secret_key)
             .context("Invalid secret key")?;
-            
+
         let local_node = crate::discovery::message::DiscoveryNode {
-            ip: alloy_primitives::Bytes::from(vec![127, 0, 0, 1]), // TODO: Resolve local IP
+            ip: alloy_primitives::Bytes::from(vec![127, 0, 0, 1]), // Localhost; external IP detection (UPnP/STUN) not yet implemented
             udp_port: self.config.discovery_port,
             tcp_port: self.config.listen_port,
             id: self.config.id,
@@ -101,47 +102,60 @@ impl Node {
         let discovery = Arc::new(crate::discovery::DiscoveryService::new(
             &discovery_addr,
             signing_key,
-            table.clone(),
+            table,
             self.config.network_id as u32,
             local_node,
         ).await?);
 
-        // Start discovery service in background
-        let discovery_task = discovery.start();
-        tokio::spawn(discovery_task);
+        tokio::spawn(discovery.start());
+        Ok(())
+    }
 
-        // Periodically save discovery table
-        let table_save = table.clone();
+    /// Spawns a background task that periodically persists the discovery table.
+    fn start_table_persistence(
+        &self,
+        table: Arc<tokio::sync::Mutex<crate::discovery::table::NodeTable>>,
+    ) {
+        let discovery_path = std::path::Path::new(&self.config.data_dir)
+            .join("discovery.rlp");
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-                let data = table_save.lock().await.encode();
+                let data = table.lock().await.encode();
                 if let Err(e) = tokio::fs::write(&discovery_path, data).await {
                     error!(target: "rustock::net", "Failed to save discovery table: {:?}", e);
                 }
             }
         });
+    }
 
-        // 2. Register peer exchange handler (GetPeers / Peers)
+    /// Starts the P2P node: discovery, outbound connector, and the accept loop.
+    pub async fn start(&self) -> Result<()> {
+        let addr = format!("0.0.0.0:{}", self.config.listen_port);
+        let listener = TcpListener::bind(&addr).await.context("Failed to bind listener")?;
+        info!(target: "rustock::net", "P2P node started on {}", addr);
+
+        let table = self.init_discovery_table().await;
+        self.start_discovery(table.clone()).await?;
+        self.start_table_persistence(table.clone());
+
         let peer_exchange = Arc::new(crate::peer_exchange::PeerExchangeHandler::new(table.clone()));
         let mut all_handlers = vec![peer_exchange as Arc<dyn P2pHandler>];
         all_handlers.extend(self.handlers.clone());
 
-        // 3. Start Outbound Connector
         let outbound = crate::outbound::OutboundConnector::new(
             self.config.clone(),
             table.clone(),
             self.peer_store.clone(),
             all_handlers.clone(),
-            10, // Max outbound connections
+            10,
         );
         tokio::spawn(outbound.start());
 
-        // 4. Start Accept Loop
         loop {
             let (stream, peer_addr) = listener.accept().await?;
             trace!(target: "rustock::net", "New connection from: {}", peer_addr);
-            
+
             let config = self.config.clone();
             let handlers = all_handlers.clone();
             let peer_store = self.peer_store.clone();
@@ -222,6 +236,7 @@ mod tests {
             network_id: 33,
             genesis_hash: B256::repeat_byte(0xaa),
             best_hash: B256::repeat_byte(0xaa),
+            best_block_number: 0,
             total_difficulty: U256::ZERO,
             bootnodes: vec![],
             secret_key: [0x42; 32],
@@ -237,6 +252,7 @@ mod tests {
             network_id: 33,
             genesis_hash: B256::repeat_byte(0xaa),
             best_hash: B256::repeat_byte(0xaa),
+            best_block_number: 0,
             total_difficulty: U256::ZERO,
             bootnodes: vec![],
             secret_key: [0x43; 32],
@@ -285,5 +301,19 @@ mod tests {
         
         let response = handler.handle_message(alloy_primitives::B512::ZERO, crate::protocol::P2pMessage::Pong);
         assert!(response.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_peer_rejected() {
+        let store = Arc::new(PeerStore::new());
+        let peer_id = B512::repeat_byte(0x01);
+
+        let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
+        assert!(store.add_peer(peer_id, tx1).await, "First add should succeed");
+
+        let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
+        assert!(!store.add_peer(peer_id, tx2).await, "Duplicate add should be rejected");
+
+        assert_eq!(store.count().await, 1);
     }
 }

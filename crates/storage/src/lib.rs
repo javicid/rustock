@@ -213,9 +213,9 @@ impl BlockStore {
         self.put_canonical_hash(block.header.number, block.hash())
     }
 
+    /// Returns a header-only block. Body (transactions, ommers) storage is
+    /// intentionally omitted — this is a light client that only tracks headers.
     pub fn get_block(&self, hash: B256) -> Result<Option<Block>> {
-        // Reconstruct basic block from header (body missing)
-        // TODO: Implement body storage
         self.get_header(hash).map(|opt| opt.map(|header| Block {
             header,
             transactions: vec![],
