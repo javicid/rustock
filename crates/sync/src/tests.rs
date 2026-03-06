@@ -1488,3 +1488,176 @@ async fn test_serve_requests_dont_interfere_with_event_forwarding() {
     assert!(resp.is_none(), "Forwarding should not return a response");
     assert!(event_rx.try_recv().is_ok(), "Should forward the event");
 }
+
+// -- Reorg tests ----------------------------------------------------------
+
+/// Like dummy_header but with extra_data to differentiate fork branches.
+fn fork_header(number: u64, parent: B256, difficulty: U256, branch: u8) -> Header {
+    let mut h = dummy_header(number, parent, difficulty);
+    h.extra_data = Bytes::from(vec![branch]);
+    h
+}
+
+#[tokio::test]
+async fn test_new_block_hashes_reorg_candidate_triggers_request() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    let genesis_hash = genesis.hash();
+    store.update_head(&genesis, U256::from(1)).unwrap();
+
+    let b1 = dummy_header(1, genesis_hash, U256::from(1));
+    let b1_hash = b1.hash();
+    store.put_header(&b1).unwrap();
+    store.put_canonical_hash(1, b1_hash).unwrap();
+    store.put_total_difficulty(b1_hash, U256::from(2)).unwrap();
+    store.update_head(&b1, U256::from(2)).unwrap();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+
+    let peer = B512::repeat_byte(0x01);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    peer_store.add_peer(peer, tx).await;
+
+    let manager = Arc::new(SyncManager::new(store, verifier, peer_store.clone()));
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store.clone(), event_rx);
+    service.state = SyncState::Following;
+
+    // Announce a competing block at height 1 with a different hash
+    let competing_hash = B256::repeat_byte(0xCC);
+    service.on_new_block_hashes(peer, vec![
+        BlockIdentifier { hash: competing_hash, number: 1 },
+    ]).await;
+
+    // Should have sent a headers request for the competing chain
+    let msg = rx.try_recv();
+    assert!(msg.is_ok(), "Should request headers for reorg candidate");
+}
+
+#[tokio::test]
+async fn test_new_block_hashes_same_hash_ignored() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    let genesis_hash = genesis.hash();
+    store.update_head(&genesis, U256::from(1)).unwrap();
+
+    let b1 = dummy_header(1, genesis_hash, U256::from(1));
+    let b1_hash = b1.hash();
+    store.put_header(&b1).unwrap();
+    store.put_canonical_hash(1, b1_hash).unwrap();
+    store.put_total_difficulty(b1_hash, U256::from(2)).unwrap();
+    store.update_head(&b1, U256::from(2)).unwrap();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+
+    let peer = B512::repeat_byte(0x01);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    peer_store.add_peer(peer, tx).await;
+
+    let manager = Arc::new(SyncManager::new(store, verifier, peer_store.clone()));
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store.clone(), event_rx);
+    service.state = SyncState::Following;
+
+    // Announce the SAME hash at height 1 — should be ignored
+    service.on_new_block_hashes(peer, vec![
+        BlockIdentifier { hash: b1_hash, number: 1 },
+    ]).await;
+
+    assert!(rx.try_recv().is_err(), "Should not request headers for same hash");
+}
+
+#[tokio::test]
+async fn test_reorg_via_headers_response_higher_td() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    // Build canonical chain: genesis -> 1A -> 2A
+    let genesis = dummy_header(0, B256::ZERO, U256::from(10));
+    let genesis_hash = genesis.hash();
+    store.update_head(&genesis, U256::from(10)).unwrap();
+
+    let a1 = dummy_header(1, genesis_hash, U256::from(10));
+    let a2 = dummy_header(2, a1.hash(), U256::from(10));
+    store.put_header(&a1).unwrap();
+    store.put_canonical_hash(1, a1.hash()).unwrap();
+    store.put_total_difficulty(a1.hash(), U256::from(20)).unwrap();
+    store.put_header(&a2).unwrap();
+    store.put_canonical_hash(2, a2.hash()).unwrap();
+    store.put_total_difficulty(a2.hash(), U256::from(30)).unwrap();
+    store.update_head(&a2, U256::from(30)).unwrap();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store, event_rx);
+    service.state = SyncState::Following;
+
+    // Fork from genesis: 1B -> 2B with higher difficulty
+    let b1 = fork_header(1, genesis_hash, U256::from(20), 0xBB);
+    let b2 = fork_header(2, b1.hash(), U256::from(20), 0xBB);
+
+    // Receive fork headers (descending order, like real peers send)
+    let peer = B512::repeat_byte(0x01);
+    service.on_headers_response(peer, vec![b2.clone(), b1.clone()]).await;
+
+    // Fork B has TD = 10 + 20 + 20 = 50 vs chain A's TD = 30
+    // Head should switch to fork B
+    assert_eq!(store.get_head().unwrap(), Some(b2.hash()));
+    assert_eq!(store.get_canonical_hash(1).unwrap(), Some(b1.hash()));
+    assert_eq!(store.get_canonical_hash(2).unwrap(), Some(b2.hash()));
+}
+
+#[tokio::test]
+async fn test_no_reorg_via_headers_response_lower_td() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    // Build canonical chain: genesis -> 1A -> 2A (high difficulty)
+    let genesis = dummy_header(0, B256::ZERO, U256::from(10));
+    let genesis_hash = genesis.hash();
+    store.update_head(&genesis, U256::from(10)).unwrap();
+
+    let a1 = dummy_header(1, genesis_hash, U256::from(20));
+    let a2 = dummy_header(2, a1.hash(), U256::from(20));
+    store.put_header(&a1).unwrap();
+    store.put_canonical_hash(1, a1.hash()).unwrap();
+    store.put_total_difficulty(a1.hash(), U256::from(30)).unwrap();
+    store.put_header(&a2).unwrap();
+    store.put_canonical_hash(2, a2.hash()).unwrap();
+    store.put_total_difficulty(a2.hash(), U256::from(50)).unwrap();
+    store.update_head(&a2, U256::from(50)).unwrap();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store, event_rx);
+    service.state = SyncState::Following;
+
+    // Fork from genesis: 1B -> 2B with lower difficulty
+    let b1 = fork_header(1, genesis_hash, U256::from(5), 0xBB);
+    let b2 = fork_header(2, b1.hash(), U256::from(5), 0xBB);
+
+    let peer = B512::repeat_byte(0x01);
+    service.on_headers_response(peer, vec![b2.clone(), b1.clone()]).await;
+
+    // Fork B has TD = 10 + 5 + 5 = 20 vs chain A's TD = 50
+    // Head should NOT change
+    assert_eq!(store.get_head().unwrap(), Some(a2.hash()));
+    assert_eq!(store.get_canonical_hash(1).unwrap(), Some(a1.hash()));
+    assert_eq!(store.get_canonical_hash(2).unwrap(), Some(a2.hash()));
+
+    // Fork B headers should still be stored
+    assert!(store.get_header(b1.hash()).unwrap().is_some());
+    assert!(store.get_header(b2.hash()).unwrap().is_some());
+}

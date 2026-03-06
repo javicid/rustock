@@ -5,11 +5,15 @@ use alloy_rlp::{Decodable, Encodable};
 use anyhow::{Result, Context, anyhow};
 use std::path::Path;
 use std::sync::Arc;
+use tracing::{debug, warn};
 
 const CF_HEADERS: &str = "headers";
 const CF_NUMBERS: &str = "block_numbers";
 const CF_TD: &str = "total_difficulty"; // Total Difficulty
 const KEY_HEAD: &[u8] = b"head";
+
+/// Safety limit: refuse to reorg deeper than this many blocks.
+const MAX_REORG_DEPTH: u64 = 1000;
 
 /// Manages storage of blockchain data using RocksDB.
 /// 
@@ -129,29 +133,22 @@ impl BlockStore {
     /// Updates the chain head and canonical mapping for a new best block.
     pub fn update_head(&self, header: &Header, td: U256) -> Result<()> {
         let hash = header.hash();
-        
-        // 1. Store the header itself
-        self.put_header(header)?;
-        
-        // 2. Update Total Difficulty
-        self.put_total_difficulty(hash, td)?;
 
-        // 3. Update Head
+        self.put_header(header)?;
+        self.put_total_difficulty(hash, td)?;
+        self.put_canonical_hash(header.number, hash)?;
         self.set_head(hash)?;
 
-        // 4. Update Canonical Chain
-        // Note: In a full implementation with reorgs, this would be more complex.
-        // For linear sync, we just set it.
-        self.put_canonical_hash(header.number, hash)?;
-        
         Ok(())
     }
 
     /// Atomically stores a batch of validated headers along with their total
-    /// difficulties, and updates the chain head if appropriate.
+    /// difficulties, then updates the canonical chain if the head changed.
     ///
-    /// Each entry is `(header, total_difficulty)`.  The caller must have
-    /// already validated the headers and computed the TDs.
+    /// Headers and TDs are always stored (keyed by hash, safe for forks).
+    /// Canonical `number → hash` mappings are only updated for blocks on the
+    /// winning chain, preventing fork headers from corrupting the canonical
+    /// pointers.
     ///
     /// Returns the hash of the new head (if it changed) or the existing head.
     pub fn store_headers_batch(
@@ -168,7 +165,6 @@ impl BlockStore {
 
         let cf_headers = self.cf(CF_HEADERS)?;
         let cf_td = self.cf(CF_TD)?;
-        let cf_numbers = self.cf(CF_NUMBERS)?;
 
         let mut batch = WriteBatch::default();
         let mut best_hash = current_head_hash;
@@ -177,30 +173,82 @@ impl BlockStore {
         for &(header, td) in entries {
             let hash = header.hash();
 
-            // Encode header
             let mut header_buf = Vec::new();
             header.encode(&mut header_buf);
             batch.put_cf(cf_headers, hash.as_slice(), &header_buf);
 
-            // Encode TD
             let mut td_buf = Vec::new();
             td.encode(&mut td_buf);
             batch.put_cf(cf_td, hash.as_slice(), &td_buf);
 
-            // Always store canonical number → hash mapping for every header.
-            // This enables forward chain traversal (needed for TD repair).
-            batch.put_cf(cf_numbers, header.number.to_be_bytes(), hash.as_slice());
-
-            // Update head tracking if this block has higher TD
             if td > best_td {
                 best_td = td;
                 best_hash = Some(hash);
-                batch.put(KEY_HEAD, hash.as_slice());
             }
         }
 
+        // Commit headers + TDs first so update_canonical_chain can read them.
         self.db.write(batch).context("Failed to write header batch")?;
+
+        // Update canonical chain only if the head actually changed.
+        if best_hash != current_head_hash {
+            if let Some(new_head) = best_hash {
+                self.update_canonical_chain(new_head)?;
+            }
+        }
+
         Ok(best_hash)
+    }
+
+    /// Walks backward from `new_head` using `parent_hash` links, updating
+    /// canonical `number → hash` mappings until reaching a block that is
+    /// already canonical (the fork point).  Also sets `KEY_HEAD`.
+    ///
+    /// Handles both direct extensions (walk stops after 1 step) and reorgs
+    /// (walk continues through the fork chain to the common ancestor).
+    pub fn update_canonical_chain(&self, new_head: B256) -> Result<()> {
+        let mut hash = new_head;
+        let mut depth: u64 = 0;
+
+        loop {
+            let header = match self.get_header(hash)? {
+                Some(h) => h,
+                None => break, // parent not in store (e.g. pruned or pre-genesis)
+            };
+
+            let existing = self.get_canonical_hash(header.number)?;
+            if existing == Some(hash) {
+                break;
+            }
+
+            self.put_canonical_hash(header.number, hash)?;
+            depth += 1;
+
+            if header.number == 0 || depth >= MAX_REORG_DEPTH {
+                if depth >= MAX_REORG_DEPTH {
+                    warn!(
+                        target: "rustock::storage",
+                        "Canonical chain update reached MAX_REORG_DEPTH ({}) at block #{}",
+                        MAX_REORG_DEPTH, header.number
+                    );
+                }
+                break;
+            }
+
+            hash = header.parent_hash;
+        }
+
+        self.set_head(new_head)?;
+
+        if depth > 1 {
+            debug!(
+                target: "rustock::storage",
+                "Updated canonical chain ({} blocks rewritten)",
+                depth
+            );
+        }
+
+        Ok(())
     }
 }
 
@@ -440,5 +488,218 @@ mod tests {
         // But the header should still be stored
         assert!(store.get_header(h.hash()).unwrap().is_some());
         assert_eq!(store.get_total_difficulty(h.hash()).unwrap(), Some(U256::from(5)));
+    }
+
+    // --- Reorg / canonical chain tests ---
+
+    fn make_chain_header(number: u64, parent_hash: B256, difficulty: u64, nonce: u8) -> Header {
+        let mut h = dummy_header(number);
+        h.parent_hash = parent_hash;
+        h.difficulty = U256::from(difficulty);
+        // Use extra_data to differentiate forks at the same height
+        h.extra_data = Bytes::from(vec![nonce]);
+        h
+    }
+
+    /// Build a chain of headers and store them as the canonical chain.
+    /// Returns (headers, cumulative TDs) for each block.
+    fn build_and_store_chain(
+        store: &BlockStore,
+        count: usize,
+        difficulty: u64,
+        nonce: u8,
+    ) -> Vec<(Header, U256)> {
+        let mut chain = Vec::new();
+        let mut parent_hash = B256::ZERO;
+        let mut td = U256::ZERO;
+
+        for i in 0..count {
+            let h = make_chain_header(i as u64, parent_hash, difficulty, nonce);
+            let hash = h.hash();
+            td += h.difficulty;
+            store.put_header(&h).unwrap();
+            store.put_total_difficulty(hash, td).unwrap();
+            store.put_canonical_hash(i as u64, hash).unwrap();
+            parent_hash = hash;
+            chain.push((h, td));
+        }
+        if let Some((last, _)) = chain.last() {
+            store.set_head(last.hash()).unwrap();
+        }
+        chain
+    }
+
+    #[test]
+    fn test_reorg_to_higher_td_fork() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+
+        // Main chain: genesis -> 1A -> 2A -> 3A (difficulty 10 each, TD: 10, 20, 30, 40)
+        let chain_a = build_and_store_chain(&store, 4, 10, 0xAA);
+        let head_a = chain_a.last().unwrap().0.hash();
+        assert_eq!(store.get_head().unwrap(), Some(head_a));
+
+        // Fork chain: same genesis -> 1B -> 2B -> 3B (difficulty 20 each, higher TD)
+        let genesis = &chain_a[0];
+        let b1 = make_chain_header(1, genesis.0.hash(), 20, 0xBB);
+        let b2 = make_chain_header(2, b1.hash(), 20, 0xBB);
+        let b3 = make_chain_header(3, b2.hash(), 20, 0xBB);
+
+        let td_b1 = genesis.1 + b1.difficulty; // 10 + 20 = 30
+        let td_b2 = td_b1 + b2.difficulty;     // 30 + 20 = 50
+        let td_b3 = td_b2 + b3.difficulty;     // 50 + 20 = 70
+
+        let entries = vec![
+            (&b1, td_b1),
+            (&b2, td_b2),
+            (&b3, td_b3),
+        ];
+
+        let result = store
+            .store_headers_batch(&entries, Some(head_a), chain_a.last().unwrap().1)
+            .unwrap();
+
+        // Fork B has higher TD (70 vs 40), so head should switch
+        assert_eq!(result, Some(b3.hash()));
+        assert_eq!(store.get_head().unwrap(), Some(b3.hash()));
+
+        // Canonical chain should now point to fork B
+        assert_eq!(store.get_canonical_hash(0).unwrap(), Some(genesis.0.hash())); // common ancestor
+        assert_eq!(store.get_canonical_hash(1).unwrap(), Some(b1.hash()));
+        assert_eq!(store.get_canonical_hash(2).unwrap(), Some(b2.hash()));
+        assert_eq!(store.get_canonical_hash(3).unwrap(), Some(b3.hash()));
+
+        // Old fork A headers should still be retrievable by hash
+        assert!(store.get_header(chain_a[1].0.hash()).unwrap().is_some());
+        assert!(store.get_header(chain_a[2].0.hash()).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_lower_td_fork_does_not_corrupt_canonical() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+
+        // Main chain: genesis -> 1A -> 2A -> 3A (difficulty 20 each)
+        let chain_a = build_and_store_chain(&store, 4, 20, 0xAA);
+        let head_a = chain_a.last().unwrap().0.hash();
+
+        // Fork chain with lower TD (difficulty 5 each)
+        let genesis = &chain_a[0];
+        let b1 = make_chain_header(1, genesis.0.hash(), 5, 0xBB);
+        let b2 = make_chain_header(2, b1.hash(), 5, 0xBB);
+        let b3 = make_chain_header(3, b2.hash(), 5, 0xBB);
+
+        let td_b1 = genesis.1 + b1.difficulty;
+        let td_b2 = td_b1 + b2.difficulty;
+        let td_b3 = td_b2 + b3.difficulty;
+
+        let entries = vec![(&b1, td_b1), (&b2, td_b2), (&b3, td_b3)];
+
+        let result = store
+            .store_headers_batch(&entries, Some(head_a), chain_a.last().unwrap().1)
+            .unwrap();
+
+        // Head should NOT change (fork B has lower TD)
+        assert_eq!(result, Some(head_a));
+        assert_eq!(store.get_head().unwrap(), Some(head_a));
+
+        // Canonical chain must still point to fork A
+        assert_eq!(store.get_canonical_hash(1).unwrap(), Some(chain_a[1].0.hash()));
+        assert_eq!(store.get_canonical_hash(2).unwrap(), Some(chain_a[2].0.hash()));
+        assert_eq!(store.get_canonical_hash(3).unwrap(), Some(chain_a[3].0.hash()));
+
+        // Fork B headers should still be stored (keyed by hash)
+        assert!(store.get_header(b1.hash()).unwrap().is_some());
+        assert!(store.get_header(b2.hash()).unwrap().is_some());
+        assert!(store.get_header(b3.hash()).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_direct_extension_updates_canonical() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+
+        // Build a chain of 3 blocks
+        let chain = build_and_store_chain(&store, 3, 10, 0xAA);
+        let head = chain.last().unwrap();
+        let head_hash = head.0.hash();
+        let head_td = head.1;
+
+        // Extend with block 3 (direct child of block 2)
+        let b3 = make_chain_header(3, head_hash, 10, 0xAA);
+        let td_b3 = head_td + b3.difficulty;
+        let entries = vec![(&b3, td_b3)];
+
+        let result = store
+            .store_headers_batch(&entries, Some(head_hash), head_td)
+            .unwrap();
+
+        // Head should advance
+        assert_eq!(result, Some(b3.hash()));
+        assert_eq!(store.get_head().unwrap(), Some(b3.hash()));
+
+        // All canonical pointers should be correct
+        assert_eq!(store.get_canonical_hash(0).unwrap(), Some(chain[0].0.hash()));
+        assert_eq!(store.get_canonical_hash(1).unwrap(), Some(chain[1].0.hash()));
+        assert_eq!(store.get_canonical_hash(2).unwrap(), Some(chain[2].0.hash()));
+        assert_eq!(store.get_canonical_hash(3).unwrap(), Some(b3.hash()));
+    }
+
+    #[test]
+    fn test_update_canonical_chain_direct() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+
+        let chain = build_and_store_chain(&store, 3, 10, 0xAA);
+        let head = chain.last().unwrap();
+
+        // Add block 3 manually (simulating a new block)
+        let b3 = make_chain_header(3, head.0.hash(), 10, 0xAA);
+        store.put_header(&b3).unwrap();
+
+        // update_canonical_chain should write canonical for block 3 and stop
+        store.update_canonical_chain(b3.hash()).unwrap();
+
+        assert_eq!(store.get_head().unwrap(), Some(b3.hash()));
+        assert_eq!(store.get_canonical_hash(3).unwrap(), Some(b3.hash()));
+        // Previous canonical entries untouched
+        assert_eq!(store.get_canonical_hash(2).unwrap(), Some(head.0.hash()));
+    }
+
+    #[test]
+    fn test_reorg_longer_fork() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+
+        // Main chain: 5 blocks, difficulty 10
+        let chain_a = build_and_store_chain(&store, 5, 10, 0xAA);
+        let head_a = chain_a.last().unwrap();
+
+        // Fork from block 2, with 5 more blocks (longer chain, higher TD)
+        let fork_base = &chain_a[2]; // block #2
+        let mut parent = fork_base.0.hash();
+        let mut fork_entries = Vec::new();
+        let mut td = fork_base.1;
+
+        for i in 3..8u64 {
+            let h = make_chain_header(i, parent, 15, 0xBB);
+            td += h.difficulty;
+            fork_entries.push((h.clone(), td));
+            parent = h.hash();
+        }
+
+        let refs: Vec<(&Header, U256)> = fork_entries.iter().map(|(h, td)| (h, *td)).collect();
+        let result = store
+            .store_headers_batch(&refs, Some(head_a.0.hash()), head_a.1)
+            .unwrap();
+
+        let fork_head = fork_entries.last().unwrap();
+        assert_eq!(result, Some(fork_head.0.hash()));
+        assert_eq!(store.get_head().unwrap(), Some(fork_head.0.hash()));
+
+        // Canonical should follow fork B from block 3 onward
+        assert_eq!(store.get_canonical_hash(2).unwrap(), Some(chain_a[2].0.hash())); // common ancestor
+        assert_eq!(store.get_canonical_hash(3).unwrap(), Some(fork_entries[0].0.hash()));
+        assert_eq!(store.get_canonical_hash(7).unwrap(), Some(fork_entries[4].0.hash()));
     }
 }

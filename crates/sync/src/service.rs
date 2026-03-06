@@ -589,22 +589,34 @@ impl SyncService {
             other => {
                 let is_following = matches!(other, SyncState::Following);
                 self.state = other;
-                let before = self.our_head_number();
+                let before_height = self.our_head_number();
+                let before_hash = self.manager.store.get_head().ok().flatten();
                 let _ = self.manager.handle_headers_response(headers);
                 if is_following {
-                    let after = self.our_head_number();
-                    if after > before {
-                        info!(
-                            target: "rustock::sync",
-                            "New tip: #{}", after
-                        );
+                    let after_height = self.our_head_number();
+                    let after_hash = self.manager.store.get_head().ok().flatten();
+                    if after_hash != before_hash {
+                        if after_height > before_height {
+                            info!(
+                                target: "rustock::sync",
+                                "New tip: #{}", after_height
+                            );
+                        } else {
+                            info!(
+                                target: "rustock::sync",
+                                "Reorg: #{} -> #{} (new head {:?})",
+                                before_height, after_height,
+                                after_hash
+                            );
+                        }
                     }
                 }
             }
         }
     }
 
-    /// Handle NewBlockHashes: fetch announced headers we don't have yet.
+    /// Handle NewBlockHashes: fetch announced headers we don't have yet,
+    /// and detect potential reorgs (different hash at a height we already have).
     /// Only active in Following state; ignored during skeleton sync.
     pub(crate) async fn on_new_block_hashes(&mut self, peer: B512, identifiers: Vec<BlockIdentifier>) {
         if !matches!(self.state, SyncState::Following) {
@@ -619,28 +631,49 @@ impl SyncService {
         let our_height = self.our_head_number();
 
         for id in &identifiers {
-            if id.number <= our_height {
-                continue;
+            if id.number > our_height {
+                // New block ahead of our tip — request it
+                let metadata = rustock_networking::peers::PeerMetadata {
+                    best_number: id.number,
+                    best_hash: id.hash,
+                    total_difficulty: alloy_primitives::U256::ZERO,
+                    client_id: String::new(),
+                };
+                self.peer_store.update_metadata(&peer, metadata).await;
+
+                let count = (id.number - our_height) as u32;
+                trace!(
+                    target: "rustock::sync",
+                    "NewBlockHashes: requesting {} headers up to #{} from peer {:?}",
+                    count, id.number, &peer.as_slice()[..4]
+                );
+                let msg = self.manager.create_headers_request(id.hash, count);
+                self.peer_store.send_to_peer(&peer, msg).await;
+            } else {
+                // Block at or below our height — check for reorg candidate
+                let canonical = self.manager.store
+                    .get_canonical_hash(id.number)
+                    .ok()
+                    .flatten();
+
+                if canonical == Some(id.hash) {
+                    continue; // same block, nothing to do
+                }
+
+                // Different hash at a height we already have — potential reorg.
+                // Request enough headers to cover a shallow fork.
+                let count = std::cmp::min(LONG_SYNC_LIMIT, id.number) as u32;
+                debug!(
+                    target: "rustock::sync",
+                    "NewBlockHashes: reorg candidate at #{} (canonical {:?}, announced {:?}), requesting {} headers",
+                    id.number,
+                    canonical.map(|h| format!("{:?}", h)).unwrap_or_else(|| "none".into()),
+                    id.hash,
+                    count
+                );
+                let msg = self.manager.create_headers_request(id.hash, count);
+                self.peer_store.send_to_peer(&peer, msg).await;
             }
-
-            // Update peer metadata so try_start_sync sees the latest tip
-            let metadata = rustock_networking::peers::PeerMetadata {
-                best_number: id.number,
-                best_hash: id.hash,
-                total_difficulty: alloy_primitives::U256::ZERO,
-                client_id: String::new(),
-            };
-            self.peer_store.update_metadata(&peer, metadata).await;
-
-            // Request headers ending at this hash (count = gap from our head)
-            let count = (id.number - our_height) as u32;
-            trace!(
-                target: "rustock::sync",
-                "NewBlockHashes: requesting {} headers up to #{} from peer {:?}",
-                count, id.number, &peer.as_slice()[..4]
-            );
-            let msg = self.manager.create_headers_request(id.hash, count);
-            self.peer_store.send_to_peer(&peer, msg).await;
         }
     }
 
