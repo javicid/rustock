@@ -1067,3 +1067,424 @@ async fn test_headers_response_in_following_mode() {
     assert!(store.get_header(b1_hash).unwrap().is_some());
     assert_eq!(store.get_head().unwrap(), Some(b1_hash));
 }
+
+// -- Peer serving tests (BlockHeadersRequest, BlockHashRequest, SkeletonRequest) --
+
+#[tokio::test]
+async fn test_serve_block_hash_request() {
+    use rustock_networking::protocol::{P2pMessage, RskMessage, RskSubMessage};
+    use rustock_networking::protocol::P2pHandler;
+    use rustock_networking::protocol::rsk::BlockHashRequest;
+
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    let genesis_hash = genesis.hash();
+    store.update_head(&genesis, U256::from(1)).unwrap();
+
+    let b1 = dummy_header(1, genesis_hash, U256::from(1));
+    let b1_hash = b1.hash();
+    store.put_header(&b1).unwrap();
+    store.put_canonical_hash(1, b1_hash).unwrap();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store, verifier, peer_store));
+
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let handler = SyncHandler::new(manager, event_tx);
+
+    let req = BlockHashRequest { id: 42, height: 1 };
+    let msg = P2pMessage::RskMessage(RskMessage::new(RskSubMessage::BlockHashRequest(req)));
+
+    let resp = handler.handle_message(B512::repeat_byte(0x01), msg);
+    assert!(resp.is_some(), "Should respond to BlockHashRequest");
+
+    if let Some(P2pMessage::RskMessage(rsk_msg)) = resp {
+        if let RskSubMessage::BlockHashResponse(r) = rsk_msg.sub_message {
+            assert_eq!(r.id, 42);
+            assert_eq!(r.hash, b1_hash);
+        } else {
+            panic!("Expected BlockHashResponse");
+        }
+    } else {
+        panic!("Expected RskMessage response");
+    }
+}
+
+#[tokio::test]
+async fn test_serve_block_hash_request_unknown_height() {
+    use rustock_networking::protocol::{P2pMessage, RskMessage, RskSubMessage};
+    use rustock_networking::protocol::P2pHandler;
+    use rustock_networking::protocol::rsk::BlockHashRequest;
+
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store, verifier, peer_store));
+
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let handler = SyncHandler::new(manager, event_tx);
+
+    let req = BlockHashRequest { id: 99, height: 9999 };
+    let msg = P2pMessage::RskMessage(RskMessage::new(RskSubMessage::BlockHashRequest(req)));
+
+    let resp = handler.handle_message(B512::ZERO, msg);
+    assert!(resp.is_none(), "Should not respond for unknown height");
+}
+
+#[tokio::test]
+async fn test_serve_block_hash_request_height_zero() {
+    use rustock_networking::protocol::{P2pMessage, RskMessage, RskSubMessage};
+    use rustock_networking::protocol::P2pHandler;
+    use rustock_networking::protocol::rsk::BlockHashRequest;
+
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store, verifier, peer_store));
+
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let handler = SyncHandler::new(manager, event_tx);
+
+    let req = BlockHashRequest { id: 1, height: 0 };
+    let msg = P2pMessage::RskMessage(RskMessage::new(RskSubMessage::BlockHashRequest(req)));
+
+    let resp = handler.handle_message(B512::ZERO, msg);
+    assert!(resp.is_none(), "Should not respond for height 0 (matches rskj)");
+}
+
+#[tokio::test]
+async fn test_serve_headers_request_single() {
+    use rustock_networking::protocol::{P2pMessage, RskMessage, RskSubMessage};
+    use rustock_networking::protocol::P2pHandler;
+    use rustock_networking::protocol::rsk::{BlockHeadersRequest, BlockHeadersQuery};
+
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    let genesis_hash = genesis.hash();
+    store.update_head(&genesis, U256::from(1)).unwrap();
+
+    let b1 = dummy_header(1, genesis_hash, U256::from(1));
+    let b1_hash = b1.hash();
+    store.put_header(&b1).unwrap();
+    store.put_canonical_hash(1, b1_hash).unwrap();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store, verifier, peer_store));
+
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let handler = SyncHandler::new(manager, event_tx);
+
+    let req = BlockHeadersRequest {
+        id: 7,
+        query: BlockHeadersQuery { hash: b1_hash, count: 1 },
+    };
+    let msg = P2pMessage::RskMessage(RskMessage::new(RskSubMessage::BlockHeadersRequest(req)));
+
+    let resp = handler.handle_message(B512::repeat_byte(0x01), msg);
+    assert!(resp.is_some());
+
+    if let Some(P2pMessage::RskMessage(rsk_msg)) = resp {
+        if let RskSubMessage::BlockHeadersResponse(r) = rsk_msg.sub_message {
+            assert_eq!(r.id, 7);
+            assert_eq!(r.headers.len(), 1);
+            assert_eq!(r.headers[0].number, 1);
+        } else {
+            panic!("Expected BlockHeadersResponse");
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_serve_headers_request_chain_walk() {
+    use rustock_networking::protocol::{P2pMessage, RskMessage, RskSubMessage};
+    use rustock_networking::protocol::P2pHandler;
+    use rustock_networking::protocol::rsk::{BlockHeadersRequest, BlockHeadersQuery};
+
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    let genesis_hash = genesis.hash();
+    store.update_head(&genesis, U256::from(1)).unwrap();
+
+    let b1 = dummy_header(1, genesis_hash, U256::from(1));
+    let b2 = dummy_header(2, b1.hash(), U256::from(1));
+    let b3 = dummy_header(3, b2.hash(), U256::from(1));
+    store.put_header(&b1).unwrap();
+    store.put_header(&b2).unwrap();
+    store.put_header(&b3).unwrap();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store, verifier, peer_store));
+
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let handler = SyncHandler::new(manager, event_tx);
+
+    // Request 3 headers starting from b3 (walking backwards)
+    let req = BlockHeadersRequest {
+        id: 10,
+        query: BlockHeadersQuery { hash: b3.hash(), count: 3 },
+    };
+    let msg = P2pMessage::RskMessage(RskMessage::new(RskSubMessage::BlockHeadersRequest(req)));
+
+    let resp = handler.handle_message(B512::ZERO, msg);
+    assert!(resp.is_some());
+
+    if let Some(P2pMessage::RskMessage(rsk_msg)) = resp {
+        if let RskSubMessage::BlockHeadersResponse(r) = rsk_msg.sub_message {
+            assert_eq!(r.id, 10);
+            assert_eq!(r.headers.len(), 3);
+            // Headers are returned in descending order (b3, b2, b1)
+            assert_eq!(r.headers[0].number, 3);
+            assert_eq!(r.headers[1].number, 2);
+            assert_eq!(r.headers[2].number, 1);
+        } else {
+            panic!("Expected BlockHeadersResponse");
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_serve_headers_request_unknown_hash() {
+    use rustock_networking::protocol::{P2pMessage, RskMessage, RskSubMessage};
+    use rustock_networking::protocol::P2pHandler;
+    use rustock_networking::protocol::rsk::{BlockHeadersRequest, BlockHeadersQuery};
+
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store, verifier, peer_store));
+
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let handler = SyncHandler::new(manager, event_tx);
+
+    let req = BlockHeadersRequest {
+        id: 1,
+        query: BlockHeadersQuery {
+            hash: B256::repeat_byte(0xFF),
+            count: 10,
+        },
+    };
+    let msg = P2pMessage::RskMessage(RskMessage::new(RskSubMessage::BlockHeadersRequest(req)));
+
+    let resp = handler.handle_message(B512::ZERO, msg);
+    assert!(resp.is_none(), "Should not respond for unknown hash");
+}
+
+#[tokio::test]
+async fn test_serve_headers_request_capped_count() {
+    use rustock_networking::protocol::{P2pMessage, RskMessage, RskSubMessage};
+    use rustock_networking::protocol::P2pHandler;
+    use rustock_networking::protocol::rsk::{BlockHeadersRequest, BlockHeadersQuery};
+
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    let genesis_hash = genesis.hash();
+    store.update_head(&genesis, U256::from(1)).unwrap();
+
+    let b1 = dummy_header(1, genesis_hash, U256::from(1));
+    store.put_header(&b1).unwrap();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store, verifier, peer_store));
+
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let handler = SyncHandler::new(manager, event_tx);
+
+    // Request 1000 headers but we only have 2 (b1 + genesis)
+    let req = BlockHeadersRequest {
+        id: 1,
+        query: BlockHeadersQuery { hash: b1.hash(), count: 1000 },
+    };
+    let msg = P2pMessage::RskMessage(RskMessage::new(RskSubMessage::BlockHeadersRequest(req)));
+
+    let resp = handler.handle_message(B512::ZERO, msg);
+    assert!(resp.is_some());
+
+    if let Some(P2pMessage::RskMessage(rsk_msg)) = resp {
+        if let RskSubMessage::BlockHeadersResponse(r) = rsk_msg.sub_message {
+            // Should only return what's available (capped at MAX_HEADERS_SERVE=192
+            // and chain length = 2)
+            assert_eq!(r.headers.len(), 2);
+        } else {
+            panic!("Expected BlockHeadersResponse");
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_serve_skeleton_request() {
+    use rustock_networking::protocol::{P2pMessage, RskMessage, RskSubMessage};
+    use rustock_networking::protocol::P2pHandler;
+    use rustock_networking::protocol::rsk::SkeletonRequest;
+
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    // Build a chain of 500 blocks
+    let mut prev_hash = B256::ZERO;
+    let mut td = U256::ZERO;
+    for i in 0..=500u64 {
+        let h = dummy_header(i, prev_hash, U256::from(1));
+        let hash = h.hash();
+        td += h.difficulty;
+        store.put_header(&h).unwrap();
+        store.put_canonical_hash(i, hash).unwrap();
+        store.put_total_difficulty(hash, td).unwrap();
+        if i == 500 {
+            store.set_head(hash).unwrap();
+        }
+        prev_hash = hash;
+    }
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store, verifier, peer_store));
+
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let handler = SyncHandler::new(manager, event_tx);
+
+    let req = SkeletonRequest { id: 55, start_number: 0 };
+    let msg = P2pMessage::RskMessage(RskMessage::new(RskSubMessage::SkeletonRequest(req)));
+
+    let resp = handler.handle_message(B512::ZERO, msg);
+    assert!(resp.is_some(), "Should respond to SkeletonRequest");
+
+    if let Some(P2pMessage::RskMessage(rsk_msg)) = resp {
+        if let RskSubMessage::SkeletonResponse(r) = rsk_msg.sub_message {
+            assert_eq!(r.id, 55);
+            // Should have entries at 0, 192, 384, and best=500
+            assert!(r.block_identifiers.len() >= 3);
+            assert_eq!(r.block_identifiers[0].number, 0);
+            assert_eq!(r.block_identifiers[1].number, 192);
+            assert_eq!(r.block_identifiers[2].number, 384);
+            // Last entry should be the best block (500)
+            let last = r.block_identifiers.last().unwrap();
+            assert_eq!(last.number, 500);
+        } else {
+            panic!("Expected SkeletonResponse");
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_serve_skeleton_request_unknown_start() {
+    use rustock_networking::protocol::{P2pMessage, RskMessage, RskSubMessage};
+    use rustock_networking::protocol::P2pHandler;
+    use rustock_networking::protocol::rsk::SkeletonRequest;
+
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store, verifier, peer_store));
+
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let handler = SyncHandler::new(manager, event_tx);
+
+    let req = SkeletonRequest { id: 1, start_number: 99999 };
+    let msg = P2pMessage::RskMessage(RskMessage::new(RskSubMessage::SkeletonRequest(req)));
+
+    let resp = handler.handle_message(B512::ZERO, msg);
+    assert!(resp.is_none(), "Should not respond for unknown start number");
+}
+
+#[tokio::test]
+async fn test_serve_skeleton_request_at_boundary() {
+    use rustock_networking::protocol::{P2pMessage, RskMessage, RskSubMessage};
+    use rustock_networking::protocol::P2pHandler;
+    use rustock_networking::protocol::rsk::SkeletonRequest;
+
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    // Build a chain of exactly 192 blocks (one skeleton step)
+    let mut prev_hash = B256::ZERO;
+    let mut td = U256::ZERO;
+    for i in 0..=192u64 {
+        let h = dummy_header(i, prev_hash, U256::from(1));
+        let hash = h.hash();
+        td += h.difficulty;
+        store.put_header(&h).unwrap();
+        store.put_canonical_hash(i, hash).unwrap();
+        store.put_total_difficulty(hash, td).unwrap();
+        if i == 192 {
+            store.set_head(hash).unwrap();
+        }
+        prev_hash = hash;
+    }
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store, verifier, peer_store));
+
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let handler = SyncHandler::new(manager, event_tx);
+
+    let req = SkeletonRequest { id: 1, start_number: 0 };
+    let msg = P2pMessage::RskMessage(RskMessage::new(RskSubMessage::SkeletonRequest(req)));
+
+    let resp = handler.handle_message(B512::ZERO, msg);
+    assert!(resp.is_some());
+
+    if let Some(P2pMessage::RskMessage(rsk_msg)) = resp {
+        if let RskSubMessage::SkeletonResponse(r) = rsk_msg.sub_message {
+            // Should have entries at 0 and 192
+            assert_eq!(r.block_identifiers.len(), 2);
+            assert_eq!(r.block_identifiers[0].number, 0);
+            assert_eq!(r.block_identifiers[1].number, 192);
+        } else {
+            panic!("Expected SkeletonResponse");
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_serve_requests_dont_interfere_with_event_forwarding() {
+    use rustock_networking::protocol::{P2pMessage, RskMessage, RskSubMessage};
+    use rustock_networking::protocol::P2pHandler;
+    use rustock_networking::protocol::rsk::{BlockHashRequest, BlockHeadersResponse as BHResp};
+
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store, verifier, peer_store));
+
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let handler = SyncHandler::new(manager, event_tx);
+    let peer = B512::repeat_byte(0x01);
+
+    // 1. Serve a block hash request (returns response, no event)
+    let req = BlockHashRequest { id: 1, height: 0 };
+    let msg = P2pMessage::RskMessage(RskMessage::new(RskSubMessage::BlockHashRequest(req)));
+    let _resp = handler.handle_message(peer, msg);
+    assert!(event_rx.try_recv().is_err(), "Serving should not forward events");
+
+    // 2. Forward a headers response (no response, forwards event)
+    let headers_resp = BHResp { id: 2, headers: vec![genesis.clone()] };
+    let msg = P2pMessage::RskMessage(RskMessage::new(RskSubMessage::BlockHeadersResponse(headers_resp)));
+    let resp = handler.handle_message(peer, msg);
+    assert!(resp.is_none(), "Forwarding should not return a response");
+    assert!(event_rx.try_recv().is_ok(), "Should forward the event");
+}
