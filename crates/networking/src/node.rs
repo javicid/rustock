@@ -4,6 +4,7 @@ use crate::handshake::Handshake;
 use crate::peers::PeerStore;
 use alloy_primitives::{B512, B256, U256};
 use anyhow::{Result, Context};
+use std::net::IpAddr;
 use std::sync::Arc;
 use tracing::{info, error, debug, trace};
 
@@ -30,6 +31,7 @@ pub struct NodeConfig {
     pub secret_key: [u8; 32],
     pub discovery_port: u16,
     pub data_dir: String,
+    pub external_ip: Option<IpAddr>,
 }
 
 impl Node {
@@ -91,8 +93,13 @@ impl Node {
         let signing_key = k256::ecdsa::SigningKey::from_slice(&self.config.secret_key)
             .context("Invalid secret key")?;
 
+        let ip_bytes: Vec<u8> = match self.config.external_ip {
+            Some(IpAddr::V4(v4)) => v4.octets().to_vec(),
+            Some(IpAddr::V6(v6)) => v6.octets().to_vec(),
+            None => vec![127, 0, 0, 1],
+        };
         let local_node = crate::discovery::message::DiscoveryNode {
-            ip: alloy_primitives::Bytes::from(vec![127, 0, 0, 1]), // Localhost; external IP detection (UPnP/STUN) not yet implemented
+            ip: alloy_primitives::Bytes::from(ip_bytes),
             udp_port: self.config.discovery_port,
             tcp_port: self.config.listen_port,
             id: self.config.id,
@@ -242,6 +249,7 @@ mod tests {
             secret_key: [0x42; 32],
             discovery_port: 0,
             data_dir: ".".to_string(),
+            external_ip: None,
         };
         
         let node2_config = NodeConfig {
@@ -258,6 +266,7 @@ mod tests {
             secret_key: [0x43; 32],
             discovery_port: 0,
             data_dir: ".".to_string(),
+            external_ip: None,
         };
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -172,6 +172,7 @@ mod tests {
             secret_key: sk,
             discovery_port: 0,
             data_dir: ".".to_string(),
+            external_ip: None,
         }
     }
 

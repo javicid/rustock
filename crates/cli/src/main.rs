@@ -50,6 +50,11 @@ struct Args {
     /// Disable the JSON-RPC server
     #[arg(long, default_value_t = false)]
     no_rpc: bool,
+
+    /// External IP address to advertise to peers (e.g., 203.0.113.42).
+    /// If not set, 127.0.0.1 is used.
+    #[arg(long)]
+    external_ip: Option<std::net::IpAddr>,
 }
 
 #[tokio::main]
@@ -155,6 +160,7 @@ async fn main() -> Result<()> {
         secret_key: secret_key_bytes,
         discovery_port: args.port + 1,
         data_dir: args.data_dir.clone(),
+        external_ip: args.external_ip,
     };
 
     let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
