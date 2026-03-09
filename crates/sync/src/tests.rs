@@ -50,25 +50,25 @@ async fn test_sync_manager_processing() {
     // 1. Valid sequential block
     let b1 = dummy_header(1, genesis_hash, U256::from(10));
     manager.handle_headers_response(vec![b1.clone()]).unwrap();
-    assert_eq!(store.get_head().unwrap(), Some(b1.hash()));
-    assert_eq!(store.get_total_difficulty(b1.hash()).unwrap(), Some(U256::from(11)));
+    assert_eq!(store.head().unwrap(), Some(b1.hash()));
+    assert_eq!(store.total_difficulty(b1.hash()).unwrap(), Some(U256::from(11)));
 
     // 2. Duplicate block (should be ignored)
     manager.handle_headers_response(vec![b1.clone()]).unwrap();
-    assert_eq!(store.get_head().unwrap(), Some(b1.hash()));
+    assert_eq!(store.head().unwrap(), Some(b1.hash()));
 
     // 3. Extension block
     let b2 = dummy_header(2, b1.hash(), U256::from(5));
     manager.handle_headers_response(vec![b2.clone()]).unwrap();
-    assert_eq!(store.get_head().unwrap(), Some(b2.hash()));
+    assert_eq!(store.head().unwrap(), Some(b2.hash()));
 
     // 4. Gap block (parent unknown) — stored with TD = difficulty only
     let b4 = dummy_header(4, B256::repeat_byte(0xee), U256::from(1));
     let b4_hash = b4.hash();
     manager.handle_headers_response(vec![b4]).unwrap();
-    assert_eq!(store.get_head().unwrap(), Some(b2.hash()), "Head should not change");
-    assert!(store.get_header(b4_hash).unwrap().is_some(), "Gap block should be stored");
-    assert_eq!(store.get_total_difficulty(b4_hash).unwrap(), Some(U256::from(1)));
+    assert_eq!(store.head().unwrap(), Some(b2.hash()), "Head should not change");
+    assert!(store.header(b4_hash).unwrap().is_some(), "Gap block should be stored");
+    assert_eq!(store.total_difficulty(b4_hash).unwrap(), Some(U256::from(1)));
 }
 
 #[tokio::test]
@@ -91,8 +91,8 @@ async fn test_invalid_header_rejected_when_parent_known() {
     let bad_hash = bad.hash();
     manager.handle_headers_response(vec![bad]).unwrap();
 
-    assert!(store.get_header(bad_hash).unwrap().is_none(), "Invalid header should be rejected");
-    assert_eq!(store.get_head().unwrap(), Some(genesis_hash));
+    assert!(store.header(bad_hash).unwrap().is_none(), "Invalid header should be rejected");
+    assert_eq!(store.head().unwrap(), Some(genesis_hash));
 }
 
 // -- SyncHandler tests (event forwarding) --------------------------------
@@ -118,7 +118,7 @@ async fn test_sync_handler_forwards_headers() {
     };
     let msg = P2pMessage::RskMessage(RskMessage::new(RskSubMessage::BlockHeadersResponse(resp)));
 
-    let handler_resp = handler.handle_message(B512::ZERO, msg);
+    let handler_resp = handler.handle_message(B512::ZERO, &msg);
     assert!(handler_resp.is_none());
 
     // Event should be forwarded to the channel
@@ -150,7 +150,7 @@ async fn test_sync_handler_forwards_block_hash() {
     let resp = BlockHashResponse { id: 5, hash: B256::repeat_byte(0xab) };
     let msg = P2pMessage::RskMessage(RskMessage::new(RskSubMessage::BlockHashResponse(resp)));
 
-    handler.handle_message(B512::ZERO, msg);
+    handler.handle_message(B512::ZERO, &msg);
 
     match event_rx.try_recv().unwrap() {
         SyncEvent::BlockHashResponse { hash, .. } => {
@@ -184,7 +184,7 @@ async fn test_sync_handler_forwards_skeleton() {
     };
     let msg = P2pMessage::RskMessage(RskMessage::new(RskSubMessage::SkeletonResponse(resp)));
 
-    handler.handle_message(B512::ZERO, msg);
+    handler.handle_message(B512::ZERO, &msg);
 
     match event_rx.try_recv().unwrap() {
         SyncEvent::SkeletonResponse { identifiers, .. } => {
@@ -413,8 +413,8 @@ async fn test_headers_response_advances_chunks() {
         "Expected Following after final chunk, got {:?}", service.state);
 
     // Verify all headers are stored
-    assert!(store.get_header(b1.hash()).unwrap().is_some());
-    assert!(store.get_header(b4.hash()).unwrap().is_some());
+    assert!(store.header(b1.hash()).unwrap().is_some());
+    assert!(store.header(b4.hash()).unwrap().is_some());
 
     drop(event_tx);
 }
@@ -535,10 +535,10 @@ async fn test_descending_headers_reversed() {
 
     manager.handle_headers_response(vec![b3.clone(), b2.clone(), b1.clone()]).unwrap();
 
-    assert!(store.get_header(b1.hash()).unwrap().is_some());
-    assert!(store.get_header(b2.hash()).unwrap().is_some());
-    assert!(store.get_header(b3.hash()).unwrap().is_some());
-    assert_eq!(store.get_head().unwrap(), Some(b3.hash()));
+    assert!(store.header(b1.hash()).unwrap().is_some());
+    assert!(store.header(b2.hash()).unwrap().is_some());
+    assert!(store.header(b3.hash()).unwrap().is_some());
+    assert_eq!(store.head().unwrap(), Some(b3.hash()));
 }
 
 #[tokio::test]
@@ -914,7 +914,7 @@ async fn test_new_block_hashes_processed_in_following_mode() {
     assert!(msg.is_ok(), "Expected a headers request message to be sent");
 
     // Peer metadata should be updated
-    let best = peer_store.get_best_peer().await;
+    let best = peer_store.best_peer().await;
     assert!(best.is_some());
     let (_, meta) = best.unwrap();
     assert_eq!(meta.best_number, 1);
@@ -1021,7 +1021,7 @@ async fn test_handler_forwards_new_block_hashes() {
         RskSubMessage::NewBlockHashes(blocks),
     ));
 
-    let resp = handler.handle_message(B512::repeat_byte(0xaa), msg);
+    let resp = handler.handle_message(B512::repeat_byte(0xaa), &msg);
     assert!(resp.is_none());
 
     match event_rx.try_recv().unwrap() {
@@ -1064,8 +1064,8 @@ async fn test_headers_response_in_following_mode() {
         "Expected Following after headers response, got {:?}", service.state);
 
     // Header should be stored
-    assert!(store.get_header(b1_hash).unwrap().is_some());
-    assert_eq!(store.get_head().unwrap(), Some(b1_hash));
+    assert!(store.header(b1_hash).unwrap().is_some());
+    assert_eq!(store.head().unwrap(), Some(b1_hash));
 }
 
 // -- Peer serving tests (BlockHeadersRequest, BlockHashRequest, SkeletonRequest) --
@@ -1098,7 +1098,7 @@ async fn test_serve_block_hash_request() {
     let req = BlockHashRequest { id: 42, height: 1 };
     let msg = P2pMessage::RskMessage(RskMessage::new(RskSubMessage::BlockHashRequest(req)));
 
-    let resp = handler.handle_message(B512::repeat_byte(0x01), msg);
+    let resp = handler.handle_message(B512::repeat_byte(0x01), &msg);
     assert!(resp.is_some(), "Should respond to BlockHashRequest");
 
     if let Some(P2pMessage::RskMessage(rsk_msg)) = resp {
@@ -1131,7 +1131,7 @@ async fn test_serve_block_hash_request_unknown_height() {
     let req = BlockHashRequest { id: 99, height: 9999 };
     let msg = P2pMessage::RskMessage(RskMessage::new(RskSubMessage::BlockHashRequest(req)));
 
-    let resp = handler.handle_message(B512::ZERO, msg);
+    let resp = handler.handle_message(B512::ZERO, &msg);
     assert!(resp.is_none(), "Should not respond for unknown height");
 }
 
@@ -1156,7 +1156,7 @@ async fn test_serve_block_hash_request_height_zero() {
     let req = BlockHashRequest { id: 1, height: 0 };
     let msg = P2pMessage::RskMessage(RskMessage::new(RskSubMessage::BlockHashRequest(req)));
 
-    let resp = handler.handle_message(B512::ZERO, msg);
+    let resp = handler.handle_message(B512::ZERO, &msg);
     assert!(resp.is_none(), "Should not respond for height 0 (matches rskj)");
 }
 
@@ -1191,7 +1191,7 @@ async fn test_serve_headers_request_single() {
     };
     let msg = P2pMessage::RskMessage(RskMessage::new(RskSubMessage::BlockHeadersRequest(req)));
 
-    let resp = handler.handle_message(B512::repeat_byte(0x01), msg);
+    let resp = handler.handle_message(B512::repeat_byte(0x01), &msg);
     assert!(resp.is_some());
 
     if let Some(P2pMessage::RskMessage(rsk_msg)) = resp {
@@ -1239,7 +1239,7 @@ async fn test_serve_headers_request_chain_walk() {
     };
     let msg = P2pMessage::RskMessage(RskMessage::new(RskSubMessage::BlockHeadersRequest(req)));
 
-    let resp = handler.handle_message(B512::ZERO, msg);
+    let resp = handler.handle_message(B512::ZERO, &msg);
     assert!(resp.is_some());
 
     if let Some(P2pMessage::RskMessage(rsk_msg)) = resp {
@@ -1280,7 +1280,7 @@ async fn test_serve_headers_request_unknown_hash() {
     };
     let msg = P2pMessage::RskMessage(RskMessage::new(RskSubMessage::BlockHeadersRequest(req)));
 
-    let resp = handler.handle_message(B512::ZERO, msg);
+    let resp = handler.handle_message(B512::ZERO, &msg);
     assert!(resp.is_none(), "Should not respond for unknown hash");
 }
 
@@ -1314,7 +1314,7 @@ async fn test_serve_headers_request_capped_count() {
     };
     let msg = P2pMessage::RskMessage(RskMessage::new(RskSubMessage::BlockHeadersRequest(req)));
 
-    let resp = handler.handle_message(B512::ZERO, msg);
+    let resp = handler.handle_message(B512::ZERO, &msg);
     assert!(resp.is_some());
 
     if let Some(P2pMessage::RskMessage(rsk_msg)) = resp {
@@ -1363,7 +1363,7 @@ async fn test_serve_skeleton_request() {
     let req = SkeletonRequest { id: 55, start_number: 0 };
     let msg = P2pMessage::RskMessage(RskMessage::new(RskSubMessage::SkeletonRequest(req)));
 
-    let resp = handler.handle_message(B512::ZERO, msg);
+    let resp = handler.handle_message(B512::ZERO, &msg);
     assert!(resp.is_some(), "Should respond to SkeletonRequest");
 
     if let Some(P2pMessage::RskMessage(rsk_msg)) = resp {
@@ -1401,7 +1401,7 @@ async fn test_serve_skeleton_request_unknown_start() {
     let req = SkeletonRequest { id: 1, start_number: 99999 };
     let msg = P2pMessage::RskMessage(RskMessage::new(RskSubMessage::SkeletonRequest(req)));
 
-    let resp = handler.handle_message(B512::ZERO, msg);
+    let resp = handler.handle_message(B512::ZERO, &msg);
     assert!(resp.is_none(), "Should not respond for unknown start number");
 }
 
@@ -1440,7 +1440,7 @@ async fn test_serve_skeleton_request_at_boundary() {
     let req = SkeletonRequest { id: 1, start_number: 0 };
     let msg = P2pMessage::RskMessage(RskMessage::new(RskSubMessage::SkeletonRequest(req)));
 
-    let resp = handler.handle_message(B512::ZERO, msg);
+    let resp = handler.handle_message(B512::ZERO, &msg);
     assert!(resp.is_some());
 
     if let Some(P2pMessage::RskMessage(rsk_msg)) = resp {
@@ -1478,13 +1478,13 @@ async fn test_serve_requests_dont_interfere_with_event_forwarding() {
     // 1. Serve a block hash request (returns response, no event)
     let req = BlockHashRequest { id: 1, height: 0 };
     let msg = P2pMessage::RskMessage(RskMessage::new(RskSubMessage::BlockHashRequest(req)));
-    let _resp = handler.handle_message(peer, msg);
+    let _resp = handler.handle_message(peer, &msg);
     assert!(event_rx.try_recv().is_err(), "Serving should not forward events");
 
     // 2. Forward a headers response (no response, forwards event)
     let headers_resp = BHResp { id: 2, headers: vec![genesis.clone()] };
     let msg = P2pMessage::RskMessage(RskMessage::new(RskSubMessage::BlockHeadersResponse(headers_resp)));
-    let resp = handler.handle_message(peer, msg);
+    let resp = handler.handle_message(peer, &msg);
     assert!(resp.is_none(), "Forwarding should not return a response");
     assert!(event_rx.try_recv().is_ok(), "Should forward the event");
 }
@@ -1611,9 +1611,9 @@ async fn test_reorg_via_headers_response_higher_td() {
 
     // Fork B has TD = 10 + 20 + 20 = 50 vs chain A's TD = 30
     // Head should switch to fork B
-    assert_eq!(store.get_head().unwrap(), Some(b2.hash()));
-    assert_eq!(store.get_canonical_hash(1).unwrap(), Some(b1.hash()));
-    assert_eq!(store.get_canonical_hash(2).unwrap(), Some(b2.hash()));
+    assert_eq!(store.head().unwrap(), Some(b2.hash()));
+    assert_eq!(store.canonical_hash(1).unwrap(), Some(b1.hash()));
+    assert_eq!(store.canonical_hash(2).unwrap(), Some(b2.hash()));
 }
 
 #[tokio::test]
@@ -1653,13 +1653,13 @@ async fn test_no_reorg_via_headers_response_lower_td() {
 
     // Fork B has TD = 10 + 5 + 5 = 20 vs chain A's TD = 50
     // Head should NOT change
-    assert_eq!(store.get_head().unwrap(), Some(a2.hash()));
-    assert_eq!(store.get_canonical_hash(1).unwrap(), Some(a1.hash()));
-    assert_eq!(store.get_canonical_hash(2).unwrap(), Some(a2.hash()));
+    assert_eq!(store.head().unwrap(), Some(a2.hash()));
+    assert_eq!(store.canonical_hash(1).unwrap(), Some(a1.hash()));
+    assert_eq!(store.canonical_hash(2).unwrap(), Some(a2.hash()));
 
     // Fork B headers should still be stored
-    assert!(store.get_header(b1.hash()).unwrap().is_some());
-    assert!(store.get_header(b2.hash()).unwrap().is_some());
+    assert!(store.header(b1.hash()).unwrap().is_some());
+    assert!(store.header(b2.hash()).unwrap().is_some());
 }
 
 // ========== TxRelay tests ==========
@@ -1687,12 +1687,12 @@ async fn test_tx_relay_filters_duplicates() {
     let msg = P2pMessage::RskMessage(RskMessage::new(
         RskSubMessage::Transactions(vec![tx_data.clone()]),
     ));
-    relay.handle_message(peer_a, msg.clone());
+    relay.handle_message(peer_a, &msg);
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     assert!(rx_b.try_recv().is_ok(), "peer B should receive the tx");
 
-    relay.handle_message(peer_a, msg);
+    relay.handle_message(peer_a, &msg);
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert!(rx_b.try_recv().is_err(), "duplicate should be suppressed");
 }

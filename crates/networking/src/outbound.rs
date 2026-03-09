@@ -6,7 +6,7 @@ use crate::peers::PeerStore;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tokio::time::{sleep, Duration};
 use tracing::{info, trace, warn};
 use tokio::net::TcpStream;
@@ -14,7 +14,7 @@ use tokio::net::TcpStream;
 /// Service that proactively initiates connections to peers discovered in the network.
 pub struct OutboundConnector {
     config: NodeConfig,
-    table: Arc<Mutex<NodeTable>>,
+    table: Arc<RwLock<NodeTable>>,
     peer_store: Arc<PeerStore>,
     handlers: Vec<Arc<dyn P2pHandler>>,
     max_outbound: usize,
@@ -23,7 +23,7 @@ pub struct OutboundConnector {
 impl OutboundConnector {
     pub fn new(
         config: NodeConfig, 
-        table: Arc<Mutex<NodeTable>>, 
+        table: Arc<RwLock<NodeTable>>, 
         peer_store: Arc<PeerStore>,
         handlers: Vec<Arc<dyn P2pHandler>>, 
         max_outbound: usize
@@ -55,7 +55,7 @@ impl OutboundConnector {
             }
 
             let needed = self.max_outbound - current_count;
-            let nodes = self.table.lock().await.get_all_nodes();
+            let nodes = self.table.read().await.all_nodes();
             let table_size = nodes.len();
 
             // Try more candidates than needed since many will fail.

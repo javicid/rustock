@@ -58,9 +58,9 @@ impl SyncManager {
         );
 
         // Read current head TD once (instead of per-header)
-        let current_head_hash = self.store.get_head()?;
+        let current_head_hash = self.store.head()?;
         let current_td = match current_head_hash {
-            Some(h) => self.store.get_total_difficulty(h)?.unwrap_or_default(),
+            Some(h) => self.store.total_difficulty(h)?.unwrap_or_default(),
             None => U256::ZERO,
         };
 
@@ -83,7 +83,7 @@ impl SyncManager {
             }
 
             let hash = header.hash();
-            let already_stored = self.store.get_header(hash)?.is_some();
+            let already_stored = self.store.header(hash)?.is_some();
 
             // Determine parent header and TD:
             // 1) Sequential from the previous header in this chunk (most common)
@@ -99,19 +99,19 @@ impl SyncManager {
                     parent_td = prev_td;
                 } else {
                     // Non-sequential — fall back to store lookup
-                    parent_from_store = self.store.get_header(header.parent_hash)?;
+                    parent_from_store = self.store.header(header.parent_hash)?;
                     if parent_from_store.is_some() {
                         parent_ref = parent_from_store.as_ref();
                         parent_td = self.store
-                            .get_total_difficulty(header.parent_hash)?
+                            .total_difficulty(header.parent_hash)?
                             .unwrap_or_default();
                     } else if header.number > 0 {
                         let parent_number = header.number - 1;
-                        if let Some(canonical_hash) = self.store.get_canonical_hash(parent_number)? {
-                            parent_from_store = self.store.get_header(canonical_hash)?;
+                        if let Some(canonical_hash) = self.store.canonical_hash(parent_number)? {
+                            parent_from_store = self.store.header(canonical_hash)?;
                             parent_ref = parent_from_store.as_ref();
                             parent_td = if parent_ref.is_some() {
-                                self.store.get_total_difficulty(canonical_hash)?.unwrap_or_default()
+                                self.store.total_difficulty(canonical_hash)?.unwrap_or_default()
                             } else {
                                 U256::ZERO
                             };
@@ -128,20 +128,20 @@ impl SyncManager {
                 // First header in the chunk — look up parent from store.
                 // Try by parent_hash first; if not found (Java non-canonical RLP
                 // hash mismatch), fall back to canonical number → hash lookup.
-                parent_from_store = self.store.get_header(header.parent_hash)?;
+                parent_from_store = self.store.header(header.parent_hash)?;
                 if parent_from_store.is_some() {
                     parent_ref = parent_from_store.as_ref();
                     parent_td = self.store
-                        .get_total_difficulty(header.parent_hash)?
+                        .total_difficulty(header.parent_hash)?
                         .unwrap_or_default();
                 } else if header.number > 0 {
                     // Fall back: look up parent by block number
                     let parent_number = header.number - 1;
-                    if let Some(canonical_hash) = self.store.get_canonical_hash(parent_number)? {
-                        parent_from_store = self.store.get_header(canonical_hash)?;
+                    if let Some(canonical_hash) = self.store.canonical_hash(parent_number)? {
+                        parent_from_store = self.store.header(canonical_hash)?;
                         parent_ref = parent_from_store.as_ref();
                         parent_td = if parent_ref.is_some() {
-                            self.store.get_total_difficulty(canonical_hash)?.unwrap_or_default()
+                            self.store.total_difficulty(canonical_hash)?.unwrap_or_default()
                         } else {
                             U256::ZERO
                         };

@@ -145,9 +145,9 @@ async fn main() -> Result<()> {
     let encoded_point = verifying_key.to_encoded_point(false);
     let node_id = alloy_primitives::B512::from_slice(&encoded_point.as_bytes()[1..]);
 
-    let (best_hash, best_td, best_number) = if let Some(head_hash) = store.get_head()? {
-        let td = store.get_total_difficulty(head_hash)?.unwrap_or(U256::ZERO);
-        let number = store.get_header(head_hash)?
+    let (best_hash, best_td, best_number) = if let Some(head_hash) = store.head()? {
+        let td = store.total_difficulty(head_hash)?.unwrap_or(U256::ZERO);
+        let number = store.header(head_hash)?
             .map(|h| h.number)
             .unwrap_or(0);
         (head_hash, td, number)
@@ -209,7 +209,7 @@ async fn main() -> Result<()> {
 }
 
 fn setup_genesis(store: &BlockStore, config: &ChainConfig) -> Result<alloy_primitives::B256> {
-    if let Some(genesis) = store.get_canonical_hash(0)? {
+    if let Some(genesis) = store.canonical_hash(0)? {
         return Ok(genesis);
     }
 

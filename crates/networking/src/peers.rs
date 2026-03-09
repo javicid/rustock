@@ -50,13 +50,13 @@ impl PeerStore {
     }
 
     /// Returns the metadata for a specific peer.
-    pub async fn get_metadata(&self, id: &B512) -> Option<PeerMetadata> {
+    pub async fn metadata(&self, id: &B512) -> Option<PeerMetadata> {
         let peers = self.connected_peers.lock().await;
         peers.get(id).map(|s| s.metadata.clone())
     }
 
     /// Finds the best peer to sync from based on total difficulty.
-    pub async fn get_best_peer(&self) -> Option<(B512, PeerMetadata)> {
+    pub async fn best_peer(&self) -> Option<(B512, PeerMetadata)> {
         let peers = self.connected_peers.lock().await;
         peers.iter()
             .max_by_key(|(_, s)| s.metadata.total_difficulty)
@@ -84,7 +84,7 @@ impl PeerStore {
     }
 
     /// Returns a list of all connected peer IDs.
-    pub async fn get_peers(&self) -> Vec<B512> {
+    pub async fn peers(&self) -> Vec<B512> {
         self.connected_peers.lock().await.keys().cloned().collect()
     }
     
@@ -97,16 +97,10 @@ impl PeerStore {
     /// Returns the number of peers the message was sent to.
     pub async fn broadcast(&self, msg: P2pMessage, exclude: &[B512]) -> usize {
         let peers = self.connected_peers.lock().await;
-        let mut sent = 0;
-        for (id, state) in peers.iter() {
-            if exclude.contains(id) {
-                continue;
-            }
-            if state.sender.send(msg.clone()).is_ok() {
-                sent += 1;
-            }
-        }
-        sent
+        peers.iter()
+            .filter(|(id, _)| !exclude.contains(id))
+            .filter(|(_, state)| state.sender.send(msg.clone()).is_ok())
+            .count()
     }
 }
 
@@ -138,7 +132,7 @@ mod tests {
             ..Default::default()
         }).await;
 
-        let best = store.get_best_peer().await.unwrap();
+        let best = store.best_peer().await.unwrap();
         assert_eq!(best.0, peer_b, "peer B has higher TD");
 
         store.update_metadata(&peer_a, PeerMetadata {
@@ -147,14 +141,14 @@ mod tests {
             ..Default::default()
         }).await;
 
-        let best = store.get_best_peer().await.unwrap();
+        let best = store.best_peer().await.unwrap();
         assert_eq!(best.0, peer_a, "peer A now has higher TD");
     }
 
     #[tokio::test]
     async fn test_get_best_peer_empty() {
         let store = PeerStore::new();
-        assert!(store.get_best_peer().await.is_none());
+        assert!(store.best_peer().await.is_none());
     }
 
     #[tokio::test]
@@ -172,14 +166,14 @@ mod tests {
         };
         store.update_metadata(&peer_id, metadata.clone()).await;
 
-        let retrieved = store.get_metadata(&peer_id).await.unwrap();
+        let retrieved = store.metadata(&peer_id).await.unwrap();
         assert_eq!(retrieved.best_number, 42);
         assert_eq!(retrieved.best_hash, B256::repeat_byte(0x11));
         assert_eq!(retrieved.total_difficulty, U256::from(999));
         assert_eq!(retrieved.client_id, "test");
 
         let unknown = B512::repeat_byte(0xff);
-        assert!(store.get_metadata(&unknown).await.is_none());
+        assert!(store.metadata(&unknown).await.is_none());
     }
 
     #[tokio::test]
@@ -199,7 +193,7 @@ mod tests {
         assert!(store.is_connected(&id1).await);
         
         // Get peers
-        let peers = store.get_peers().await;
+        let peers = store.peers().await;
         assert_eq!(peers.len(), 2);
         assert!(peers.contains(&id1));
         assert!(peers.contains(&id2));

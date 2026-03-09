@@ -18,7 +18,7 @@ pub fn net_listening(id: Value) -> JsonRpcResponse {
 }
 
 pub async fn net_peer_list(id: Value, peer_store: &PeerStore) -> JsonRpcResponse {
-    let peers = peer_store.get_peers().await;
+    let peers = peer_store.peers().await;
     let list: Vec<String> = peers.iter().map(|p| format!("{:#x}", p)).collect();
     JsonRpcResponse::success(id, json!(list))
 }

@@ -217,7 +217,7 @@ async fn test_eth_get_block_by_number_not_found() {
 async fn test_eth_get_block_by_hash() {
     let (state, _tmp) = setup_state();
 
-    let head_hash = state.store.get_head().unwrap().unwrap();
+    let head_hash = state.store.head().unwrap().unwrap();
     let hash_str = format!("{:#x}", head_hash);
 
     let req = make_request("eth_getBlockByHash", json!([hash_str, false]));
@@ -289,7 +289,7 @@ async fn test_rsk_get_raw_block_header_by_number() {
 #[tokio::test]
 async fn test_rsk_get_raw_block_header_by_hash() {
     let (state, _tmp) = setup_state();
-    let head_hash = state.store.get_head().unwrap().unwrap();
+    let head_hash = state.store.head().unwrap().unwrap();
     let hash_str = format!("{:#x}", head_hash);
     let req = make_request("rsk_getRawBlockHeaderByHash", json!([hash_str]));
     let resp = dispatch_for_test(&state, req).await;

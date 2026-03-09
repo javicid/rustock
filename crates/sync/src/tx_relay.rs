@@ -22,7 +22,7 @@ impl TxRelay {
         Self {
             peer_store,
             seen: Mutex::new(LruCache::new(
-                NonZeroUsize::new(SEEN_CACHE_SIZE).unwrap(),
+                NonZeroUsize::new(SEEN_CACHE_SIZE).expect("SEEN_CACHE_SIZE is non-zero"),
             )),
         }
     }
@@ -32,7 +32,7 @@ impl TxRelay {
     }
 
     fn filter_new_txs(&self, txs: &[Bytes]) -> Vec<Bytes> {
-        let mut seen = self.seen.lock().unwrap();
+        let mut seen = self.seen.lock().expect("seen cache lock poisoned");
         let mut new_txs = Vec::new();
         for tx in txs {
             let hash = Self::tx_hash(tx);
@@ -48,7 +48,7 @@ impl TxRelay {
     pub async fn submit_transaction(&self, raw_tx: Bytes) -> B256 {
         let hash = Self::tx_hash(&raw_tx);
         {
-            let mut seen = self.seen.lock().unwrap();
+            let mut seen = self.seen.lock().expect("seen cache lock poisoned");
             seen.put(hash, ());
         }
 
@@ -62,10 +62,10 @@ impl TxRelay {
 }
 
 impl P2pHandler for TxRelay {
-    fn handle_message(&self, id: B512, msg: P2pMessage) -> Option<P2pMessage> {
+    fn handle_message(&self, id: B512, msg: &P2pMessage) -> Option<P2pMessage> {
         if let P2pMessage::RskMessage(m) = msg {
-            if let RskSubMessage::Transactions(txs) = m.sub_message {
-                let new_txs = self.filter_new_txs(&txs);
+            if let RskSubMessage::Transactions(txs) = &m.sub_message {
+                let new_txs = self.filter_new_txs(txs);
                 if new_txs.is_empty() {
                     trace!(from = %id, "All transactions already seen, skipping relay");
                     return None;

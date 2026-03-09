@@ -63,14 +63,10 @@ impl BlockStore {
             .context("Failed to write header")
     }
 
-    pub fn get_header(&self, hash: B256) -> Result<Option<Header>> {
+    pub fn header(&self, hash: B256) -> Result<Option<Header>> {
         let bytes = self.db.get_cf(self.cf(CF_HEADERS)?, hash.as_slice())
             .context("Failed to read header")?;
-            
-        match bytes {
-            Some(bytes) => Ok(Some(Header::decode(&mut bytes.as_slice())?)),
-            None => Ok(None),
-        }
+        bytes.map(|b| Header::decode(&mut b.as_slice()).map_err(Into::into)).transpose()
     }
 
     // --- Canonical Chain Operations ---
@@ -80,7 +76,7 @@ impl BlockStore {
             .context("Failed to map number to hash")
     }
 
-    pub fn get_canonical_hash(&self, number: u64) -> Result<Option<B256>> {
+    pub fn canonical_hash(&self, number: u64) -> Result<Option<B256>> {
         let bytes = self.db.get_cf(self.cf(CF_NUMBERS)?, number.to_be_bytes())
             .context("Failed to read canonical hash")?;
             
@@ -97,14 +93,10 @@ impl BlockStore {
             .context("Failed to write total difficulty")
     }
 
-    pub fn get_total_difficulty(&self, hash: B256) -> Result<Option<U256>> {
+    pub fn total_difficulty(&self, hash: B256) -> Result<Option<U256>> {
         let bytes = self.db.get_cf(self.cf(CF_TD)?, hash.as_slice())
             .context("Failed to read total difficulty")?;
-            
-        match bytes {
-            Some(bytes) => Ok(Some(U256::decode(&mut bytes.as_slice())?)),
-            None => Ok(None),
-        }
+        bytes.map(|b| U256::decode(&mut b.as_slice()).map_err(Into::into)).transpose()
     }
 
     /// Checks if a block header exists in the store by hash.
@@ -121,7 +113,7 @@ impl BlockStore {
             .context("Failed to set head")
     }
 
-    pub fn get_head(&self) -> Result<Option<B256>> {
+    pub fn head(&self) -> Result<Option<B256>> {
         let bytes = self.db.get(KEY_HEAD)
             .context("Failed to read head")?;
             
@@ -211,12 +203,12 @@ impl BlockStore {
         let mut depth: u64 = 0;
 
         loop {
-            let header = match self.get_header(hash)? {
+            let header = match self.header(hash)? {
                 Some(h) => h,
                 None => break, // parent not in store (e.g. pruned or pre-genesis)
             };
 
-            let existing = self.get_canonical_hash(header.number)?;
+            let existing = self.canonical_hash(header.number)?;
             if existing == Some(hash) {
                 break;
             }
@@ -263,8 +255,8 @@ impl BlockStore {
 
     /// Returns a header-only block. Body (transactions, ommers) storage is
     /// intentionally omitted — this is a light client that only tracks headers.
-    pub fn get_block(&self, hash: B256) -> Result<Option<Block>> {
-        self.get_header(hash).map(|opt| opt.map(|header| Block {
+    pub fn block(&self, hash: B256) -> Result<Option<Block>> {
+        self.header(hash).map(|opt| opt.map(|header| Block {
             header,
             transactions: vec![],
             ommers: vec![],
@@ -318,20 +310,20 @@ mod tests {
         store.put_header(&header).unwrap();
         
         // 2. Retrieve Header
-        let retrieved = store.get_header(hash).unwrap().unwrap();
+        let retrieved = store.header(hash).unwrap().unwrap();
         assert_eq!(header, retrieved);
 
         // 3. Set Canonical
         store.put_canonical_hash(1, hash).unwrap();
-        assert_eq!(store.get_canonical_hash(1).unwrap(), Some(hash));
+        assert_eq!(store.canonical_hash(1).unwrap(), Some(hash));
 
         // 4. Set Head
         store.set_head(hash).unwrap();
-        assert_eq!(store.get_head().unwrap(), Some(hash));
+        assert_eq!(store.head().unwrap(), Some(hash));
 
         // 5. Total Difficulty
         store.put_total_difficulty(hash, U256::from(100)).unwrap();
-        assert_eq!(store.get_total_difficulty(hash).unwrap(), Some(U256::from(100)));
+        assert_eq!(store.total_difficulty(hash).unwrap(), Some(U256::from(100)));
     }
 
     #[test]
@@ -345,10 +337,10 @@ mod tests {
         store.update_head(&header, td).unwrap();
 
         // Verify everything was set
-        assert_eq!(store.get_header(hash).unwrap().unwrap(), header);
-        assert_eq!(store.get_canonical_hash(100).unwrap(), Some(hash));
-        assert_eq!(store.get_total_difficulty(hash).unwrap(), Some(td));
-        assert_eq!(store.get_head().unwrap(), Some(hash));
+        assert_eq!(store.header(hash).unwrap().unwrap(), header);
+        assert_eq!(store.canonical_hash(100).unwrap(), Some(hash));
+        assert_eq!(store.total_difficulty(hash).unwrap(), Some(td));
+        assert_eq!(store.head().unwrap(), Some(hash));
     }
 
     #[test]
@@ -360,8 +352,8 @@ mod tests {
 
         store.put_header_with_hash(custom_hash, &header).unwrap();
 
-        assert!(store.get_header(custom_hash).unwrap().is_some());
-        assert!(store.get_header(header.hash()).unwrap().is_none());
+        assert!(store.header(custom_hash).unwrap().is_some());
+        assert!(store.header(header.hash()).unwrap().is_none());
     }
 
     #[test]
@@ -386,8 +378,8 @@ mod tests {
         store.put_header_with_hash(known_hash, &genesis).unwrap();
         store.put_total_difficulty(known_hash, td).unwrap();
 
-        assert_eq!(store.get_header(known_hash).unwrap().unwrap(), genesis);
-        assert_eq!(store.get_total_difficulty(known_hash).unwrap(), Some(td));
+        assert_eq!(store.header(known_hash).unwrap().unwrap(), genesis);
+        assert_eq!(store.total_difficulty(known_hash).unwrap(), Some(td));
     }
 
     // --- store_headers_batch tests ---
@@ -424,10 +416,10 @@ mod tests {
 
         // TD(10) > current TD(0), so head should be updated
         assert_eq!(new_head, Some(h.hash()));
-        assert!(store.get_header(h.hash()).unwrap().is_some());
-        assert_eq!(store.get_total_difficulty(h.hash()).unwrap(), Some(td));
-        assert_eq!(store.get_head().unwrap(), Some(h.hash()));
-        assert_eq!(store.get_canonical_hash(1).unwrap(), Some(h.hash()));
+        assert!(store.header(h.hash()).unwrap().is_some());
+        assert_eq!(store.total_difficulty(h.hash()).unwrap(), Some(td));
+        assert_eq!(store.head().unwrap(), Some(h.hash()));
+        assert_eq!(store.canonical_hash(1).unwrap(), Some(h.hash()));
     }
 
     #[test]
@@ -450,17 +442,17 @@ mod tests {
 
         // h3 has the highest TD, so it should be the head
         assert_eq!(new_head, Some(h3.hash()));
-        assert_eq!(store.get_head().unwrap(), Some(h3.hash()));
-        assert_eq!(store.get_canonical_hash(3).unwrap(), Some(h3.hash()));
+        assert_eq!(store.head().unwrap(), Some(h3.hash()));
+        assert_eq!(store.canonical_hash(3).unwrap(), Some(h3.hash()));
 
         // All headers should be retrievable
-        assert!(store.get_header(h1.hash()).unwrap().is_some());
-        assert!(store.get_header(h2.hash()).unwrap().is_some());
-        assert!(store.get_header(h3.hash()).unwrap().is_some());
+        assert!(store.header(h1.hash()).unwrap().is_some());
+        assert!(store.header(h2.hash()).unwrap().is_some());
+        assert!(store.header(h3.hash()).unwrap().is_some());
 
         // All TDs should be stored
-        assert_eq!(store.get_total_difficulty(h1.hash()).unwrap(), Some(U256::from(5)));
-        assert_eq!(store.get_total_difficulty(h3.hash()).unwrap(), Some(U256::from(15)));
+        assert_eq!(store.total_difficulty(h1.hash()).unwrap(), Some(U256::from(5)));
+        assert_eq!(store.total_difficulty(h3.hash()).unwrap(), Some(U256::from(15)));
     }
 
     #[test]
@@ -483,11 +475,11 @@ mod tests {
 
         // Head should remain unchanged
         assert_eq!(result, Some(existing_hash));
-        assert_eq!(store.get_head().unwrap(), Some(existing_hash));
+        assert_eq!(store.head().unwrap(), Some(existing_hash));
 
         // But the header should still be stored
-        assert!(store.get_header(h.hash()).unwrap().is_some());
-        assert_eq!(store.get_total_difficulty(h.hash()).unwrap(), Some(U256::from(5)));
+        assert!(store.header(h.hash()).unwrap().is_some());
+        assert_eq!(store.total_difficulty(h.hash()).unwrap(), Some(U256::from(5)));
     }
 
     // --- Reorg / canonical chain tests ---
@@ -537,7 +529,7 @@ mod tests {
         // Main chain: genesis -> 1A -> 2A -> 3A (difficulty 10 each, TD: 10, 20, 30, 40)
         let chain_a = build_and_store_chain(&store, 4, 10, 0xAA);
         let head_a = chain_a.last().unwrap().0.hash();
-        assert_eq!(store.get_head().unwrap(), Some(head_a));
+        assert_eq!(store.head().unwrap(), Some(head_a));
 
         // Fork chain: same genesis -> 1B -> 2B -> 3B (difficulty 20 each, higher TD)
         let genesis = &chain_a[0];
@@ -561,17 +553,17 @@ mod tests {
 
         // Fork B has higher TD (70 vs 40), so head should switch
         assert_eq!(result, Some(b3.hash()));
-        assert_eq!(store.get_head().unwrap(), Some(b3.hash()));
+        assert_eq!(store.head().unwrap(), Some(b3.hash()));
 
         // Canonical chain should now point to fork B
-        assert_eq!(store.get_canonical_hash(0).unwrap(), Some(genesis.0.hash())); // common ancestor
-        assert_eq!(store.get_canonical_hash(1).unwrap(), Some(b1.hash()));
-        assert_eq!(store.get_canonical_hash(2).unwrap(), Some(b2.hash()));
-        assert_eq!(store.get_canonical_hash(3).unwrap(), Some(b3.hash()));
+        assert_eq!(store.canonical_hash(0).unwrap(), Some(genesis.0.hash())); // common ancestor
+        assert_eq!(store.canonical_hash(1).unwrap(), Some(b1.hash()));
+        assert_eq!(store.canonical_hash(2).unwrap(), Some(b2.hash()));
+        assert_eq!(store.canonical_hash(3).unwrap(), Some(b3.hash()));
 
         // Old fork A headers should still be retrievable by hash
-        assert!(store.get_header(chain_a[1].0.hash()).unwrap().is_some());
-        assert!(store.get_header(chain_a[2].0.hash()).unwrap().is_some());
+        assert!(store.header(chain_a[1].0.hash()).unwrap().is_some());
+        assert!(store.header(chain_a[2].0.hash()).unwrap().is_some());
     }
 
     #[test]
@@ -601,17 +593,17 @@ mod tests {
 
         // Head should NOT change (fork B has lower TD)
         assert_eq!(result, Some(head_a));
-        assert_eq!(store.get_head().unwrap(), Some(head_a));
+        assert_eq!(store.head().unwrap(), Some(head_a));
 
         // Canonical chain must still point to fork A
-        assert_eq!(store.get_canonical_hash(1).unwrap(), Some(chain_a[1].0.hash()));
-        assert_eq!(store.get_canonical_hash(2).unwrap(), Some(chain_a[2].0.hash()));
-        assert_eq!(store.get_canonical_hash(3).unwrap(), Some(chain_a[3].0.hash()));
+        assert_eq!(store.canonical_hash(1).unwrap(), Some(chain_a[1].0.hash()));
+        assert_eq!(store.canonical_hash(2).unwrap(), Some(chain_a[2].0.hash()));
+        assert_eq!(store.canonical_hash(3).unwrap(), Some(chain_a[3].0.hash()));
 
         // Fork B headers should still be stored (keyed by hash)
-        assert!(store.get_header(b1.hash()).unwrap().is_some());
-        assert!(store.get_header(b2.hash()).unwrap().is_some());
-        assert!(store.get_header(b3.hash()).unwrap().is_some());
+        assert!(store.header(b1.hash()).unwrap().is_some());
+        assert!(store.header(b2.hash()).unwrap().is_some());
+        assert!(store.header(b3.hash()).unwrap().is_some());
     }
 
     #[test]
@@ -636,13 +628,13 @@ mod tests {
 
         // Head should advance
         assert_eq!(result, Some(b3.hash()));
-        assert_eq!(store.get_head().unwrap(), Some(b3.hash()));
+        assert_eq!(store.head().unwrap(), Some(b3.hash()));
 
         // All canonical pointers should be correct
-        assert_eq!(store.get_canonical_hash(0).unwrap(), Some(chain[0].0.hash()));
-        assert_eq!(store.get_canonical_hash(1).unwrap(), Some(chain[1].0.hash()));
-        assert_eq!(store.get_canonical_hash(2).unwrap(), Some(chain[2].0.hash()));
-        assert_eq!(store.get_canonical_hash(3).unwrap(), Some(b3.hash()));
+        assert_eq!(store.canonical_hash(0).unwrap(), Some(chain[0].0.hash()));
+        assert_eq!(store.canonical_hash(1).unwrap(), Some(chain[1].0.hash()));
+        assert_eq!(store.canonical_hash(2).unwrap(), Some(chain[2].0.hash()));
+        assert_eq!(store.canonical_hash(3).unwrap(), Some(b3.hash()));
     }
 
     #[test]
@@ -660,10 +652,10 @@ mod tests {
         // update_canonical_chain should write canonical for block 3 and stop
         store.update_canonical_chain(b3.hash()).unwrap();
 
-        assert_eq!(store.get_head().unwrap(), Some(b3.hash()));
-        assert_eq!(store.get_canonical_hash(3).unwrap(), Some(b3.hash()));
+        assert_eq!(store.head().unwrap(), Some(b3.hash()));
+        assert_eq!(store.canonical_hash(3).unwrap(), Some(b3.hash()));
         // Previous canonical entries untouched
-        assert_eq!(store.get_canonical_hash(2).unwrap(), Some(head.0.hash()));
+        assert_eq!(store.canonical_hash(2).unwrap(), Some(head.0.hash()));
     }
 
     #[test]
@@ -695,11 +687,11 @@ mod tests {
 
         let fork_head = fork_entries.last().unwrap();
         assert_eq!(result, Some(fork_head.0.hash()));
-        assert_eq!(store.get_head().unwrap(), Some(fork_head.0.hash()));
+        assert_eq!(store.head().unwrap(), Some(fork_head.0.hash()));
 
         // Canonical should follow fork B from block 3 onward
-        assert_eq!(store.get_canonical_hash(2).unwrap(), Some(chain_a[2].0.hash())); // common ancestor
-        assert_eq!(store.get_canonical_hash(3).unwrap(), Some(fork_entries[0].0.hash()));
-        assert_eq!(store.get_canonical_hash(7).unwrap(), Some(fork_entries[4].0.hash()));
+        assert_eq!(store.canonical_hash(2).unwrap(), Some(chain_a[2].0.hash())); // common ancestor
+        assert_eq!(store.canonical_hash(3).unwrap(), Some(fork_entries[0].0.hash()));
+        assert_eq!(store.canonical_hash(7).unwrap(), Some(fork_entries[4].0.hash()));
     }
 }

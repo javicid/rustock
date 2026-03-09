@@ -148,5 +148,5 @@ pub struct PeerInfo {
 pub const P2P_VERSION: u64 = 5;
 
 pub trait P2pHandler: Send + Sync {
-    fn handle_message(&self, id: B512, msg: P2pMessage) -> Option<P2pMessage>;
+    fn handle_message(&self, id: B512, msg: &P2pMessage) -> Option<P2pMessage>;
 }

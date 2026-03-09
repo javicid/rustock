@@ -22,7 +22,7 @@ pub fn rsk_get_raw_block_header_by_hash(
         None => return JsonRpcResponse::error(id, INVALID_PARAMS, "Invalid block hash"),
     };
 
-    match store.get_header(hash) {
+    match store.header(hash) {
         Ok(Some(header)) => {
             let mut buf = Vec::new();
             header.encode(&mut buf);
@@ -43,10 +43,10 @@ pub fn rsk_get_raw_block_header_by_number(
     };
 
     let head_num = store
-        .get_head()
+        .head()
         .ok()
         .flatten()
-        .and_then(|h| store.get_header(h).ok().flatten())
+        .and_then(|h| store.header(h).ok().flatten())
         .map(|h| h.number)
         .unwrap_or(0);
 
@@ -55,12 +55,12 @@ pub fn rsk_get_raw_block_header_by_number(
         None => return JsonRpcResponse::error(id, INVALID_PARAMS, "Invalid block number"),
     };
 
-    let hash = match store.get_canonical_hash(number) {
+    let hash = match store.canonical_hash(number) {
         Ok(Some(h)) => h,
         _ => return JsonRpcResponse::success(id, Value::Null),
     };
 
-    match store.get_header(hash) {
+    match store.header(hash) {
         Ok(Some(header)) => {
             let mut buf = Vec::new();
             header.encode(&mut buf);

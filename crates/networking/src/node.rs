@@ -57,13 +57,13 @@ impl Node {
     }
 
     /// Initializes the discovery node table, loading persisted nodes and bootnodes.
-    async fn init_discovery_table(&self) -> Arc<tokio::sync::Mutex<crate::discovery::table::NodeTable>> {
-        let table = Arc::new(tokio::sync::Mutex::from(
+    async fn init_discovery_table(&self) -> Arc<tokio::sync::RwLock<crate::discovery::table::NodeTable>> {
+        let table = Arc::new(tokio::sync::RwLock::new(
             crate::discovery::table::NodeTable::new(self.config.id),
         ));
         let discovery_path = std::path::Path::new(&self.config.data_dir).join("discovery.rlp");
 
-        let mut table_lock = table.lock().await;
+        let mut table_lock = table.write().await;
         if discovery_path.exists() {
             match tokio::fs::read(&discovery_path).await {
                 Ok(data) => {
@@ -88,7 +88,7 @@ impl Node {
     /// Starts the UDP discovery service and returns the shared table handle.
     async fn start_discovery(
         &self,
-        table: Arc<tokio::sync::Mutex<crate::discovery::table::NodeTable>>,
+        table: Arc<tokio::sync::RwLock<crate::discovery::table::NodeTable>>,
     ) -> Result<()> {
         let signing_key = k256::ecdsa::SigningKey::from_slice(&self.config.secret_key)
             .context("Invalid secret key")?;
@@ -121,14 +121,14 @@ impl Node {
     /// Spawns a background task that periodically persists the discovery table.
     fn start_table_persistence(
         &self,
-        table: Arc<tokio::sync::Mutex<crate::discovery::table::NodeTable>>,
+        table: Arc<tokio::sync::RwLock<crate::discovery::table::NodeTable>>,
     ) {
         let discovery_path = std::path::Path::new(&self.config.data_dir)
             .join("discovery.rlp");
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-                let data = table.lock().await.encode();
+                let data = table.read().await.encode();
                 if let Err(e) = tokio::fs::write(&discovery_path, data).await {
                     error!(target: "rustock::net", "Failed to save discovery table: {:?}", e);
                 }
@@ -293,7 +293,7 @@ mod tests {
 
     struct PingHandler;
     impl crate::protocol::P2pHandler for PingHandler {
-        fn handle_message(&self, _id: alloy_primitives::B512, msg: crate::protocol::P2pMessage) -> Option<crate::protocol::P2pMessage> {
+        fn handle_message(&self, _id: alloy_primitives::B512, msg: &crate::protocol::P2pMessage) -> Option<crate::protocol::P2pMessage> {
             if let crate::protocol::P2pMessage::Ping = msg {
                 Some(crate::protocol::P2pMessage::Pong)
             } else {
@@ -305,10 +305,10 @@ mod tests {
     #[test]
     fn test_handler_logic() {
         let handler = PingHandler;
-        let response = handler.handle_message(alloy_primitives::B512::ZERO, crate::protocol::P2pMessage::Ping);
+        let response = handler.handle_message(alloy_primitives::B512::ZERO, &crate::protocol::P2pMessage::Ping);
         assert!(matches!(response, Some(crate::protocol::P2pMessage::Pong)));
         
-        let response = handler.handle_message(alloy_primitives::B512::ZERO, crate::protocol::P2pMessage::Pong);
+        let response = handler.handle_message(alloy_primitives::B512::ZERO, &crate::protocol::P2pMessage::Pong);
         assert!(response.is_none());
     }
 

@@ -12,7 +12,7 @@ use k256::ecdsa::SigningKey;
 use anyhow::Result;
 use std::collections::HashSet;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{info, debug, trace, warn, error};
 
 /// Service for node discovery using UDP based on RSK protocol.
@@ -30,7 +30,7 @@ use tracing::{info, debug, trace, warn, error};
 pub struct DiscoveryService {
     socket: UdpSocket,
     key: SigningKey,
-    table: Arc<Mutex<NodeTable>>,
+    table: Arc<RwLock<NodeTable>>,
     /// Peers that have completed the bonding handshake (received their Ping,
     /// sent our Pong). Stored as socket addresses since we might not know
     /// the node ID at discovery time.
@@ -43,7 +43,7 @@ impl DiscoveryService {
     pub async fn new(
         listen_addr: &str,
         key: SigningKey,
-        table: Arc<Mutex<NodeTable>>,
+        table: Arc<RwLock<NodeTable>>,
         network_id: u32,
         local_node: DiscoveryNode,
     ) -> Result<Self> {
@@ -82,7 +82,7 @@ impl DiscoveryService {
 
         // Background discovery loop
         loop {
-            let nodes = self.table.lock().await.get_all_nodes();
+            let nodes = self.table.read().await.all_nodes();
             let bonded = self.bonded.lock().await;
 
             trace!(
@@ -154,7 +154,7 @@ impl DiscoveryService {
                     tcp_port: ping.from.tcp_port,
                     id: packet.recover_id()?,
                 };
-                self.table.lock().await.add_node(node);
+                self.table.write().await.add_node(node);
 
                 // Mark this peer as bonded — we replied with Pong, so the
                 // remote will accept our FindNode after processing our Pong.
@@ -178,7 +178,7 @@ impl DiscoveryService {
             }
             DiscoveryPayload::FindNode(find) => {
                 trace!(target: "rustock::discovery", "Received FindNode from {}", addr);
-                let closest = self.table.lock().await.get_closest_nodes(&find.target, 16);
+                let closest = self.table.read().await.closest_nodes(&find.target, 16);
                 self.send_neighbors(find.message_id.clone(), closest, addr).await?;
             }
             DiscoveryPayload::Neighbors(neighbors) => {
@@ -188,7 +188,7 @@ impl DiscoveryService {
                     neighbors.nodes.len(),
                     addr
                 );
-                let mut table = self.table.lock().await;
+                let mut table = self.table.write().await;
                 for node in &neighbors.nodes {
                     table.add_node(node.clone());
                 }

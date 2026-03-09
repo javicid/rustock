@@ -17,7 +17,7 @@ pub fn eth_chain_id(id: Value, config: &ChainConfig) -> JsonRpcResponse {
 }
 
 pub fn eth_block_number(id: Value, store: &BlockStore) -> JsonRpcResponse {
-    match get_head_number(store) {
+    match head_number(store) {
         Some(n) => JsonRpcResponse::success(id, json!(to_hex_u64(n))),
         None => JsonRpcResponse::error(id, INTERNAL_ERROR, "No head block"),
     }
@@ -28,8 +28,8 @@ pub async fn eth_syncing(
     store: &BlockStore,
     peer_store: &rustock_networking::peers::PeerStore,
 ) -> JsonRpcResponse {
-    let current = get_head_number(store).unwrap_or(0);
-    let best_peer = peer_store.get_best_peer().await;
+    let current = head_number(store).unwrap_or(0);
+    let best_peer = peer_store.best_peer().await;
 
     match best_peer {
         Some((_, meta)) if meta.best_number > current => {
@@ -47,7 +47,7 @@ pub async fn eth_syncing(
 }
 
 pub fn eth_gas_price(id: Value, store: &BlockStore) -> JsonRpcResponse {
-    let price = get_head_header(store)
+    let price = head_header(store)
         .map(|h| to_hex_u256(&h.minimum_gas_price))
         .unwrap_or_else(|| "0x0".to_string());
     JsonRpcResponse::success(id, json!(price))
@@ -74,13 +74,8 @@ pub fn eth_get_block_by_hash(
     params: &Value,
     store: &BlockStore,
 ) -> JsonRpcResponse {
-    let hash_str = match params.get(0).and_then(|v| v.as_str()) {
-        Some(s) => s,
-        None => return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing block hash parameter"),
-    };
-    let hash = match parse_b256(hash_str) {
-        Some(h) => h,
-        None => return JsonRpcResponse::error(id, INVALID_PARAMS, "Invalid block hash"),
+    let Some(hash) = params.get(0).and_then(|v| v.as_str()).and_then(parse_b256) else {
+        return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid block hash");
     };
 
     match build_block_dto(store, hash) {
@@ -94,17 +89,15 @@ pub fn eth_get_block_by_number(
     params: &Value,
     store: &BlockStore,
 ) -> JsonRpcResponse {
-    let bn_str = match params.get(0).and_then(|v| v.as_str()) {
-        Some(s) => s,
-        None => return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing block number parameter"),
+    let Some(bn_str) = params.get(0).and_then(|v| v.as_str()) else {
+        return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing block number parameter");
     };
-    let head_num = get_head_number(store).unwrap_or(0);
-    let number = match parse_block_number(bn_str, head_num) {
-        Some(n) => n,
-        None => return JsonRpcResponse::error(id, INVALID_PARAMS, "Invalid block number"),
+    let head_num = head_number(store).unwrap_or(0);
+    let Some(number) = parse_block_number(bn_str, head_num) else {
+        return JsonRpcResponse::error(id, INVALID_PARAMS, "Invalid block number");
     };
 
-    let hash = match store.get_canonical_hash(number) {
+    let hash = match store.canonical_hash(number) {
         Ok(Some(h)) => h,
         _ => return JsonRpcResponse::success(id, Value::Null),
     };
@@ -116,13 +109,8 @@ pub fn eth_get_block_by_number(
 }
 
 pub fn eth_get_block_transaction_count_by_hash(id: Value, params: &Value, store: &BlockStore) -> JsonRpcResponse {
-    let hash_str = match params.get(0).and_then(|v| v.as_str()) {
-        Some(s) => s,
-        None => return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing block hash"),
-    };
-    let hash = match parse_b256(hash_str) {
-        Some(h) => h,
-        None => return JsonRpcResponse::error(id, INVALID_PARAMS, "Invalid block hash"),
+    let Some(hash) = params.get(0).and_then(|v| v.as_str()).and_then(parse_b256) else {
+        return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid block hash");
     };
     match store.has_block(hash) {
         Ok(true) => JsonRpcResponse::success(id, json!("0x0")),
@@ -131,51 +119,42 @@ pub fn eth_get_block_transaction_count_by_hash(id: Value, params: &Value, store:
 }
 
 pub fn eth_get_block_transaction_count_by_number(id: Value, params: &Value, store: &BlockStore) -> JsonRpcResponse {
-    let bn_str = match params.get(0).and_then(|v| v.as_str()) {
-        Some(s) => s,
-        None => return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing block number"),
+    let Some(bn_str) = params.get(0).and_then(|v| v.as_str()) else {
+        return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing block number");
     };
-    let head_num = get_head_number(store).unwrap_or(0);
-    let number = match parse_block_number(bn_str, head_num) {
-        Some(n) => n,
-        None => return JsonRpcResponse::error(id, INVALID_PARAMS, "Invalid block number"),
+    let head_num = head_number(store).unwrap_or(0);
+    let Some(number) = parse_block_number(bn_str, head_num) else {
+        return JsonRpcResponse::error(id, INVALID_PARAMS, "Invalid block number");
     };
-    match store.get_canonical_hash(number) {
+    match store.canonical_hash(number) {
         Ok(Some(_)) => JsonRpcResponse::success(id, json!("0x0")),
         _ => JsonRpcResponse::success(id, Value::Null),
     }
 }
 
 pub fn eth_get_uncle_count_by_block_hash(id: Value, params: &Value, store: &BlockStore) -> JsonRpcResponse {
-    let hash_str = match params.get(0).and_then(|v| v.as_str()) {
-        Some(s) => s,
-        None => return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing block hash"),
+    let Some(hash) = params.get(0).and_then(|v| v.as_str()).and_then(parse_b256) else {
+        return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid block hash");
     };
-    let hash = match parse_b256(hash_str) {
-        Some(h) => h,
-        None => return JsonRpcResponse::error(id, INVALID_PARAMS, "Invalid block hash"),
-    };
-    match store.get_header(hash) {
+    match store.header(hash) {
         Ok(Some(h)) => JsonRpcResponse::success(id, json!(to_hex_u64(h.uncle_count))),
         _ => JsonRpcResponse::success(id, Value::Null),
     }
 }
 
 pub fn eth_get_uncle_count_by_block_number(id: Value, params: &Value, store: &BlockStore) -> JsonRpcResponse {
-    let bn_str = match params.get(0).and_then(|v| v.as_str()) {
-        Some(s) => s,
-        None => return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing block number"),
+    let Some(bn_str) = params.get(0).and_then(|v| v.as_str()) else {
+        return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing block number");
     };
-    let head_num = get_head_number(store).unwrap_or(0);
-    let number = match parse_block_number(bn_str, head_num) {
-        Some(n) => n,
-        None => return JsonRpcResponse::error(id, INVALID_PARAMS, "Invalid block number"),
+    let head_num = head_number(store).unwrap_or(0);
+    let Some(number) = parse_block_number(bn_str, head_num) else {
+        return JsonRpcResponse::error(id, INVALID_PARAMS, "Invalid block number");
     };
-    let hash = match store.get_canonical_hash(number) {
+    let hash = match store.canonical_hash(number) {
         Ok(Some(h)) => h,
         _ => return JsonRpcResponse::success(id, Value::Null),
     };
-    match store.get_header(hash) {
+    match store.header(hash) {
         Ok(Some(h)) => JsonRpcResponse::success(id, json!(to_hex_u64(h.uncle_count))),
         _ => JsonRpcResponse::success(id, Value::Null),
     }
@@ -183,23 +162,23 @@ pub fn eth_get_uncle_count_by_block_number(id: Value, params: &Value, store: &Bl
 
 // -- internal helpers --------------------------------------------------------
 
-fn get_head_number(store: &BlockStore) -> Option<u64> {
-    store.get_head().ok()?
-        .and_then(|h| store.get_header(h).ok().flatten())
+fn head_number(store: &BlockStore) -> Option<u64> {
+    store.head().ok()?
+        .and_then(|h| store.header(h).ok().flatten())
         .map(|h| h.number)
 }
 
-fn get_head_header(store: &BlockStore) -> Option<rustock_core::types::header::Header> {
-    store.get_head().ok()?
-        .and_then(|h| store.get_header(h).ok().flatten())
+fn head_header(store: &BlockStore) -> Option<rustock_core::types::header::Header> {
+    store.head().ok()?
+        .and_then(|h| store.header(h).ok().flatten())
 }
 
 fn build_block_dto(
     store: &BlockStore,
     hash: alloy_primitives::B256,
 ) -> Option<BlockResultDto> {
-    let header = store.get_header(hash).ok()??;
-    let td = store.get_total_difficulty(hash).ok()?.unwrap_or_default();
+    let header = store.header(hash).ok()??;
+    let td = store.total_difficulty(hash).ok()?.unwrap_or_default();
     Some(BlockResultDto::from_header(&header, hash, td))
 }
 
@@ -208,30 +187,17 @@ pub async fn eth_send_raw_transaction(
     params: &Value,
     tx_submitter: &Option<Arc<dyn TxSubmitter>>,
 ) -> JsonRpcResponse {
-    let submitter = match tx_submitter {
-        Some(s) => s,
-        None => {
-            return JsonRpcResponse::error(
-                id,
-                METHOD_NOT_FOUND,
-                "Transaction relay not available",
-            );
-        }
+    let Some(submitter) = tx_submitter else {
+        return JsonRpcResponse::error(id, METHOD_NOT_FOUND, "Transaction relay not available");
     };
 
-    let raw_hex = match params.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()) {
-        Some(s) => s,
-        None => {
-            return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing raw transaction hex");
-        }
+    let Some(raw_hex) = params.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()) else {
+        return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing raw transaction hex");
     };
 
     let raw_hex = raw_hex.strip_prefix("0x").unwrap_or(raw_hex);
-    let raw_bytes = match hex::decode(raw_hex) {
-        Ok(b) => b,
-        Err(_) => {
-            return JsonRpcResponse::error(id, INVALID_PARAMS, "Invalid hex");
-        }
+    let Ok(raw_bytes) = hex::decode(raw_hex) else {
+        return JsonRpcResponse::error(id, INVALID_PARAMS, "Invalid hex");
     };
 
     let tx_hash = submitter

@@ -2,14 +2,14 @@ use super::*;
 use k256::ecdsa::SigningKey;
 use alloy_primitives::{B512, Bytes};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use crate::discovery::message::{DiscoveryNode, DiscoveryPayload, DiscoveryPacket};
 
 #[tokio::test]
 async fn test_discovery_service_interaction() {
     let key1 = SigningKey::from_slice(&[0x01; 32]).unwrap();
     let id1 = B512::from_slice(&key1.verifying_key().to_encoded_point(false).as_bytes()[1..]);
-    let table1 = Arc::new(Mutex::new(NodeTable::new(id1)));
+    let table1 = Arc::new(RwLock::new(NodeTable::new(id1)));
     let local_node1 = DiscoveryNode {
         ip: Bytes::from(vec![127, 0, 0, 1]),
         udp_port: 0,
@@ -25,11 +25,11 @@ async fn test_discovery_service_interaction() {
 
     let key2 = SigningKey::from_slice(&[0x02; 32]).unwrap();
     let id2 = B512::from_slice(&key2.verifying_key().to_encoded_point(false).as_bytes()[1..]);
-    let table2 = Arc::new(Mutex::new(NodeTable::new(id2)));
+    let table2 = Arc::new(RwLock::new(NodeTable::new(id2)));
 
     // Pre-populate table2 with a fake node so Neighbors will be non-empty
     let fake_id = B512::repeat_byte(0xAA);
-    table2.lock().await.add_node(DiscoveryNode {
+    table2.write().await.add_node(DiscoveryNode {
         ip: Bytes::from(vec![10, 0, 0, 1]),
         udp_port: 5050,
         tcp_port: 5050,
@@ -59,8 +59,8 @@ async fn test_discovery_service_interaction() {
 
     // Verify service 1 added service 2 to its table and bonded
     {
-        let table = table1.lock().await;
-        assert!(table.get_all_nodes().iter().any(|n| n.id == id2));
+        let table = table1.read().await;
+        assert!(table.all_nodes().iter().any(|n| n.id == id2));
     }
     assert!(service1.bonded.lock().await.contains(&addr));
 
@@ -95,9 +95,9 @@ async fn test_discovery_service_interaction() {
     // Verify service1 adds the neighbor to its table
     service1.handle_packet(&buf[..n], _addr).await.unwrap();
     {
-        let table = table1.lock().await;
+        let table = table1.read().await;
         assert!(
-            table.get_all_nodes().iter().any(|n| n.id == fake_id),
+            table.all_nodes().iter().any(|n| n.id == fake_id),
             "Service 1 should have learned about the fake node via Neighbors"
         );
     }

@@ -41,12 +41,12 @@ impl SyncHandler {
         let count = count.min(MAX_HEADERS_SERVE);
         let store = &self.manager.store;
 
-        let first = store.get_header(hash).ok()??;
+        let first = store.header(hash).ok()??;
         let mut headers = vec![first.clone()];
         let mut current = first;
 
         for _ in 1..count {
-            match store.get_header(current.parent_hash) {
+            match store.header(current.parent_hash) {
                 Ok(Some(parent)) => {
                     current = parent.clone();
                     headers.push(parent);
@@ -80,7 +80,7 @@ impl SyncHandler {
         if height == 0 {
             return None;
         }
-        let hash = self.manager.store.get_canonical_hash(height).ok()??;
+        let hash = self.manager.store.canonical_hash(height).ok()??;
         trace!(
             target: "rustock::sync",
             "Serving block hash for height #{}: {:?}",
@@ -105,12 +105,12 @@ impl SyncHandler {
         let store = &self.manager.store;
 
         // Verify we have the starting block
-        store.get_canonical_hash(start_number).ok()??;
+        store.canonical_hash(start_number).ok()??;
 
         let best_number = store
-            .get_head()
+            .head()
             .ok()?
-            .and_then(|h| store.get_header(h).ok()?)
+            .and_then(|h| store.header(h).ok()?)
             .map(|h| h.number)?;
 
         let skeleton_start = (start_number / SKELETON_STEP) * SKELETON_STEP;
@@ -121,7 +121,7 @@ impl SyncHandler {
         let mut identifiers = Vec::new();
         let mut n = skeleton_start;
         while n < max_skeleton_number {
-            if let Ok(Some(hash)) = store.get_canonical_hash(n) {
+            if let Ok(Some(hash)) = store.canonical_hash(n) {
                 identifiers.push(BlockIdentifier { hash, number: n });
             }
             n += SKELETON_STEP;
@@ -129,7 +129,7 @@ impl SyncHandler {
 
         // Always include the best block (or the last skeleton point if equal)
         let last_number = best_number.min(n);
-        if let Ok(Some(hash)) = store.get_canonical_hash(last_number) {
+        if let Ok(Some(hash)) = store.canonical_hash(last_number) {
             if identifiers.last().map_or(true, |last| last.number != last_number) {
                 identifiers.push(BlockIdentifier {
                     hash,
@@ -161,9 +161,9 @@ impl SyncHandler {
 }
 
 impl P2pHandler for SyncHandler {
-    fn handle_message(&self, id: B512, msg: P2pMessage) -> Option<P2pMessage> {
+    fn handle_message(&self, id: B512, msg: &P2pMessage) -> Option<P2pMessage> {
         if let P2pMessage::RskMessage(m) = msg {
-            match m.sub_message {
+            match &m.sub_message {
                 RskSubMessage::Status(s) => {
                     trace!(
                         target: "rustock::sync",
@@ -192,19 +192,19 @@ impl P2pHandler for SyncHandler {
                 RskSubMessage::SkeletonResponse(r) => {
                     let _ = self.event_tx.send(SyncEvent::SkeletonResponse {
                         peer: id,
-                        identifiers: r.block_identifiers,
+                        identifiers: r.block_identifiers.clone(),
                     });
                 }
                 RskSubMessage::BlockHeadersResponse(r) => {
                     let _ = self.event_tx.send(SyncEvent::HeadersResponse {
                         peer: id,
-                        headers: r.headers,
+                        headers: r.headers.clone(),
                     });
                 }
                 RskSubMessage::NewBlockHashes(blocks) => {
                     let _ = self.event_tx.send(SyncEvent::NewBlockHashes {
                         peer: id,
-                        identifiers: blocks,
+                        identifiers: blocks.clone(),
                     });
                 }
 

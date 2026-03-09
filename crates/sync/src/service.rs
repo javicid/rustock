@@ -149,17 +149,17 @@ impl SyncService {
     /// Small gaps (<= LONG_SYNC_LIMIT) enter Following mode;
     /// large gaps use skeleton sync.
     pub(crate) async fn try_start_sync(&mut self) {
-        let best_peer = self.peer_store.get_best_peer().await;
+        let best_peer = self.peer_store.best_peer().await;
         let (peer_id, metadata) = match best_peer {
             Some(p) => p,
             None => return,
         };
 
-        let head_hash = match self.manager.store.get_head().ok().flatten() {
+        let head_hash = match self.manager.store.head().ok().flatten() {
             Some(h) => h,
             None => return,
         };
-        let head = match self.manager.store.get_header(head_hash).ok().flatten() {
+        let head = match self.manager.store.header(head_hash).ok().flatten() {
             Some(h) => h,
             None => return,
         };
@@ -262,7 +262,7 @@ impl SyncService {
             ..
         } = &mut self.state
         {
-            let peers = self.peer_store.get_peers().await;
+            let peers = self.peer_store.peers().await;
             if peers.is_empty() {
                 return;
             }
@@ -307,7 +307,7 @@ impl SyncService {
                 && pending_next_skeleton.is_none()
             {
                 let last_height = skeleton.last().map(|b| b.number).unwrap_or(0);
-                if let Some(peer) = self.peer_store.get_peers().await.first() {
+                if let Some(peer) = self.peer_store.peers().await.first() {
                     debug!(
                         target: "rustock::sync",
                         "Pre-fetching next skeleton from #{}",
@@ -560,7 +560,7 @@ impl SyncService {
                             our_height, peer_best
                         );
                         // Pick the best available peer for the next skeleton
-                        let next_peer = self.peer_store.get_best_peer().await
+                        let next_peer = self.peer_store.best_peer().await
                             .map(|(id, _)| id)
                             .unwrap_or(peer);
                         self.state = SyncState::DownloadingSkeleton {
@@ -590,11 +590,11 @@ impl SyncService {
                 let is_following = matches!(other, SyncState::Following);
                 self.state = other;
                 let before_height = self.our_head_number();
-                let before_hash = self.manager.store.get_head().ok().flatten();
+                let before_hash = self.manager.store.head().ok().flatten();
                 let _ = self.manager.handle_headers_response(headers);
                 if is_following {
                     let after_height = self.our_head_number();
-                    let after_hash = self.manager.store.get_head().ok().flatten();
+                    let after_hash = self.manager.store.head().ok().flatten();
                     if after_hash != before_hash {
                         if after_height > before_height {
                             info!(
@@ -652,7 +652,7 @@ impl SyncService {
             } else {
                 // Block at or below our height — check for reorg candidate
                 let canonical = self.manager.store
-                    .get_canonical_hash(id.number)
+                    .canonical_hash(id.number)
                     .ok()
                     .flatten();
 
@@ -680,7 +680,7 @@ impl SyncService {
     /// In Following state, periodically check if we've fallen too far behind
     /// and need to switch back to skeleton sync.
     pub(crate) async fn check_follow_gap(&mut self) {
-        let best_peer = self.peer_store.get_best_peer().await;
+        let best_peer = self.peer_store.best_peer().await;
         let (_, metadata) = match best_peer {
             Some(p) => p,
             None => return,
@@ -706,10 +706,10 @@ impl SyncService {
     fn our_head_number(&self) -> u64 {
         self.manager
             .store
-            .get_head()
+            .head()
             .ok()
             .flatten()
-            .and_then(|h| self.manager.store.get_header(h).ok().flatten())
+            .and_then(|h| self.manager.store.header(h).ok().flatten())
             .map(|h| h.number)
             .unwrap_or(0)
     }
@@ -717,7 +717,7 @@ impl SyncService {
     /// Log sync progress: percentage, speed, ETA, peers.
     async fn log_progress(&mut self) {
         let current = self.our_head_number();
-        let peers = self.peer_store.get_peers().await.len();
+        let peers = self.peer_store.peers().await.len();
         self.progress.log(&self.state, current, peers);
     }
 }

@@ -41,30 +41,21 @@ impl NodeTable {
         }
     }
 
-    pub fn get_closest_nodes(&self, target: &B512, count: usize) -> Vec<DiscoveryNode> {
-        let mut nodes = Vec::new();
-        for bucket in &self.buckets {
-            nodes.extend(bucket.iter().cloned());
-        }
-
-        // Sort by distance to target
+    pub fn closest_nodes(&self, target: &B512, count: usize) -> Vec<DiscoveryNode> {
+        let mut nodes: Vec<_> = self.buckets.iter().flat_map(|b| b.iter().cloned()).collect();
         nodes.sort_by_cached_key(|n| self.xor_distance_between(&n.id, target));
         nodes.truncate(count);
         nodes
     }
 
-    pub fn get_all_nodes(&self) -> Vec<DiscoveryNode> {
-        let mut nodes = Vec::new();
-        for bucket in &self.buckets {
-            nodes.extend(bucket.iter().cloned());
-        }
-        nodes
+    pub fn all_nodes(&self) -> Vec<DiscoveryNode> {
+        self.buckets.iter().flat_map(|b| b.iter().cloned()).collect()
     }
 
     /// Serializes the table to RLP bytes.
     pub fn encode(&self) -> Vec<u8> {
         use alloy_rlp::Encodable;
-        let nodes = self.get_all_nodes();
+        let nodes = self.all_nodes();
         let mut buf = Vec::new();
         nodes.encode(&mut buf);
         buf

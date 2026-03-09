@@ -4,7 +4,7 @@ use crate::protocol::p2p::PeerInfo;
 use crate::protocol::{P2pHandler, P2pMessage};
 use alloy_primitives::B512;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tracing::trace;
 
 /// Maximum number of peers to return in a Peers response.
@@ -13,21 +13,21 @@ const MAX_PEERS_RESPONSE: usize = 25;
 /// Handles P2P peer exchange: responds to GetPeers requests and ingests
 /// Peers messages into the discovery table for future outbound connections.
 pub struct PeerExchangeHandler {
-    table: Arc<Mutex<NodeTable>>,
+    table: Arc<RwLock<NodeTable>>,
 }
 
 impl PeerExchangeHandler {
-    pub fn new(table: Arc<Mutex<NodeTable>>) -> Self {
+    pub fn new(table: Arc<RwLock<NodeTable>>) -> Self {
         Self { table }
     }
 }
 
 impl P2pHandler for PeerExchangeHandler {
-    fn handle_message(&self, id: B512, msg: P2pMessage) -> Option<P2pMessage> {
+    fn handle_message(&self, id: B512, msg: &P2pMessage) -> Option<P2pMessage> {
         match msg {
             P2pMessage::GetPeers => {
-                let table = self.table.try_lock().ok()?;
-                let nodes = table.get_all_nodes();
+                let table = self.table.try_read().ok()?;
+                let nodes = table.all_nodes();
                 let peers: Vec<PeerInfo> = nodes
                     .into_iter()
                     .filter(|n| n.id != id)
@@ -46,19 +46,17 @@ impl P2pHandler for PeerExchangeHandler {
                 Some(P2pMessage::Peers(peers))
             }
             P2pMessage::Peers(peers) => {
-                if let Ok(mut table) = self.table.try_lock() {
-                    let mut added = 0usize;
-                    for peer in &peers {
-                        let node = DiscoveryNode {
-                            ip: peer.ip.clone(),
-                            udp_port: peer.port,
-                            tcp_port: peer.port,
-                            id: peer.id,
-                        };
-                        if table.add_node(node) {
-                            added += 1;
-                        }
-                    }
+                if let Ok(mut table) = self.table.try_write() {
+                    let added = peers.iter()
+                        .filter(|peer| {
+                            table.add_node(DiscoveryNode {
+                                ip: peer.ip.clone(),
+                                udp_port: peer.port,
+                                tcp_port: peer.port,
+                                id: peer.id,
+                            })
+                        })
+                        .count();
                     trace!(
                         target: "rustock::net",
                         "Peer exchange: received {} peers, added {} new to discovery table",
@@ -83,9 +81,9 @@ mod tests {
         nodes: Vec<DiscoveryNode>,
     ) -> PeerExchangeHandler {
         let table = crate::discovery::table::NodeTable::new(local_id);
-        let table = Arc::new(Mutex::new(table));
+        let table = Arc::new(RwLock::new(table));
         {
-            let mut t = table.try_lock().unwrap();
+            let mut t = table.try_write().unwrap();
             for n in nodes {
                 t.add_node(n);
             }
@@ -109,7 +107,7 @@ mod tests {
         let handler = make_handler_with_nodes(local_id, nodes);
 
         let requester = B512::repeat_byte(0x01);
-        let response = handler.handle_message(requester, P2pMessage::GetPeers);
+        let response = handler.handle_message(requester, &P2pMessage::GetPeers);
 
         match response {
             Some(P2pMessage::Peers(peers)) => {
@@ -131,7 +129,7 @@ mod tests {
         let handler = make_handler_with_nodes(local_id, vec![]);
 
         let requester = B512::repeat_byte(0xFF);
-        let response = handler.handle_message(requester, P2pMessage::GetPeers);
+        let response = handler.handle_message(requester, &P2pMessage::GetPeers);
 
         match response {
             Some(P2pMessage::Peers(peers)) => {
@@ -150,7 +148,7 @@ mod tests {
         let handler = make_handler_with_nodes(local_id, nodes);
 
         let requester = B512::repeat_byte(0xFF);
-        let response = handler.handle_message(requester, P2pMessage::GetPeers);
+        let response = handler.handle_message(requester, &P2pMessage::GetPeers);
 
         match response {
             Some(P2pMessage::Peers(peers)) => {
@@ -184,14 +182,14 @@ mod tests {
         ];
 
         let sender = B512::repeat_byte(0xAA);
-        let response = handler.handle_message(sender, P2pMessage::Peers(incoming_peers));
+        let response = handler.handle_message(sender, &P2pMessage::Peers(incoming_peers));
 
         // Peers message should not produce a reply
         assert!(response.is_none());
 
         // Verify nodes were added to the table
-        let table = handler.table.try_lock().unwrap();
-        let all = table.get_all_nodes();
+        let table = handler.table.try_read().unwrap();
+        let all = table.all_nodes();
         assert_eq!(all.len(), 2);
         let ids: Vec<B512> = all.iter().map(|n| n.id).collect();
         assert!(ids.contains(&B512::repeat_byte(0x01)));
@@ -212,10 +210,10 @@ mod tests {
         }];
 
         let sender = B512::repeat_byte(0xAA);
-        handler.handle_message(sender, P2pMessage::Peers(peers));
+        handler.handle_message(sender, &P2pMessage::Peers(peers));
 
-        let table = handler.table.try_lock().unwrap();
-        let all = table.get_all_nodes();
+        let table = handler.table.try_read().unwrap();
+        let all = table.all_nodes();
         // Should still be 1, not duplicated
         let count = all.iter().filter(|n| n.id == B512::repeat_byte(0x01)).count();
         assert_eq!(count, 1);
@@ -227,7 +225,7 @@ mod tests {
         let handler = make_handler_with_nodes(local_id, vec![]);
 
         let peer = B512::repeat_byte(0x01);
-        let response = handler.handle_message(peer, P2pMessage::Disconnect(0));
+        let response = handler.handle_message(peer, &P2pMessage::Disconnect(0));
         assert!(response.is_none());
     }
 }

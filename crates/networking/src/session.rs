@@ -82,7 +82,7 @@ impl PeerSession {
                     }
 
                     for handler in &self.handlers {
-                        if let Some(resp) = handler.handle_message(self.peer_id, msg.clone()) {
+                        if let Some(resp) = handler.handle_message(self.peer_id, &msg) {
                             trace!(target: "rustock::net", "Outbound response to {:?}: {:?}", self.peer_id, resp);
                             self.framed.send(resp).await?;
                         }
