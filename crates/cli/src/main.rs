@@ -100,7 +100,7 @@ async fn main() -> Result<()> {
         Some(guard)
     };
 
-    info!("Starting Rustock Light Client on port {}...", args.port);
+    info!("Starting Rustock on port {}...", args.port);
 
     let config = match args.network_id {
         30 => ChainConfig::mainnet(),

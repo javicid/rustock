@@ -167,7 +167,7 @@ async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
         | "eth_compileSolidity"
         | "eth_sign"
         | "eth_signTransaction" => {
-            light_client_unsupported(id, &req.method)
+            execution_not_available(id, &req.method)
         }
 
         m if m.starts_with("debug_")
@@ -178,18 +178,18 @@ async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
             || m.starts_with("mnr_")
             || m.starts_with("db_")
             || m.starts_with("sco_") => {
-            light_client_unsupported(id, m)
+            execution_not_available(id, m)
         }
 
         _ => JsonRpcResponse::error(id, METHOD_NOT_FOUND, "Method not found"),
     }
 }
 
-fn light_client_unsupported(id: Value, method: &str) -> JsonRpcResponse {
+fn execution_not_available(id: Value, method: &str) -> JsonRpcResponse {
     JsonRpcResponse::error(
         id,
         METHOD_NOT_FOUND,
-        format!("Method {} not available on light client", method),
+        format!("Method {} requires execution engine (not yet available)", method),
     )
 }
 

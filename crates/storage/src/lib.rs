@@ -1,7 +1,7 @@
 use rocksdb::{DB, Options, ColumnFamilyDescriptor};
-use rustock_core::{Block, Header};
+use rustock_core::{Block, Header, Transaction};
 use alloy_primitives::{B256, U256};
-use alloy_rlp::{Decodable, Encodable};
+use alloy_rlp::{Decodable, Encodable, Header as RlpHeader};
 use anyhow::{Result, Context, anyhow};
 use std::path::Path;
 use std::sync::Arc;
@@ -9,7 +9,8 @@ use tracing::{debug, warn};
 
 const CF_HEADERS: &str = "headers";
 const CF_NUMBERS: &str = "block_numbers";
-const CF_TD: &str = "total_difficulty"; // Total Difficulty
+const CF_TD: &str = "total_difficulty";
+const CF_BODIES: &str = "block_bodies";
 const KEY_HEAD: &[u8] = b"head";
 
 /// Safety limit: refuse to reorg deeper than this many blocks.
@@ -21,6 +22,7 @@ const MAX_REORG_DEPTH: u64 = 1000;
 /// - `headers`: Hash -> RLP(Header)
 /// - `block_numbers`: BlockNumber (u64 BE) -> Hash
 /// - `total_difficulty`: Hash -> RLP(TotalDifficulty)
+/// - `block_bodies`: Hash -> RLP([transactions, ommers])
 /// - `default`: Metadata like "head" -> Hash
 pub struct BlockStore {
     db: Arc<DB>,
@@ -36,6 +38,7 @@ impl BlockStore {
             ColumnFamilyDescriptor::new(CF_HEADERS, Options::default()),
             ColumnFamilyDescriptor::new(CF_NUMBERS, Options::default()),
             ColumnFamilyDescriptor::new(CF_TD, Options::default()),
+            ColumnFamilyDescriptor::new(CF_BODIES, Options::default()),
         ];
 
         let db = DB::open_cf_descriptors(&opts, path, cfs).context("Failed to open RocksDB")?;
@@ -244,32 +247,116 @@ impl BlockStore {
     }
 }
 
-// Keeping basic Block support for backward compatibility/future use
 impl BlockStore {
-    pub fn put_block(&self, block: &Block) -> Result<()> {
-        // For now, we just store the header. 
-        // In a real full node, we'd store the body (txs, ommers) in a separate CF.
-        self.put_header(&block.header)?;
-        self.put_canonical_hash(block.header.number, block.hash())
+    /// Stores a block body (transactions + ommers) keyed by block hash.
+    pub fn put_body(
+        &self,
+        hash: B256,
+        transactions: &[Transaction],
+        ommers: &[Header],
+    ) -> Result<()> {
+        let mut txs_payload = Vec::new();
+        for tx in transactions {
+            tx.encode(&mut txs_payload);
+        }
+        let mut ommers_payload = Vec::new();
+        for uncle in ommers {
+            uncle.encode(&mut ommers_payload);
+        }
+
+        let body_len = RlpHeader { list: true, payload_length: txs_payload.len() }.length()
+            + txs_payload.len()
+            + RlpHeader { list: true, payload_length: ommers_payload.len() }.length()
+            + ommers_payload.len();
+
+        let mut buf = Vec::with_capacity(body_len + 5);
+        RlpHeader { list: true, payload_length: body_len }.encode(&mut buf);
+        RlpHeader { list: true, payload_length: txs_payload.len() }.encode(&mut buf);
+        buf.extend_from_slice(&txs_payload);
+        RlpHeader { list: true, payload_length: ommers_payload.len() }.encode(&mut buf);
+        buf.extend_from_slice(&ommers_payload);
+
+        self.db
+            .put_cf(self.cf(CF_BODIES)?, hash.as_slice(), &buf)
+            .context("Failed to write block body")
     }
 
-    /// Returns a header-only block. Body (transactions, ommers) storage is
-    /// intentionally omitted — this is a light client that only tracks headers.
+    /// Reads a block body (transactions + ommers) by hash.
+    pub fn body(&self, hash: B256) -> Result<Option<(Vec<Transaction>, Vec<Header>)>> {
+        let bytes = self.db
+            .get_cf(self.cf(CF_BODIES)?, hash.as_slice())
+            .context("Failed to read block body")?;
+        match bytes {
+            None => Ok(None),
+            Some(b) => {
+                let mut buf = b.as_slice();
+                let outer = RlpHeader::decode(&mut buf)?;
+                let mut body = &buf[..outer.payload_length];
+
+                let txs_h = RlpHeader::decode(&mut body)?;
+                let mut txs_buf = &body[..txs_h.payload_length];
+                body = &body[txs_h.payload_length..];
+                let mut transactions = Vec::new();
+                while !txs_buf.is_empty() {
+                    transactions.push(Transaction::decode(&mut txs_buf)?);
+                }
+
+                let ommers_h = RlpHeader::decode(&mut body)?;
+                let mut ommers_buf = &body[..ommers_h.payload_length];
+                let mut ommers = Vec::new();
+                while !ommers_buf.is_empty() {
+                    ommers.push(Header::decode(&mut ommers_buf)?);
+                }
+
+                Ok(Some((transactions, ommers)))
+            }
+        }
+    }
+
+    /// Stores a full block (header + body).
+    pub fn put_block(&self, block: &Block) -> Result<()> {
+        let hash = block.hash();
+        self.put_header(&block.header)?;
+        self.put_body(hash, &block.transactions, &block.ommers)?;
+        self.put_canonical_hash(block.header.number, hash)
+    }
+
+    /// Returns a full block (header + body) by hash.
+    /// If only the header is stored (no body), returns a header-only block
+    /// with empty transactions and ommers.
     pub fn block(&self, hash: B256) -> Result<Option<Block>> {
-        self.header(hash).map(|opt| opt.map(|header| Block {
-            header,
-            transactions: vec![],
-            ommers: vec![],
-        }))
+        let header = match self.header(hash)? {
+            Some(h) => h,
+            None => return Ok(None),
+        };
+
+        let (transactions, ommers) = self.body(hash)?
+            .unwrap_or_default();
+
+        Ok(Some(Block { header, transactions, ommers }))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustock_core::Header;
+    use rustock_core::{Header, Transaction};
     use alloy_primitives::{Address, B256, U256, Bytes};
     use tempfile::tempdir;
+
+    fn dummy_tx(nonce: u64) -> Transaction {
+        Transaction {
+            nonce,
+            gas_price: U256::from(20_000_000_000u64),
+            gas_limit: U256::from(21_000),
+            to: Bytes::from(vec![0x12; 20]),
+            value: U256::from(1_000_000u64),
+            input: Bytes::default(),
+            v: 27,
+            r: U256::from(nonce + 100),
+            s: U256::from(nonce + 200),
+        }
+    }
 
     fn dummy_header(number: u64) -> Header {
         Header {
@@ -693,5 +780,93 @@ mod tests {
         assert_eq!(store.canonical_hash(2).unwrap(), Some(chain_a[2].0.hash())); // common ancestor
         assert_eq!(store.canonical_hash(3).unwrap(), Some(fork_entries[0].0.hash()));
         assert_eq!(store.canonical_hash(7).unwrap(), Some(fork_entries[4].0.hash()));
+    }
+
+    // --- Body storage tests ---
+
+    #[test]
+    fn test_put_and_get_body() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        let hash = B256::repeat_byte(0xAA);
+
+        let txs = vec![dummy_tx(0), dummy_tx(1), dummy_tx(2)];
+        let ommers = vec![dummy_header(99)];
+
+        store.put_body(hash, &txs, &ommers).unwrap();
+
+        let (retrieved_txs, retrieved_ommers) = store.body(hash).unwrap().unwrap();
+        assert_eq!(retrieved_txs.len(), 3);
+        assert_eq!(retrieved_ommers.len(), 1);
+        assert_eq!(retrieved_txs[0].nonce, 0);
+        assert_eq!(retrieved_txs[2].nonce, 2);
+        assert_eq!(retrieved_ommers[0].number, 99);
+    }
+
+    #[test]
+    fn test_body_not_found() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        assert!(store.body(B256::repeat_byte(0xFF)).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_put_and_get_body_empty() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        let hash = B256::repeat_byte(0xBB);
+
+        store.put_body(hash, &[], &[]).unwrap();
+
+        let (txs, ommers) = store.body(hash).unwrap().unwrap();
+        assert!(txs.is_empty());
+        assert!(ommers.is_empty());
+    }
+
+    #[test]
+    fn test_put_block_stores_header_and_body() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+
+        let header = dummy_header(5);
+        let txs = vec![dummy_tx(0), dummy_tx(1)];
+        let block = Block {
+            header: header.clone(),
+            transactions: txs.clone(),
+            ommers: vec![],
+        };
+        let hash = block.hash();
+
+        store.put_block(&block).unwrap();
+
+        // Header should be stored
+        let h = store.header(hash).unwrap().unwrap();
+        assert_eq!(h.number, 5);
+
+        // Body should be stored
+        let (retrieved_txs, retrieved_ommers) = store.body(hash).unwrap().unwrap();
+        assert_eq!(retrieved_txs.len(), 2);
+        assert!(retrieved_ommers.is_empty());
+
+        // Full block retrieval
+        let full_block = store.block(hash).unwrap().unwrap();
+        assert_eq!(full_block.header.number, 5);
+        assert_eq!(full_block.transactions.len(), 2);
+        assert_eq!(full_block.transactions[0].nonce, 0);
+    }
+
+    #[test]
+    fn test_block_returns_header_only_when_no_body() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        let header = dummy_header(10);
+        let hash = header.hash();
+
+        store.put_header(&header).unwrap();
+
+        let block = store.block(hash).unwrap().unwrap();
+        assert_eq!(block.header.number, 10);
+        assert!(block.transactions.is_empty());
+        assert!(block.ommers.is_empty());
     }
 }

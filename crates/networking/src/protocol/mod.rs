@@ -9,4 +9,5 @@ pub use rsk::{
     BlockHeadersRequest, BlockHeadersQuery, BlockHeadersResponse,
     BlockHashRequest, BlockHashResponse,
     SkeletonRequest, SkeletonResponse, BlockIdentifier,
+    BodyRequest, BodyResponse,
 };

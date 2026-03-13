@@ -4,8 +4,10 @@ use crate::progress::SyncProgress;
 use crate::state::SyncState;
 use crate::tracker::PeerChunkTracker;
 use rustock_core::types::header::Header;
+use rustock_core::types::transaction::Transaction;
 use rustock_networking::protocol::{
-    BlockHashRequest, BlockIdentifier, P2pMessage, RskMessage, RskSubMessage, SkeletonRequest,
+    BlockHashRequest, BlockIdentifier, BodyRequest, P2pMessage, RskMessage, RskSubMessage,
+    SkeletonRequest,
 };
 use alloy_primitives::{B256, B512};
 use std::sync::Arc;
@@ -30,6 +32,12 @@ fn create_block_hash_request(height: u64) -> P2pMessage {
         height,
     };
     P2pMessage::RskMessage(RskMessage::new(RskSubMessage::BlockHashRequest(req)))
+}
+
+fn create_body_request(hash: B256) -> (u64, P2pMessage) {
+    let id: u64 = rand::random();
+    let req = BodyRequest { id, hash };
+    (id, P2pMessage::RskMessage(RskMessage::new(RskSubMessage::BodyRequest(req))))
 }
 
 fn create_skeleton_request(start_number: u64) -> P2pMessage {
@@ -334,6 +342,9 @@ impl SyncService {
             }
             SyncEvent::HeadersResponse { peer, headers } => {
                 self.on_headers_response(peer, headers).await;
+            }
+            SyncEvent::BodyResponse { id, transactions, uncles, .. } => {
+                self.on_body_response(id, transactions, uncles).await;
             }
             SyncEvent::NewBlockHashes { peer, identifiers } => {
                 self.on_new_block_hashes(peer, identifiers).await;
@@ -712,6 +723,146 @@ impl SyncService {
             .and_then(|h| self.manager.store.header(h).ok().flatten())
             .map(|h| h.number)
             .unwrap_or(0)
+    }
+
+    /// After all headers in a skeleton round are downloaded, transition to
+    /// body downloading for any headers that don't already have bodies stored.
+    pub(crate) async fn start_body_downloads(&mut self, peer_best: u64) {
+        let our_height = self.our_head_number();
+
+        // Walk the canonical chain to find headers without bodies.
+        // For efficiency, only go back to the start of what we just synced.
+        let mut pending = Vec::new();
+        let start = if our_height > 1000 { our_height - 1000 } else { 1 };
+        for num in start..=our_height {
+            if let Ok(Some(hash)) = self.manager.store.canonical_hash(num) {
+                if let Ok(None) = self.manager.store.body(hash) {
+                    if let Ok(Some(header)) = self.manager.store.header(hash) {
+                        pending.push((hash, header));
+                    }
+                }
+            }
+        }
+
+        if pending.is_empty() {
+            debug!(
+                target: "rustock::sync",
+                "All bodies already stored, entering follow mode"
+            );
+            self.state = SyncState::Following;
+            return;
+        }
+
+        info!(
+            target: "rustock::sync",
+            "Starting body download for {} blocks", pending.len()
+        );
+
+        self.state = SyncState::DownloadingBodies {
+            peer_best,
+            pending_headers: pending,
+            next_request: 0,
+            in_flight: std::collections::HashMap::new(),
+        };
+        self.last_progress = Instant::now();
+        self.send_body_requests().await;
+    }
+
+    /// Send body requests for up to `MAX_BODY_REQUESTS` pending headers.
+    async fn send_body_requests(&mut self) {
+        const MAX_BODY_IN_FLIGHT: usize = 8;
+
+        if let SyncState::DownloadingBodies {
+            pending_headers,
+            next_request,
+            in_flight,
+            ..
+        } = &mut self.state
+        {
+            let peers = self.peer_store.peers().await;
+            if peers.is_empty() {
+                return;
+            }
+
+            while in_flight.len() < MAX_BODY_IN_FLIGHT && *next_request < pending_headers.len() {
+                let (hash, _header) = &pending_headers[*next_request];
+                let (req_id, msg) = create_body_request(*hash);
+                let peer = &peers[*next_request % peers.len()];
+                self.peer_store.send_to_peer(peer, msg).await;
+                in_flight.insert(req_id, *next_request);
+                *next_request += 1;
+            }
+        }
+    }
+
+    pub(crate) async fn on_body_response(
+        &mut self,
+        request_id: u64,
+        transactions: Vec<Transaction>,
+        uncles: Vec<Header>,
+    ) {
+        let old = std::mem::take(&mut self.state);
+        match old {
+            SyncState::DownloadingBodies {
+                peer_best,
+                pending_headers,
+                next_request,
+                mut in_flight,
+            } => {
+                let idx = match in_flight.remove(&request_id) {
+                    Some(i) => i,
+                    None => {
+                        warn!(
+                            target: "rustock::sync",
+                            "Received body response for unknown request {}", request_id
+                        );
+                        self.state = SyncState::DownloadingBodies {
+                            peer_best,
+                            pending_headers,
+                            next_request,
+                            in_flight,
+                        };
+                        return;
+                    }
+                };
+
+                let (hash, _header) = &pending_headers[idx];
+                if let Err(e) = self.manager.store.put_body(*hash, &transactions, &uncles) {
+                    error!(
+                        target: "rustock::sync",
+                        "Failed to store body for {:?}: {:?}", hash, e
+                    );
+                }
+
+                trace!(
+                    target: "rustock::sync",
+                    "Stored body for block {:?} ({} txs, {} uncles)",
+                    hash, transactions.len(), uncles.len()
+                );
+
+                // Check if all bodies are done
+                let all_done = next_request >= pending_headers.len() && in_flight.is_empty();
+                if all_done {
+                    info!(
+                        target: "rustock::sync",
+                        "All {} block bodies downloaded, entering follow mode",
+                        pending_headers.len()
+                    );
+                    self.state = SyncState::Following;
+                } else {
+                    self.state = SyncState::DownloadingBodies {
+                        peer_best,
+                        pending_headers,
+                        next_request,
+                        in_flight,
+                    };
+                    self.send_body_requests().await;
+                }
+            }
+            other => {
+                self.state = other;
+            }
+        }
     }
 
     /// Log sync progress: percentage, speed, ETA, peers.

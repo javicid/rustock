@@ -1,5 +1,6 @@
 use alloy_primitives::{B256, B512};
 use rustock_core::types::header::Header;
+use rustock_core::types::transaction::Transaction;
 use rustock_networking::protocol::BlockIdentifier;
 
 /// Forwarded from SyncHandler to the SyncService state machine.
@@ -13,6 +14,12 @@ pub enum SyncEvent {
     HeadersResponse {
         peer: B512,
         headers: Vec<Header>,
+    },
+    BodyResponse {
+        peer: B512,
+        id: u64,
+        transactions: Vec<Transaction>,
+        uncles: Vec<Header>,
     },
     NewBlockHashes {
         peer: B512,

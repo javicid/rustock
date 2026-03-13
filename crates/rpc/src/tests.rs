@@ -316,7 +316,7 @@ async fn test_unsupported_eth_method() {
     assert!(resp.error.is_some());
     let err = resp.error.unwrap();
     assert_eq!(err.code, METHOD_NOT_FOUND);
-    assert!(err.message.contains("light client"));
+    assert!(err.message.contains("execution engine"));
 }
 
 #[tokio::test]
@@ -326,7 +326,7 @@ async fn test_unsupported_debug_method() {
     let resp = dispatch_for_test(&state, req).await;
     assert!(resp.error.is_some());
     let err = resp.error.unwrap();
-    assert!(err.message.contains("light client"));
+    assert!(err.message.contains("execution engine"));
 }
 
 #[tokio::test]

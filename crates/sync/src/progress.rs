@@ -37,6 +37,7 @@ impl SyncProgress {
             SyncState::DownloadingHeaders { peer_best, .. } => *peer_best,
             SyncState::DownloadingSkeleton { peer_best, .. } => *peer_best,
             SyncState::FindingConnectionPoint { peer_best, .. } => *peer_best,
+            SyncState::DownloadingBodies { peer_best, .. } => *peer_best,
             SyncState::Idle | SyncState::Following => return,
         };
 
@@ -85,6 +86,7 @@ impl SyncProgress {
             SyncState::FindingConnectionPoint { .. } => "finding connection point",
             SyncState::DownloadingSkeleton { .. } => "downloading skeleton",
             SyncState::DownloadingHeaders { .. } => "downloading headers",
+            SyncState::DownloadingBodies { .. } => "downloading bodies",
             SyncState::Idle => "idle",
             SyncState::Following => "following",
         };

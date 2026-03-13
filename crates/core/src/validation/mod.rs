@@ -84,7 +84,7 @@ impl HeaderVerifier {
         }
     }
 
-    /// Creates a standard RSK light client verifier with all consensus rules.
+    /// Creates a standard RSK verifier with all consensus rules.
     ///
     /// Note: `ParentHashRule` is intentionally **not** included here because
     /// the sync pipeline looks up the parent by `header.parent_hash`, so

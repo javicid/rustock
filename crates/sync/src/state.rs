@@ -1,4 +1,5 @@
-use alloy_primitives::B512;
+use alloy_primitives::{B256, B512};
+use rustock_core::Header;
 use rustock_networking::protocol::BlockIdentifier;
 
 use crate::tracker::PeerChunkTracker;
@@ -29,6 +30,16 @@ pub enum SyncState {
         tracker: PeerChunkTracker,
         /// Pre-fetched skeleton for the next round (Optimization 4).
         pending_next_skeleton: Option<Vec<BlockIdentifier>>,
+    },
+    /// Downloading block bodies for headers we already have.
+    DownloadingBodies {
+        peer_best: u64,
+        /// Headers whose bodies we still need, in ascending order.
+        pending_headers: Vec<(B256, Header)>,
+        /// Index of the next header to request a body for.
+        next_request: usize,
+        /// Map of in-flight request IDs to header indices.
+        in_flight: std::collections::HashMap<u64, usize>,
     },
     /// At or near the chain tip — listening for NewBlockHashes announcements
     /// and fetching individual headers as they arrive.

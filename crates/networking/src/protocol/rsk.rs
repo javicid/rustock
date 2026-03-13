@@ -1,6 +1,6 @@
 use alloy_rlp::{Decodable, Encodable, RlpDecodable, RlpEncodable, Header as RlpHeader};
 use alloy_primitives::{B256, Bytes, U256};
-use rustock_core::Header;
+use rustock_core::{Header, Transaction};
 use rustock_core::rlp_compat::{decode_u8_lenient, decode_u64_lenient, decode_u256_lenient, decode_u32_lenient};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +85,21 @@ pub struct BlockIdentifier {
     pub number: u64,
 }
 
+/// Request a block body by hash (type 14).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BodyRequest {
+    pub id: u64,
+    pub hash: B256,
+}
+
+/// Response containing a block body (type 15).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BodyResponse {
+    pub id: u64,
+    pub transactions: Vec<Transaction>,
+    pub uncles: Vec<Header>,
+}
+
 /// Request the hash of the block at a given height (type 8).
 /// Used during connection-point binary search.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,6 +139,8 @@ pub enum RskMessageType {
     BlockHeadersRequest = 9,
     BlockHeadersResponse = 10,
     SkeletonResponse = 13,
+    BodyRequest = 14,
+    BodyResponse = 15,
     SkeletonRequest = 16,
     BlockHashResponse = 18,
 }
@@ -137,6 +154,8 @@ pub enum RskSubMessage {
     SkeletonRequest(SkeletonRequest),
     SkeletonResponse(SkeletonResponse),
     BlockHashResponse(BlockHashResponse),
+    BodyRequest(BodyRequest),
+    BodyResponse(BodyResponse),
     NewBlockHashes(Vec<BlockIdentifier>),
     Transactions(Vec<Bytes>),
     Unknown(u8),
@@ -152,6 +171,8 @@ impl RskSubMessage {
             RskSubMessage::SkeletonRequest(_) => RskMessageType::SkeletonRequest,
             RskSubMessage::SkeletonResponse(_) => RskMessageType::SkeletonResponse,
             RskSubMessage::BlockHashResponse(_) => RskMessageType::BlockHashResponse,
+            RskSubMessage::BodyRequest(_) => RskMessageType::BodyRequest,
+            RskSubMessage::BodyResponse(_) => RskMessageType::BodyResponse,
             RskSubMessage::NewBlockHashes(_) => RskMessageType::NewBlockHashes,
             RskSubMessage::Transactions(_) => RskMessageType::Transactions,
             RskSubMessage::Unknown(_) => RskMessageType::Status, // Not used for encoding
@@ -284,6 +305,53 @@ impl RskSubMessage {
                 let mut params = Vec::new();
                 r.id.encode(&mut params);
                 params.extend_from_slice(&outer);
+
+                RlpHeader { list: true, payload_length: params.len() }.encode(out);
+                out.extend_from_slice(&params);
+            }
+            RskSubMessage::BodyRequest(r) => {
+                // RLP([id, RLP([hash])])
+                let mut inner = Vec::new();
+                r.hash.encode(&mut inner);
+
+                let mut inner_list = Vec::new();
+                RlpHeader { list: true, payload_length: inner.len() }.encode(&mut inner_list);
+                inner_list.extend_from_slice(&inner);
+
+                let mut params = Vec::new();
+                r.id.encode(&mut params);
+                params.extend_from_slice(&inner_list);
+
+                RlpHeader { list: true, payload_length: params.len() }.encode(out);
+                out.extend_from_slice(&params);
+            }
+            RskSubMessage::BodyResponse(r) => {
+                // RLP([id, RLP([txs_list, uncles_list])])
+                let mut txs_payload = Vec::new();
+                for tx in &r.transactions {
+                    tx.encode(&mut txs_payload);
+                }
+                let mut txs_list = Vec::new();
+                RlpHeader { list: true, payload_length: txs_payload.len() }.encode(&mut txs_list);
+                txs_list.extend_from_slice(&txs_payload);
+
+                let mut uncles_payload = Vec::new();
+                for uncle in &r.uncles {
+                    uncle.encode(&mut uncles_payload);
+                }
+                let mut uncles_list = Vec::new();
+                RlpHeader { list: true, payload_length: uncles_payload.len() }.encode(&mut uncles_list);
+                uncles_list.extend_from_slice(&uncles_payload);
+
+                let body_len = txs_list.len() + uncles_list.len();
+                let mut body = Vec::new();
+                RlpHeader { list: true, payload_length: body_len }.encode(&mut body);
+                body.extend_from_slice(&txs_list);
+                body.extend_from_slice(&uncles_list);
+
+                let mut params = Vec::new();
+                r.id.encode(&mut params);
+                params.extend_from_slice(&body);
 
                 RlpHeader { list: true, payload_length: params.len() }.encode(out);
                 out.extend_from_slice(&params);
@@ -475,6 +543,48 @@ impl Decodable for RskMessage {
                 let hash = B256::decode(&mut inner_body)?;
 
                 RskSubMessage::BlockHashResponse(BlockHashResponse { id, hash })
+            }
+            14 => {
+                // BodyRequest: RLP([id, RLP([hash])])
+                let list_h = RlpHeader::decode(&mut body_params)?;
+                let mut list_body = &body_params[..list_h.payload_length];
+                let id = decode_u64_lenient(&mut list_body)?;
+
+                let inner_h = RlpHeader::decode(&mut list_body)?;
+                let mut inner_body = &list_body[..inner_h.payload_length];
+                let hash = B256::decode(&mut inner_body)?;
+
+                RskSubMessage::BodyRequest(BodyRequest { id, hash })
+            }
+            15 => {
+                // BodyResponse: RLP([id, RLP([txs_list, uncles_list, extension?])])
+                let list_h = RlpHeader::decode(&mut body_params)?;
+                let mut list_body = &body_params[..list_h.payload_length];
+                let id = decode_u64_lenient(&mut list_body)?;
+
+                let body_h = RlpHeader::decode(&mut list_body)?;
+                let mut body_data = &list_body[..body_h.payload_length];
+
+                // Decode transactions list
+                let txs_h = RlpHeader::decode(&mut body_data)?;
+                let mut txs_body = &body_data[..txs_h.payload_length];
+                body_data = &body_data[txs_h.payload_length..];
+                let mut transactions = Vec::new();
+                while !txs_body.is_empty() {
+                    transactions.push(Transaction::decode(&mut txs_body)?);
+                }
+
+                // Decode uncles list
+                let uncles_h = RlpHeader::decode(&mut body_data)?;
+                let mut uncles_body = &body_data[..uncles_h.payload_length];
+                let mut uncles = Vec::new();
+                while !uncles_body.is_empty() {
+                    uncles.push(Header::decode_with_hash(&mut uncles_body)?);
+                }
+
+                // Skip optional BlockHeaderExtension (we don't need it for body storage)
+
+                RskSubMessage::BodyResponse(BodyResponse { id, transactions, uncles })
             }
             6 => {
                 // NewBlockHashes: RLP list of [hash, number] pairs
@@ -691,6 +801,88 @@ mod tests {
             assert_eq!(txs[1], tx2);
         } else {
             panic!("Expected Transactions, got {:?}", decoded.sub_message);
+        }
+    }
+
+    #[test]
+    fn test_rsk_message_rlp_body_request() {
+        let req = BodyRequest { id: 55, hash: B256::repeat_byte(0xdd) };
+        let msg = RskMessage::new(RskSubMessage::BodyRequest(req));
+
+        let mut buf = Vec::new();
+        msg.encode(&mut buf);
+
+        let mut decode_buf = buf.as_slice();
+        let decoded = RskMessage::decode(&mut decode_buf).unwrap();
+
+        if let RskSubMessage::BodyRequest(r) = decoded.sub_message {
+            assert_eq!(r.id, 55);
+            assert_eq!(r.hash, B256::repeat_byte(0xdd));
+        } else {
+            panic!("Expected BodyRequest, got {:?}", decoded.sub_message);
+        }
+    }
+
+    #[test]
+    fn test_rsk_message_rlp_body_response_empty() {
+        let resp = BodyResponse {
+            id: 55,
+            transactions: vec![],
+            uncles: vec![],
+        };
+        let msg = RskMessage::new(RskSubMessage::BodyResponse(resp));
+
+        let mut buf = Vec::new();
+        msg.encode(&mut buf);
+
+        let mut decode_buf = buf.as_slice();
+        let decoded = RskMessage::decode(&mut decode_buf).unwrap();
+
+        if let RskSubMessage::BodyResponse(r) = decoded.sub_message {
+            assert_eq!(r.id, 55);
+            assert!(r.transactions.is_empty());
+            assert!(r.uncles.is_empty());
+        } else {
+            panic!("Expected BodyResponse, got {:?}", decoded.sub_message);
+        }
+    }
+
+    #[test]
+    fn test_rsk_message_rlp_body_response_with_data() {
+        use rustock_core::Transaction;
+
+        let tx = Transaction {
+            nonce: 1,
+            gas_price: U256::from(10),
+            gas_limit: U256::from(21000),
+            to: Bytes::from(vec![0x12; 20]),
+            value: U256::from(1000),
+            input: Bytes::default(),
+            v: 27,
+            r: U256::from(88),
+            s: U256::from(99),
+        };
+
+        let resp = BodyResponse {
+            id: 77,
+            transactions: vec![tx],
+            uncles: vec![],
+        };
+        let msg = RskMessage::new(RskSubMessage::BodyResponse(resp));
+
+        let mut buf = Vec::new();
+        msg.encode(&mut buf);
+
+        let mut decode_buf = buf.as_slice();
+        let decoded = RskMessage::decode(&mut decode_buf).unwrap();
+
+        if let RskSubMessage::BodyResponse(r) = decoded.sub_message {
+            assert_eq!(r.id, 77);
+            assert_eq!(r.transactions.len(), 1);
+            assert_eq!(r.transactions[0].nonce, 1);
+            assert!(r.uncles.is_empty());
+        } else {
+            panic!("Expected BodyResponse, got {:?}", decoded.sub_message);
         }
     }
 

@@ -2,7 +2,7 @@ use crate::events::SyncEvent;
 use crate::manager::SyncManager;
 use alloy_primitives::B512;
 use rustock_networking::protocol::{
-    BlockHashResponse, BlockHeadersResponse, BlockIdentifier,
+    BlockHashResponse, BlockHeadersResponse, BlockIdentifier, BodyResponse,
     P2pHandler, P2pMessage, RskMessage, RskSubMessage, SkeletonResponse,
 };
 use std::sync::Arc;
@@ -28,6 +28,31 @@ pub struct SyncHandler {
 impl SyncHandler {
     pub fn new(manager: Arc<SyncManager>, event_tx: mpsc::UnboundedSender<SyncEvent>) -> Self {
         Self { manager, event_tx }
+    }
+
+    /// Respond to a BodyRequest by looking up the block and returning its body.
+    fn serve_body_request(
+        &self,
+        request_id: u64,
+        hash: alloy_primitives::B256,
+    ) -> Option<P2pMessage> {
+        let store = &self.manager.store;
+        let (transactions, uncles) = store.body(hash).ok()??;
+
+        trace!(
+            target: "rustock::sync",
+            "Serving block body for {:?} ({} txs, {} uncles)",
+            hash, transactions.len(), uncles.len()
+        );
+
+        let resp = BodyResponse {
+            id: request_id,
+            transactions,
+            uncles,
+        };
+        Some(P2pMessage::RskMessage(RskMessage::new(
+            RskSubMessage::BodyResponse(resp),
+        )))
     }
 
     /// Respond to a BlockHeadersRequest by walking backwards from the given
@@ -208,6 +233,15 @@ impl P2pHandler for SyncHandler {
                     });
                 }
 
+                RskSubMessage::BodyResponse(r) => {
+                    let _ = self.event_tx.send(SyncEvent::BodyResponse {
+                        peer: id,
+                        id: r.id,
+                        transactions: r.transactions.clone(),
+                        uncles: r.uncles.clone(),
+                    });
+                }
+
                 // --- Serve data to peers ---
                 RskSubMessage::BlockHeadersRequest(r) => {
                     return self.serve_headers_request(r.id, r.query.hash, r.query.count);
@@ -217,6 +251,9 @@ impl P2pHandler for SyncHandler {
                 }
                 RskSubMessage::SkeletonRequest(r) => {
                     return self.serve_skeleton_request(r.id, r.start_number);
+                }
+                RskSubMessage::BodyRequest(r) => {
+                    return self.serve_body_request(r.id, r.hash);
                 }
 
                 _ => {}

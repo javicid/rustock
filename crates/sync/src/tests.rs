@@ -1662,6 +1662,206 @@ async fn test_no_reorg_via_headers_response_lower_td() {
     assert!(store.header(b2.hash()).unwrap().is_some());
 }
 
+// ========== Body download tests ==========
+
+#[tokio::test]
+async fn test_sync_handler_serves_body_request() {
+    use rustock_networking::protocol::{P2pMessage, RskMessage, RskSubMessage};
+    use rustock_networking::protocol::P2pHandler;
+    use rustock_networking::protocol::rsk::BodyRequest;
+    use rustock_core::Transaction;
+
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    let genesis_hash = genesis.hash();
+    store.update_head(&genesis, U256::from(1)).unwrap();
+
+    // Store a body for genesis
+    let tx = Transaction {
+        nonce: 42,
+        gas_price: U256::from(10),
+        gas_limit: U256::from(21000),
+        to: Bytes::from(vec![0x12; 20]),
+        value: U256::from(100),
+        input: Bytes::default(),
+        v: 27,
+        r: U256::from(88),
+        s: U256::from(99),
+    };
+    store.put_body(genesis_hash, &[tx], &[]).unwrap();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store, verifier, peer_store));
+
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let handler = SyncHandler::new(manager, event_tx);
+
+    let req = BodyRequest { id: 33, hash: genesis_hash };
+    let msg = P2pMessage::RskMessage(RskMessage::new(RskSubMessage::BodyRequest(req)));
+
+    let resp = handler.handle_message(B512::repeat_byte(0x01), &msg);
+    assert!(resp.is_some(), "Should respond to BodyRequest");
+
+    if let Some(P2pMessage::RskMessage(rsk_msg)) = resp {
+        if let RskSubMessage::BodyResponse(r) = rsk_msg.sub_message {
+            assert_eq!(r.id, 33);
+            assert_eq!(r.transactions.len(), 1);
+            assert_eq!(r.transactions[0].nonce, 42);
+            assert!(r.uncles.is_empty());
+        } else {
+            panic!("Expected BodyResponse");
+        }
+    } else {
+        panic!("Expected RskMessage response");
+    }
+}
+
+#[tokio::test]
+async fn test_sync_handler_serves_body_request_not_found() {
+    use rustock_networking::protocol::{P2pMessage, RskMessage, RskSubMessage};
+    use rustock_networking::protocol::P2pHandler;
+    use rustock_networking::protocol::rsk::BodyRequest;
+
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store, verifier, peer_store));
+
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let handler = SyncHandler::new(manager, event_tx);
+
+    let req = BodyRequest { id: 1, hash: B256::repeat_byte(0xFF) };
+    let msg = P2pMessage::RskMessage(RskMessage::new(RskSubMessage::BodyRequest(req)));
+
+    let resp = handler.handle_message(B512::ZERO, &msg);
+    assert!(resp.is_none(), "Should not respond when body not found");
+}
+
+#[tokio::test]
+async fn test_sync_handler_forwards_body_response() {
+    use rustock_networking::protocol::{P2pMessage, RskMessage, RskSubMessage};
+    use rustock_networking::protocol::P2pHandler;
+    use rustock_networking::protocol::rsk::BodyResponse;
+    use crate::events::SyncEvent;
+
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store, verifier, peer_store));
+
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let handler = SyncHandler::new(manager, event_tx);
+
+    let resp = BodyResponse {
+        id: 42,
+        transactions: vec![],
+        uncles: vec![],
+    };
+    let msg = P2pMessage::RskMessage(RskMessage::new(RskSubMessage::BodyResponse(resp)));
+
+    let handler_resp = handler.handle_message(B512::repeat_byte(0x01), &msg);
+    assert!(handler_resp.is_none());
+
+    match event_rx.try_recv().unwrap() {
+        SyncEvent::BodyResponse { id, transactions, uncles, .. } => {
+            assert_eq!(id, 42);
+            assert!(transactions.is_empty());
+            assert!(uncles.is_empty());
+        }
+        other => panic!("Expected BodyResponse event, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_body_download_state_machine() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    let genesis_hash = genesis.hash();
+    store.update_head(&genesis, U256::from(1)).unwrap();
+
+    let b1 = dummy_header(1, genesis_hash, U256::from(1));
+    let b1_hash = b1.hash();
+    store.put_header(&b1).unwrap();
+    store.put_canonical_hash(1, b1_hash).unwrap();
+    store.put_total_difficulty(b1_hash, U256::from(2)).unwrap();
+    store.update_head(&b1, U256::from(2)).unwrap();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+
+    let peer = B512::repeat_byte(0x01);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    peer_store.add_peer(peer, tx).await;
+
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store, event_rx);
+
+    // Trigger body download; genesis at block 0 won't be scanned (start=1)
+    service.start_body_downloads(2).await;
+
+    match &service.state {
+        SyncState::DownloadingBodies { pending_headers, .. } => {
+            assert_eq!(pending_headers.len(), 1);
+            assert_eq!(pending_headers[0].0, b1_hash);
+        }
+        _ => panic!("Expected DownloadingBodies, got {:?}", service.state),
+    }
+
+    // Simulate receiving the body response
+    if let SyncState::DownloadingBodies { in_flight, .. } = &service.state {
+        let req_id = *in_flight.keys().next().unwrap();
+        service.on_body_response(req_id, vec![], vec![]).await;
+    }
+
+    assert!(matches!(service.state, SyncState::Following),
+        "Expected Following after all bodies downloaded, got {:?}", service.state);
+
+    // Body should be stored
+    let (txs, ommers) = store.body(b1_hash).unwrap().unwrap();
+    assert!(txs.is_empty());
+    assert!(ommers.is_empty());
+}
+
+#[tokio::test]
+async fn test_body_download_all_bodies_present_skips() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    let genesis_hash = genesis.hash();
+    store.update_head(&genesis, U256::from(1)).unwrap();
+
+    let b1 = dummy_header(1, genesis_hash, U256::from(1));
+    let b1_hash = b1.hash();
+    store.put_header(&b1).unwrap();
+    store.put_canonical_hash(1, b1_hash).unwrap();
+    store.put_total_difficulty(b1_hash, U256::from(2)).unwrap();
+    store.update_head(&b1, U256::from(2)).unwrap();
+
+    // Pre-store the body
+    store.put_body(b1_hash, &[], &[]).unwrap();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store, verifier, peer_store.clone()));
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store, event_rx);
+
+    service.start_body_downloads(2).await;
+
+    // Should skip directly to Following since all bodies are present
+    assert!(matches!(service.state, SyncState::Following),
+        "Expected Following when all bodies present, got {:?}", service.state);
+}
+
 // ========== TxRelay tests ==========
 
 #[tokio::test]
