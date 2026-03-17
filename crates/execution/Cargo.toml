@@ -1,0 +1,19 @@
+[package]
+name = "rustock-execution"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rustock-core = { path = "../core" }
+rustock-trie = { path = "../trie" }
+rustock-storage = { path = "../storage" }
+revm = { version = "36", default-features = false, features = ["std", "secp256k1"] }
+alloy-primitives = { workspace = true }
+alloy-rlp = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+sha3 = "0.10"
+
+[dev-dependencies]
+tempfile = { workspace = true }

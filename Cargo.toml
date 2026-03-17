@@ -7,6 +7,7 @@ members = [
     "crates/sync",
     "crates/rpc",
     "crates/trie",
+    "crates/execution",
 ]
 resolver = "2"
 
