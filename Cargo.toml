@@ -6,6 +6,7 @@ members = [
     "crates/networking",
     "crates/sync",
     "crates/rpc",
+    "crates/trie",
 ]
 resolver = "2"
 

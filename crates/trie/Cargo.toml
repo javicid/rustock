@@ -1,0 +1,14 @@
+[package]
+name = "rustock-trie"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+alloy-primitives = { workspace = true }
+alloy-rlp = { workspace = true }
+anyhow = { workspace = true }
+sha3 = "0.10"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

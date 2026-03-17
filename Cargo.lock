@@ -2235,6 +2235,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustock-trie"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "alloy-rlp",
+ "anyhow",
+ "sha3",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "rustversion"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"

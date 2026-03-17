@@ -869,4 +869,107 @@ mod tests {
         assert!(block.transactions.is_empty());
         assert!(block.ommers.is_empty());
     }
+
+    #[test]
+    fn test_put_body_with_many_txs_and_ommers() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        let hash = B256::repeat_byte(0xCC);
+
+        let txs: Vec<Transaction> = (0..10).map(dummy_tx).collect();
+        let ommers: Vec<Header> = (100..109).map(dummy_header).collect();
+
+        store.put_body(hash, &txs, &ommers).unwrap();
+
+        let (ret_txs, ret_ommers) = store.body(hash).unwrap().unwrap();
+        assert_eq!(ret_txs.len(), 10);
+        assert_eq!(ret_ommers.len(), 9);
+
+        for (i, tx) in ret_txs.iter().enumerate() {
+            assert_eq!(tx.nonce, i as u64, "tx {i} nonce mismatch");
+        }
+        for (i, uncle) in ret_ommers.iter().enumerate() {
+            assert_eq!(uncle.number, (100 + i) as u64, "uncle {i} number mismatch");
+        }
+    }
+
+    #[test]
+    fn test_put_body_overwrite() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        let hash = B256::repeat_byte(0xDD);
+
+        store.put_body(hash, &[dummy_tx(0)], &[]).unwrap();
+        let (txs, _) = store.body(hash).unwrap().unwrap();
+        assert_eq!(txs.len(), 1);
+        assert_eq!(txs[0].nonce, 0);
+
+        store.put_body(hash, &[dummy_tx(5), dummy_tx(6)], &[]).unwrap();
+        let (txs, _) = store.body(hash).unwrap().unwrap();
+        assert_eq!(txs.len(), 2);
+        assert_eq!(txs[0].nonce, 5);
+        assert_eq!(txs[1].nonce, 6);
+    }
+
+    #[test]
+    fn test_put_block_full_roundtrip() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+
+        let header = dummy_header(42);
+        let txs = vec![dummy_tx(0), dummy_tx(1), dummy_tx(2)];
+        let ommers = vec![dummy_header(40), dummy_header(41)];
+        let block = Block {
+            header: header.clone(),
+            transactions: txs.clone(),
+            ommers: ommers.clone(),
+        };
+        let hash = block.hash();
+
+        store.put_block(&block).unwrap();
+
+        let full = store.block(hash).unwrap().unwrap();
+        assert_eq!(full.header.number, 42);
+        assert_eq!(full.transactions.len(), 3);
+        assert_eq!(full.ommers.len(), 2);
+        assert_eq!(full.ommers[0].number, 40);
+        assert_eq!(full.ommers[1].number, 41);
+
+        for (i, tx) in full.transactions.iter().enumerate() {
+            assert_eq!(tx.nonce, i as u64);
+        }
+    }
+
+    #[test]
+    fn test_body_storage_rlp_stability() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        let hash = B256::repeat_byte(0xEE);
+
+        let txs = vec![dummy_tx(7)];
+        let ommers = vec![dummy_header(99)];
+
+        store.put_body(hash, &txs, &ommers).unwrap();
+
+        // Read raw bytes and re-decode to verify RLP stability
+        let raw = store.db.get_cf(store.cf(CF_BODIES).unwrap(), hash.as_slice())
+            .unwrap().unwrap();
+
+        // Decode the raw bytes manually
+        let mut cursor = raw.as_slice();
+        let outer = alloy_rlp::Header::decode(&mut cursor).unwrap();
+        assert!(outer.list);
+
+        let txs_header = alloy_rlp::Header::decode(&mut cursor).unwrap();
+        assert!(txs_header.list);
+
+        let tx = Transaction::decode(&mut cursor).unwrap();
+        assert_eq!(tx.nonce, 7);
+
+        let ommers_header = alloy_rlp::Header::decode(&mut cursor).unwrap();
+        assert!(ommers_header.list);
+
+        let uncle = Header::decode(&mut cursor).unwrap();
+        assert_eq!(uncle.number, 99);
+    }
 }

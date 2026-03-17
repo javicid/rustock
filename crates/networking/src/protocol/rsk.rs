@@ -887,6 +887,144 @@ mod tests {
     }
 
     #[test]
+    fn test_rsk_message_rlp_body_response_with_txs_and_uncles() {
+        use rustock_core::Transaction;
+        use alloy_primitives::Address;
+
+        fn make_tx(nonce: u64) -> Transaction {
+            Transaction {
+                nonce,
+                gas_price: U256::from(20_000_000_000u64),
+                gas_limit: U256::from(21000),
+                to: Bytes::from(Address::repeat_byte(0xAA).as_slice().to_vec()),
+                value: U256::from(nonce * 1000 + 1000),
+                input: Bytes::default(),
+                v: 27,
+                r: U256::from(nonce + 100),
+                s: U256::from(nonce + 200),
+            }
+        }
+
+        fn make_uncle(number: u64) -> Header {
+            Header {
+                number,
+                parent_hash: B256::repeat_byte(number as u8),
+                ommers_hash: B256::ZERO,
+                beneficiary: Address::ZERO,
+                state_root: B256::ZERO,
+                transactions_root: B256::ZERO,
+                receipts_root: B256::ZERO,
+                logs_bloom: Default::default(),
+                extension_data: None,
+                difficulty: U256::from(1000),
+                gas_limit: U256::from(8_000_000),
+                gas_used: 0,
+                timestamp: number * 15,
+                extra_data: Bytes::default(),
+                paid_fees: U256::ZERO,
+                minimum_gas_price: U256::ZERO,
+                uncle_count: 0,
+                umm_root: None,
+                bitcoin_merged_mining_header: None,
+                bitcoin_merged_mining_merkle_proof: None,
+                bitcoin_merged_mining_coinbase_transaction: None,
+                cached_hash: None,
+                cached_hash_for_merged_mining: None,
+            }
+        }
+
+        let transactions: Vec<Transaction> = (1..=10).map(make_tx).collect();
+        let uncles: Vec<Header> = (1..=9).map(make_uncle).collect();
+
+        let resp = BodyResponse {
+            id: 100,
+            transactions: transactions.clone(),
+            uncles: uncles.clone(),
+        };
+        let msg = RskMessage::new(RskSubMessage::BodyResponse(resp));
+
+        let mut buf = Vec::new();
+        msg.encode(&mut buf);
+
+        let mut decode_buf = buf.as_slice();
+        let decoded = RskMessage::decode(&mut decode_buf).unwrap();
+
+        if let RskSubMessage::BodyResponse(r) = decoded.sub_message {
+            assert_eq!(r.id, 100);
+            assert_eq!(r.transactions.len(), 10);
+            assert_eq!(r.uncles.len(), 9);
+
+            for (i, tx) in r.transactions.iter().enumerate() {
+                let n = (i + 1) as u64;
+                assert_eq!(tx.nonce, n, "tx {i} nonce mismatch");
+                assert_eq!(tx.value, U256::from(n * 1000 + 1000));
+            }
+
+            for (i, uncle) in r.uncles.iter().enumerate() {
+                let n = (i + 1) as u64;
+                assert_eq!(uncle.number, n, "uncle {i} number mismatch");
+                assert_eq!(uncle.parent_hash, B256::repeat_byte(n as u8));
+            }
+        } else {
+            panic!("Expected BodyResponse, got {:?}", decoded.sub_message);
+        }
+    }
+
+    #[test]
+    fn test_rsk_message_rlp_body_response_uncles_only() {
+        use alloy_primitives::Address;
+
+        let uncle = Header {
+            number: 42,
+            parent_hash: B256::repeat_byte(0x11),
+            ommers_hash: B256::ZERO,
+            beneficiary: Address::ZERO,
+            state_root: B256::ZERO,
+            transactions_root: B256::ZERO,
+            receipts_root: B256::ZERO,
+            logs_bloom: Default::default(),
+            extension_data: None,
+            difficulty: U256::from(500),
+            gas_limit: U256::from(8_000_000),
+            gas_used: 0,
+            timestamp: 630,
+            extra_data: Bytes::default(),
+            paid_fees: U256::ZERO,
+            minimum_gas_price: U256::ZERO,
+            uncle_count: 0,
+            umm_root: None,
+            bitcoin_merged_mining_header: None,
+            bitcoin_merged_mining_merkle_proof: None,
+            bitcoin_merged_mining_coinbase_transaction: None,
+            cached_hash: None,
+            cached_hash_for_merged_mining: None,
+        };
+
+        let resp = BodyResponse {
+            id: 88,
+            transactions: vec![],
+            uncles: vec![uncle],
+        };
+        let msg = RskMessage::new(RskSubMessage::BodyResponse(resp));
+
+        let mut buf = Vec::new();
+        msg.encode(&mut buf);
+
+        let mut decode_buf = buf.as_slice();
+        let decoded = RskMessage::decode(&mut decode_buf).unwrap();
+
+        if let RskSubMessage::BodyResponse(r) = decoded.sub_message {
+            assert_eq!(r.id, 88);
+            assert!(r.transactions.is_empty());
+            assert_eq!(r.uncles.len(), 1);
+            assert_eq!(r.uncles[0].number, 42);
+            assert_eq!(r.uncles[0].difficulty, U256::from(500));
+        } else {
+            panic!("Expected BodyResponse, got {:?}", decoded.sub_message);
+        }
+    }
+
+    #[test]
     fn test_rsk_message_rlp_transactions_empty() {
         let msg = RskMessage::new(RskSubMessage::Transactions(vec![]));
 
