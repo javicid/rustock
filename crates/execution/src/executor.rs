@@ -18,6 +18,7 @@ use tracing::debug;
 use crate::database::RskDatabase;
 use crate::env::{block_env_from_header, tx_env_from_rsk_tx};
 use crate::hardfork::RskHardforkConfig;
+use crate::precompiles::{rsk_precompiles, RskPrecompileProvider};
 
 /// Result of executing a single transaction.
 #[derive(Debug)]
@@ -69,7 +70,11 @@ impl RskExecutor {
             .with_block(block_env)
             .with_cfg(cfg);
 
-        let mut evm = ctx.build_mainnet();
+        let precompile_provider = RskPrecompileProvider::new(
+            rsk_precompiles(&self.hardfork_cfg, header.number),
+            &self.hardfork_cfg,
+        );
+        let mut evm = ctx.build_mainnet().with_precompiles(precompile_provider);
 
         let result = evm
             .transact(tx_env)
@@ -108,7 +113,11 @@ impl RskExecutor {
             .with_block(block_env)
             .with_cfg(cfg);
 
-        let mut evm = ctx.build_mainnet();
+        let precompile_provider = RskPrecompileProvider::new(
+            rsk_precompiles(&self.hardfork_cfg, header.number),
+            &self.hardfork_cfg,
+        );
+        let mut evm = ctx.build_mainnet().with_precompiles(precompile_provider);
 
         let mut total_gas = 0u64;
         let mut tx_results = Vec::with_capacity(transactions.len());
@@ -1012,6 +1021,407 @@ mod tests {
             ben_state.info.balance,
             U256::from(2_100_000u64),
             "beneficiary receives 21000 * 100 = 2_100_000"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // End-to-end precompile execution tests
+    // -----------------------------------------------------------------------
+
+    /// Direct tx to REMASC precompile (0x01000008).
+    /// REMASC costs 0 gas — total should be only intrinsic gas (21000).
+    #[test]
+    fn test_remasc_precompile_direct_call() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+
+        let block_store = Arc::new(
+            BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
+        );
+
+        let header = dummy_header(8_000_000);
+
+        let remasc_addr = crate::precompiles::REMASC_ADDR;
+
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(remasc_addr.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::new(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+        };
+
+        let executor = RskExecutor::new(
+            RskHardforkConfig::all_active(33),
+            block_store,
+        );
+
+        let result = executor
+            .execute_tx(&header, &tx, sender, &root, store)
+            .unwrap();
+
+        assert!(result.success, "REMASC direct call should succeed");
+        assert_eq!(result.gas_used, 21_000, "REMASC costs 0 gas, total = intrinsic only");
+    }
+
+    /// Direct tx to Bridge precompile (0x01000006).
+    /// Bridge stub charges 10,000 gas.
+    #[test]
+    fn test_bridge_precompile_direct_call() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+
+        let block_store = Arc::new(
+            BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
+        );
+
+        let header = dummy_header(8_000_000);
+
+        let bridge_addr = crate::precompiles::BRIDGE_ADDR;
+
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(bridge_addr.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::new(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+        };
+
+        let executor = RskExecutor::new(
+            RskHardforkConfig::all_active(33),
+            block_store,
+        );
+
+        let result = executor
+            .execute_tx(&header, &tx, sender, &root, store)
+            .unwrap();
+
+        assert!(result.success, "Bridge direct call should succeed");
+        assert_eq!(
+            result.gas_used,
+            21_000 + 10_000,
+            "Bridge charges 10k gas on top of intrinsic"
+        );
+    }
+
+    /// Direct tx to Identity precompile (0x04) with known input.
+    /// Ported from rskj PrecompiledContractTest.identityTest1:
+    ///   input = 0x112233445566, output = 0x112233445566, gas = 18
+    #[test]
+    fn test_identity_precompile_direct_call() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+
+        let block_store = Arc::new(
+            BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
+        );
+
+        let header = dummy_header(8_000_000);
+
+        let identity_addr = Address::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4]);
+        let input_data: Vec<u8> = vec![0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(identity_addr.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::from(input_data.clone()),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+        };
+
+        let executor = RskExecutor::new(
+            RskHardforkConfig::all_active(33),
+            block_store,
+        );
+
+        let result = executor
+            .execute_tx(&header, &tx, sender, &root, store)
+            .unwrap();
+
+        assert!(result.success, "Identity precompile should succeed");
+        assert_eq!(
+            result.output, input_data,
+            "Identity precompile returns input unchanged"
+        );
+
+        // Identity gas: 15 base + 3 * ceil(6/32) = 15 + 3 = 18
+        // Intrinsic: 21000 + 6*16 = 21096 (all non-zero at Istanbul)
+        // Total: 21096 + 18 = 21114
+        assert_eq!(result.gas_used, 21_114, "Identity: 21000 + 96 + 18 = 21114");
+    }
+
+    /// Direct tx to SHA256 precompile (0x02) with empty input.
+    /// Ported from rskj PrecompiledContractTest.sha256Test1:
+    ///   SHA256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+    #[test]
+    fn test_sha256_precompile_direct_call() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+
+        let block_store = Arc::new(
+            BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
+        );
+
+        let header = dummy_header(8_000_000);
+
+        let sha256_addr = Address::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(sha256_addr.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::new(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+        };
+
+        let executor = RskExecutor::new(
+            RskHardforkConfig::all_active(33),
+            block_store,
+        );
+
+        let result = executor
+            .execute_tx(&header, &tx, sender, &root, store)
+            .unwrap();
+
+        assert!(result.success, "SHA256 precompile should succeed");
+
+        let expected = hex_to_bytes(
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(result.output, expected, "SHA256('') matches rskj test vector");
+
+        // SHA256 gas: 60 base + 12 * ceil(0/32) = 60
+        // Intrinsic: 21000 (no data)
+        // Total: 21060
+        assert_eq!(result.gas_used, 21_060, "SHA256: 21000 + 60 = 21060");
+    }
+
+    /// Verify that SHA256 with non-empty input produces the correct hash.
+    /// Ported from rskj PrecompiledContractTest.sha256Test3:
+    ///   SHA256(0x112233) = 49ee2bf93aac3b1fb4117e59095e07abe555c3383b38d608da37680a406096e8
+    #[test]
+    fn test_sha256_precompile_with_data() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+
+        let block_store = Arc::new(
+            BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
+        );
+
+        let header = dummy_header(8_000_000);
+
+        let sha256_addr = Address::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        let input_data = vec![0x11, 0x22, 0x33];
+
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(sha256_addr.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::from(input_data),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+        };
+
+        let executor = RskExecutor::new(
+            RskHardforkConfig::all_active(33),
+            block_store,
+        );
+
+        let result = executor
+            .execute_tx(&header, &tx, sender, &root, store)
+            .unwrap();
+
+        assert!(result.success, "SHA256 precompile should succeed");
+
+        let expected = hex_to_bytes(
+            "49ee2bf93aac3b1fb4117e59095e07abe555c3383b38d608da37680a406096e8"
+        );
+        assert_eq!(result.output, expected, "SHA256(0x112233) matches rskj test vector");
+
+        // SHA256 gas: 60 + 12*1 = 72 (3 bytes = 1 word)
+        // Intrinsic: 21000 + 3*16 = 21048
+        // Total: 21048 + 72 = 21120
+        assert_eq!(result.gas_used, 21_120, "SHA256: 21000 + 48 + 72 = 21120");
+    }
+
+    /// Contract calls Identity precompile via STATICCALL and returns the result.
+    /// This tests the precompile-from-contract path (CALL opcode → precompile).
+    #[test]
+    fn test_identity_precompile_via_contract_call() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+
+        let block_store = Arc::new(
+            BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
+        );
+
+        let header = dummy_header(8_000_000);
+
+        // Deploy a contract whose runtime code:
+        //   1. Stores 0xDEADBEEF at memory[0:4]
+        //   2. STATICCALLs Identity (0x04) with that 4-byte input
+        //   3. RETURNs the 4-byte output
+        //
+        // Runtime bytecode:
+        //   PUSH4 0xDEADBEEF  ; 63 DEADBEEF
+        //   PUSH1 0x00        ; 60 00
+        //   MSTORE            ; 52           -> mem[28..32] = 0xDEADBEEF (right-aligned in 32 bytes)
+        //
+        //   PUSH1 0x04        ; 60 04        retSize
+        //   PUSH1 0x40        ; 60 40        retOffset
+        //   PUSH1 0x04        ; 60 04        argsSize
+        //   PUSH1 0x1c        ; 60 1c        argsOffset (28, where the 4 bytes are)
+        //   PUSH1 0x04        ; 60 04        address (Identity)
+        //   GAS               ; 5A           gas
+        //   STATICCALL        ; FA
+        //
+        //   PUSH1 0x04        ; 60 04        size
+        //   PUSH1 0x40        ; 60 40        offset
+        //   RETURN            ; F3
+        let runtime: Vec<u8> = vec![
+            0x63, 0xDE, 0xAD, 0xBE, 0xEF,  // PUSH4 0xDEADBEEF
+            0x60, 0x00,                      // PUSH1 0
+            0x52,                            // MSTORE
+            0x60, 0x04,                      // PUSH1 4 (retSize)
+            0x60, 0x40,                      // PUSH1 64 (retOffset)
+            0x60, 0x04,                      // PUSH1 4 (argsSize)
+            0x60, 0x1c,                      // PUSH1 28 (argsOffset)
+            0x60, 0x04,                      // PUSH1 4 (Identity address)
+            0x5A,                            // GAS
+            0xFA,                            // STATICCALL
+            0x60, 0x04,                      // PUSH1 4 (return size)
+            0x60, 0x40,                      // PUSH1 64 (return offset)
+            0xF3,                            // RETURN
+        ];
+
+        let runtime_len = runtime.len() as u8;
+        let initcode_prefix: Vec<u8> = vec![
+            0x60, runtime_len,              // PUSH1 runtime_len
+            0x60, 0x0c,                     // PUSH1 12 (offset after initcode prefix)
+            0x60, 0x00,                     // PUSH1 0
+            0x39,                           // CODECOPY
+            0x60, runtime_len,              // PUSH1 runtime_len
+            0x60, 0x00,                     // PUSH1 0
+            0xF3,                           // RETURN
+        ];
+
+        let mut initcode = initcode_prefix;
+        initcode.extend_from_slice(&runtime);
+
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(500_000),
+            to: Bytes::new(),
+            value: U256::ZERO,
+            input: Bytes::from(initcode),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+        };
+
+        let executor = RskExecutor::new(
+            RskHardforkConfig::all_active(33),
+            block_store.clone(),
+        );
+
+        // Step 1: deploy the contract
+        let deploy_result = executor
+            .execute_block(&header, &[(tx, sender)], &root, store.clone())
+            .unwrap();
+
+        assert!(deploy_result.tx_results[0].success, "deployment should succeed");
+
+        // Find the created contract address from state changes
+        let contract_addr = deploy_result.state_changes.iter()
+            .find(|(addr, acct)| {
+                **addr != sender
+                    && **addr != header.beneficiary
+                    && acct.info.code.as_ref().map_or(false, |c| !c.is_empty())
+            })
+            .map(|(addr, _)| *addr)
+            .expect("should have created a contract");
+
+        // Step 2: call the contract — it will STATICCALL Identity and return the result
+        let root2 = TrieNode::empty();
+        let root2 = put_account(&root2, store.as_ref(), &sender, 1, one_rbtc);
+
+        // Put the deployed code into the trie for the contract
+        let code_bytes = deploy_result.state_changes.get(&contract_addr)
+            .unwrap().info.code.as_ref().unwrap().bytes_slice().to_vec();
+
+        use rustock_trie::{TrieKeySlice, code_key};
+        let ckey = code_key(&contract_addr);
+        let root2 = root2.put(&TrieKeySlice::from_key(&ckey), &code_bytes, store.as_ref());
+
+        let caccount = AccountState::new(U256::ZERO, U256::ZERO);
+        let akey = account_key(&contract_addr);
+        let root2 = root2.put(&TrieKeySlice::from_key(&akey), &caccount.encode(), store.as_ref());
+
+        let call_tx = rustock_core::Transaction {
+            nonce: 1,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(contract_addr.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::new(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+        };
+
+        let call_result = executor
+            .execute_tx(&header, &call_tx, sender, &root2, store)
+            .unwrap();
+
+        assert!(call_result.success, "contract call should succeed");
+        assert_eq!(
+            call_result.output,
+            vec![0xDE, 0xAD, 0xBE, 0xEF],
+            "Identity precompile should return input unchanged via contract STATICCALL"
         );
     }
 
