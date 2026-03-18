@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 rustock-core = { version = "0.1.0", path = "../core" }
+rustock-trie = { version = "0.1.0", path = "../trie" }
 rocksdb = "0.22.0"
 anyhow = { workspace = true }
 alloy-rlp = { workspace = true }

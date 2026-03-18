@@ -5,10 +5,13 @@ use crate::state::SyncState;
 use crate::tracker::PeerChunkTracker;
 use rustock_core::types::header::Header;
 use rustock_core::types::transaction::Transaction;
+use rustock_core::Block;
+use rustock_execution::BlockProcessor;
 use rustock_networking::protocol::{
     BlockHashRequest, BlockIdentifier, BodyRequest, P2pMessage, RskMessage, RskSubMessage,
     SkeletonRequest,
 };
+use rustock_trie::{TrieNode, TrieStore};
 use alloy_primitives::{B256, B512};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -57,6 +60,9 @@ pub struct SyncService {
     pub(crate) state: SyncState,
     pub(crate) last_progress: Instant,
     progress: SyncProgress,
+    block_processor: Option<BlockProcessor>,
+    trie_store: Option<Arc<dyn TrieStore>>,
+    current_state_root: Option<TrieNode>,
 }
 
 impl SyncService {
@@ -72,7 +78,23 @@ impl SyncService {
             state: SyncState::Idle,
             last_progress: Instant::now(),
             progress: SyncProgress::new(),
+            block_processor: None,
+            trie_store: None,
+            current_state_root: None,
         }
+    }
+
+    /// Attach a block processor for full block validation and execution.
+    pub fn with_block_processor(
+        mut self,
+        processor: BlockProcessor,
+        trie_store: Arc<dyn TrieStore>,
+        initial_state_root: TrieNode,
+    ) -> Self {
+        self.block_processor = Some(processor);
+        self.trie_store = Some(trie_store);
+        self.current_state_root = Some(initial_state_root);
+        self
     }
 
     pub async fn start(mut self) {
@@ -845,9 +867,10 @@ impl SyncService {
                 if all_done {
                     info!(
                         target: "rustock::sync",
-                        "All {} block bodies downloaded, entering follow mode",
+                        "All {} block bodies downloaded",
                         pending_headers.len()
                     );
+                    self.process_downloaded_blocks(&pending_headers).await;
                     self.state = SyncState::Following;
                 } else {
                     self.state = SyncState::DownloadingBodies {
@@ -862,6 +885,89 @@ impl SyncService {
             other => {
                 self.state = other;
             }
+        }
+    }
+
+    /// Process blocks that have been downloaded (headers + bodies).
+    /// Executes each block in order, applying state changes to the trie.
+    async fn process_downloaded_blocks(
+        &mut self,
+        pending_headers: &[(B256, Header)],
+    ) {
+        let (processor, trie_store, state_root) = match (
+            &self.block_processor,
+            &self.trie_store,
+            &self.current_state_root,
+        ) {
+            (Some(p), Some(ts), Some(sr)) => (p, ts.clone(), sr.clone()),
+            _ => {
+                debug!(
+                    target: "rustock::sync",
+                    "No block processor configured, skipping execution"
+                );
+                return;
+            }
+        };
+
+        let mut current_root = state_root;
+        let mut processed = 0u64;
+
+        for (hash, header) in pending_headers {
+            let (transactions, ommers) = match self.manager.store.body(*hash) {
+                Ok(Some(body)) => body,
+                Ok(None) => {
+                    warn!(
+                        target: "rustock::sync",
+                        "Body not found for block #{} ({:?}), skipping execution",
+                        header.number, hash
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    error!(
+                        target: "rustock::sync",
+                        "Failed to read body for block #{}: {:?}", header.number, e
+                    );
+                    break;
+                }
+            };
+
+            let block = Block {
+                header: header.clone(),
+                transactions,
+                ommers,
+            };
+
+            match processor.process_and_commit(&block, &current_root, trie_store.clone()) {
+                Ok(result) => {
+                    current_root = result.new_state_root;
+                    processed += 1;
+                    if processed % 100 == 0 {
+                        debug!(
+                            target: "rustock::sync",
+                            "Processed {} blocks (latest #{}, state root {:?})",
+                            processed, header.number, result.state_root_hash
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        target: "rustock::sync",
+                        "Block #{} execution failed: {}, skipping remaining blocks",
+                        header.number, e
+                    );
+                    break;
+                }
+            }
+        }
+
+        if processed > 0 {
+            info!(
+                target: "rustock::sync",
+                "Processed {} blocks, state root: {:?}",
+                processed, current_root.compute_hash(trie_store.as_ref())
+            );
+            self.current_state_root = Some(current_root);
         }
     }
 

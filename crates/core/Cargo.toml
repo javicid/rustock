@@ -10,6 +10,9 @@ anyhow = { workspace = true }
 bitcoin = "0.32.8"
 hex = "0.4.3"
 hex-literal = "0.4.1"
+k256 = { version = "0.13.4", features = ["ecdsa"] }
 serde = { workspace = true }
 sha2 = "0.10.9"
+sha3 = "0.10"
+rustock-trie = { version = "0.1.0", path = "../trie" }
 thiserror = { workspace = true }

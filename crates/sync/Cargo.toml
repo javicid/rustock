@@ -7,6 +7,8 @@ edition = "2021"
 rustock-core = { version = "0.1.0", path = "../core" }
 rustock-storage = { version = "0.1.0", path = "../storage" }
 rustock-networking = { version = "0.1.0", path = "../networking" }
+rustock-execution = { version = "0.1.0", path = "../execution" }
+rustock-trie = { version = "0.1.0", path = "../trie" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }

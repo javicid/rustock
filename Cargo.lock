@@ -2932,8 +2932,11 @@ dependencies = [
  "bitcoin",
  "hex",
  "hex-literal",
+ "k256",
+ "rustock-trie",
  "serde",
  "sha2",
+ "sha3",
  "thiserror",
 ]
 
@@ -2944,6 +2947,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "anyhow",
+ "k256",
  "revm",
  "rustock-core",
  "rustock-storage",
@@ -3012,6 +3016,7 @@ dependencies = [
  "anyhow",
  "rocksdb",
  "rustock-core",
+ "rustock-trie",
  "tempfile",
  "tracing",
 ]
@@ -3027,8 +3032,10 @@ dependencies = [
  "lru",
  "rand 0.8.5",
  "rustock-core",
+ "rustock-execution",
  "rustock-networking",
  "rustock-storage",
+ "rustock-trie",
  "sha3",
  "tempfile",
  "tokio",

@@ -1,5 +1,8 @@
+pub mod trie_store;
+pub use trie_store::RocksDbTrieStore;
+
 use rocksdb::{DB, Options, ColumnFamilyDescriptor};
-use rustock_core::{Block, Header, Transaction};
+use rustock_core::{Block, Header, Receipt, Transaction};
 use alloy_primitives::{B256, U256};
 use alloy_rlp::{Decodable, Encodable, Header as RlpHeader};
 use anyhow::{Result, Context, anyhow};
@@ -11,6 +14,7 @@ const CF_HEADERS: &str = "headers";
 const CF_NUMBERS: &str = "block_numbers";
 const CF_TD: &str = "total_difficulty";
 const CF_BODIES: &str = "block_bodies";
+const CF_RECEIPTS: &str = "receipts";
 const KEY_HEAD: &[u8] = b"head";
 
 /// Safety limit: refuse to reorg deeper than this many blocks.
@@ -39,6 +43,7 @@ impl BlockStore {
             ColumnFamilyDescriptor::new(CF_NUMBERS, Options::default()),
             ColumnFamilyDescriptor::new(CF_TD, Options::default()),
             ColumnFamilyDescriptor::new(CF_BODIES, Options::default()),
+            ColumnFamilyDescriptor::new(CF_RECEIPTS, Options::default()),
         ];
 
         let db = DB::open_cf_descriptors(&opts, path, cfs).context("Failed to open RocksDB")?;
@@ -334,6 +339,43 @@ impl BlockStore {
             .unwrap_or_default();
 
         Ok(Some(Block { header, transactions, ommers }))
+    }
+}
+
+impl BlockStore {
+    /// Stores receipts for a block, keyed by block hash.
+    pub fn put_receipts(&self, hash: B256, receipts: &[Receipt]) -> Result<()> {
+        let mut payload = Vec::new();
+        for r in receipts {
+            r.encode(&mut payload);
+        }
+        let mut buf = Vec::with_capacity(payload.len() + 5);
+        RlpHeader { list: true, payload_length: payload.len() }.encode(&mut buf);
+        buf.extend_from_slice(&payload);
+
+        self.db
+            .put_cf(self.cf(CF_RECEIPTS)?, hash.as_slice(), &buf)
+            .context("Failed to write receipts")
+    }
+
+    /// Reads receipts for a block by hash.
+    pub fn receipts(&self, hash: B256) -> Result<Option<Vec<Receipt>>> {
+        let bytes = self.db
+            .get_cf(self.cf(CF_RECEIPTS)?, hash.as_slice())
+            .context("Failed to read receipts")?;
+        match bytes {
+            None => Ok(None),
+            Some(b) => {
+                let mut buf = b.as_slice();
+                let header = RlpHeader::decode(&mut buf)?;
+                let mut data = &buf[..header.payload_length];
+                let mut receipts = Vec::new();
+                while !data.is_empty() {
+                    receipts.push(Receipt::decode(&mut data)?);
+                }
+                Ok(Some(receipts))
+            }
+        }
     }
 }
 
