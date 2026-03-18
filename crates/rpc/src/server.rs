@@ -6,8 +6,10 @@ use axum::{
     Json, Router,
 };
 use rustock_core::config::ChainConfig;
+use rustock_execution::RskHardforkConfig;
 use rustock_networking::peers::PeerStore;
 use rustock_storage::BlockStore;
+use rustock_trie::TrieStore;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -15,7 +17,7 @@ use tower_http::cors::CorsLayer;
 use tracing::info;
 
 use crate::types::*;
-use crate::{eth, net, rsk, web3};
+use crate::{call, eth, logs, net, rsk, state, tx, web3};
 
 /// Trait for submitting raw transactions, allowing the RPC layer to use
 /// the P2P relay without depending on the sync crate directly.
@@ -31,6 +33,9 @@ pub struct RpcState {
     pub peer_store: Arc<PeerStore>,
     pub config: Arc<ChainConfig>,
     pub tx_submitter: Option<Arc<dyn TxSubmitter>>,
+    pub trie_store: Option<Arc<dyn TrieStore>>,
+    pub hardfork_cfg: Option<RskHardforkConfig>,
+    pub filter_store: Arc<logs::FilterStore>,
 }
 
 /// Starts the JSON-RPC HTTP server on the given host and port.
@@ -144,25 +149,33 @@ async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
 
         "eth_sendRawTransaction" => eth::eth_send_raw_transaction(id, params, &state.tx_submitter).await,
 
-        // -- unsupported methods (state, bodies, receipts, tx pool, etc.) --
-        "eth_getBalance"
-        | "eth_getStorageAt"
-        | "eth_getCode"
-        | "eth_getTransactionCount"
-        | "eth_call"
-        | "eth_estimateGas"
-        | "eth_sendTransaction"
-        | "eth_getTransactionByHash"
-        | "eth_getTransactionByBlockHashAndIndex"
-        | "eth_getTransactionByBlockNumberAndIndex"
-        | "eth_getTransactionReceipt"
-        | "eth_getLogs"
-        | "eth_newFilter"
-        | "eth_newBlockFilter"
-        | "eth_newPendingTransactionFilter"
-        | "eth_uninstallFilter"
-        | "eth_getFilterChanges"
-        | "eth_getFilterLogs"
+        // -- state queries --
+        "eth_getBalance" => state::eth_get_balance(id, params, state),
+        "eth_getTransactionCount" => state::eth_get_transaction_count(id, params, state),
+        "eth_getCode" => state::eth_get_code(id, params, state),
+        "eth_getStorageAt" => state::eth_get_storage_at(id, params, state),
+
+        // -- execution calls --
+        "eth_call" => call::eth_call(id, params, state),
+        "eth_estimateGas" => call::eth_estimate_gas(id, params, state),
+
+        // -- transaction and receipt lookup --
+        "eth_getTransactionByHash" => tx::eth_get_transaction_by_hash(id, params, state),
+        "eth_getTransactionByBlockHashAndIndex" => tx::eth_get_transaction_by_block_hash_and_index(id, params, state),
+        "eth_getTransactionByBlockNumberAndIndex" => tx::eth_get_transaction_by_block_number_and_index(id, params, state),
+        "eth_getTransactionReceipt" => tx::eth_get_transaction_receipt(id, params, state),
+
+        // -- log filtering --
+        "eth_getLogs" => logs::eth_get_logs(id, params, state),
+        "eth_newFilter" => logs::eth_new_filter(id, params, state),
+        "eth_newBlockFilter" => logs::eth_new_block_filter(id, state),
+        "eth_newPendingTransactionFilter" => logs::eth_new_pending_transaction_filter(id),
+        "eth_getFilterChanges" => logs::eth_get_filter_changes(id, params, state),
+        "eth_getFilterLogs" => logs::eth_get_filter_logs(id, params, state),
+        "eth_uninstallFilter" => logs::eth_uninstall_filter(id, params, state),
+
+        // -- unsupported methods --
+        "eth_sendTransaction"
         | "eth_getCompilers"
         | "eth_compileSolidity"
         | "eth_sign"

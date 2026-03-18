@@ -10,8 +10,10 @@ anyhow = { workspace = true }
 async-trait = "0.1"
 axum = "0.8"
 rustock-core = { version = "0.1.0", path = "../core" }
+rustock-execution = { version = "0.1.0", path = "../execution" }
 rustock-networking = { version = "0.1.0", path = "../networking" }
 rustock-storage = { version = "0.1.0", path = "../storage" }
+rustock-trie = { version = "0.1.0", path = "../trie" }
 hex = "0.4"
 serde = { workspace = true }
 serde_json = "1"

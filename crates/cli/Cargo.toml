@@ -10,10 +10,12 @@ async-trait = "0.1"
 clap = { version = "4.5.58", features = ["derive"] }
 k256 = "0.13.4"
 rustock-core = { version = "0.1.0", path = "../core" }
+rustock-execution = { version = "0.1.0", path = "../execution" }
 rustock-networking = { version = "0.1.0", path = "../networking" }
 rustock-storage = { version = "0.1.0", path = "../storage" }
 rustock-rpc = { version = "0.1.0", path = "../rpc" }
 rustock-sync = { version = "0.1.0", path = "../sync" }
+rustock-trie = { version = "0.1.0", path = "../trie" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

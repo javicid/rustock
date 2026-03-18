@@ -48,6 +48,9 @@ fn setup_state() -> (RpcState, tempfile::TempDir) {
         peer_store: Arc::new(PeerStore::new()),
         config: Arc::new(ChainConfig::mainnet()),
         tx_submitter: None,
+        trie_store: None,
+        hardfork_cfg: None,
+        filter_store: Arc::new(crate::logs::FilterStore::new()),
     };
     (state, tmp)
 }
@@ -311,7 +314,7 @@ async fn test_method_not_found() {
 #[tokio::test]
 async fn test_unsupported_eth_method() {
     let (state, _tmp) = setup_state();
-    let req = make_request("eth_getBalance", json!(["0x1234", "latest"]));
+    let req = make_request("eth_sendTransaction", json!(["0x1234", "latest"]));
     let resp = dispatch_for_test(&state, req).await;
     assert!(resp.error.is_some());
     let err = resp.error.unwrap();
@@ -443,6 +446,9 @@ async fn test_eth_send_raw_transaction_with_submitter() {
         peer_store: Arc::new(PeerStore::new()),
         config: Arc::new(ChainConfig::mainnet()),
         tx_submitter: Some(Arc::new(MockSubmitter)),
+        trie_store: None,
+        hardfork_cfg: None,
+        filter_store: Arc::new(crate::logs::FilterStore::new()),
     };
 
     let req = make_request("eth_sendRawTransaction", json!(["0xdeadbeef"]));
@@ -478,9 +484,566 @@ async fn test_eth_send_raw_transaction_invalid_hex() {
         peer_store: Arc::new(PeerStore::new()),
         config: Arc::new(ChainConfig::mainnet()),
         tx_submitter: Some(Arc::new(MockSubmitter)),
+        trie_store: None,
+        hardfork_cfg: None,
+        filter_store: Arc::new(crate::logs::FilterStore::new()),
     };
 
     let req = make_request("eth_sendRawTransaction", json!(["0xZZZZ"]));
     let resp = dispatch_for_test(&state, req).await;
     assert!(resp.error.is_some(), "Should error on invalid hex");
+}
+
+// ========== Phase 6: State queries with trie ==========
+
+fn setup_state_with_trie() -> (RpcState, tempfile::TempDir) {
+    use rustock_trie::{MemoryTrieStore, TrieKeySlice, TrieNode, account_key, code_key, storage_key};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(tmp.path()).unwrap());
+
+    let trie_store = Arc::new(MemoryTrieStore::new());
+
+    // Create accounts in the trie
+    let mut root = TrieNode::empty();
+
+    // Account with 10000 balance (0x2710) and nonce 1
+    let addr = "0xcd2a3d9f938e13cd947ec05abc7fe734df8dd826".parse::<alloy_primitives::Address>().unwrap();
+    let acct = rustock_trie::AccountState::new(U256::from(1), U256::from(10000));
+    let key = account_key(&addr);
+    root = root.put(&TrieKeySlice::from_key(&key), &acct.encode(), &*trie_store);
+
+    // Code for the account: [0x01, 0x02, 0x03]
+    let ckey = code_key(&addr);
+    root = root.put(&TrieKeySlice::from_key(&ckey), &[0x01, 0x02, 0x03], &*trie_store);
+
+    // Storage slot 0x01 with value 42
+    let mut slot_bytes = [0u8; 32];
+    slot_bytes[31] = 1;
+    let slot = B256::from(slot_bytes);
+    let skey = storage_key(&addr, &slot);
+    root = root.put(&TrieKeySlice::from_key(&skey), &[42], &*trie_store);
+
+    root.save(&*trie_store, true);
+    let state_root = root.compute_hash(&*trie_store);
+
+    // Store the root node by its hash
+    let root_data = root.to_message(&*trie_store);
+    rustock_trie::TrieStore::put(&*trie_store, state_root.as_slice(), &root_data);
+
+    let header = Header {
+        state_root,
+        ..test_header(42)
+    };
+    let hash = header.hash();
+    store.put_header(&header).unwrap();
+    store.put_canonical_hash(42, hash).unwrap();
+    store.set_head(hash).unwrap();
+    store.put_total_difficulty(hash, U256::from(42_000)).unwrap();
+
+    let state = RpcState {
+        store,
+        peer_store: Arc::new(PeerStore::new()),
+        config: Arc::new(ChainConfig::mainnet()),
+        tx_submitter: None,
+        trie_store: Some(trie_store),
+        hardfork_cfg: Some(rustock_execution::RskHardforkConfig::mainnet()),
+        filter_store: Arc::new(crate::logs::FilterStore::new()),
+    };
+    (state, tmp)
+}
+
+#[tokio::test]
+async fn test_eth_get_balance_with_account() {
+    let (state, _tmp) = setup_state_with_trie();
+    let addr = "0xcd2a3d9f938e13cd947ec05abc7fe734df8dd826";
+    let req = make_request("eth_getBalance", json!([addr, "latest"]));
+    let resp = dispatch_for_test(&state, req).await;
+    assert_eq!(resp.result.unwrap(), json!("0x2710"));
+}
+
+#[tokio::test]
+async fn test_eth_get_balance_missing_account() {
+    let (state, _tmp) = setup_state_with_trie();
+    let addr = "0x0000000000000000000000000000000000000001";
+    let req = make_request("eth_getBalance", json!([addr, "latest"]));
+    let resp = dispatch_for_test(&state, req).await;
+    assert_eq!(resp.result.unwrap(), json!("0x0"));
+}
+
+#[tokio::test]
+async fn test_eth_get_transaction_count_with_account() {
+    let (state, _tmp) = setup_state_with_trie();
+    let addr = "0xcd2a3d9f938e13cd947ec05abc7fe734df8dd826";
+    let req = make_request("eth_getTransactionCount", json!([addr, "latest"]));
+    let resp = dispatch_for_test(&state, req).await;
+    assert_eq!(resp.result.unwrap(), json!("0x1"));
+}
+
+#[tokio::test]
+async fn test_eth_get_transaction_count_missing() {
+    let (state, _tmp) = setup_state_with_trie();
+    let addr = "0x0000000000000000000000000000000000000001";
+    let req = make_request("eth_getTransactionCount", json!([addr, "latest"]));
+    let resp = dispatch_for_test(&state, req).await;
+    assert_eq!(resp.result.unwrap(), json!("0x0"));
+}
+
+#[tokio::test]
+async fn test_eth_get_code_existing() {
+    let (state, _tmp) = setup_state_with_trie();
+    let addr = "0xcd2a3d9f938e13cd947ec05abc7fe734df8dd826";
+    let req = make_request("eth_getCode", json!([addr, "latest"]));
+    let resp = dispatch_for_test(&state, req).await;
+    assert_eq!(resp.result.unwrap(), json!("0x010203"));
+}
+
+#[tokio::test]
+async fn test_eth_get_code_missing() {
+    let (state, _tmp) = setup_state_with_trie();
+    let addr = "0x0000000000000000000000000000000000000001";
+    let req = make_request("eth_getCode", json!([addr, "latest"]));
+    let resp = dispatch_for_test(&state, req).await;
+    assert_eq!(resp.result.unwrap(), json!("0x"));
+}
+
+#[tokio::test]
+async fn test_eth_get_storage_at_nonexistent_slot() {
+    let (state, _tmp) = setup_state_with_trie();
+    let addr = "0xcd2a3d9f938e13cd947ec05abc7fe734df8dd826";
+    let slot = format!("{:#066x}", B256::ZERO);
+    let req = make_request("eth_getStorageAt", json!([addr, slot, "latest"]));
+    let resp = dispatch_for_test(&state, req).await;
+    let expected = "0x0000000000000000000000000000000000000000000000000000000000000000";
+    assert_eq!(resp.result.unwrap(), json!(expected));
+}
+
+// ========== Phase 6: Transaction and Receipt Lookup ==========
+
+fn setup_state_with_tx() -> (RpcState, tempfile::TempDir, B256) {
+    use alloy_rlp::Encodable;
+    use sha3::{Digest, Keccak256};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(tmp.path()).unwrap());
+
+    let tx = rustock_core::Transaction {
+        nonce: 0,
+        gas_price: U256::from(20_000_000_000u64),
+        gas_limit: U256::from(21_000),
+        to: alloy_primitives::Bytes::from(vec![0x12; 20]),
+        value: U256::from(1_000_000),
+        input: alloy_primitives::Bytes::default(),
+        v: 27,
+        r: U256::from(100),
+        s: U256::from(200),
+    };
+
+    let mut tx_buf = Vec::new();
+    tx.encode(&mut tx_buf);
+    let tx_hash = B256::from_slice(&Keccak256::digest(&tx_buf));
+
+    let header = test_header(1);
+    let block_hash = header.hash();
+    store.put_header(&header).unwrap();
+    store.put_canonical_hash(1, block_hash).unwrap();
+    store.set_head(block_hash).unwrap();
+    store.put_total_difficulty(block_hash, U256::from(1000)).unwrap();
+
+    store.put_body(block_hash, &[tx.clone()], &[]).unwrap();
+    store.put_tx_index(tx_hash, block_hash, 0).unwrap();
+
+    let receipt = rustock_core::Receipt {
+        post_tx_state: vec![0x01],
+        cumulative_gas_used: 21_000,
+        gas_used: 21_000,
+        logs_bloom: alloy_primitives::Bloom::ZERO,
+        logs: vec![],
+        status: true,
+    };
+    store.put_receipts(block_hash, &[receipt]).unwrap();
+
+    let state = RpcState {
+        store,
+        peer_store: Arc::new(PeerStore::new()),
+        config: Arc::new(ChainConfig::mainnet()),
+        tx_submitter: None,
+        trie_store: None,
+        hardfork_cfg: None,
+        filter_store: Arc::new(crate::logs::FilterStore::new()),
+    };
+    (state, tmp, tx_hash)
+}
+
+#[tokio::test]
+async fn test_eth_get_transaction_by_hash() {
+    let (state, _tmp, tx_hash) = setup_state_with_tx();
+    let hash_str = format!("{:#x}", tx_hash);
+    let req = make_request("eth_getTransactionByHash", json!([hash_str]));
+    let resp = dispatch_for_test(&state, req).await;
+    let result = resp.result.unwrap();
+    assert_eq!(result["hash"], json!(hash_str));
+    assert_eq!(result["nonce"], json!("0x0"));
+    assert!(result["blockHash"].is_string());
+    assert_eq!(result["blockNumber"], json!("0x1"));
+    assert_eq!(result["transactionIndex"], json!("0x0"));
+    assert_eq!(result["input"], json!("0x"));
+    assert_eq!(result["type"], json!("0x0"));
+}
+
+#[tokio::test]
+async fn test_eth_get_transaction_by_hash_not_found() {
+    let (state, _tmp, _) = setup_state_with_tx();
+    let hash = format!("{:#x}", B256::repeat_byte(0xff));
+    let req = make_request("eth_getTransactionByHash", json!([hash]));
+    let resp = dispatch_for_test(&state, req).await;
+    assert_eq!(resp.result.unwrap(), Value::Null);
+}
+
+#[tokio::test]
+async fn test_eth_get_transaction_by_block_number_and_index() {
+    let (state, _tmp, tx_hash) = setup_state_with_tx();
+    let req = make_request("eth_getTransactionByBlockNumberAndIndex", json!(["0x1", "0x0"]));
+    let resp = dispatch_for_test(&state, req).await;
+    let result = resp.result.unwrap();
+    let hash_str = format!("{:#x}", tx_hash);
+    assert_eq!(result["hash"], json!(hash_str));
+    assert_eq!(result["transactionIndex"], json!("0x0"));
+}
+
+#[tokio::test]
+async fn test_eth_get_transaction_by_block_hash_and_index() {
+    let (state, _tmp, tx_hash) = setup_state_with_tx();
+    let block_hash = state.store.head().unwrap().unwrap();
+    let block_hash_str = format!("{:#x}", block_hash);
+    let req = make_request("eth_getTransactionByBlockHashAndIndex", json!([block_hash_str, "0x0"]));
+    let resp = dispatch_for_test(&state, req).await;
+    let result = resp.result.unwrap();
+    let hash_str = format!("{:#x}", tx_hash);
+    assert_eq!(result["hash"], json!(hash_str));
+}
+
+#[tokio::test]
+async fn test_eth_get_transaction_receipt() {
+    let (state, _tmp, tx_hash) = setup_state_with_tx();
+    let hash_str = format!("{:#x}", tx_hash);
+    let req = make_request("eth_getTransactionReceipt", json!([hash_str]));
+    let resp = dispatch_for_test(&state, req).await;
+    let result = resp.result.unwrap();
+    assert_eq!(result["transactionHash"], json!(hash_str));
+    assert_eq!(result["transactionIndex"], json!("0x0"));
+    assert_eq!(result["blockNumber"], json!("0x1"));
+    assert_eq!(result["status"], json!("0x1"));
+    assert_eq!(result["gasUsed"], json!("0x5208"));
+    assert_eq!(result["cumulativeGasUsed"], json!("0x5208"));
+    assert_eq!(result["type"], json!("0x0"));
+    assert!(result["contractAddress"].is_null());
+}
+
+#[tokio::test]
+async fn test_eth_get_transaction_receipt_not_found() {
+    let (state, _tmp, _) = setup_state_with_tx();
+    let hash = format!("{:#x}", B256::repeat_byte(0xff));
+    let req = make_request("eth_getTransactionReceipt", json!([hash]));
+    let resp = dispatch_for_test(&state, req).await;
+    assert_eq!(resp.result.unwrap(), Value::Null);
+}
+
+// ========== Phase 6: Log filtering ==========
+
+fn setup_state_with_logs() -> (RpcState, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(tmp.path()).unwrap());
+
+    let log_addr = "0x1111111111111111111111111111111111111111".parse::<alloy_primitives::Address>().unwrap();
+    let topic1 = B256::repeat_byte(0xAA);
+
+    for block_num in 1u64..=3 {
+        let header = test_header(block_num);
+        let hash = header.hash();
+        store.put_header(&header).unwrap();
+        store.put_canonical_hash(block_num, hash).unwrap();
+        store.put_total_difficulty(hash, U256::from(block_num * 1000)).unwrap();
+
+        store.put_body(hash, &[], &[]).unwrap();
+
+        let receipt = rustock_core::Receipt {
+            post_tx_state: vec![0x01],
+            cumulative_gas_used: 21_000,
+            gas_used: 21_000,
+            logs_bloom: alloy_primitives::Bloom::ZERO,
+            logs: vec![
+                rustock_core::Log {
+                    address: log_addr,
+                    topics: vec![topic1],
+                    data: vec![block_num as u8].into(),
+                }
+            ],
+            status: true,
+        };
+        store.put_receipts(hash, &[receipt]).unwrap();
+
+        if block_num == 3 {
+            store.set_head(hash).unwrap();
+        }
+    }
+
+    let state = RpcState {
+        store,
+        peer_store: Arc::new(PeerStore::new()),
+        config: Arc::new(ChainConfig::mainnet()),
+        tx_submitter: None,
+        trie_store: None,
+        hardfork_cfg: None,
+        filter_store: Arc::new(crate::logs::FilterStore::new()),
+    };
+    (state, tmp)
+}
+
+#[tokio::test]
+async fn test_eth_get_logs_by_range() {
+    let (state, _tmp) = setup_state_with_logs();
+    let req = make_request("eth_getLogs", json!([{
+        "fromBlock": "0x1",
+        "toBlock": "0x3"
+    }]));
+    let resp = dispatch_for_test(&state, req).await;
+    let logs = resp.result.unwrap();
+    let logs = logs.as_array().unwrap();
+    assert_eq!(logs.len(), 3);
+}
+
+#[tokio::test]
+async fn test_eth_get_logs_by_address() {
+    let (state, _tmp) = setup_state_with_logs();
+    let req = make_request("eth_getLogs", json!([{
+        "fromBlock": "0x1",
+        "toBlock": "0x3",
+        "address": "0x1111111111111111111111111111111111111111"
+    }]));
+    let resp = dispatch_for_test(&state, req).await;
+    let logs = resp.result.unwrap().as_array().unwrap().len();
+    assert_eq!(logs, 3);
+
+    // Different address should return nothing
+    let req2 = make_request("eth_getLogs", json!([{
+        "fromBlock": "0x1",
+        "toBlock": "0x3",
+        "address": "0x2222222222222222222222222222222222222222"
+    }]));
+    let resp2 = dispatch_for_test(&state, req2).await;
+    assert_eq!(resp2.result.unwrap().as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn test_eth_get_logs_by_topic() {
+    let (state, _tmp) = setup_state_with_logs();
+    let topic = format!("{:#x}", B256::repeat_byte(0xAA));
+    let req = make_request("eth_getLogs", json!([{
+        "fromBlock": "0x1",
+        "toBlock": "0x3",
+        "topics": [topic]
+    }]));
+    let resp = dispatch_for_test(&state, req).await;
+    assert_eq!(resp.result.unwrap().as_array().unwrap().len(), 3);
+
+    // Non-matching topic
+    let wrong_topic = format!("{:#x}", B256::repeat_byte(0xBB));
+    let req2 = make_request("eth_getLogs", json!([{
+        "fromBlock": "0x1",
+        "toBlock": "0x3",
+        "topics": [wrong_topic]
+    }]));
+    let resp2 = dispatch_for_test(&state, req2).await;
+    assert_eq!(resp2.result.unwrap().as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn test_eth_new_filter_and_get_changes() {
+    let (state, _tmp) = setup_state_with_logs();
+    // Create a filter
+    let req = make_request("eth_newFilter", json!([{
+        "fromBlock": "0x1",
+        "toBlock": "0x3"
+    }]));
+    let resp = dispatch_for_test(&state, req).await;
+    let filter_id = resp.result.unwrap();
+    assert!(filter_id.is_string());
+
+    // Get changes — since we just created it with last_polled = head (3), no new blocks
+    let req2 = make_request("eth_getFilterChanges", json!([filter_id]));
+    let resp2 = dispatch_for_test(&state, req2).await;
+    let changes = resp2.result.unwrap().as_array().unwrap().len();
+    assert_eq!(changes, 0);
+}
+
+#[tokio::test]
+async fn test_eth_new_block_filter() {
+    let (state, _tmp) = setup_state_with_logs();
+    let req = make_request("eth_newBlockFilter", json!([]));
+    let resp = dispatch_for_test(&state, req).await;
+    assert!(resp.result.unwrap().is_string());
+}
+
+#[tokio::test]
+async fn test_eth_uninstall_filter() {
+    let (state, _tmp) = setup_state_with_logs();
+    let req = make_request("eth_newFilter", json!([{"fromBlock": "0x1"}]));
+    let resp = dispatch_for_test(&state, req).await;
+    let filter_id = resp.result.unwrap();
+
+    let req2 = make_request("eth_uninstallFilter", json!([filter_id]));
+    let resp2 = dispatch_for_test(&state, req2).await;
+    assert_eq!(resp2.result.unwrap(), json!(true));
+
+    // Second uninstall should return false
+    let req3 = make_request("eth_uninstallFilter", json!([filter_id]));
+    let resp3 = dispatch_for_test(&state, req3).await;
+    assert_eq!(resp3.result.unwrap(), json!(false));
+}
+
+#[tokio::test]
+async fn test_eth_new_pending_transaction_filter() {
+    let (state, _tmp) = setup_state();
+    let req = make_request("eth_newPendingTransactionFilter", json!([]));
+    let resp = dispatch_for_test(&state, req).await;
+    assert_eq!(resp.result.unwrap(), json!("0x0"));
+}
+
+// ========== Phase 6: DTO field name compatibility with rskj ==========
+
+#[tokio::test]
+async fn test_transaction_dto_fields_match_rskj() {
+    let (state, _tmp, tx_hash) = setup_state_with_tx();
+    let hash_str = format!("{:#x}", tx_hash);
+    let req = make_request("eth_getTransactionByHash", json!([hash_str]));
+    let resp = dispatch_for_test(&state, req).await;
+    let result = resp.result.unwrap();
+
+    let required_fields = [
+        "hash", "nonce", "blockHash", "blockNumber", "transactionIndex",
+        "from", "to", "gas", "gasPrice", "value", "input", "v", "r", "s", "type",
+    ];
+    for field in &required_fields {
+        assert!(result.get(field).is_some(), "Missing TransactionDTO field: {}", field);
+    }
+
+    // Verify hex formatting matches rskj conventions
+    assert!(result["nonce"].as_str().unwrap().starts_with("0x"));
+    assert!(result["gas"].as_str().unwrap().starts_with("0x"));
+    assert!(result["gasPrice"].as_str().unwrap().starts_with("0x"));
+    assert!(result["value"].as_str().unwrap().starts_with("0x"));
+    assert_eq!(result["type"], json!("0x0"));
+    // v should be formatted as 0x%02x
+    let v_str = result["v"].as_str().unwrap();
+    assert!(v_str.starts_with("0x"));
+    assert_eq!(v_str, "0x1b"); // v=27 -> 0x1b
+}
+
+#[tokio::test]
+async fn test_receipt_dto_fields_match_rskj() {
+    let (state, _tmp, tx_hash) = setup_state_with_tx();
+    let hash_str = format!("{:#x}", tx_hash);
+    let req = make_request("eth_getTransactionReceipt", json!([hash_str]));
+    let resp = dispatch_for_test(&state, req).await;
+    let result = resp.result.unwrap();
+
+    let required_fields = [
+        "transactionHash", "transactionIndex", "blockHash", "blockNumber",
+        "cumulativeGasUsed", "gasUsed", "contractAddress", "logs",
+        "from", "to", "status", "logsBloom", "type",
+    ];
+    for field in &required_fields {
+        assert!(result.get(field).is_some(), "Missing ReceiptDTO field: {}", field);
+    }
+
+    assert_eq!(result["type"], json!("0x0"));
+    assert_eq!(result["status"], json!("0x1"));
+}
+
+#[tokio::test]
+async fn test_receipt_dto_failed_status() {
+    use alloy_rlp::Encodable;
+    use sha3::{Digest, Keccak256};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(tmp.path()).unwrap());
+
+    let tx = rustock_core::Transaction {
+        nonce: 0,
+        gas_price: U256::from(20_000_000_000u64),
+        gas_limit: U256::from(21_000),
+        to: alloy_primitives::Bytes::from(vec![0x12; 20]),
+        value: U256::from(1_000_000),
+        input: alloy_primitives::Bytes::default(),
+        v: 27,
+        r: U256::from(100),
+        s: U256::from(200),
+    };
+
+    let mut tx_buf = Vec::new();
+    tx.encode(&mut tx_buf);
+    let tx_hash = B256::from_slice(&Keccak256::digest(&tx_buf));
+
+    let header = test_header(1);
+    let block_hash = header.hash();
+    store.put_header(&header).unwrap();
+    store.put_canonical_hash(1, block_hash).unwrap();
+    store.set_head(block_hash).unwrap();
+    store.put_total_difficulty(block_hash, U256::from(1000)).unwrap();
+    store.put_body(block_hash, &[tx], &[]).unwrap();
+    store.put_tx_index(tx_hash, block_hash, 0).unwrap();
+
+    let receipt = rustock_core::Receipt {
+        post_tx_state: vec![],
+        cumulative_gas_used: 21_000,
+        gas_used: 21_000,
+        logs_bloom: alloy_primitives::Bloom::ZERO,
+        logs: vec![],
+        status: false,
+    };
+    store.put_receipts(block_hash, &[receipt]).unwrap();
+
+    let state = RpcState {
+        store,
+        peer_store: Arc::new(PeerStore::new()),
+        config: Arc::new(ChainConfig::mainnet()),
+        tx_submitter: None,
+        trie_store: None,
+        hardfork_cfg: None,
+        filter_store: Arc::new(crate::logs::FilterStore::new()),
+    };
+
+    let hash_str = format!("{:#x}", tx_hash);
+    let req = make_request("eth_getTransactionReceipt", json!([hash_str]));
+    let resp = dispatch_for_test(&state, req).await;
+    let result = resp.result.unwrap();
+    assert_eq!(result["status"], json!("0x0"));
+}
+
+// ========== Phase 6: Log DTO field names ==========
+
+#[tokio::test]
+async fn test_log_dto_fields_match_rskj() {
+    let (state, _tmp) = setup_state_with_logs();
+    let req = make_request("eth_getLogs", json!([{
+        "fromBlock": "0x1",
+        "toBlock": "0x1"
+    }]));
+    let resp = dispatch_for_test(&state, req).await;
+    let logs = resp.result.unwrap();
+    let log = &logs.as_array().unwrap()[0];
+
+    let required_fields = [
+        "address", "topics", "data", "blockNumber", "blockHash",
+        "transactionHash", "transactionIndex", "logIndex", "removed",
+    ];
+    for field in &required_fields {
+        assert!(log.get(field).is_some(), "Missing LogDTO field: {}", field);
+    }
+
+    assert_eq!(log["removed"], json!(false));
+    assert!(log["address"].as_str().unwrap().starts_with("0x"));
+    assert!(log["blockNumber"].as_str().unwrap().starts_with("0x"));
+    assert_eq!(log["logIndex"], json!("0x0"));
 }

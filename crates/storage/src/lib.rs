@@ -15,6 +15,7 @@ const CF_NUMBERS: &str = "block_numbers";
 const CF_TD: &str = "total_difficulty";
 const CF_BODIES: &str = "block_bodies";
 const CF_RECEIPTS: &str = "receipts";
+const CF_TX_INDEX: &str = "tx_index";
 const KEY_HEAD: &[u8] = b"head";
 
 /// Safety limit: refuse to reorg deeper than this many blocks.
@@ -44,6 +45,7 @@ impl BlockStore {
             ColumnFamilyDescriptor::new(CF_TD, Options::default()),
             ColumnFamilyDescriptor::new(CF_BODIES, Options::default()),
             ColumnFamilyDescriptor::new(CF_RECEIPTS, Options::default()),
+            ColumnFamilyDescriptor::new(CF_TX_INDEX, Options::default()),
         ];
 
         let db = DB::open_cf_descriptors(&opts, path, cfs).context("Failed to open RocksDB")?;
@@ -376,6 +378,55 @@ impl BlockStore {
                 Ok(Some(receipts))
             }
         }
+    }
+}
+
+impl BlockStore {
+    /// Stores a transaction index entry: tx_hash -> (block_hash, tx_index).
+    pub fn put_tx_index(&self, tx_hash: B256, block_hash: B256, tx_index: u32) -> Result<()> {
+        let mut val = [0u8; 36];
+        val[..32].copy_from_slice(block_hash.as_slice());
+        val[32..].copy_from_slice(&tx_index.to_be_bytes());
+        self.db
+            .put_cf(self.cf(CF_TX_INDEX)?, tx_hash.as_slice(), &val)
+            .context("Failed to write tx index")
+    }
+
+    /// Looks up which block contains a transaction and at what index.
+    pub fn tx_location(&self, tx_hash: B256) -> Result<Option<(B256, u32)>> {
+        let bytes = self.db
+            .get_cf(self.cf(CF_TX_INDEX)?, tx_hash.as_slice())
+            .context("Failed to read tx index")?;
+        match bytes {
+            None => Ok(None),
+            Some(b) => {
+                if b.len() < 36 {
+                    return Err(anyhow!("corrupt tx index entry: {} bytes", b.len()));
+                }
+                let block_hash = B256::from_slice(&b[..32]);
+                let tx_index = u32::from_be_bytes([b[32], b[33], b[34], b[35]]);
+                Ok(Some((block_hash, tx_index)))
+            }
+        }
+    }
+
+    /// Indexes all transactions in a block body for fast lookup by tx hash.
+    /// Computes each transaction's hash from its RLP encoding.
+    pub fn index_block_transactions(&self, block_hash: B256, transactions: &[Transaction]) -> Result<()> {
+        use sha3::{Digest, Keccak256};
+
+        for (i, tx) in transactions.iter().enumerate() {
+            let mut buf = Vec::new();
+            tx.encode(&mut buf);
+            let tx_hash = B256::from_slice(&Keccak256::digest(&buf));
+            self.put_tx_index(tx_hash, block_hash, i as u32)?;
+        }
+        Ok(())
+    }
+
+    /// Returns a reference to the underlying RocksDB instance.
+    pub fn db(&self) -> &Arc<DB> {
+        &self.db
     }
 }
 
@@ -1013,5 +1064,70 @@ mod tests {
 
         let uncle = Header::decode(&mut cursor).unwrap();
         assert_eq!(uncle.number, 99);
+    }
+
+    // --- Transaction Index tests ---
+
+    #[test]
+    fn test_tx_index_put_and_get() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+
+        let tx_hash = B256::repeat_byte(0x11);
+        let block_hash = B256::repeat_byte(0x22);
+        let tx_index = 5u32;
+
+        store.put_tx_index(tx_hash, block_hash, tx_index).unwrap();
+
+        let (found_block, found_idx) = store.tx_location(tx_hash).unwrap().unwrap();
+        assert_eq!(found_block, block_hash);
+        assert_eq!(found_idx, tx_index);
+    }
+
+    #[test]
+    fn test_tx_index_not_found() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        assert!(store.tx_location(B256::repeat_byte(0xFF)).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_index_block_transactions() {
+        use sha3::{Digest, Keccak256};
+
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+
+        let block_hash = B256::repeat_byte(0x33);
+        let txs = vec![dummy_tx(0), dummy_tx(1), dummy_tx(2)];
+
+        store.index_block_transactions(block_hash, &txs).unwrap();
+
+        for (i, tx) in txs.iter().enumerate() {
+            let mut buf = Vec::new();
+            tx.encode(&mut buf);
+            let tx_hash = B256::from_slice(&Keccak256::digest(&buf));
+
+            let (found_block, found_idx) = store.tx_location(tx_hash).unwrap().unwrap();
+            assert_eq!(found_block, block_hash);
+            assert_eq!(found_idx, i as u32);
+        }
+    }
+
+    #[test]
+    fn test_tx_index_overwrite() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+
+        let tx_hash = B256::repeat_byte(0x44);
+        let block_a = B256::repeat_byte(0xAA);
+        let block_b = B256::repeat_byte(0xBB);
+
+        store.put_tx_index(tx_hash, block_a, 0).unwrap();
+        store.put_tx_index(tx_hash, block_b, 3).unwrap();
+
+        let (found_block, found_idx) = store.tx_location(tx_hash).unwrap().unwrap();
+        assert_eq!(found_block, block_b);
+        assert_eq!(found_idx, 3);
     }
 }

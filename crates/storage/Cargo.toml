@@ -10,6 +10,7 @@ rocksdb = "0.22.0"
 anyhow = { workspace = true }
 alloy-rlp = { workspace = true }
 alloy-primitives = { workspace = true }
+sha3 = "0.10"
 tracing = { workspace = true }
 
 [dev-dependencies]

@@ -188,11 +188,18 @@ async fn main() -> Result<()> {
     tokio::spawn(sync_service.start());
 
     if !args.no_rpc {
+        let trie_store: Arc<dyn rustock_trie::TrieStore> =
+            Arc::new(rustock_storage::RocksDbTrieStore::from_db(store.db().clone()));
+        let hardfork_cfg = rustock_execution::RskHardforkConfig::mainnet();
+
         let rpc_state = rustock_rpc::server::RpcState {
             store: store.clone(),
             peer_store: peer_store.clone(),
             config: config.clone(),
             tx_submitter: Some(Arc::new(TxRelaySubmitter(tx_relay.clone()))),
+            trie_store: Some(trie_store),
+            hardfork_cfg: Some(hardfork_cfg),
+            filter_store: Arc::new(rustock_rpc::logs::FilterStore::new()),
         };
         let rpc_host = args.rpc_host.clone();
         let rpc_port = args.rpc_port;
