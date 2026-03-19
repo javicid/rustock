@@ -73,6 +73,7 @@ impl RskExecutor {
         let precompile_provider = RskPrecompileProvider::new(
             rsk_precompiles(&self.hardfork_cfg, header.number),
             &self.hardfork_cfg,
+            Some(self.block_store.clone()),
         );
         let mut evm = ctx.build_mainnet().with_precompiles(precompile_provider);
 
@@ -116,6 +117,7 @@ impl RskExecutor {
         let precompile_provider = RskPrecompileProvider::new(
             rsk_precompiles(&self.hardfork_cfg, header.number),
             &self.hardfork_cfg,
+            Some(self.block_store.clone()),
         );
         let mut evm = ctx.build_mainnet().with_precompiles(precompile_provider);
 
@@ -1679,5 +1681,858 @@ mod tests {
             .step_by(2)
             .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
             .collect()
+    }
+
+    // -----------------------------------------------------------------------
+    // BlockHeaderContract integration tests
+    // -----------------------------------------------------------------------
+
+    fn block_header_selector(sig: &str) -> [u8; 4] {
+        use sha3::{Digest, Keccak256};
+        let h = Keccak256::digest(sig.as_bytes());
+        [h[0], h[1], h[2], h[3]]
+    }
+
+    /// Build ABI-encoded input for a single-param BlockHeaderContract call:
+    /// 4-byte selector + 32-byte ABI-encoded int256.
+    fn bh_input(sig: &str, depth: i64) -> Vec<u8> {
+        let sel = block_header_selector(sig);
+        let mut input = vec![0u8; 36];
+        input[..4].copy_from_slice(&sel);
+        if depth >= 0 {
+            let be = (depth as u64).to_be_bytes();
+            input[28..36].copy_from_slice(&be);
+        } else {
+            // Negative int256: sign-extend with 0xFF
+            input[4..36].fill(0xFF);
+            let be = (depth as i64).to_be_bytes();
+            input[28..36].copy_from_slice(&be);
+        }
+        input
+    }
+
+    /// Decode an ABI-encoded `bytes` return value.
+    fn decode_abi_bytes(output: &[u8]) -> Vec<u8> {
+        if output.len() < 64 {
+            return Vec::new();
+        }
+        let len = u64::from_be_bytes(output[56..64].try_into().unwrap()) as usize;
+        if 64 + len > output.len() {
+            return Vec::new();
+        }
+        output[64..64 + len].to_vec()
+    }
+
+    /// Direct tx to BlockHeaderContract with getCoinbaseAddress(0).
+    /// Sets up a two-block chain and queries the parent's coinbase.
+    #[test]
+    fn test_block_header_get_coinbase_address() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+
+        let block_store = Arc::new(
+            BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
+        );
+
+        // Store a parent block (number 99) with a known coinbase
+        let parent_coinbase = Address::repeat_byte(0xCC);
+        let mut parent_header = dummy_header(99);
+        parent_header.beneficiary = parent_coinbase;
+        let parent_hash = parent_header.hash();
+        block_store.put_header(&parent_header).unwrap();
+        block_store.put_canonical_hash(99, parent_hash).unwrap();
+
+        // Current block is 100, parent_hash points to block 99
+        let mut header = dummy_header(100);
+        header.parent_hash = parent_hash;
+
+        let input = bh_input("getCoinbaseAddress(int256)", 0);
+
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::from(input),
+            v: 0, r: U256::ZERO, s: U256::ZERO,
+        };
+
+        let executor = RskExecutor::new(
+            RskHardforkConfig::all_active(33),
+            block_store,
+        );
+
+        let result = executor
+            .execute_tx(&header, &tx, sender, &root, store)
+            .unwrap();
+
+        assert!(result.success, "getCoinbaseAddress should succeed");
+
+        let decoded = decode_abi_bytes(&result.output);
+        assert_eq!(decoded.len(), 20, "coinbase address should be 20 bytes");
+        assert_eq!(decoded, parent_coinbase.as_slice());
+    }
+
+    /// getCoinbaseAddress at depth 1 returns the grandparent's coinbase.
+    #[test]
+    fn test_block_header_get_coinbase_depth_1() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+
+        let block_store = Arc::new(
+            BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
+        );
+
+        let grandparent_coinbase = Address::repeat_byte(0xDD);
+        let mut gp = dummy_header(98);
+        gp.beneficiary = grandparent_coinbase;
+        let gp_hash = gp.hash();
+        block_store.put_header(&gp).unwrap();
+        block_store.put_canonical_hash(98, gp_hash).unwrap();
+
+        let mut parent = dummy_header(99);
+        parent.parent_hash = gp_hash;
+        let parent_hash = parent.hash();
+        block_store.put_header(&parent).unwrap();
+        block_store.put_canonical_hash(99, parent_hash).unwrap();
+
+        let mut header = dummy_header(100);
+        header.parent_hash = parent_hash;
+
+        let input = bh_input("getCoinbaseAddress(int256)", 1);
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::from(input),
+            v: 0, r: U256::ZERO, s: U256::ZERO,
+        };
+
+        let executor = RskExecutor::new(
+            RskHardforkConfig::all_active(33),
+            block_store,
+        );
+
+        let result = executor.execute_tx(&header, &tx, sender, &root, store).unwrap();
+        assert!(result.success);
+
+        let decoded = decode_abi_bytes(&result.output);
+        assert_eq!(decoded, grandparent_coinbase.as_slice());
+    }
+
+    /// getBlockHash returns the correct block hash.
+    #[test]
+    fn test_block_header_get_block_hash() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+
+        let block_store = Arc::new(
+            BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
+        );
+
+        let parent = dummy_header(99);
+        let parent_hash = parent.hash();
+        block_store.put_header(&parent).unwrap();
+        block_store.put_canonical_hash(99, parent_hash).unwrap();
+
+        let mut header = dummy_header(100);
+        header.parent_hash = parent_hash;
+
+        let input = bh_input("getBlockHash(int256)", 0);
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::from(input),
+            v: 0, r: U256::ZERO, s: U256::ZERO,
+        };
+
+        let executor = RskExecutor::new(
+            RskHardforkConfig::all_active(33),
+            block_store,
+        );
+
+        let result = executor.execute_tx(&header, &tx, sender, &root, store).unwrap();
+        assert!(result.success);
+
+        let decoded = decode_abi_bytes(&result.output);
+        assert_eq!(decoded.len(), 32);
+        assert_eq!(decoded, parent_hash.as_slice());
+    }
+
+    /// getDifficulty returns the parent block's difficulty.
+    #[test]
+    fn test_block_header_get_difficulty() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+
+        let block_store = Arc::new(
+            BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
+        );
+
+        let mut parent = dummy_header(99);
+        parent.difficulty = U256::from(1_234_567u64);
+        let parent_hash = parent.hash();
+        block_store.put_header(&parent).unwrap();
+        block_store.put_canonical_hash(99, parent_hash).unwrap();
+
+        let mut header = dummy_header(100);
+        header.parent_hash = parent_hash;
+
+        let input = bh_input("getDifficulty(int256)", 0);
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::from(input),
+            v: 0, r: U256::ZERO, s: U256::ZERO,
+        };
+
+        let executor = RskExecutor::new(
+            RskHardforkConfig::all_active(33),
+            block_store,
+        );
+
+        let result = executor.execute_tx(&header, &tx, sender, &root, store).unwrap();
+        assert!(result.success);
+
+        let decoded = decode_abi_bytes(&result.output);
+        // 1_234_567 = 0x12D687 → Java BigInteger bytes = [0x12, 0xD6, 0x87]
+        assert_eq!(decoded, vec![0x12, 0xD6, 0x87]);
+    }
+
+    /// getGasUsed returns ABI-encoded gas used (Java BigInteger format).
+    #[test]
+    fn test_block_header_get_gas_used() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+
+        let block_store = Arc::new(
+            BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
+        );
+
+        let mut parent = dummy_header(99);
+        parent.gas_used = 21_000;
+        let parent_hash = parent.hash();
+        block_store.put_header(&parent).unwrap();
+        block_store.put_canonical_hash(99, parent_hash).unwrap();
+
+        let mut header = dummy_header(100);
+        header.parent_hash = parent_hash;
+
+        let input = bh_input("getGasUsed(int256)", 0);
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::from(input),
+            v: 0, r: U256::ZERO, s: U256::ZERO,
+        };
+
+        let executor = RskExecutor::new(
+            RskHardforkConfig::all_active(33),
+            block_store,
+        );
+
+        let result = executor.execute_tx(&header, &tx, sender, &root, store).unwrap();
+        assert!(result.success);
+
+        let decoded = decode_abi_bytes(&result.output);
+        // 21000 = 0x5208
+        assert_eq!(decoded, vec![0x52, 0x08]);
+    }
+
+    /// Depth beyond MAX_BLOCK_DEPTH (4000) returns empty bytes.
+    #[test]
+    fn test_block_header_depth_beyond_max_returns_empty() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+
+        let block_store = Arc::new(
+            BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
+        );
+
+        let header = dummy_header(5000);
+
+        // depth 4000 → >= MAX_BLOCK_DEPTH → empty
+        let mut input = vec![0u8; 36];
+        input[..4].copy_from_slice(&block_header_selector("getDifficulty(int256)"));
+        // 4000 = 0x0FA0
+        input[34] = 0x0F;
+        input[35] = 0xA0;
+
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::from(input),
+            v: 0, r: U256::ZERO, s: U256::ZERO,
+        };
+
+        let executor = RskExecutor::new(
+            RskHardforkConfig::all_active(33),
+            block_store,
+        );
+
+        let result = executor.execute_tx(&header, &tx, sender, &root, store).unwrap();
+        assert!(result.success, "depth beyond MAX should succeed with empty");
+
+        let decoded = decode_abi_bytes(&result.output);
+        assert!(decoded.is_empty(), "should return empty bytes for depth >= 4000");
+    }
+
+    /// Negative depth should fail (rskj throws VMException).
+    #[test]
+    fn test_block_header_negative_depth_fails() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+
+        let block_store = Arc::new(
+            BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
+        );
+
+        let header = dummy_header(100);
+
+        let input = bh_input("getCoinbaseAddress(int256)", -1);
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::from(input),
+            v: 0, r: U256::ZERO, s: U256::ZERO,
+        };
+
+        let executor = RskExecutor::new(
+            RskHardforkConfig::all_active(33),
+            block_store,
+        );
+
+        let result = executor.execute_tx(&header, &tx, sender, &root, store).unwrap();
+        assert!(!result.success, "negative depth should fail");
+    }
+
+    /// Block not found at depth returns empty bytes.
+    #[test]
+    fn test_block_header_block_not_found_returns_empty() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+
+        let block_store = Arc::new(
+            BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
+        );
+
+        // Block 100 executing, no blocks stored → depth 0 will find nothing
+        let header = dummy_header(100);
+
+        let input = bh_input("getCoinbaseAddress(int256)", 0);
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::from(input),
+            v: 0, r: U256::ZERO, s: U256::ZERO,
+        };
+
+        let executor = RskExecutor::new(
+            RskHardforkConfig::all_active(33),
+            block_store,
+        );
+
+        let result = executor.execute_tx(&header, &tx, sender, &root, store).unwrap();
+        assert!(result.success, "missing block should succeed with empty result");
+
+        let decoded = decode_abi_bytes(&result.output);
+        assert!(decoded.is_empty());
+    }
+
+    /// Gas cost is 4000 + 2*input.len() (on top of intrinsic).
+    #[test]
+    fn test_block_header_gas_cost() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+
+        let block_store = Arc::new(
+            BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
+        );
+
+        let header = dummy_header(100);
+
+        // 36 bytes input (4 selector + 32 depth)
+        // Precompile gas: 4000 + 2*36 = 4072
+        let input = bh_input("getDifficulty(int256)", 0);
+
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::from(input),
+            v: 0, r: U256::ZERO, s: U256::ZERO,
+        };
+
+        let executor = RskExecutor::new(
+            RskHardforkConfig::all_active(33),
+            block_store,
+        );
+
+        let result = executor.execute_tx(&header, &tx, sender, &root, store).unwrap();
+        assert!(result.success);
+
+        // Intrinsic: 21000 base + (4 non-zero selector bytes * 16) + (some zero/non-zero depth bytes * 4 or 16)
+        // Precompile: 4000 + 72 = 4072
+        // Total should be > 21000 + 4000
+        assert!(result.gas_used > 25_000, "should include precompile gas");
+    }
+
+    /// getMinGasPrice returns the parent's minimum gas price.
+    #[test]
+    fn test_block_header_get_min_gas_price() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+
+        let block_store = Arc::new(
+            BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
+        );
+
+        let mut parent = dummy_header(99);
+        parent.minimum_gas_price = U256::from(59_240_000u64);
+        let parent_hash = parent.hash();
+        block_store.put_header(&parent).unwrap();
+        block_store.put_canonical_hash(99, parent_hash).unwrap();
+
+        let mut header = dummy_header(100);
+        header.parent_hash = parent_hash;
+
+        let input = bh_input("getMinGasPrice(int256)", 0);
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::from(input),
+            v: 0, r: U256::ZERO, s: U256::ZERO,
+        };
+
+        let executor = RskExecutor::new(
+            RskHardforkConfig::all_active(33),
+            block_store,
+        );
+
+        let result = executor.execute_tx(&header, &tx, sender, &root, store).unwrap();
+        assert!(result.success);
+
+        let decoded = decode_abi_bytes(&result.output);
+        // 59_240_000 = 0x387_EE40 → Java BigInteger: [0x03, 0x87, 0xEE, 0x40]
+        assert_eq!(decoded, vec![0x03, 0x87, 0xEE, 0x40]);
+    }
+
+    /// getGasLimit returns the parent's gas limit.
+    #[test]
+    fn test_block_header_get_gas_limit() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+
+        let block_store = Arc::new(
+            BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
+        );
+
+        let mut parent = dummy_header(99);
+        parent.gas_limit = U256::from(6_800_000u64);
+        let parent_hash = parent.hash();
+        block_store.put_header(&parent).unwrap();
+        block_store.put_canonical_hash(99, parent_hash).unwrap();
+
+        let mut header = dummy_header(100);
+        header.parent_hash = parent_hash;
+
+        let input = bh_input("getGasLimit(int256)", 0);
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::from(input),
+            v: 0, r: U256::ZERO, s: U256::ZERO,
+        };
+
+        let executor = RskExecutor::new(
+            RskHardforkConfig::all_active(33),
+            block_store,
+        );
+
+        let result = executor.execute_tx(&header, &tx, sender, &root, store).unwrap();
+        assert!(result.success);
+
+        let decoded = decode_abi_bytes(&result.output);
+        // 6_800_000 = 0x67C280 → Java BigInteger: [0x67, 0xC2, 0x80]
+        assert_eq!(decoded, vec![0x67, 0xC2, 0x80]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Ported from rskj BlockHeaderContractTest
+    // -----------------------------------------------------------------------
+
+    /// Ported from rskj BlockHeaderContractTest.getGasUsed:
+    ///   GAS_USED = 0 → BigInteger(0).toByteArray() = [0]
+    #[test]
+    fn test_rskj_block_header_gas_used_zero() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+
+        let block_store = Arc::new(
+            BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
+        );
+
+        let mut parent = dummy_header(99);
+        parent.gas_used = 0;
+        let parent_hash = parent.hash();
+        block_store.put_header(&parent).unwrap();
+        block_store.put_canonical_hash(99, parent_hash).unwrap();
+
+        let mut header = dummy_header(100);
+        header.parent_hash = parent_hash;
+
+        let input = bh_input("getGasUsed(int256)", 0);
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::from(input),
+            v: 0, r: U256::ZERO, s: U256::ZERO,
+        };
+
+        let executor = RskExecutor::new(
+            RskHardforkConfig::all_active(33),
+            block_store,
+        );
+
+        let result = executor.execute_tx(&header, &tx, sender, &root, store).unwrap();
+        assert!(result.success);
+
+        let decoded = decode_abi_bytes(&result.output);
+        // BigInteger.valueOf(0).toByteArray() = [0]
+        assert_eq!(decoded, vec![0x00], "gas_used=0 should return [0] (Java BigInteger)");
+    }
+
+    /// Ported from rskj BlockHeaderContractTest.getUncleCoinbaseAddress:
+    ///   Tests uncle index 0, 1 (valid), and 2 (out of range → empty).
+    #[test]
+    fn test_rskj_block_header_uncle_coinbase() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+
+        let block_store = Arc::new(
+            BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
+        );
+
+        // Create parent with two uncles
+        let uncle0_coinbase = Address::repeat_byte(0x11);
+        let uncle1_coinbase = Address::repeat_byte(0x22);
+
+        let mut uncle0 = dummy_header(98);
+        uncle0.beneficiary = uncle0_coinbase;
+        let mut uncle1 = dummy_header(98);
+        uncle1.beneficiary = uncle1_coinbase;
+
+        let parent = dummy_header(99);
+        let parent_hash = parent.hash();
+        block_store.put_header(&parent).unwrap();
+        block_store.put_canonical_hash(99, parent_hash).unwrap();
+        block_store
+            .put_body(parent_hash, &[], &[uncle0, uncle1])
+            .unwrap();
+
+        let mut header = dummy_header(100);
+        header.parent_hash = parent_hash;
+
+        let executor = RskExecutor::new(
+            RskHardforkConfig::all_active(33),
+            block_store,
+        );
+
+        // Uncle index 0 → uncle0_coinbase
+        let mut input = vec![0u8; 68];
+        input[..4].copy_from_slice(&block_header_selector("getUncleCoinbaseAddress(int256,int256)"));
+        // blockDepth = 0
+        // uncleIndex = 0 (already zero)
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::from(input.clone()),
+            v: 0, r: U256::ZERO, s: U256::ZERO,
+        };
+        let result = executor.execute_tx(&header, &tx, sender, &root, store.clone()).unwrap();
+        assert!(result.success, "uncle index 0 should succeed");
+        let decoded = decode_abi_bytes(&result.output);
+        assert_eq!(decoded, uncle0_coinbase.as_slice(), "uncle 0 coinbase");
+
+        // Uncle index 1 → uncle1_coinbase
+        let mut input1 = vec![0u8; 68];
+        input1[..4].copy_from_slice(&block_header_selector("getUncleCoinbaseAddress(int256,int256)"));
+        input1[67] = 1; // uncleIndex = 1
+        let tx1 = rustock_core::Transaction {
+            nonce: 1,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::from(input1),
+            v: 0, r: U256::ZERO, s: U256::ZERO,
+        };
+        let root1 = put_account(&TrieNode::empty(), store.as_ref(), &sender, 1, one_rbtc);
+        let result1 = executor.execute_tx(&header, &tx1, sender, &root1, store.clone()).unwrap();
+        assert!(result1.success, "uncle index 1 should succeed");
+        let decoded1 = decode_abi_bytes(&result1.output);
+        assert_eq!(decoded1, uncle1_coinbase.as_slice(), "uncle 1 coinbase");
+
+        // Uncle index 2 → out of range → empty
+        let mut input2 = vec![0u8; 68];
+        input2[..4].copy_from_slice(&block_header_selector("getUncleCoinbaseAddress(int256,int256)"));
+        input2[67] = 2; // uncleIndex = 2
+        let tx2 = rustock_core::Transaction {
+            nonce: 2,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::from(input2),
+            v: 0, r: U256::ZERO, s: U256::ZERO,
+        };
+        let root2 = put_account(&TrieNode::empty(), store.as_ref(), &sender, 2, one_rbtc);
+        let result2 = executor.execute_tx(&header, &tx2, sender, &root2, store.clone()).unwrap();
+        assert!(result2.success, "uncle index 2 (out of range) should succeed with empty");
+        let decoded2 = decode_abi_bytes(&result2.output);
+        assert!(decoded2.is_empty(), "uncle index 2 should return empty (only 2 uncles)");
+    }
+
+    /// Ported from rskj BlockHeaderContractTest.negativeUncleIndex:
+    ///   Negative uncle index should fail.
+    #[test]
+    fn test_rskj_block_header_negative_uncle_index() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+
+        let block_store = Arc::new(
+            BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
+        );
+
+        let parent = dummy_header(99);
+        let parent_hash = parent.hash();
+        block_store.put_header(&parent).unwrap();
+        block_store.put_canonical_hash(99, parent_hash).unwrap();
+        block_store.put_body(parent_hash, &[], &[]).unwrap();
+
+        let mut header = dummy_header(100);
+        header.parent_hash = parent_hash;
+
+        // blockDepth=0, uncleIndex=-1
+        let mut input = vec![0u8; 68];
+        input[..4].copy_from_slice(&block_header_selector("getUncleCoinbaseAddress(int256,int256)"));
+        // uncleIndex = -1 → all 0xFF in the second int256
+        input[36..68].fill(0xFF);
+
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::from(input),
+            v: 0, r: U256::ZERO, s: U256::ZERO,
+        };
+
+        let executor = RskExecutor::new(
+            RskHardforkConfig::all_active(33),
+            block_store,
+        );
+
+        let result = executor.execute_tx(&header, &tx, sender, &root, store).unwrap();
+        assert!(!result.success, "negative uncle index should fail");
+    }
+
+    /// Ported from rskj BlockHeaderContractTest.getEmptyMergedMiningTags:
+    ///   When parent has no bitcoin_merged_mining_coinbase_transaction,
+    ///   getMergedMiningTags returns empty bytes.
+    #[test]
+    fn test_rskj_block_header_empty_merged_mining_tags() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+
+        let block_store = Arc::new(
+            BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
+        );
+
+        // Parent with no merged mining data at all
+        let parent = dummy_header(99);
+        assert!(parent.bitcoin_merged_mining_coinbase_transaction.is_none());
+        let parent_hash = parent.hash();
+        block_store.put_header(&parent).unwrap();
+        block_store.put_canonical_hash(99, parent_hash).unwrap();
+
+        let mut header = dummy_header(100);
+        header.parent_hash = parent_hash;
+
+        let input = bh_input("getMergedMiningTags(int256)", 0);
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::from(input),
+            v: 0, r: U256::ZERO, s: U256::ZERO,
+        };
+
+        let executor = RskExecutor::new(
+            RskHardforkConfig::all_active(33),
+            block_store,
+        );
+
+        let result = executor.execute_tx(&header, &tx, sender, &root, store).unwrap();
+        assert!(result.success, "empty merged mining should succeed");
+
+        let decoded = decode_abi_bytes(&result.output);
+        assert!(decoded.is_empty(), "no coinbase tx → empty merged mining tags");
+    }
+
+    /// Ported from rskj BlockHeaderContractTest.invalidBlockDepth:
+    ///   Chain of 300 blocks, query at depth 500 → block not found → empty.
+    #[test]
+    fn test_rskj_block_header_depth_exceeds_chain_length() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+
+        let block_store = Arc::new(
+            BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
+        );
+
+        // Store a small chain: blocks 0 through 9
+        for i in 0..10 {
+            let mut h = dummy_header(i);
+            if i > 0 {
+                let prev_hash = block_store.canonical_hash(i - 1).unwrap().unwrap();
+                h.parent_hash = prev_hash;
+            }
+            let hash = h.hash();
+            block_store.put_header(&h).unwrap();
+            block_store.put_canonical_hash(i, hash).unwrap();
+        }
+
+        // Execute at block 10, parent is block 9
+        let parent_hash = block_store.canonical_hash(9).unwrap().unwrap();
+        let mut header = dummy_header(10);
+        header.parent_hash = parent_hash;
+
+        // depth 500 → target = 10 - 1 - 500 = underflow → empty
+        let mut input = vec![0u8; 36];
+        input[..4].copy_from_slice(&block_header_selector("getCoinbaseAddress(int256)"));
+        input[34] = 0x01; // depth = 256+244=500
+        input[35] = 0xF4;
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::from(input),
+            v: 0, r: U256::ZERO, s: U256::ZERO,
+        };
+
+        let executor = RskExecutor::new(
+            RskHardforkConfig::all_active(33),
+            block_store,
+        );
+
+        let result = executor.execute_tx(&header, &tx, sender, &root, store).unwrap();
+        assert!(result.success, "depth exceeding chain length should succeed with empty");
+        let decoded = decode_abi_bytes(&result.output);
+        assert!(decoded.is_empty(), "depth 500 in 10-block chain → empty");
     }
 }
