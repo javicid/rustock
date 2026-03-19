@@ -200,8 +200,11 @@ pub async fn eth_send_raw_transaction(
         return JsonRpcResponse::error(id, INVALID_PARAMS, "Invalid hex");
     };
 
-    let tx_hash = submitter
+    match submitter
         .submit_transaction(alloy_primitives::Bytes::from(raw_bytes))
-        .await;
-    JsonRpcResponse::success(id, json!(format!("0x{:x}", tx_hash)))
+        .await
+    {
+        Ok(tx_hash) => JsonRpcResponse::success(id, json!(format!("0x{:x}", tx_hash))),
+        Err(e) => JsonRpcResponse::error(id, INVALID_PARAMS, e),
+    }
 }

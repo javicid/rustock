@@ -30,6 +30,18 @@ pub fn eth_get_transaction_count(id: Value, params: &Value, state: &RpcState) ->
     };
     let block_param = params.get(1).and_then(|v| v.as_str()).unwrap_or("latest");
 
+    // For "pending", return the pool's pending nonce if available
+    if block_param == "pending" {
+        if let Some(pool) = &state.tx_pool {
+            if let Some(pending_nonce) = pool.pending_nonce(&addr) {
+                return JsonRpcResponse::success(
+                    id,
+                    json!(format!("0x{:x}", pending_nonce)),
+                );
+            }
+        }
+    }
+
     let Some((root, _header)) = resolve_state_root(block_param, state) else {
         return JsonRpcResponse::error(id, INTERNAL_ERROR, "Cannot resolve block");
     };

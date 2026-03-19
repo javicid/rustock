@@ -14,8 +14,28 @@ struct TxRelaySubmitter(Arc<TxRelay>);
 
 #[async_trait::async_trait]
 impl rustock_rpc::server::TxSubmitter for TxRelaySubmitter {
-    async fn submit_transaction(&self, raw_tx: alloy_primitives::Bytes) -> alloy_primitives::B256 {
+    async fn submit_transaction(&self, raw_tx: alloy_primitives::Bytes) -> Result<alloy_primitives::B256, String> {
         self.0.submit_transaction(raw_tx).await
+    }
+}
+
+struct PoolAdapter(Arc<rustock_sync::TransactionPool>);
+
+impl rustock_rpc::server::TxPoolReader for PoolAdapter {
+    fn get_pending_tx(
+        &self,
+        hash: &alloy_primitives::B256,
+    ) -> Option<(rustock_core::Transaction, alloy_primitives::Address, alloy_primitives::B256)> {
+        let ptx = self.0.get(hash)?;
+        Some((ptx.tx, ptx.sender, ptx.hash))
+    }
+
+    fn pending_nonce(&self, addr: &alloy_primitives::Address) -> Option<u64> {
+        self.0.pending_nonce(addr)
+    }
+
+    fn pool_status(&self) -> (usize, usize) {
+        self.0.status()
     }
 }
 
@@ -177,9 +197,18 @@ async fn main() -> Result<()> {
 
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
     let sync_handler = Arc::new(SyncHandler::new(sync_manager.clone(), event_tx));
-    let sync_service = SyncService::new(sync_manager.clone(), peer_store.clone(), event_rx);
+    let trie_store_for_pool: Arc<dyn rustock_trie::TrieStore> =
+        Arc::new(rustock_storage::RocksDbTrieStore::from_db(store.db().clone()));
+    let pool = Arc::new(rustock_sync::TransactionPool::new(
+        rustock_sync::txpool::PoolConfig::default(),
+        config.chain_id.into(),
+        store.clone(),
+        trie_store_for_pool,
+    ));
 
-    let tx_relay = Arc::new(TxRelay::new(peer_store.clone()));
+    let sync_service = SyncService::new(sync_manager.clone(), peer_store.clone(), event_rx)
+        .with_tx_pool(pool.clone());
+    let tx_relay = Arc::new(TxRelay::with_pool(peer_store.clone(), pool.clone()));
 
     let mut node = Node::with_peer_store(node_config, peer_store.clone());
     node.add_handler(sync_handler);
@@ -200,6 +229,7 @@ async fn main() -> Result<()> {
             trie_store: Some(trie_store),
             hardfork_cfg: Some(hardfork_cfg),
             filter_store: Arc::new(rustock_rpc::logs::FilterStore::new()),
+            tx_pool: Some(Arc::new(PoolAdapter(pool.clone()))),
         };
         let rpc_host = args.rpc_host.clone();
         let rpc_port = args.rpc_port;

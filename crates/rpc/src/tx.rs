@@ -12,6 +12,14 @@ pub fn eth_get_transaction_by_hash(id: Value, params: &Value, state: &RpcState) 
         return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid tx hash");
     };
 
+    // Check pool first for pending transactions
+    if let Some(pool) = &state.tx_pool {
+        if let Some((tx, sender, hash)) = pool.get_pending_tx(&tx_hash) {
+            let dto = TransactionDto::from_tx(&tx, hash, None, None, None, sender);
+            return JsonRpcResponse::success(id, serde_json::to_value(dto).unwrap());
+        }
+    }
+
     let Some((block_hash, tx_index)) = state.store.tx_location(tx_hash).ok().flatten() else {
         return JsonRpcResponse::success(id, Value::Null);
     };

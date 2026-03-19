@@ -21,3 +21,4 @@ sha3 = "0.10"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+k256 = { version = "0.13.4", features = ["ecdsa"] }

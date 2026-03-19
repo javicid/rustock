@@ -6,6 +6,7 @@ mod service;
 mod state;
 mod tracker;
 pub mod tx_relay;
+pub mod txpool;
 
 // Re-exports for external consumers
 pub use events::SyncEvent;
@@ -15,6 +16,7 @@ pub use service::SyncService;
 pub use state::SyncState;
 pub use tracker::PeerChunkTracker;
 pub use tx_relay::TxRelay;
+pub use txpool::TransactionPool;
 
 #[cfg(test)]
 pub use rustock_core::types::header::Header;

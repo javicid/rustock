@@ -408,9 +408,9 @@ async fn test_headers_response_advances_chunks() {
     // Chunk 2: headers for blocks 3-4 (descending from b4)
     service.on_headers_response(peer, vec![b4.clone(), b3.clone()]).await;
 
-    // All chunks done and we're at peer_best → Following
-    assert!(matches!(service.state, SyncState::Following),
-        "Expected Following after final chunk, got {:?}", service.state);
+    // All chunks done → transitions to DownloadingBodies (bodies not yet stored)
+    assert!(matches!(service.state, SyncState::DownloadingBodies { .. }),
+        "Expected DownloadingBodies after final chunk, got {:?}", service.state);
 
     // Verify all headers are stored
     assert!(store.header(b1.hash()).unwrap().is_some());
@@ -599,11 +599,28 @@ async fn test_skeleton_round_transitions_to_next_skeleton() {
 
     service.on_headers_response(peer, vec![b4.clone(), b3.clone()]).await;
 
+    // Headers complete → transitions to DownloadingBodies since bodies are missing
+    match &service.state {
+        SyncState::DownloadingBodies { peer_best, .. } => {
+            assert_eq!(*peer_best, 10000);
+        }
+        _ => panic!("Expected DownloadingBodies after completing last chunk, got {:?}", service.state),
+    }
+
+    // Simulate body responses to complete the phase
+    if let SyncState::DownloadingBodies { in_flight, .. } = &service.state {
+        let req_ids: Vec<u64> = in_flight.keys().copied().collect();
+        for req_id in req_ids {
+            service.on_body_response(req_id, vec![], vec![]).await;
+        }
+    }
+
+    // After all bodies downloaded, should continue to DownloadingSkeleton
     match &service.state {
         SyncState::DownloadingSkeleton { connection_point, .. } => {
             assert_eq!(*connection_point, 4, "Should request next skeleton from our head");
         }
-        _ => panic!("Expected DownloadingSkeleton after completing last chunk, got {:?}", service.state),
+        _ => panic!("Expected DownloadingSkeleton after body download, got {:?}", service.state),
     }
 
     drop(event_tx);
@@ -1804,8 +1821,8 @@ async fn test_body_download_state_machine() {
     let (_event_tx, event_rx) = mpsc::unbounded_channel();
     let mut service = SyncService::new(manager, peer_store, event_rx);
 
-    // Trigger body download; genesis at block 0 won't be scanned (start=1)
-    service.start_body_downloads(2).await;
+    // Trigger body download; peer_best=1 means we're at tip after downloading
+    service.start_body_downloads(1).await;
 
     match &service.state {
         SyncState::DownloadingBodies { pending_headers, .. } => {
@@ -1855,7 +1872,7 @@ async fn test_body_download_all_bodies_present_skips() {
     let (_event_tx, event_rx) = mpsc::unbounded_channel();
     let mut service = SyncService::new(manager, peer_store, event_rx);
 
-    service.start_body_downloads(2).await;
+    service.start_body_downloads(1).await;
 
     // Should skip directly to Following since all bodies are present
     assert!(matches!(service.state, SyncState::Following),
@@ -1910,7 +1927,7 @@ async fn test_tx_relay_submit_transaction() {
 
     let relay = TxRelay::new(peer_store);
     let raw = Bytes::from(vec![0xca, 0xfe]);
-    let hash = relay.submit_transaction(raw).await;
+    let hash = relay.submit_transaction(raw).await.unwrap();
 
     assert_ne!(hash, alloy_primitives::B256::ZERO);
     assert!(rx_a.try_recv().is_ok(), "peer should receive broadcast");

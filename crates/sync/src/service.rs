@@ -13,6 +13,7 @@ use rustock_networking::protocol::{
 };
 use rustock_trie::{TrieNode, TrieStore};
 use alloy_primitives::{B256, B512};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -63,6 +64,9 @@ pub struct SyncService {
     block_processor: Option<BlockProcessor>,
     trie_store: Option<Arc<dyn TrieStore>>,
     current_state_root: Option<TrieNode>,
+    last_body_height: u64,
+    pending_follow_bodies: HashMap<u64, (B256, Header)>,
+    tx_pool: Option<Arc<crate::TransactionPool>>,
 }
 
 impl SyncService {
@@ -81,7 +85,16 @@ impl SyncService {
             block_processor: None,
             trie_store: None,
             current_state_root: None,
+            last_body_height: 0,
+            pending_follow_bodies: HashMap::new(),
+            tx_pool: None,
         }
+    }
+
+    /// Attach a transaction pool for removing mined txs during block processing.
+    pub fn with_tx_pool(mut self, pool: Arc<crate::TransactionPool>) -> Self {
+        self.tx_pool = Some(pool);
+        self
     }
 
     /// Attach a block processor for full block validation and execution.
@@ -541,74 +554,7 @@ impl SyncService {
                 }
 
                 if tracker.is_complete() {
-                    // All chunks in this skeleton round are processed
-                    let our_height = self.our_head_number();
-                    if our_height < peer_best {
-                        // Check if we have a pre-fetched skeleton ready
-                        if let Some(next_skel) = pending_next_skeleton {
-                            if next_skel.len() >= 2 {
-                                // Trim skeleton: find the last entry at or below our_height
-                                // to use as the new base. This avoids requesting chunks we
-                                // already have (the head advanced while we were downloading).
-                                let base_idx = next_skel
-                                    .iter()
-                                    .rposition(|b| b.number <= our_height)
-                                    .unwrap_or(0);
-                                let trimmed: Vec<BlockIdentifier> =
-                                    next_skel[base_idx..].to_vec();
-
-                                if trimmed.len() < 2 {
-                                    // Nothing useful left after trimming — request fresh
-                                    debug!(
-                                        target: "rustock::sync",
-                                        "Pre-fetched skeleton fully consumed, requesting fresh one"
-                                    );
-                                } else {
-                                    debug!(
-                                        target: "rustock::sync",
-                                        "Skeleton round complete (head #{}), using pre-fetched skeleton ({} entries after trim)",
-                                        our_height, trimmed.len()
-                                    );
-                                    let chunks = std::cmp::min(
-                                        trimmed.len(),
-                                        MAX_SKELETON_CHUNKS + 1,
-                                    );
-                                    let new_tracker = PeerChunkTracker::new(chunks);
-                                    self.state = SyncState::DownloadingHeaders {
-                                        peer_best,
-                                        skeleton: trimmed,
-                                        connection_point: our_height,
-                                        tracker: new_tracker,
-                                        pending_next_skeleton: None,
-                                    };
-                                    self.fill_pipeline().await;
-                                    return;
-                                }
-                                // trimmed too small — fall through to request fresh skeleton
-                            }
-                        }
-                        debug!(
-                            target: "rustock::sync",
-                            "Skeleton round complete (head #{}, peer #{}), requesting next skeleton",
-                            our_height, peer_best
-                        );
-                        // Pick the best available peer for the next skeleton
-                        let next_peer = self.peer_store.best_peer().await
-                            .map(|(id, _)| id)
-                            .unwrap_or(peer);
-                        self.state = SyncState::DownloadingSkeleton {
-                            peer: next_peer,
-                            peer_best,
-                            connection_point: our_height,
-                        };
-                        self.send_skeleton_request_to(&next_peer, our_height).await;
-                    } else {
-                        info!(
-                            target: "rustock::sync",
-                            "Sync complete! Head at #{}, entering follow mode", our_height
-                        );
-                        self.state = SyncState::Following;
-                    }
+                    self.start_body_downloads(peer_best).await;
                 } else {
                     // More chunks to go — restore state and refill pipeline
                     self.state = SyncState::DownloadingHeaders {
@@ -624,7 +570,7 @@ impl SyncService {
                 self.state = other;
                 let before_height = self.our_head_number();
                 let before_hash = self.manager.store.head().ok().flatten();
-                let _ = self.manager.handle_headers_response(headers);
+                let _ = self.manager.handle_headers_response(headers.clone());
                 if is_following {
                     let after_height = self.our_head_number();
                     let after_hash = self.manager.store.head().ok().flatten();
@@ -642,6 +588,7 @@ impl SyncService {
                                 after_hash
                             );
                         }
+                        self.request_follow_bodies(&headers).await;
                     }
                 }
             }
@@ -751,11 +698,9 @@ impl SyncService {
     /// body downloading for any headers that don't already have bodies stored.
     pub(crate) async fn start_body_downloads(&mut self, peer_best: u64) {
         let our_height = self.our_head_number();
+        let start = self.last_body_height + 1;
 
-        // Walk the canonical chain to find headers without bodies.
-        // For efficiency, only go back to the start of what we just synced.
         let mut pending = Vec::new();
-        let start = if our_height > 1000 { our_height - 1000 } else { 1 };
         for num in start..=our_height {
             if let Ok(Some(hash)) = self.manager.store.canonical_hash(num) {
                 if let Ok(None) = self.manager.store.body(hash) {
@@ -769,25 +714,74 @@ impl SyncService {
         if pending.is_empty() {
             debug!(
                 target: "rustock::sync",
-                "All bodies already stored, entering follow mode"
+                "All bodies already stored up to #{}", our_height
             );
-            self.state = SyncState::Following;
+            self.last_body_height = our_height;
+            self.continue_after_bodies(peer_best).await;
             return;
         }
 
         info!(
             target: "rustock::sync",
-            "Starting body download for {} blocks", pending.len()
+            "Starting body download for {} blocks (#{} to #{})",
+            pending.len(),
+            pending.first().map(|(_, h)| h.number).unwrap_or(0),
+            pending.last().map(|(_, h)| h.number).unwrap_or(0),
         );
 
         self.state = SyncState::DownloadingBodies {
             peer_best,
             pending_headers: pending,
             next_request: 0,
-            in_flight: std::collections::HashMap::new(),
+            in_flight: HashMap::new(),
         };
         self.last_progress = Instant::now();
         self.send_body_requests().await;
+    }
+
+    /// After body downloads (or when no bodies needed), decide whether to
+    /// continue syncing headers or enter follow mode.
+    async fn continue_after_bodies(&mut self, peer_best: u64) {
+        let our_height = self.our_head_number();
+        if our_height < peer_best {
+            debug!(
+                target: "rustock::sync",
+                "Skeleton round complete (head #{}, peer #{}), requesting next skeleton",
+                our_height, peer_best
+            );
+            let next_peer = self.peer_store.best_peer().await
+                .map(|(id, _)| id)
+                .unwrap_or(B512::ZERO);
+            self.state = SyncState::DownloadingSkeleton {
+                peer: next_peer,
+                peer_best,
+                connection_point: our_height,
+            };
+            self.send_skeleton_request_to(&next_peer, our_height).await;
+        } else {
+            info!(
+                target: "rustock::sync",
+                "Sync complete! Head at #{}, entering follow mode", our_height
+            );
+            self.state = SyncState::Following;
+        }
+    }
+
+    /// In Following mode, request bodies for newly received block headers.
+    async fn request_follow_bodies(&mut self, headers: &[Header]) {
+        let peers = self.peer_store.peers().await;
+        if peers.is_empty() {
+            return;
+        }
+        for header in headers {
+            let hash = header.hash();
+            if self.manager.store.body(hash).ok().flatten().is_none() {
+                let (req_id, msg) = create_body_request(hash);
+                let peer = &peers[0];
+                self.peer_store.send_to_peer(peer, msg).await;
+                self.pending_follow_bodies.insert(req_id, (hash, header.clone()));
+            }
+        }
     }
 
     /// Send body requests for up to `MAX_BODY_REQUESTS` pending headers.
@@ -871,7 +865,11 @@ impl SyncService {
                         pending_headers.len()
                     );
                     self.process_downloaded_blocks(&pending_headers).await;
-                    self.state = SyncState::Following;
+                    self.last_body_height = pending_headers
+                        .last()
+                        .map(|(_, h)| h.number)
+                        .unwrap_or(self.last_body_height);
+                    self.continue_after_bodies(peer_best).await;
                 } else {
                     self.state = SyncState::DownloadingBodies {
                         peer_best,
@@ -880,6 +878,24 @@ impl SyncService {
                         in_flight,
                     };
                     self.send_body_requests().await;
+                }
+            }
+            SyncState::Following => {
+                self.state = SyncState::Following;
+                if let Some((hash, header)) = self.pending_follow_bodies.remove(&request_id) {
+                    if let Err(e) = self.manager.store.put_body(hash, &transactions, &uncles) {
+                        error!(
+                            target: "rustock::sync",
+                            "Failed to store follow-mode body for {:?}: {:?}", hash, e
+                        );
+                        return;
+                    }
+                    debug!(
+                        target: "rustock::sync",
+                        "Stored body for block #{} ({} txs) in follow mode",
+                        header.number, transactions.len()
+                    );
+                    self.process_single_block(hash, &header, transactions, uncles).await;
                 }
             }
             other => {
@@ -932,6 +948,10 @@ impl SyncService {
                 }
             };
 
+            if let Some(pool) = &self.tx_pool {
+                pool.remove_mined(&transactions);
+            }
+
             let block = Block {
                 header: header.clone(),
                 transactions,
@@ -968,6 +988,52 @@ impl SyncService {
                 processed, current_root.compute_hash(trie_store.as_ref())
             );
             self.current_state_root = Some(current_root);
+        }
+    }
+
+    /// Process a single block received in follow mode.
+    async fn process_single_block(
+        &mut self,
+        _hash: B256,
+        header: &Header,
+        transactions: Vec<Transaction>,
+        ommers: Vec<Header>,
+    ) {
+        if let Some(pool) = &self.tx_pool {
+            pool.remove_mined(&transactions);
+            pool.evict_outdated(header.number);
+        }
+
+        let (processor, trie_store, state_root) = match (
+            &self.block_processor,
+            &self.trie_store,
+            &self.current_state_root,
+        ) {
+            (Some(p), Some(ts), Some(sr)) => (p, ts.clone(), sr.clone()),
+            _ => return,
+        };
+
+        let block = Block {
+            header: header.clone(),
+            transactions,
+            ommers,
+        };
+
+        match processor.process_and_commit(&block, &state_root, trie_store.clone()) {
+            Ok(result) => {
+                info!(
+                    target: "rustock::sync",
+                    "Executed block #{}, state root: {:?}",
+                    header.number, result.state_root_hash
+                );
+                self.current_state_root = Some(result.new_state_root);
+            }
+            Err(e) => {
+                warn!(
+                    target: "rustock::sync",
+                    "Block #{} execution failed: {}", header.number, e
+                );
+            }
         }
     }
 

@@ -51,6 +51,7 @@ fn setup_state() -> (RpcState, tempfile::TempDir) {
         trie_store: None,
         hardfork_cfg: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
+        tx_pool: None,
     };
     (state, tmp)
 }
@@ -431,8 +432,8 @@ async fn test_eth_send_raw_transaction_with_submitter() {
 
     #[async_trait::async_trait]
     impl TxSubmitter for MockSubmitter {
-        async fn submit_transaction(&self, raw_tx: alloy_primitives::Bytes) -> B256 {
-            B256::from_slice(&sha3::Keccak256::digest(&raw_tx))
+        async fn submit_transaction(&self, raw_tx: alloy_primitives::Bytes) -> Result<B256, String> {
+            Ok(B256::from_slice(&sha3::Keccak256::digest(&raw_tx)))
         }
     }
 
@@ -449,6 +450,7 @@ async fn test_eth_send_raw_transaction_with_submitter() {
         trie_store: None,
         hardfork_cfg: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
+        tx_pool: None,
     };
 
     let req = make_request("eth_sendRawTransaction", json!(["0xdeadbeef"]));
@@ -469,8 +471,8 @@ async fn test_eth_send_raw_transaction_invalid_hex() {
 
     #[async_trait::async_trait]
     impl TxSubmitter for MockSubmitter {
-        async fn submit_transaction(&self, _raw_tx: alloy_primitives::Bytes) -> B256 {
-            B256::ZERO
+        async fn submit_transaction(&self, _raw_tx: alloy_primitives::Bytes) -> Result<B256, String> {
+            Ok(B256::ZERO)
         }
     }
 
@@ -487,6 +489,7 @@ async fn test_eth_send_raw_transaction_invalid_hex() {
         trie_store: None,
         hardfork_cfg: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
+        tx_pool: None,
     };
 
     let req = make_request("eth_sendRawTransaction", json!(["0xZZZZ"]));
@@ -549,6 +552,7 @@ fn setup_state_with_trie() -> (RpcState, tempfile::TempDir) {
         trie_store: Some(trie_store),
         hardfork_cfg: Some(rustock_execution::RskHardforkConfig::mainnet()),
         filter_store: Arc::new(crate::logs::FilterStore::new()),
+        tx_pool: None,
     };
     (state, tmp)
 }
@@ -671,6 +675,7 @@ fn setup_state_with_tx() -> (RpcState, tempfile::TempDir, B256) {
         trie_store: None,
         hardfork_cfg: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
+        tx_pool: None,
     };
     (state, tmp, tx_hash)
 }
@@ -796,6 +801,7 @@ fn setup_state_with_logs() -> (RpcState, tempfile::TempDir) {
         trie_store: None,
         hardfork_cfg: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
+        tx_pool: None,
     };
     (state, tmp)
 }
@@ -1012,6 +1018,7 @@ async fn test_receipt_dto_failed_status() {
         trie_store: None,
         hardfork_cfg: None,
         filter_store: Arc::new(crate::logs::FilterStore::new()),
+        tx_pool: None,
     };
 
     let hash_str = format!("{:#x}", tx_hash);

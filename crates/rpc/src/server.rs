@@ -23,7 +23,14 @@ use crate::{call, eth, logs, net, rsk, state, tx, web3};
 /// the P2P relay without depending on the sync crate directly.
 #[async_trait::async_trait]
 pub trait TxSubmitter: Send + Sync {
-    async fn submit_transaction(&self, raw_tx: alloy_primitives::Bytes) -> alloy_primitives::B256;
+    async fn submit_transaction(&self, raw_tx: alloy_primitives::Bytes) -> Result<alloy_primitives::B256, String>;
+}
+
+/// Trait for reading from the transaction pool without depending on the sync crate.
+pub trait TxPoolReader: Send + Sync {
+    fn get_pending_tx(&self, hash: &alloy_primitives::B256) -> Option<(rustock_core::Transaction, alloy_primitives::Address, alloy_primitives::B256)>;
+    fn pending_nonce(&self, addr: &alloy_primitives::Address) -> Option<u64>;
+    fn pool_status(&self) -> (usize, usize);
 }
 
 /// Shared application state available to every RPC handler.
@@ -36,6 +43,7 @@ pub struct RpcState {
     pub trie_store: Option<Arc<dyn TrieStore>>,
     pub hardfork_cfg: Option<RskHardforkConfig>,
     pub filter_store: Arc<logs::FilterStore>,
+    pub tx_pool: Option<Arc<dyn TxPoolReader>>,
 }
 
 /// Starts the JSON-RPC HTTP server on the given host and port.
@@ -181,6 +189,18 @@ async fn dispatch(state: &RpcState, req: JsonRpcRequest) -> JsonRpcResponse {
         | "eth_sign"
         | "eth_signTransaction" => {
             execution_not_available(id, &req.method)
+        }
+
+        "txpool_status" => {
+            if let Some(pool) = &state.tx_pool {
+                let (pending, queued) = pool.pool_status();
+                JsonRpcResponse::success(id, json!({
+                    "pending": format!("0x{:x}", pending),
+                    "queued": format!("0x{:x}", queued),
+                }))
+            } else {
+                execution_not_available(id, "txpool_status")
+            }
         }
 
         m if m.starts_with("debug_")
