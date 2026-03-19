@@ -773,7 +773,7 @@ fn test_tracker_handle_peer_disconnect() {
     assert_eq!(tracker.next_to_assign, 2);
 
     // peer_a should have no in-flight
-    assert!(tracker.in_flight.get(&peer_a).is_none());
+    assert!(!tracker.in_flight.contains_key(&peer_a));
 
     // peer_b should be unaffected
     assert_eq!(tracker.in_flight.get(&peer_b).unwrap().len(), 3);

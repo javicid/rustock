@@ -3,7 +3,6 @@
 /// Translates RSK block headers and transactions into revm's `BlockEnv`
 /// and `TxEnv` structures, accounting for RSK-specific fields like
 /// `minimum_gas_price` and merged-mining difficulty.
-
 use alloy_primitives::{Address, B256, Bytes, U256};
 use revm::context::{BlockEnv, TxEnv};
 use revm::primitives::TxKind;
@@ -13,34 +12,26 @@ use crate::hardfork::RskHardforkConfig;
 
 /// Build a revm `BlockEnv` from an RSK block header.
 pub fn block_env_from_header(header: &Header, hardfork_cfg: &RskHardforkConfig) -> BlockEnv {
-    let mut env = BlockEnv::default();
-
-    env.number = U256::from(header.number);
-    env.beneficiary = header.beneficiary;
-    env.timestamp = U256::from(header.timestamp);
-
-    // RSK stores gas_limit as U256 but revm expects u64
-    env.gas_limit = header.gas_limit.to::<u64>();
-
-    env.difficulty = header.difficulty;
-
-    // RSK uses minimum_gas_price instead of EIP-1559 basefee.
-    // Set basefee to minimum_gas_price so revm validates tx gas_price >= basefee.
-    env.basefee = header.minimum_gas_price.to::<u64>();
-
-    // For post-Merge SpecIds (SHANGHAI+), revm requires prevrandao and the
-    // DIFFICULTY opcode reads prevrandao instead. RSK still uses PoW difficulty,
-    // so we set prevrandao to the difficulty value to preserve correct semantics.
     let spec = hardfork_cfg.spec_id(header.number);
-    if spec.is_enabled_in(SpecId::MERGE) {
-        env.prevrandao = Some(B256::from(header.difficulty.to_be_bytes::<32>()));
+    let prevrandao = if spec.is_enabled_in(SpecId::MERGE) {
+        Some(B256::from(header.difficulty.to_be_bytes::<32>()))
     } else {
-        env.prevrandao = None;
+        None
+    };
+
+    BlockEnv {
+        number: U256::from(header.number),
+        beneficiary: header.beneficiary,
+        timestamp: U256::from(header.timestamp),
+        // RSK stores gas_limit as U256 but revm expects u64
+        gas_limit: header.gas_limit.to::<u64>(),
+        difficulty: header.difficulty,
+        // RSK uses minimum_gas_price instead of EIP-1559 basefee.
+        basefee: header.minimum_gas_price.to::<u64>(),
+        prevrandao,
+        blob_excess_gas_and_price: None,
+        ..Default::default()
     }
-
-    env.blob_excess_gas_and_price = None;
-
-    env
 }
 
 /// Build a revm `TxEnv` from an RSK transaction.

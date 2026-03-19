@@ -82,7 +82,7 @@ fn build_mm_proof(header: &Header, btc_bits: u32, rsk_tag_hash: Option<B256>) ->
 
     // Coinbase txid = double-SHA256 of raw tx, byte-reversed.
     let first_hash = Sha256::digest(&coinbase_bytes);
-    let txid_bytes = Sha256::digest(&first_hash);
+    let txid_bytes = Sha256::digest(first_hash);
     let mut merkle_root_bytes = [0u8; 32];
     merkle_root_bytes.copy_from_slice(&txid_bytes);
     merkle_root_bytes.reverse();

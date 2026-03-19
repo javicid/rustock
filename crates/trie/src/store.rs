@@ -3,7 +3,6 @@
 /// The store maps byte keys (typically Keccak-256 hashes) to byte values.
 /// Both trie nodes and long values (>32 bytes) share the same key space,
 /// matching rskj's TrieStoreImpl behavior.
-
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -24,6 +23,10 @@ impl MemoryTrieStore {
 
     pub fn len(&self) -> usize {
         self.data.lock().unwrap().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 

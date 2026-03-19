@@ -58,6 +58,7 @@ impl FilterStore {
 enum FilterKind {
     Log(LogFilter),
     Block,
+    #[allow(dead_code)]
     PendingTransaction,
 }
 

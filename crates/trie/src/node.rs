@@ -6,7 +6,6 @@
 /// - `value`: inline data for this key, or None
 /// - `value_hash`: keccak256 of the value
 /// - `children_size`: aggregate size of child sub-trees (VarInt-encoded in serialization)
-
 use alloy_primitives::B256;
 use sha3::{Digest, Keccak256};
 use crate::path::TrieKeySlice;
@@ -304,7 +303,7 @@ impl TrieNode {
                 | ((data[pos + 1] as u32) << 8)
                 | (data[pos + 2] as u32);
             let val = store.get(vh.as_slice());
-            debug_assert!(val.as_ref().map_or(true, |v| v.len() == vlen as usize));
+            debug_assert!(val.as_ref().is_none_or(|v| v.len() == vlen as usize));
             (val, Some(vh))
         } else {
             let remaining = data.len() - pos;
@@ -435,7 +434,7 @@ impl TrieNode {
     ) -> Option<TrieNode> {
         // Normalize: empty value = deletion
         let value = match value {
-            Some(v) if v.is_empty() => None,
+            Some([]) => None,
             other => other,
         };
 

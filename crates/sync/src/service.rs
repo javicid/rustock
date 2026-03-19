@@ -962,7 +962,7 @@ impl SyncService {
                 Ok(result) => {
                     current_root = result.new_state_root;
                     processed += 1;
-                    if processed % 100 == 0 {
+                    if processed.is_multiple_of(100) {
                         debug!(
                             target: "rustock::sync",
                             "Processed {} blocks (latest #{}, state root {:?})",

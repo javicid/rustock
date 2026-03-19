@@ -5,9 +5,10 @@ use rustock_networking::protocol::BlockIdentifier;
 use crate::tracker::PeerChunkTracker;
 
 /// The state machine for skeleton-based forward sync.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub enum SyncState {
     /// Waiting for peers / nothing to do.
+    #[default]
     Idle,
     /// Binary-searching for the last block we share with the peer.
     FindingConnectionPoint {
@@ -46,8 +47,3 @@ pub enum SyncState {
     Following,
 }
 
-impl Default for SyncState {
-    fn default() -> Self {
-        SyncState::Idle
-    }
-}

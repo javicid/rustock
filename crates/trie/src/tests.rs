@@ -11,9 +11,8 @@
 /// - PathEncoderTest.java      (concrete encode/decode vectors)
 /// - TrieTreeSizeTest.java     (children_size values)
 /// - TrieKeySliceTest.java     (bit-level key slicing)
-
 #[cfg(test)]
-mod tests {
+mod unit {
     use std::sync::Arc;
 
     use alloy_primitives::{Address, B256, U256};

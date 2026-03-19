@@ -6,7 +6,6 @@
 /// where `postTxState` is either a 32-byte state root or a 1-byte tx status
 /// (pre/post-Byzantium), `status` is `0x01` for success or `0x80`/empty for
 /// failure, and each log is `[address, [topic0, ...], data]`.
-
 use alloy_primitives::{Address, Bloom, Bytes, B256};
 use alloy_rlp::{Decodable, Encodable, Header as RlpHeader};
 

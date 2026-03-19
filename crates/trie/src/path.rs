@@ -3,7 +3,6 @@
 /// Keys in the Unitrie are byte arrays that get expanded to individual bits.
 /// Each bit selects left (0) or right (1) when traversing the trie.
 /// Bits are packed MSB-first: bit 0 of the path is the MSB of byte 0.
-
 /// Encodes an expanded path (slice of 0s and 1s) into packed bytes (MSB-first).
 pub fn encode(path: &[u8]) -> Vec<u8> {
     let len = encoded_len(path.len());
@@ -29,7 +28,7 @@ pub fn decode(encoded: &[u8], bit_length: usize) -> Vec<u8> {
 
 /// Number of bytes needed to pack `bit_count` bits.
 pub fn encoded_len(bit_count: usize) -> usize {
-    (bit_count + 7) / 8
+    bit_count.div_ceil(8)
 }
 
 /// An immutable slice of a trie key in expanded (bit-per-byte) form.

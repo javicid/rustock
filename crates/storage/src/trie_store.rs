@@ -3,7 +3,6 @@
 /// Persists trie nodes and long values to a dedicated column family,
 /// matching rskj's TrieStoreImpl behavior where both node data and
 /// externalized values share the same key space (keyed by keccak256 hash).
-
 use rocksdb::{DB, Options, ColumnFamilyDescriptor};
 use rustock_trie::TrieStore;
 use std::path::Path;

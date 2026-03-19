@@ -16,7 +16,6 @@
 /// | arrowhead600     | 6223700   | ISTANBUL          | Calldata cost reduction (RSKIP400)   |
 /// | lovell700        | 7338024   | SHANGHAI          | Initcode metering (RSKIP438), PUSH0  |
 /// | reed800          | 8052200   | SHANGHAI          | (RSK-specific fixes)                 |
-
 use revm::primitives::hardfork::SpecId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

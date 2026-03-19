@@ -311,7 +311,7 @@ mod tests {
     #[test]
     fn sha256_midstate_continuation() {
         let data = [0x42u8; 128]; // 2 full blocks
-        let expected = Sha256::digest(&data);
+        let expected = Sha256::digest(data);
 
         // Process first block normally to get midstate
         let mut state: [u32; 8] = [

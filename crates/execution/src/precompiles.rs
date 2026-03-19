@@ -16,7 +16,6 @@
 /// | 0x01000006     | RSK (genesis)       | Bridge                          |
 /// | 0x01000008     | RSK (genesis)       | REMASC                          |
 /// | 0x01000009+    | RSK (various)       | HDWalletUtils, BlockHeader, etc |
-
 use alloy_primitives::{Address, Bytes, U256};
 use revm::context::{Cfg, LocalContextTr};
 use revm::context_interface::{Block as BlockTr, ContextTr, JournalTr};
@@ -92,14 +91,32 @@ fn bridge_run(_input: &[u8], gas_limit: u64) -> Result<PrecompileOutput, Precomp
     Ok(PrecompileOutput::new(gas_cost, Vec::new().into()))
 }
 
-/// HDWalletUtils: BIP32/BIP44 wallet operations.
-/// Stub — returns empty with base gas cost.
-fn hd_wallet_utils_run(_input: &[u8], gas_limit: u64) -> Result<PrecompileOutput, PrecompileError> {
-    let gas_cost = 13_000u64;
-    if gas_limit < gas_cost {
-        return Err(PrecompileError::OutOfGas);
+/// HDWalletUtils: BIP32/Base58Check/multisig operations (0x01000009).
+///
+/// 4 methods dispatched by 4-byte ABI selector:
+///   - toBase58Check(bytes,int256) → string
+///   - deriveExtendedPublicKey(string,string) → string
+///   - extractPublicKeyFromExtendedPublicKey(string) → bytes
+///   - getMultisigScriptHash(int256,bytes[]) → bytes
+fn hd_wallet_utils_run(input: &[u8], gas_limit: u64) -> Result<PrecompileOutput, PrecompileError> {
+    if input.len() < 4 {
+        return Err(PrecompileError::other("HDWalletUtils: input too short for selector"));
     }
-    Ok(PrecompileOutput::new(gas_cost, Vec::new().into()))
+
+    let selector = [input[0], input[1], input[2], input[3]];
+    let data = &input[4..];
+
+    if selector == selector_of("toBase58Check(bytes,int256)") {
+        run_to_base58check(data, gas_limit)
+    } else if selector == selector_of("deriveExtendedPublicKey(string,string)") {
+        run_derive_extended_public_key(data, gas_limit)
+    } else if selector == selector_of("extractPublicKeyFromExtendedPublicKey(string)") {
+        run_extract_pubkey(data, gas_limit)
+    } else if selector == selector_of("getMultisigScriptHash(int256,bytes[])") {
+        run_get_multisig_script_hash(data, gas_limit)
+    } else {
+        Err(PrecompileError::other("HDWalletUtils: unknown method selector"))
+    }
 }
 
 /// BlockHeaderContract: exposes block header fields to smart contracts.
@@ -185,7 +202,7 @@ fn parse_secp256k1_point(
     uncompressed[1..33].copy_from_slice(&x_bytes);
     uncompressed[33..65].copy_from_slice(&y_bytes);
 
-    let encoded = k256::EncodedPoint::from_bytes(&uncompressed)
+    let encoded = k256::EncodedPoint::from_bytes(uncompressed)
         .map_err(|_| PrecompileError::other("invalid secp256k1 point encoding"))?;
 
     let affine = k256::AffinePoint::from_encoded_point(&encoded);
@@ -275,7 +292,7 @@ fn parse_int256_as_depth(data: &[u8]) -> Result<i16, DepthError> {
 ///
 /// Layout: 32-byte offset (0x20) | 32-byte length | data (right-padded to 32).
 fn abi_encode_bytes(data: &[u8]) -> Vec<u8> {
-    let padded_len = (data.len() + 31) / 32 * 32;
+    let padded_len = data.len().div_ceil(32) * 32;
     let mut out = vec![0u8; 64 + padded_len];
     // offset → 0x20
     out[31] = 0x20;
@@ -333,6 +350,362 @@ fn extract_merged_mining_tags(header: &rustock_core::Header) -> Vec<u8> {
         return Vec::new();
     }
     coinbase_tx[start..].to_vec()
+}
+
+// ---------------------------------------------------------------------------
+// HDWalletUtils ABI helpers
+// ---------------------------------------------------------------------------
+
+/// ABI-encode a string return value (identical layout to `abi_encode_bytes`).
+fn abi_encode_string(s: &str) -> Vec<u8> {
+    abi_encode_bytes(s.as_bytes())
+}
+
+/// Read a big-endian uint256 from a 32-byte word, returning its value as usize.
+/// Returns `None` if the value overflows usize.
+fn abi_read_offset(data: &[u8], pos: usize) -> Option<usize> {
+    if pos + 32 > data.len() {
+        return None;
+    }
+    let word = &data[pos..pos + 32];
+    if word[..24].iter().any(|&b| b != 0) {
+        return None; // too large for usize
+    }
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&word[24..32]);
+    Some(u64::from_be_bytes(buf) as usize)
+}
+
+/// ABI-decode a `bytes` parameter. `param_slot` is the 32-byte slot index
+/// (0 for first param, 1 for second, etc.) within `data` (already past the selector).
+fn abi_decode_bytes(data: &[u8], param_slot: usize) -> Option<Vec<u8>> {
+    let offset = abi_read_offset(data, param_slot * 32)?;
+    let length = abi_read_offset(data, offset)?;
+    let start = offset + 32;
+    if start + length > data.len() {
+        return None;
+    }
+    Some(data[start..start + length].to_vec())
+}
+
+/// ABI-decode a `string` parameter.
+fn abi_decode_string(data: &[u8], param_slot: usize) -> Option<String> {
+    let bytes = abi_decode_bytes(data, param_slot)?;
+    String::from_utf8(bytes).ok()
+}
+
+/// ABI-decode a static `int256` parameter as i32. Returns `None` if
+/// the value doesn't fit in i32.
+fn abi_decode_int256_as_i32(data: &[u8], param_slot: usize) -> Option<i32> {
+    let pos = param_slot * 32;
+    if pos + 32 > data.len() {
+        return None;
+    }
+    let word = &data[pos..pos + 32];
+    let is_negative = word[0] & 0x80 != 0;
+    let fill = if is_negative { 0xFF } else { 0x00 };
+    if word[..28].iter().any(|&b| b != fill) {
+        return None;
+    }
+    let val = i32::from_be_bytes([word[28], word[29], word[30], word[31]]);
+    if is_negative && val >= 0 {
+        return None;
+    }
+    if !is_negative && val < 0 {
+        return None;
+    }
+    Some(val)
+}
+
+/// ABI-decode a `bytes[]` parameter.
+fn abi_decode_bytes_array(data: &[u8], param_slot: usize) -> Option<Vec<Vec<u8>>> {
+    let array_offset = abi_read_offset(data, param_slot * 32)?;
+    let count = abi_read_offset(data, array_offset)?;
+    let mut items = Vec::with_capacity(count);
+    for i in 0..count {
+        let elem_rel_offset = abi_read_offset(data, array_offset + 32 + i * 32)?;
+        let elem_abs = array_offset + 32 + elem_rel_offset;
+        let elem_len = abi_read_offset(data, elem_abs)?;
+        let elem_start = elem_abs + 32;
+        if elem_start + elem_len > data.len() {
+            return None;
+        }
+        items.push(data[elem_start..elem_start + elem_len].to_vec());
+    }
+    Some(items)
+}
+
+// ---------------------------------------------------------------------------
+// HDWalletUtils method implementations
+// ---------------------------------------------------------------------------
+
+/// `toBase58Check(bytes hash160, int256 version) → string`
+///
+/// Encodes a 20-byte hash with a version byte into a Base58Check string.
+fn run_to_base58check(data: &[u8], gas_limit: u64) -> Result<PrecompileOutput, PrecompileError> {
+    const GAS_COST: u64 = 13_000;
+    if gas_limit < GAS_COST {
+        return Err(PrecompileError::OutOfGas);
+    }
+
+    let hash160 = abi_decode_bytes(data, 0)
+        .ok_or_else(|| PrecompileError::other("toBase58Check: cannot decode hash160"))?;
+    if hash160.len() != 20 {
+        return Err(PrecompileError::other("toBase58Check: Invalid hash160"));
+    }
+
+    let version = abi_decode_int256_as_i32(data, 1)
+        .ok_or_else(|| PrecompileError::other("toBase58Check: cannot decode version"))?;
+    if !(0..256).contains(&version) {
+        return Err(PrecompileError::other(
+            "toBase58Check: version must be a numeric value between 0 and 255",
+        ));
+    }
+
+    let mut payload = Vec::with_capacity(21);
+    payload.push(version as u8);
+    payload.extend_from_slice(&hash160);
+
+    let encoded = bitcoin::base58::encode_check(&payload);
+
+    Ok(PrecompileOutput::new(GAS_COST, abi_encode_string(&encoded).into()))
+}
+
+/// `deriveExtendedPublicKey(string xpub, string path) → string`
+///
+/// Derives a child extended public key along a BIP32 path.
+fn run_derive_extended_public_key(
+    data: &[u8],
+    gas_limit: u64,
+) -> Result<PrecompileOutput, PrecompileError> {
+    const GAS_COST: u64 = 107_000;
+    if gas_limit < GAS_COST {
+        return Err(PrecompileError::OutOfGas);
+    }
+
+    let xpub_str = abi_decode_string(data, 0)
+        .ok_or_else(|| PrecompileError::other("deriveExtendedPublicKey: cannot decode xpub"))?;
+    let path_str = abi_decode_string(data, 1)
+        .ok_or_else(|| PrecompileError::other("deriveExtendedPublicKey: cannot decode path"))?;
+
+    let xpub = parse_xpub(&xpub_str)?;
+    validate_derivation_path(&path_str)?;
+
+    let child_numbers = parse_derivation_path(&path_str)?;
+
+    let secp = bitcoin::secp256k1::Secp256k1::verification_only();
+    let mut derived = xpub;
+    for child in &child_numbers {
+        derived = derived.ckd_pub(&secp, *child).map_err(|e| {
+            PrecompileError::other(format!("deriveExtendedPublicKey: derivation failed: {e}"))
+        })?;
+    }
+
+    let result_str = derived.to_string();
+
+    Ok(PrecompileOutput::new(GAS_COST, abi_encode_string(&result_str).into()))
+}
+
+/// `extractPublicKeyFromExtendedPublicKey(string xpub) → bytes`
+///
+/// Returns the 33-byte compressed public key from an extended public key.
+fn run_extract_pubkey(data: &[u8], gas_limit: u64) -> Result<PrecompileOutput, PrecompileError> {
+    const GAS_COST: u64 = 11_300;
+    if gas_limit < GAS_COST {
+        return Err(PrecompileError::OutOfGas);
+    }
+
+    let xpub_str = abi_decode_string(data, 0).ok_or_else(|| {
+        PrecompileError::other("extractPublicKeyFromExtendedPublicKey: cannot decode xpub")
+    })?;
+
+    let xpub = parse_xpub(&xpub_str)?;
+    let pubkey_bytes = xpub.public_key.serialize();
+
+    Ok(PrecompileOutput::new(GAS_COST, abi_encode_bytes(&pubkey_bytes).into()))
+}
+
+/// `getMultisigScriptHash(int256 minimumSignatures, bytes[] publicKeys) → bytes`
+///
+/// Builds a P2SH multisig redeem script and returns RIPEMD160(SHA256(script)).
+fn run_get_multisig_script_hash(
+    data: &[u8],
+    gas_limit: u64,
+) -> Result<PrecompileOutput, PrecompileError> {
+    use k256::elliptic_curve::sec1::FromEncodedPoint;
+
+    const BASE_COST: u64 = 20_000;
+    const COST_PER_EXTRA_KEY: u64 = 700;
+
+    let min_sigs = abi_decode_int256_as_i32(data, 0)
+        .ok_or_else(|| PrecompileError::other("getMultisigScriptHash: cannot decode minimumSignatures"))?;
+
+    let public_keys = abi_decode_bytes_array(data, 1);
+    let public_keys = match public_keys {
+        Some(keys) => keys,
+        None => {
+            return Err(PrecompileError::other("getMultisigScriptHash: At least 2 public keys are required"));
+        }
+    };
+
+    let gas_cost = if public_keys.len() >= 2 {
+        BASE_COST + (public_keys.len() as u64 - 2) * COST_PER_EXTRA_KEY
+    } else {
+        BASE_COST
+    };
+    if gas_limit < gas_cost {
+        return Err(PrecompileError::OutOfGas);
+    }
+
+    if min_sigs <= 0 {
+        return Err(PrecompileError::other(
+            "getMultisigScriptHash: Minimum required signatures must be present and greater than zero",
+        ));
+    }
+
+    if public_keys.len() < 2 {
+        return Err(PrecompileError::other(
+            "getMultisigScriptHash: At least 2 public keys are required",
+        ));
+    }
+
+    if public_keys.len() < min_sigs as usize {
+        return Err(PrecompileError::other(
+            "getMultisigScriptHash: public keys are less than the minimum required signatures",
+        ));
+    }
+
+    if public_keys.len() > 15 {
+        return Err(PrecompileError::other(
+            "getMultisigScriptHash: public keys are more than the maximum allowed signatures",
+        ));
+    }
+
+    let mut compressed_keys: Vec<[u8; 33]> = Vec::with_capacity(public_keys.len());
+    for key_bytes in &public_keys {
+        if key_bytes.len() != 33 && key_bytes.len() != 65 {
+            return Err(PrecompileError::other(format!(
+                "getMultisigScriptHash: Invalid public key length: {}",
+                key_bytes.len()
+            )));
+        }
+
+        let prefix = key_bytes[0];
+        if prefix != 0x02 && prefix != 0x03 && prefix != 0x04 {
+            return Err(PrecompileError::other("getMultisigScriptHash: Invalid public key format"));
+        }
+
+        let compressed = if key_bytes.len() == 33 {
+            let mut arr = [0u8; 33];
+            arr.copy_from_slice(key_bytes);
+            // Validate the key is on the curve
+            let encoded = k256::EncodedPoint::from_bytes(key_bytes)
+                .map_err(|_| PrecompileError::other("getMultisigScriptHash: Invalid public key format"))?;
+            let pt = k256::AffinePoint::from_encoded_point(&encoded);
+            if pt.is_none().into() {
+                return Err(PrecompileError::other("getMultisigScriptHash: Invalid public key format"));
+            }
+            arr
+        } else {
+            // 65-byte uncompressed: validate and compress
+            let encoded = k256::EncodedPoint::from_bytes(key_bytes)
+                .map_err(|_| PrecompileError::other("getMultisigScriptHash: Invalid public key format"))?;
+            let pt = k256::AffinePoint::from_encoded_point(&encoded);
+            if pt.is_none().into() {
+                return Err(PrecompileError::other("getMultisigScriptHash: Invalid public key format"));
+            }
+            let affine = pt.unwrap();
+            let comp = k256::EncodedPoint::from(affine);
+            let comp_bytes = comp.compress().to_bytes();
+            let mut arr = [0u8; 33];
+            arr.copy_from_slice(&comp_bytes);
+            arr
+        };
+
+        compressed_keys.push(compressed);
+    }
+
+    // Sort keys by compressed bytes (matches bitcoinj's createRedeemScript behavior)
+    compressed_keys.sort();
+
+    // Build multisig redeem script:
+    // OP_m <pubkey1> <pubkey2> ... <pubkeyn> OP_n OP_CHECKMULTISIG
+    let mut script = Vec::new();
+    script.push(0x50 + min_sigs as u8); // OP_m
+    for key in &compressed_keys {
+        script.push(33); // OP_PUSHBYTES_33
+        script.extend_from_slice(key);
+    }
+    script.push(0x50 + compressed_keys.len() as u8); // OP_n
+    script.push(0xAE); // OP_CHECKMULTISIG
+
+    // RIPEMD160(SHA256(script))
+    use sha2::Digest as Sha2Digest;
+    let sha256_hash = sha2::Sha256::digest(&script);
+    let script_hash = ripemd::Ripemd160::digest(sha256_hash);
+
+    Ok(PrecompileOutput::new(gas_cost, abi_encode_bytes(&script_hash).into()))
+}
+
+/// Parse an xpub/tpub string into a `bitcoin::bip32::Xpub`.
+fn parse_xpub(xpub_str: &str) -> Result<bitcoin::bip32::Xpub, PrecompileError> {
+    if !xpub_str.starts_with("xpub") && !xpub_str.starts_with("tpub") {
+        return Err(PrecompileError::other(format!(
+            "Invalid extended public key '{xpub_str}'"
+        )));
+    }
+
+    xpub_str
+        .parse::<bitcoin::bip32::Xpub>()
+        .map_err(|e| PrecompileError::other(format!("Invalid extended public key '{xpub_str}': {e}")))
+}
+
+/// Validate a BIP32 derivation path string per rskj rules:
+/// - Non-empty, starts and ends with a digit
+/// - No `M` prefix, no hardening `'`, no negative numbers
+/// - Each segment < 2^31, at most 10 segments
+fn validate_derivation_path(path: &str) -> Result<(), PrecompileError> {
+    if path.is_empty() {
+        return Err(PrecompileError::other("Invalid path"));
+    }
+
+    let first_char = path.chars().next().unwrap();
+    let last_char = path.chars().last().unwrap();
+    if !first_char.is_ascii_digit() || !last_char.is_ascii_digit() {
+        return Err(PrecompileError::other("Invalid path"));
+    }
+
+    let chunks: Vec<&str> = path.split('/').collect();
+    if chunks.len() > 10 {
+        return Err(PrecompileError::other("Path should contain 10 levels at most"));
+    }
+
+    for chunk in &chunks {
+        if chunk.contains('\'') || chunk.contains('H') {
+            return Err(PrecompileError::other("Invalid path"));
+        }
+        match chunk.parse::<i64>() {
+            Ok(n) if (0..(1i64 << 31)).contains(&n) => {}
+            _ => return Err(PrecompileError::other("Invalid path")),
+        }
+    }
+
+    Ok(())
+}
+
+/// Parse a validated path string into ChildNumber values.
+fn parse_derivation_path(
+    path: &str,
+) -> Result<Vec<bitcoin::bip32::ChildNumber>, PrecompileError> {
+    path.split('/')
+        .map(|s| {
+            let idx: u32 = s
+                .parse()
+                .map_err(|_| PrecompileError::other("Invalid path"))?;
+            bitcoin::bip32::ChildNumber::from_normal_idx(idx)
+                .map_err(|_| PrecompileError::other("Invalid path"))
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1661,5 +2034,556 @@ mod tests {
         padded[32 - decoded_bytes.len()..].copy_from_slice(decoded_bytes);
         let decoded_val = U256::from_be_bytes(padded);
         assert_eq!(decoded_val, min_gas_price, "round-trip must recover original value");
+    }
+
+    // -----------------------------------------------------------------------
+    // HDWalletUtils tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_hdwallet_selectors_are_distinct() {
+        let sigs = [
+            "toBase58Check(bytes,int256)",
+            "deriveExtendedPublicKey(string,string)",
+            "extractPublicKeyFromExtendedPublicKey(string)",
+            "getMultisigScriptHash(int256,bytes[])",
+        ];
+        let sels: Vec<[u8; 4]> = sigs.iter().map(|s| selector_of(s)).collect();
+        for i in 0..sels.len() {
+            for j in (i + 1)..sels.len() {
+                assert_ne!(sels[i], sels[j], "selectors for {} and {} collide", sigs[i], sigs[j]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_hdwallet_unknown_selector_fails() {
+        let input = [0xFF, 0xFF, 0xFF, 0xFF, 0x00];
+        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
+    }
+
+    #[test]
+    fn test_hdwallet_too_short_input_fails() {
+        assert!(hd_wallet_utils_run(&[0x00, 0x01], 200_000).is_err());
+    }
+
+    // --- ABI decode helpers ---
+
+    #[test]
+    fn test_abi_decode_int256_as_i32() {
+        // Zero
+        let mut data = [0u8; 32];
+        assert_eq!(abi_decode_int256_as_i32(&data, 0), Some(0));
+
+        // Positive: 111
+        data[31] = 111;
+        assert_eq!(abi_decode_int256_as_i32(&data, 0), Some(111));
+
+        // Negative: -1
+        let neg1 = [0xFF; 32];
+        assert_eq!(abi_decode_int256_as_i32(&neg1, 0), Some(-1));
+
+        // Too large for i32 (overflow)
+        let mut big = [0u8; 32];
+        big[0] = 0x01;
+        assert_eq!(abi_decode_int256_as_i32(&big, 0), None);
+    }
+
+    #[test]
+    fn test_abi_decode_bytes_roundtrip() {
+        let original = b"hello world";
+        let encoded = abi_encode_bytes(original);
+        // abi_decode_bytes expects: offset at slot 0 → data starts at offset
+        // Our encoded has offset=0x20, length=11, data at 64..
+        // But abi_decode_bytes reads the offset from slot 0, then follows it
+        let decoded = abi_decode_bytes(&encoded, 0).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_abi_decode_string_roundtrip() {
+        let original = "test string";
+        let encoded = abi_encode_string(original);
+        let decoded = abi_decode_string(&encoded, 0).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    // --- toBase58Check tests ---
+
+    fn build_to_base58check_input(hash160: &[u8], version: i32) -> Vec<u8> {
+        let selector = selector_of("toBase58Check(bytes,int256)");
+
+        // ABI: selector + [offset_hash160(32), version(32), length(32), data(32)]
+        // offset_hash160 = 0x40 (64, pointing past the 2 static param slots)
+        let mut input = Vec::new();
+        input.extend_from_slice(&selector);
+
+        // param 0: offset to bytes data = 0x40 (2 * 32 = 64)
+        let mut offset_word = [0u8; 32];
+        offset_word[31] = 0x40;
+        input.extend_from_slice(&offset_word);
+
+        // param 1: version as int256
+        let mut version_word = [0u8; 32];
+        if version >= 0 {
+            version_word[28..32].copy_from_slice(&version.to_be_bytes());
+        } else {
+            version_word = [0xFF; 32];
+            version_word[28..32].copy_from_slice(&version.to_be_bytes());
+        }
+        input.extend_from_slice(&version_word);
+
+        // bytes data: length + padded data
+        let mut len_word = [0u8; 32];
+        len_word[31] = hash160.len() as u8;
+        input.extend_from_slice(&len_word);
+
+        let padded_len = hash160.len().div_ceil(32) * 32;
+        let mut data_padded = vec![0u8; padded_len];
+        data_padded[..hash160.len()].copy_from_slice(hash160);
+        input.extend_from_slice(&data_padded);
+
+        input
+    }
+
+    #[test]
+    fn test_to_base58check_rskj_vector() {
+        let hash160 = hex::decode("0d3bf5f30dda7584645546079318e97f0e1d044f").unwrap();
+        let input = build_to_base58check_input(&hash160, 111);
+        let result = hd_wallet_utils_run(&input, 200_000).unwrap();
+        assert_eq!(result.gas_used, 13_000);
+
+        let decoded = abi_decode_string(&result.bytes, 0).unwrap();
+        assert_eq!(decoded, "mgivuh9jErcGdRr81cJ3A7YfgbJV7WNyZV");
+    }
+
+    #[test]
+    fn test_to_base58check_invalid_hash_length() {
+        let hash = vec![0xAA; 19]; // wrong length
+        let input = build_to_base58check_input(&hash, 111);
+        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
+    }
+
+    #[test]
+    fn test_to_base58check_version_negative() {
+        let hash = vec![0x00; 20];
+        let input = build_to_base58check_input(&hash, -1);
+        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
+    }
+
+    #[test]
+    fn test_to_base58check_version_too_large() {
+        let hash = vec![0x00; 20];
+        let input = build_to_base58check_input(&hash, 256);
+        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
+    }
+
+    #[test]
+    fn test_to_base58check_oog() {
+        let hash = hex::decode("0d3bf5f30dda7584645546079318e97f0e1d044f").unwrap();
+        let input = build_to_base58check_input(&hash, 111);
+        assert!(matches!(
+            hd_wallet_utils_run(&input, 12_000),
+            Err(PrecompileError::OutOfGas)
+        ));
+    }
+
+    // --- deriveExtendedPublicKey tests ---
+
+    fn build_derive_xpub_input(xpub: &str, path: &str) -> Vec<u8> {
+        let selector = selector_of("deriveExtendedPublicKey(string,string)");
+        let mut input = Vec::new();
+        input.extend_from_slice(&selector);
+
+        // Two dynamic params: offsets then data
+        // param 0 offset: 0x40 (past 2 offset slots)
+        // param 1 offset: computed after param 0 data
+
+        let xpub_bytes = xpub.as_bytes();
+        let path_bytes = path.as_bytes();
+
+        let xpub_padded = xpub_bytes.len().div_ceil(32) * 32;
+        let param0_offset = 64u64; // 2 * 32
+        let param1_offset = param0_offset + 32 + xpub_padded as u64;
+
+        // offset for param 0
+        let mut w = [0u8; 32];
+        w[24..32].copy_from_slice(&param0_offset.to_be_bytes());
+        input.extend_from_slice(&w);
+
+        // offset for param 1
+        let mut w = [0u8; 32];
+        w[24..32].copy_from_slice(&param1_offset.to_be_bytes());
+        input.extend_from_slice(&w);
+
+        // param 0 data: length + padded string
+        let mut w = [0u8; 32];
+        w[24..32].copy_from_slice(&(xpub_bytes.len() as u64).to_be_bytes());
+        input.extend_from_slice(&w);
+        let mut padded = vec![0u8; xpub_padded];
+        padded[..xpub_bytes.len()].copy_from_slice(xpub_bytes);
+        input.extend_from_slice(&padded);
+
+        // param 1 data: length + padded string
+        let path_padded = path_bytes.len().div_ceil(32) * 32;
+        let mut w = [0u8; 32];
+        w[24..32].copy_from_slice(&(path_bytes.len() as u64).to_be_bytes());
+        input.extend_from_slice(&w);
+        let mut padded = vec![0u8; path_padded];
+        padded[..path_bytes.len()].copy_from_slice(path_bytes);
+        input.extend_from_slice(&padded);
+
+        input
+    }
+
+    const TEST_TPUB: &str = "tpubD6NzVbkrYhZ4YHQqwWz3Tm1ESZ9AidobeyLG4mEezB6hN8gFFWrcjczyF77Lw3HEs6Rjd2R11BEJ8Y9ptfxx9DFknkdujp58mFMx9H5dc1r";
+
+    #[test]
+    fn test_derive_xpub_rskj_vector_1() {
+        let input = build_derive_xpub_input(TEST_TPUB, "2/3/4");
+        let result = hd_wallet_utils_run(&input, 200_000).unwrap();
+        assert_eq!(result.gas_used, 107_000);
+        let derived = abi_decode_string(&result.bytes, 0).unwrap();
+        assert_eq!(
+            derived,
+            "tpubDCGMkPKredy7oh6zw8f4ExWFdTgQCrAHToF1ytny3gbVy9GkUNK2Nqh7NbKbh8dkd5VtjUiLJPkbEkeg29NVHwxYwzHJFt9SazGLZrrU4Y4"
+        );
+    }
+
+    #[test]
+    fn test_derive_xpub_rskj_vector_2() {
+        let input = build_derive_xpub_input(TEST_TPUB, "0/0/0/0/0/0");
+        let result = hd_wallet_utils_run(&input, 200_000).unwrap();
+        let derived = abi_decode_string(&result.bytes, 0).unwrap();
+        assert_eq!(
+            derived,
+            "tpubDJ28nwFGUypUD6i8eGCQfMkwNGxzzabA5Mh7AcUdwm6ziFxCSWjy4HyhPXH5uU2ovdMMYLT9W3g3MrGo52TrprMvX8o1dzT2ZGz1pwCPTNv"
+        );
+    }
+
+    #[test]
+    fn test_derive_xpub_rskj_vector_3_max_index() {
+        let input = build_derive_xpub_input(TEST_TPUB, "2147483647");
+        let result = hd_wallet_utils_run(&input, 200_000).unwrap();
+        let derived = abi_decode_string(&result.bytes, 0).unwrap();
+        assert_eq!(
+            derived,
+            "tpubD8fY35uPCY1rUjMUZwhkGUFi33pwkffMEBaCsTSw1he2AbM6DMbPaRR2guvk5qTWDfE9ubFB5pzuUNnMtsqbCeKAAjfepSvEWyetyF9Q4fG"
+        );
+    }
+
+    #[test]
+    fn test_derive_xpub_invalid_key() {
+        let input = build_derive_xpub_input("this-is-not-an-xpub", "0");
+        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
+    }
+
+    #[test]
+    fn test_derive_xpub_path_empty() {
+        let input = build_derive_xpub_input(TEST_TPUB, "");
+        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
+    }
+
+    #[test]
+    fn test_derive_xpub_path_leading_m() {
+        let input = build_derive_xpub_input(TEST_TPUB, "M/0/1/2");
+        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
+    }
+
+    #[test]
+    fn test_derive_xpub_path_leading_slash() {
+        let input = build_derive_xpub_input(TEST_TPUB, "/0");
+        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
+    }
+
+    #[test]
+    fn test_derive_xpub_path_trailing_slash() {
+        let input = build_derive_xpub_input(TEST_TPUB, "0/");
+        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
+    }
+
+    #[test]
+    fn test_derive_xpub_path_hardening() {
+        let input = build_derive_xpub_input(TEST_TPUB, "4'/5");
+        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
+    }
+
+    #[test]
+    fn test_derive_xpub_path_negative() {
+        let input = build_derive_xpub_input(TEST_TPUB, "0/-1");
+        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
+    }
+
+    #[test]
+    fn test_derive_xpub_path_segment_too_large() {
+        let input = build_derive_xpub_input(TEST_TPUB, "0/1/2/2147483648");
+        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
+    }
+
+    #[test]
+    fn test_derive_xpub_path_too_many_segments() {
+        let input = build_derive_xpub_input(TEST_TPUB, "0/1/2/3/4/5/6/7/8/9/10");
+        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
+    }
+
+    #[test]
+    fn test_derive_xpub_oog() {
+        let input = build_derive_xpub_input(TEST_TPUB, "2/3/4");
+        assert!(matches!(
+            hd_wallet_utils_run(&input, 100_000),
+            Err(PrecompileError::OutOfGas)
+        ));
+    }
+
+    // --- extractPublicKeyFromExtendedPublicKey tests ---
+
+    fn build_extract_pubkey_input(xpub: &str) -> Vec<u8> {
+        let selector = selector_of("extractPublicKeyFromExtendedPublicKey(string)");
+        let mut input = Vec::new();
+        input.extend_from_slice(&selector);
+
+        let xpub_bytes = xpub.as_bytes();
+        let xpub_padded = xpub_bytes.len().div_ceil(32) * 32;
+
+        // offset = 0x20 (single dynamic param, offset past 1 slot)
+        let mut w = [0u8; 32];
+        w[31] = 0x20;
+        input.extend_from_slice(&w);
+
+        // length
+        let mut w = [0u8; 32];
+        w[24..32].copy_from_slice(&(xpub_bytes.len() as u64).to_be_bytes());
+        input.extend_from_slice(&w);
+
+        // padded data
+        let mut padded = vec![0u8; xpub_padded];
+        padded[..xpub_bytes.len()].copy_from_slice(xpub_bytes);
+        input.extend_from_slice(&padded);
+
+        input
+    }
+
+    #[test]
+    fn test_extract_pubkey_rskj_vector() {
+        let xpub = "xpub661MyMwAqRbcFMGNG2YcHvj3x63bAZN9U5cKikaiQ4zu2D1cvpnZYyXNR9nH62sGp4RR39Ui7SVQSq1PY4JbPuEuu5prVJJC3d5Pogft712";
+        let input = build_extract_pubkey_input(xpub);
+        let result = hd_wallet_utils_run(&input, 200_000).unwrap();
+        assert_eq!(result.gas_used, 11_300);
+
+        let pubkey = abi_decode_bytes(&result.bytes, 0).unwrap();
+        let expected = hex::decode("02be517550b9e3be7fe42c80932d51e88e698663b4926e598b269d050e87e34d8c").unwrap();
+        assert_eq!(pubkey, expected);
+    }
+
+    #[test]
+    fn test_extract_pubkey_invalid_key() {
+        let input = build_extract_pubkey_input("this-is-not-an-xpub");
+        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
+    }
+
+    #[test]
+    fn test_extract_pubkey_bad_checksum() {
+        // Last char changed: dc1r → dc1s
+        let input = build_extract_pubkey_input(
+            "tpubD6NzVbkrYhZ4YHQqwWz3Tm1ESZ9AidobeyLG4mEezB6hN8gFFWrcjczyF77Lw3HEs6Rjd2R11BEJ8Y9ptfxx9DFknkdujp58mFMx9H5dc1s"
+        );
+        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
+    }
+
+    #[test]
+    fn test_extract_pubkey_oog() {
+        let xpub = "xpub661MyMwAqRbcFMGNG2YcHvj3x63bAZN9U5cKikaiQ4zu2D1cvpnZYyXNR9nH62sGp4RR39Ui7SVQSq1PY4JbPuEuu5prVJJC3d5Pogft712";
+        let input = build_extract_pubkey_input(xpub);
+        assert!(matches!(
+            hd_wallet_utils_run(&input, 10_000),
+            Err(PrecompileError::OutOfGas)
+        ));
+    }
+
+    // --- getMultisigScriptHash tests ---
+
+    fn build_multisig_input(min_sigs: i32, keys: &[Vec<u8>]) -> Vec<u8> {
+        let selector = selector_of("getMultisigScriptHash(int256,bytes[])");
+        let mut input = Vec::new();
+        input.extend_from_slice(&selector);
+
+        // param 0: min_sigs (int256, static)
+        let mut w = [0u8; 32];
+        if min_sigs >= 0 {
+            w[28..32].copy_from_slice(&min_sigs.to_be_bytes());
+        } else {
+            w = [0xFF; 32];
+            w[28..32].copy_from_slice(&min_sigs.to_be_bytes());
+        }
+        input.extend_from_slice(&w);
+
+        // param 1: offset to bytes[] data = 0x40 (past 2 param slots)
+        let mut w = [0u8; 32];
+        w[31] = 0x40;
+        input.extend_from_slice(&w);
+
+        // bytes[] encoding: count, then offsets, then each element
+        // count
+        let mut w = [0u8; 32];
+        w[24..32].copy_from_slice(&(keys.len() as u64).to_be_bytes());
+        input.extend_from_slice(&w);
+
+        // Calculate offsets for each element (relative to start of array content after count)
+        // Each offset points past all offsets + accumulated element data
+        let offsets_size = keys.len() * 32;
+        let mut elem_data = Vec::new();
+        let mut elem_offsets = Vec::new();
+        for key in keys {
+            elem_offsets.push(offsets_size + elem_data.len());
+            // length word
+            let mut lw = [0u8; 32];
+            lw[24..32].copy_from_slice(&(key.len() as u64).to_be_bytes());
+            elem_data.extend_from_slice(&lw);
+            // padded data
+            let padded = key.len().div_ceil(32) * 32;
+            let mut pd = vec![0u8; padded];
+            pd[..key.len()].copy_from_slice(key);
+            elem_data.extend_from_slice(&pd);
+        }
+
+        // Write offsets
+        for off in &elem_offsets {
+            let mut w = [0u8; 32];
+            w[24..32].copy_from_slice(&(*off as u64).to_be_bytes());
+            input.extend_from_slice(&w);
+        }
+
+        // Write element data
+        input.extend_from_slice(&elem_data);
+
+        input
+    }
+
+    fn compressed_test_keys() -> Vec<Vec<u8>> {
+        vec![
+            hex::decode("03b53899c390573471ba30e5054f78376c5f797fda26dde7a760789f02908cbad2").unwrap(),
+            hex::decode("027319afb15481dbeb3c426bcc37f9a30e7f51ceff586936d85548d9395bcc2344").unwrap(),
+            hex::decode("0355a2e9bf100c00fc0a214afd1bf272647c7824eb9cb055480962f0c382596a70").unwrap(),
+            hex::decode("02566d5ded7c7db1aa7ee4ef6f76989fb42527fcfdcddcd447d6793b7d869e46f7").unwrap(),
+            hex::decode("0294c817150f78607566e961b3c71df53a22022a80acbb982f83c0c8baac040adc").unwrap(),
+            hex::decode("0372cd46831f3b6afd4c044d160b7667e8ebf659d6cb51a825a3104df6ee0638c6").unwrap(),
+            hex::decode("0340df69f28d69eef60845da7d81ff60a9060d4da35c767f017b0dd4e20448fb44").unwrap(),
+            hex::decode("02ac1901b6fba2c1dbd47d894d2bd76c8ba1d296d65f6ab47f1c6b22afb53e73eb").unwrap(),
+            hex::decode("031aabbeb9b27258f98c2bf21f36677ae7bae09eb2d8c958ef41a20a6e88626d26").unwrap(),
+            hex::decode("0245ef34f5ee218005c9c21227133e8568a4f3f11aeab919c66ff7b816ae1ffeea").unwrap(),
+            hex::decode("02550cc87fa9061162b1dd395a16662529c9d8094c0feca17905a3244713d65fe8").unwrap(),
+            hex::decode("02481f02b7140acbf3fcdd9f72cf9a7d9484d8125e6df7c9451cfa55ba3b077265").unwrap(),
+            hex::decode("03f909ae15558c70cc751aff9b1f495199c325b13a9e5b934fd6299cd30ec50be8").unwrap(),
+            hex::decode("02c6018fcbd3e89f3cf9c7f48b3232ea3638eb8bf217e59ee290f5f0cfb2fb9259").unwrap(),
+            hex::decode("03b65694ccccda83cbb1e56b31308acd08e993114c33f66a456b627c2c1c68bed6").unwrap(),
+        ]
+    }
+
+    #[test]
+    fn test_multisig_rskj_15_compressed_keys() {
+        let keys = compressed_test_keys();
+        let input = build_multisig_input(8, &keys);
+        let result = hd_wallet_utils_run(&input, 200_000).unwrap();
+
+        // Gas: 20000 + (15 - 2) * 700 = 29100
+        assert_eq!(result.gas_used, 29_100);
+
+        let hash = abi_decode_bytes(&result.bytes, 0).unwrap();
+        assert_eq!(
+            hex::encode(&hash),
+            "51f103320b435b5fe417b3f3e0f18972ccc710a0"
+        );
+    }
+
+    #[test]
+    fn test_multisig_mixed_compressed_uncompressed() {
+        let mut keys = compressed_test_keys();
+        // Replace keys 0, 4, 6, 9 with uncompressed versions
+        let uncompressed_replacements = [
+            (0, "04b53899c390573471ba30e5054f78376c5f797fda26dde7a760789f02908cbad2aafaaa2611606699ec4f82777a268b708dab346de4880cd223969f7bbe5422bf"),
+            (4, "0494c817150f78607566e961b3c71df53a22022a80acbb982f83c0c8baac040adcb17171aa9ec8d8587098e0771f686ee61ac35279f9e5aadf9b06b738aa6d3720"),
+            (6, "0440df69f28d69eef60845da7d81ff60a9060d4da35c767f017b0dd4e20448fb44e1abebaea4c3c57c6e9e39e205b4df046f7110a8d3477c0d8e26a28be9692c29"),
+            (9, "0445ef34f5ee218005c9c21227133e8568a4f3f11aeab919c66ff7b816ae1ffeeae024d50312de76a7950f8c6268fbf454335cf252f961a67c47e67dc06fa590ba"),
+        ];
+        for (idx, hex_str) in &uncompressed_replacements {
+            keys[*idx] = hex::decode(hex_str).unwrap();
+        }
+
+        let input = build_multisig_input(8, &keys);
+        let result = hd_wallet_utils_run(&input, 200_000).unwrap();
+        let hash = abi_decode_bytes(&result.bytes, 0).unwrap();
+        assert_eq!(
+            hex::encode(&hash),
+            "51f103320b435b5fe417b3f3e0f18972ccc710a0",
+            "mixed keys must produce same hash as all-compressed"
+        );
+    }
+
+    #[test]
+    fn test_multisig_min_sigs_zero() {
+        let keys = compressed_test_keys()[..2].to_vec();
+        let input = build_multisig_input(0, &keys);
+        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
+    }
+
+    #[test]
+    fn test_multisig_less_than_two_keys() {
+        let keys = vec![compressed_test_keys()[0].clone()];
+        let input = build_multisig_input(1, &keys);
+        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
+    }
+
+    #[test]
+    fn test_multisig_keys_less_than_min_sigs() {
+        let keys = compressed_test_keys()[..2].to_vec();
+        let input = build_multisig_input(3, &keys);
+        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
+    }
+
+    #[test]
+    fn test_multisig_too_many_keys() {
+        // 16 keys (max is 15)
+        let mut keys = compressed_test_keys();
+        keys.push(keys[0].clone());
+        let input = build_multisig_input(3, &keys);
+        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
+    }
+
+    #[test]
+    fn test_multisig_invalid_key_length() {
+        let keys = vec![
+            compressed_test_keys()[0].clone(),
+            vec![0xAA, 0xBB, 0xCC], // wrong length
+        ];
+        let input = build_multisig_input(1, &keys);
+        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
+    }
+
+    #[test]
+    fn test_multisig_invalid_key_prefix() {
+        let mut bad_key = compressed_test_keys()[0].clone();
+        bad_key[0] = 0x08; // invalid prefix
+        let keys = vec![compressed_test_keys()[1].clone(), bad_key];
+        let input = build_multisig_input(1, &keys);
+        assert!(hd_wallet_utils_run(&input, 200_000).is_err());
+    }
+
+    #[test]
+    fn test_multisig_gas_base_for_two_keys() {
+        let keys = compressed_test_keys()[..2].to_vec();
+        let input = build_multisig_input(1, &keys);
+        let result = hd_wallet_utils_run(&input, 200_000).unwrap();
+        assert_eq!(result.gas_used, 20_000);
+    }
+
+    #[test]
+    fn test_multisig_oog() {
+        let keys = compressed_test_keys();
+        let input = build_multisig_input(8, &keys);
+        // Need 29100, supply 29000
+        assert!(matches!(
+            hd_wallet_utils_run(&input, 29_000),
+            Err(PrecompileError::OutOfGas)
+        ));
     }
 }

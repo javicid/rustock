@@ -388,7 +388,7 @@ impl BlockStore {
         val[..32].copy_from_slice(block_hash.as_slice());
         val[32..].copy_from_slice(&tx_index.to_be_bytes());
         self.db
-            .put_cf(self.cf(CF_TX_INDEX)?, tx_hash.as_slice(), &val)
+            .put_cf(self.cf(CF_TX_INDEX)?, tx_hash.as_slice(), val)
             .context("Failed to write tx index")
     }
 

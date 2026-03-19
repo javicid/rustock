@@ -8,7 +8,6 @@
 /// | other          | 0xFF           | 1 byte + VarInt(lshared)     |
 ///
 /// Followed by the encoded path bytes (bits packed MSB-first).
-
 use crate::path::{self, TrieKeySlice};
 use crate::varint;
 

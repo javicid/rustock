@@ -3,7 +3,6 @@
 /// After executing a block through revm, the resulting `EvmState` contains
 /// all account, code, and storage modifications. This module translates
 /// those changes into Unitrie put/delete operations.
-
 use alloy_primitives::{Address, B256, U256};
 use revm::state::{AccountStatus, EvmState};
 use rustock_trie::{
@@ -95,7 +94,7 @@ fn delete_account(
 ) -> TrieNode {
     let mut new_root = root.clone();
 
-    for (slot, _) in &account.storage {
+    for slot in account.storage.keys() {
         let slot_b256 = B256::from(*slot);
         let key_bytes = storage_key(addr, &slot_b256);
         let key = TrieKeySlice::from_key(&key_bytes);

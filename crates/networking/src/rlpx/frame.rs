@@ -170,9 +170,10 @@ impl FrameCodec {
                     self.assembling = false;
                     let payload = self.assembly_buf[..self.assembly_expected].to_vec();
                     self.assembly_buf.clear();
-                    return Ok(Some((protocol_id, payload)));
+                    Ok(Some((protocol_id, payload)))
+                } else {
+                    Ok(None)
                 }
-                return Ok(None);
             }
             FrameType::ChunkedContinuation { .. } => {
                 if self.assembling {
@@ -188,12 +189,13 @@ impl FrameCodec {
                         let protocol_id = self.assembly_protocol_id;
                         let payload = self.assembly_buf[..self.assembly_expected].to_vec();
                         self.assembly_buf.clear();
-                        return Ok(Some((protocol_id, payload)));
+                        Ok(Some((protocol_id, payload)))
+                    } else {
+                        Ok(None)
                     }
-                    return Ok(None);
                 } else {
                     // Continuation frame but not assembling — stale/orphaned chunk, skip it
-                    return Ok(None);
+                    Ok(None)
                 }
             }
             FrameType::Normal => {

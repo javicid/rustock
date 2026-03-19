@@ -155,7 +155,7 @@ impl SyncHandler {
         // Always include the best block (or the last skeleton point if equal)
         let last_number = best_number.min(n);
         if let Ok(Some(hash)) = store.canonical_hash(last_number) {
-            if identifiers.last().map_or(true, |last| last.number != last_number) {
+            if identifiers.last().is_none_or(|last| last.number != last_number) {
                 identifiers.push(BlockIdentifier {
                     hash,
                     number: last_number,

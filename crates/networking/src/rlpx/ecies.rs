@@ -232,9 +232,9 @@ impl ECIES {
         
         // KDF (Concat KDF NIST SP 800-56A)
         // Order: counter || z || s1
-        let mut kdf_bytes = vec![0u8; 32];
+        let mut kdf_bytes = [0u8; 32];
         let mut hasher = Sha256::new();
-        hasher.update(&1u32.to_be_bytes()); // counter = 1
+        hasher.update(1u32.to_be_bytes()); // counter = 1
         hasher.update(&z[..]);
         if let Some(info) = s1 {
             hasher.update(info);
@@ -303,9 +303,9 @@ impl ECIES {
         let z = shared_secret.raw_secret_bytes();
 
         // KDF (uses s1 as additional data)
-        let mut kdf_bytes = vec![0u8; 32];
+        let mut kdf_bytes = [0u8; 32];
         let mut hasher = Sha256::new();
-        hasher.update(&1u32.to_be_bytes());
+        hasher.update(1u32.to_be_bytes());
         hasher.update(&z[..]);
         if let Some(info) = s1 {
             hasher.update(info);

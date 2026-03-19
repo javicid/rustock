@@ -6,7 +6,6 @@
 ///
 /// Unlike Ethereum, RSK does not store storageRoot or codeHash in the account.
 /// These are derived from the Unitrie key layout instead.
-
 use alloy_primitives::U256;
 use alloy_rlp::{Decodable, Encodable};
 

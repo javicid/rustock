@@ -4,7 +4,6 @@
 /// - Account: `0x00 || keccak256(addr)[0:10] || addr`  (31 bytes for 20-byte addr)
 /// - Code:    `account_key || 0x80`
 /// - Storage: `account_key || 0x00 || keccak256(slot)[0:10] || strip_leading_zeros(slot)`
-
 use alloy_primitives::{Address, B256};
 use sha3::{Digest, Keccak256};
 

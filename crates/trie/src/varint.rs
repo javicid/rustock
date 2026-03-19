@@ -6,7 +6,6 @@
 /// | 0xFD       | 3           | 253–65,535  (LE uint16) |
 /// | 0xFE       | 5           | 65,536–2^32 (LE uint32) |
 /// | 0xFF       | 9           | 2^32+       (LE uint64) |
-
 pub fn encode_varint(value: u64) -> Vec<u8> {
     if value < 253 {
         vec![value as u8]

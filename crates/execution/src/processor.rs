@@ -2,7 +2,6 @@
 ///
 /// Orchestrates sender recovery, EVM execution, state application,
 /// receipt construction, and validation against the block header.
-
 use alloy_primitives::{Address, Bloom, B256};
 use rustock_core::{Block, Log, Receipt, Transaction, ordered_trie_root};
 use rustock_storage::BlockStore;
@@ -118,9 +117,9 @@ impl BlockProcessor {
         let state_root_hash = new_state_root.compute_hash(trie_store.as_ref());
         let receipts_root = ordered_trie_root(&receipts);
 
-        if exec_result.gas_used != header.gas_used as u64 {
+        if exec_result.gas_used != header.gas_used {
             return Err(ProcessError::GasUsedMismatch {
-                header: header.gas_used as u64,
+                header: header.gas_used,
                 computed: exec_result.gas_used,
             });
         }

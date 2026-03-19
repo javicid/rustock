@@ -3,7 +3,6 @@
 /// revm reads account state, code, and storage through the `Database` trait.
 /// This adapter translates those queries into Unitrie key lookups using the
 /// key_mapper module from rustock-trie.
-
 use alloy_primitives::{Address, B256, U256};
 use revm::database_interface::DBErrorMarker;
 use revm::database_interface::DatabaseRef;

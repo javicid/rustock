@@ -239,7 +239,7 @@ impl Header {
             let mm_end = body.len() - cursor.len();
 
             let has_umm_root = header.umm_root.is_some();
-            let is_umm_block = header.umm_root.as_ref().map_or(false, |u| !u.is_empty());
+            let is_umm_block = header.umm_root.as_ref().is_some_and(|u| !u.is_empty());
 
             let mm_hash = if has_umm_root {
                 // ummRoot is present in the RLP — include it in the hash payload.
@@ -300,7 +300,7 @@ impl Header {
         }
 
         let has_umm_root = self.umm_root.is_some();
-        let is_umm_block = self.umm_root.as_ref().map_or(false, |u| !u.is_empty());
+        let is_umm_block = self.umm_root.as_ref().is_some_and(|u| !u.is_empty());
 
         let mut list_fields: Vec<Vec<u8>> = vec![
             alloy_rlp::encode(self.parent_hash),

@@ -85,6 +85,7 @@ pub struct ReceiptDto {
 }
 
 impl ReceiptDto {
+    #[allow(clippy::too_many_arguments)]
     pub fn from_receipt(
         receipt: &Receipt,
         tx: &Transaction,
@@ -167,7 +168,7 @@ impl LogDto {
     ) -> Self {
         Self {
             address: format!("{:#x}", log.address),
-            topics: log.topics.iter().map(|t| to_hex_b256(t)).collect(),
+            topics: log.topics.iter().map(to_hex_b256).collect(),
             data: if log.data.is_empty() { "0x".to_string() } else { to_hex_bytes(&log.data) },
             block_number: to_hex_u64(block_number),
             block_hash: to_hex_b256(&block_hash),
@@ -204,15 +205,15 @@ impl CallRequest {
 
         let gas = obj.get("gas")
             .and_then(|v| v.as_str())
-            .and_then(|s| parse_hex_u64(s));
+            .and_then(parse_hex_u64);
 
         let gas_price = obj.get("gasPrice")
             .and_then(|v| v.as_str())
-            .and_then(|s| parse_hex_u256(s));
+            .and_then(parse_hex_u256);
 
         let value = obj.get("value")
             .and_then(|v| v.as_str())
-            .and_then(|s| parse_hex_u256(s));
+            .and_then(parse_hex_u256);
 
         let data = obj.get("data")
             .or_else(|| obj.get("input"))

@@ -24,8 +24,8 @@ impl Decoder for RLPxCodec {
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>> {
         match self.frame_codec.decode_frame(src) {
-            Err(e) => return Err(e),
-            Ok(None) => return Ok(None),
+            Err(e) => Err(e),
+            Ok(None) => Ok(None),
             Ok(Some((protocol_id, payload))) => {
                 // Prepend protocol_id to payload to satisfy P2pMessage::decode
                 let mut data = Vec::with_capacity(payload.len() + 1);

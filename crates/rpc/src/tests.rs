@@ -654,7 +654,7 @@ fn setup_state_with_tx() -> (RpcState, tempfile::TempDir, B256) {
     store.set_head(block_hash).unwrap();
     store.put_total_difficulty(block_hash, U256::from(1000)).unwrap();
 
-    store.put_body(block_hash, &[tx.clone()], &[]).unwrap();
+    store.put_body(block_hash, std::slice::from_ref(&tx), &[]).unwrap();
     store.put_tx_index(tx_hash, block_hash, 0).unwrap();
 
     let receipt = rustock_core::Receipt {

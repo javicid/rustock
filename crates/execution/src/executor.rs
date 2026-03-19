@@ -3,7 +3,6 @@
 /// Executes RSK transactions against the Unitrie state, producing
 /// execution results (gas used, logs, state changes) compatible with
 /// rskj's behavior.
-
 use alloy_primitives::Address;
 use revm::context::CfgEnv;
 use revm::database::WrapDatabaseRef;
@@ -1382,7 +1381,7 @@ mod tests {
             .find(|(addr, acct)| {
                 **addr != sender
                     && **addr != header.beneficiary
-                    && acct.info.code.as_ref().map_or(false, |c| !c.is_empty())
+                    && acct.info.code.as_ref().is_some_and(|c| !c.is_empty())
             })
             .map(|(addr, _)| *addr)
             .expect("should have created a contract");
@@ -1623,7 +1622,7 @@ mod tests {
             .find(|(addr, acct)| {
                 **addr != sender
                     && **addr != header.beneficiary
-                    && acct.info.code.as_ref().map_or(false, |c| !c.is_empty())
+                    && acct.info.code.as_ref().is_some_and(|c| !c.is_empty())
             })
             .map(|(addr, _)| *addr)
             .expect("should have created a contract");
@@ -1705,7 +1704,7 @@ mod tests {
         } else {
             // Negative int256: sign-extend with 0xFF
             input[4..36].fill(0xFF);
-            let be = (depth as i64).to_be_bytes();
+            let be = depth.to_be_bytes();
             input[28..36].copy_from_slice(&be);
         }
         input

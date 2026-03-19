@@ -14,7 +14,7 @@ use bytes::BytesMut;
 
 pub enum HandshakeCodec {
     Plain(P2pCodec),
-    RLPx(RLPxCodec),
+    RLPx(Box<RLPxCodec>),
 }
 
 impl Decoder for HandshakeCodec {
@@ -64,7 +64,7 @@ impl Handshake {
             let rlpx = RLPxHandshake::new(stream, config.clone(), remote_pk);
             let (peer_id, frame_codec, stream) = rlpx.run_initiator().await.context("RLPx handshake failed")?;
             
-            let codec = HandshakeCodec::RLPx(RLPxCodec::new(frame_codec));
+            let codec = HandshakeCodec::RLPx(Box::new(RLPxCodec::new(frame_codec)));
             let mut framed = Framed::new(stream, codec);
             
             let rsk_status = Self::p2p_handshake(&config, &mut framed).await?;
@@ -74,7 +74,7 @@ impl Handshake {
             let rlpx = RLPxHandshake::new(stream, config.clone(), B512::ZERO);
             let (peer_id, frame_codec, stream) = rlpx.run_responder().await.context("Inbound RLPx handshake failed")?;
 
-            let codec = HandshakeCodec::RLPx(RLPxCodec::new(frame_codec));
+            let codec = HandshakeCodec::RLPx(Box::new(RLPxCodec::new(frame_codec)));
             let mut framed = Framed::new(stream, codec);
 
             let (_, rsk_status) = Self::p2p_handshake_inbound(&config, &mut framed).await?;

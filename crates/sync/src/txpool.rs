@@ -169,7 +169,7 @@ impl TransactionPool {
             pending_map
                 .keys()
                 .last()
-                .map_or(false, |&last| tx.nonce == last + 1)
+                .is_some_and(|&last| tx.nonce == last + 1)
         } else {
             false
         };

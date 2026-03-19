@@ -91,10 +91,8 @@ impl PeerChunkTracker {
     pub fn handle_peer_disconnect(&mut self, peer: &B512) {
         if let Some(queue) = self.in_flight.remove(peer) {
             for idx in queue {
-                if idx >= self.next_to_process && !self.buffered.contains_key(&idx) {
-                    if idx < self.next_to_assign {
-                        self.next_to_assign = idx;
-                    }
+                if idx >= self.next_to_process && !self.buffered.contains_key(&idx) && idx < self.next_to_assign {
+                    self.next_to_assign = idx;
                 }
             }
         }
