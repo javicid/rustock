@@ -1425,6 +1425,255 @@ mod tests {
         );
     }
 
+    /// Direct tx to Environment precompile (0x01000011) with getCallStackDepth() selector.
+    /// Ported from rskj EnvironmentTest.getCallStackDepth:
+    ///   selector = 0x80af2871, returns depth as uint32.
+    ///   Direct tx call → depth = 1 (matching rskj's getCallDeep()==0 + 1).
+    #[test]
+    fn test_environment_precompile_direct_call() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+
+        let block_store = Arc::new(
+            BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
+        );
+
+        let header = dummy_header(8_000_000);
+
+        let env_addr = crate::precompiles::ENVIRONMENT_ADDR;
+        let selector = vec![0xe8, 0xce, 0x22, 0x74]; // keccak256("getCallStackDepth()")[0:4]
+
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(env_addr.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::from(selector),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+        };
+
+        let executor = RskExecutor::new(
+            RskHardforkConfig::all_active(33),
+            block_store,
+        );
+
+        let result = executor
+            .execute_tx(&header, &tx, sender, &root, store)
+            .unwrap();
+
+        assert!(result.success, "Environment direct call should succeed");
+
+        // Output: uint32 ABI-encoded as 32-byte big-endian
+        assert_eq!(result.output.len(), 32);
+        let depth = u32::from_be_bytes([
+            result.output[28],
+            result.output[29],
+            result.output[30],
+            result.output[31],
+        ]);
+        assert_eq!(depth, 1, "direct tx call depth should be 1 (matching rskj)");
+
+        // Gas: 0 for Environment + intrinsic cost
+        // Intrinsic: 21000 base + 16*4 (4 non-zero selector bytes at Istanbul rate) = 21064
+        assert_eq!(result.gas_used, 21_064, "Environment costs 0 gas, total = intrinsic only");
+    }
+
+    /// Environment precompile with unknown selector should fail.
+    #[test]
+    fn test_environment_precompile_unknown_selector() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+
+        let block_store = Arc::new(
+            BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
+        );
+
+        let header = dummy_header(8_000_000);
+
+        let env_addr = crate::precompiles::ENVIRONMENT_ADDR;
+        let bad_selector = vec![0xDE, 0xAD, 0xBE, 0xEF];
+
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(env_addr.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::from(bad_selector),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+        };
+
+        let executor = RskExecutor::new(
+            RskHardforkConfig::all_active(33),
+            block_store,
+        );
+
+        let result = executor
+            .execute_tx(&header, &tx, sender, &root, store)
+            .unwrap();
+
+        assert!(!result.success, "unknown selector should fail");
+    }
+
+    /// Environment precompile called via contract STATICCALL should return
+    /// depth > 1 (one extra level for the contract frame).
+    #[test]
+    fn test_environment_precompile_via_contract() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+
+        let block_store = Arc::new(
+            BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
+        );
+
+        let header = dummy_header(8_000_000);
+
+        // Runtime code:
+        //   Store selector 0xe8ce2274 at memory[0..4]
+        //   STATICCALL Environment precompile (0x01000011)
+        //   Return 32 bytes of output
+        //
+        // PUSH4 0xe8ce2274    ; 63 e8ce2274
+        // PUSH1 0x00          ; 60 00
+        // MSTORE              ; 52       -> mem[28..32] = 0xe8ce2274
+        //
+        // PUSH1 0x20          ; 60 20    retSize (32)
+        // PUSH1 0x40          ; 60 40    retOffset
+        // PUSH1 0x04          ; 60 04    argsSize (4)
+        // PUSH1 0x1c          ; 60 1c    argsOffset (28)
+        // PUSH4 0x01000011    ; 63 01000011   address (4 bytes)
+        // GAS                 ; 5A
+        // STATICCALL          ; FA
+        //
+        // PUSH1 0x20          ; 60 20    size
+        // PUSH1 0x40          ; 60 40    offset
+        // RETURN              ; F3
+        let runtime: Vec<u8> = vec![
+            0x63, 0xe8, 0xce, 0x22, 0x74,  // PUSH4 0xe8ce2274
+            0x60, 0x00,                      // PUSH1 0
+            0x52,                            // MSTORE
+            0x60, 0x20,                      // PUSH1 32 (retSize)
+            0x60, 0x40,                      // PUSH1 64 (retOffset)
+            0x60, 0x04,                      // PUSH1 4 (argsSize)
+            0x60, 0x1c,                      // PUSH1 28 (argsOffset)
+            0x63, 0x01, 0x00, 0x00, 0x11,   // PUSH4 0x01000011 (Environment addr)
+            0x5A,                            // GAS
+            0xFA,                            // STATICCALL
+            0x60, 0x20,                      // PUSH1 32 (return size)
+            0x60, 0x40,                      // PUSH1 64 (return offset)
+            0xF3,                            // RETURN
+        ];
+
+        let runtime_len = runtime.len() as u8;
+        let mut initcode: Vec<u8> = vec![
+            0x60, runtime_len,
+            0x60, 0x0c,
+            0x60, 0x00,
+            0x39,
+            0x60, runtime_len,
+            0x60, 0x00,
+            0xF3,
+        ];
+        initcode.extend_from_slice(&runtime);
+
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(500_000),
+            to: Bytes::new(),
+            value: U256::ZERO,
+            input: Bytes::from(initcode),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+        };
+
+        let executor = RskExecutor::new(
+            RskHardforkConfig::all_active(33),
+            block_store.clone(),
+        );
+
+        // Deploy
+        let deploy_result = executor
+            .execute_block(&header, &[(tx, sender)], &root, store.clone())
+            .unwrap();
+
+        assert!(deploy_result.tx_results[0].success, "deployment should succeed");
+
+        let contract_addr = deploy_result.state_changes.iter()
+            .find(|(addr, acct)| {
+                **addr != sender
+                    && **addr != header.beneficiary
+                    && acct.info.code.as_ref().map_or(false, |c| !c.is_empty())
+            })
+            .map(|(addr, _)| *addr)
+            .expect("should have created a contract");
+
+        // Set up state for calling the contract
+        let root2 = TrieNode::empty();
+        let root2 = put_account(&root2, store.as_ref(), &sender, 1, one_rbtc);
+
+        let code_bytes = deploy_result.state_changes.get(&contract_addr)
+            .unwrap().info.code.as_ref().unwrap().bytes_slice().to_vec();
+
+        use rustock_trie::{TrieKeySlice, code_key, AccountState};
+        let ckey = code_key(&contract_addr);
+        let root2 = root2.put(&TrieKeySlice::from_key(&ckey), &code_bytes, store.as_ref());
+
+        let caccount = AccountState::new(U256::ZERO, U256::ZERO);
+        let akey = account_key(&contract_addr);
+        let root2 = root2.put(&TrieKeySlice::from_key(&akey), &caccount.encode(), store.as_ref());
+
+        let call_tx = rustock_core::Transaction {
+            nonce: 1,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(contract_addr.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::new(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+        };
+
+        let call_result = executor
+            .execute_tx(&header, &call_tx, sender, &root2, store)
+            .unwrap();
+
+        assert!(call_result.success, "contract call should succeed");
+        assert_eq!(call_result.output.len(), 32, "should return 32-byte ABI-encoded uint32");
+
+        let depth = u32::from_be_bytes([
+            call_result.output[28],
+            call_result.output[29],
+            call_result.output[30],
+            call_result.output[31],
+        ]);
+
+        assert!(
+            depth >= 2,
+            "depth via contract call should be >= 2 (tx frame + contract frame), got {}",
+            depth
+        );
+    }
+
     fn hex_to_bytes(hex: &str) -> Vec<u8> {
         (0..hex.len())
             .step_by(2)

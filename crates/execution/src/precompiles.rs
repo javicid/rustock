@@ -311,6 +311,9 @@ pub struct RskPrecompileProvider {
     spec: SpecId,
 }
 
+/// Addresses handled via the stateful dispatch path (have access to &mut CTX).
+const STATEFUL_PRECOMPILES: [Address; 3] = [ENVIRONMENT_ADDR, BLOCK_HEADER_ADDR, REMASC_ADDR];
+
 impl RskPrecompileProvider {
     pub fn new(precompiles: Precompiles, hardfork_cfg: &RskHardforkConfig) -> Self {
         Self {
@@ -318,6 +321,143 @@ impl RskPrecompileProvider {
             hardfork_cfg: hardfork_cfg.clone(),
             spec: SpecId::default(),
         }
+    }
+
+    /// Dispatch stateful RSK precompiles that need access to the execution context.
+    ///
+    /// Returns `Ok(Some(result))` if the address was handled, `Ok(None)` to
+    /// fall through to the generic (pure-function) precompile path.
+    fn run_stateful<CTX: ContextTr>(
+        &self,
+        context: &mut CTX,
+        inputs: &CallInputs,
+    ) -> Result<Option<InterpreterResult>, String> {
+        let addr = &inputs.bytecode_address;
+
+        if !STATEFUL_PRECOMPILES.contains(addr) {
+            return Ok(None);
+        }
+
+        // Copy input to owned bytes so we can pass &mut CTX to the handler
+        // without conflicting with the SharedBuffer borrow.
+        let input_bytes: Vec<u8> = match &inputs.input {
+            CallInput::SharedBuffer(range) => {
+                if let Some(slice) = context.local().shared_memory_buffer_slice(range.clone()) {
+                    slice.as_ref().to_vec()
+                } else {
+                    Vec::new()
+                }
+            }
+            CallInput::Bytes(bytes) => bytes.to_vec(),
+        };
+
+        let exec_result = if *addr == ENVIRONMENT_ADDR {
+            self.run_environment(context, &input_bytes, inputs.gas_limit)
+        } else if *addr == BLOCK_HEADER_ADDR {
+            self.run_block_header(context, &input_bytes, inputs.gas_limit)
+        } else {
+            self.run_remasc(context, &input_bytes, inputs.gas_limit)
+        };
+
+        let mut result = InterpreterResult {
+            result: InstructionResult::Return,
+            gas: Gas::new(inputs.gas_limit),
+            output: Bytes::new(),
+        };
+
+        match exec_result {
+            Ok(output) => {
+                result.gas.record_refund(output.gas_refunded);
+                let underflow = result.gas.record_cost(output.gas_used);
+                assert!(underflow, "Gas underflow is not possible");
+                result.result = if output.reverted {
+                    InstructionResult::Revert
+                } else {
+                    InstructionResult::Return
+                };
+                result.output = output.bytes;
+            }
+            Err(PrecompileError::Fatal(e)) => return Err(e),
+            Err(e) => {
+                result.result = if e.is_oog() {
+                    InstructionResult::PrecompileOOG
+                } else {
+                    InstructionResult::PrecompileError
+                };
+                if !e.is_oog() && context.journal().depth() == 1 {
+                    context
+                        .local_mut()
+                        .set_precompile_error_context(e.to_string());
+                }
+            }
+        }
+
+        Ok(Some(result))
+    }
+
+    /// Environment precompile (0x01000011).
+    /// Single method: `getCallStackDepth()` → returns the current call depth.
+    /// Gas: 0.
+    ///
+    /// The depth value matches rskj's `programInvoke.getCallDeep() + 1`:
+    /// in revm, `journal().depth()` already includes the precompile's own
+    /// call frame, so no adjustment is needed.
+    fn run_environment<CTX: ContextTr>(
+        &self,
+        context: &mut CTX,
+        input: &[u8],
+        _gas_limit: u64,
+    ) -> Result<PrecompileOutput, PrecompileError> {
+        // keccak256("getCallStackDepth()")[0:4]
+        const GET_CALL_STACK_DEPTH: [u8; 4] = [0xe8, 0xce, 0x22, 0x74];
+
+        if input.len() < 4 {
+            return Err(PrecompileError::other(
+                "Environment: input too short for method selector",
+            ));
+        }
+
+        if input[..4] != GET_CALL_STACK_DEPTH {
+            return Err(PrecompileError::other(
+                "Environment: unknown method selector",
+            ));
+        }
+
+        let depth = context.journal().depth() as u32;
+
+        // ABI-encode as uint32 (32-byte left-padded big-endian)
+        let mut output = vec![0u8; 32];
+        output[28..32].copy_from_slice(&depth.to_be_bytes());
+
+        Ok(PrecompileOutput::new(0, output.into()))
+    }
+
+    /// BlockHeaderContract precompile (0x01000010).
+    /// Exposes block header fields via ABI method dispatch. Gas: 4000 + 2*input.len().
+    /// Stub — actual implementation in Stage 4 will use block store lookups.
+    fn run_block_header<CTX: ContextTr>(
+        &self,
+        _context: &mut CTX,
+        input: &[u8],
+        gas_limit: u64,
+    ) -> Result<PrecompileOutput, PrecompileError> {
+        let gas_cost = 4_000u64 + 2 * input.len() as u64;
+        if gas_limit < gas_cost {
+            return Err(PrecompileError::OutOfGas);
+        }
+        Ok(PrecompileOutput::new(gas_cost, Vec::new().into()))
+    }
+
+    /// REMASC precompile (0x01000008).
+    /// Distributes miner fees with delayed maturity. Gas: 0.
+    /// Stub — actual implementation in Stage 6 will use journal storage.
+    fn run_remasc<CTX: ContextTr>(
+        &self,
+        _context: &mut CTX,
+        _input: &[u8],
+        _gas_limit: u64,
+    ) -> Result<PrecompileOutput, PrecompileError> {
+        Ok(PrecompileOutput::new(0, Vec::new().into()))
     }
 }
 
@@ -348,6 +488,12 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for RskPrecompileProvider {
         context: &mut CTX,
         inputs: &CallInputs,
     ) -> Result<Option<InterpreterResult>, String> {
+        // Stateful RSK precompiles are intercepted first — they need &mut CTX
+        // for journal depth, block store lookups, or storage access.
+        if let Some(result) = self.run_stateful(context, inputs)? {
+            return Ok(Some(result));
+        }
+
         let Some(precompile) = self.precompiles.get(&inputs.bytecode_address) else {
             return Ok(None);
         };
@@ -866,5 +1012,56 @@ mod tests {
         assert!(is_rsk_precompile(&REMASC_ADDR, &cfg, 0));
         assert!(is_rsk_precompile(&BRIDGE_ADDR, &cfg, 0));
         assert!(!is_rsk_precompile(&Address::repeat_byte(0xFF), &cfg, 0));
+    }
+
+    // -----------------------------------------------------------------------
+    // Stateful dispatch infrastructure tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_stateful_precompiles_list() {
+        assert!(STATEFUL_PRECOMPILES.contains(&ENVIRONMENT_ADDR));
+        assert!(STATEFUL_PRECOMPILES.contains(&BLOCK_HEADER_ADDR));
+        assert!(STATEFUL_PRECOMPILES.contains(&REMASC_ADDR));
+        assert!(!STATEFUL_PRECOMPILES.contains(&BRIDGE_ADDR));
+        assert!(!STATEFUL_PRECOMPILES.contains(&SECP256K1_ADD_ADDR));
+    }
+
+    #[test]
+    fn test_stateful_addresses_still_in_precompile_set() {
+        let cfg = RskHardforkConfig::all_active(33);
+        let precompiles = rsk_precompiles(&cfg, 0);
+
+        assert!(precompiles.contains(&ENVIRONMENT_ADDR));
+        assert!(precompiles.contains(&BLOCK_HEADER_ADDR));
+        assert!(precompiles.contains(&REMASC_ADDR));
+    }
+
+    #[test]
+    fn test_provider_contains_stateful_addresses() {
+        let cfg = RskHardforkConfig::all_active(33);
+        let precompiles = rsk_precompiles(&cfg, 0);
+        let provider = RskPrecompileProvider::new(precompiles, &cfg);
+
+        assert!(provider.precompiles.contains(&ENVIRONMENT_ADDR));
+        assert!(provider.precompiles.contains(&BLOCK_HEADER_ADDR));
+        assert!(provider.precompiles.contains(&REMASC_ADDR));
+        assert!(provider.precompiles.contains(&BRIDGE_ADDR));
+        assert!(provider.precompiles.contains(&SECP256K1_ADD_ADDR));
+    }
+
+    // -----------------------------------------------------------------------
+    // Environment precompile tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_environment_selector_is_keccak256() {
+        use sha3::{Digest, Keccak256};
+        let hash = Keccak256::digest(b"getCallStackDepth()");
+        assert_eq!(
+            &hash[..4],
+            &[0xe8, 0xce, 0x22, 0x74],
+            "selector should be keccak256('getCallStackDepth()')[0:4]"
+        );
     }
 }
