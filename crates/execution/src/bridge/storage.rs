@@ -157,6 +157,100 @@ pub fn bridge_store_btc_block_hash_by_height<CTX: ContextTr>(ctx: &mut CTX, heig
     bridge_sstore(ctx, key, U256::from_be_bytes(hash.0));
 }
 
+/// Store a variable-length byte array in Bridge contract storage.
+///
+/// Matches rskj's `Repository.addStorageBytes` / Solidity dynamic byte layout:
+/// - If `value.len() <= 31`: packed into a single slot as `value || (len * 2)`
+/// - If `value.len() > 31`: slot `key` stores `len * 2 + 1`, data is stored
+///   in consecutive slots starting at `keccak256(key)`.
+pub fn bridge_store_bytes<CTX: ContextTr>(ctx: &mut CTX, key: U256, value: &[u8]) {
+    use sha3::{Digest, Keccak256};
+
+    if value.is_empty() {
+        bridge_sstore(ctx, key, U256::ZERO);
+        return;
+    }
+
+    if value.len() <= 31 {
+        let mut buf = [0u8; 32];
+        buf[..value.len()].copy_from_slice(value);
+        buf[31] = (value.len() * 2) as u8;
+        bridge_sstore(ctx, key, U256::from_be_bytes(buf));
+        return;
+    }
+
+    let len = value.len();
+    bridge_sstore(ctx, key, U256::from(len * 2 + 1));
+
+    let hashed_key = Keccak256::digest(key.to_be_bytes::<32>());
+    let base = U256::from_be_bytes(hashed_key.into());
+
+    let chunks = len.div_ceil(32);
+    for i in 0..chunks {
+        let mut chunk = [0u8; 32];
+        let start = i * 32;
+        let end = std::cmp::min(start + 32, len);
+        chunk[..end - start].copy_from_slice(&value[start..end]);
+        let chunk_key = base.wrapping_add(U256::from(i));
+        bridge_sstore(ctx, chunk_key, U256::from_be_bytes(chunk));
+    }
+}
+
+/// Load a variable-length byte array from Bridge contract storage.
+///
+/// Inverse of `bridge_store_bytes`. Decodes based on the Solidity-style
+/// encoding in the key slot.
+pub fn bridge_load_bytes<CTX: ContextTr>(ctx: &mut CTX, key: U256) -> Vec<u8> {
+    use sha3::{Digest, Keccak256};
+
+    let slot = bridge_sload(ctx, key);
+    if slot.is_zero() {
+        return Vec::new();
+    }
+
+    let raw = slot.to_be_bytes::<32>();
+    let low_bit = raw[31] & 1;
+
+    if low_bit == 0 {
+        // Short encoding: data in upper bytes, length in lower byte
+        let len = (raw[31] / 2) as usize;
+        if len > 31 { return Vec::new(); }
+        raw[..len].to_vec()
+    } else {
+        // Long encoding: key slot has len*2+1, data in keccak256(key)+i
+        let len = (slot - U256::from(1)) / U256::from(2);
+        let len = len.to::<usize>();
+        if len == 0 { return Vec::new(); }
+
+        let hashed_key = Keccak256::digest(key.to_be_bytes::<32>());
+        let base = U256::from_be_bytes(hashed_key.into());
+
+        let mut result = Vec::with_capacity(len);
+        let chunks = len.div_ceil(32);
+        for i in 0..chunks {
+            let chunk_key = base.wrapping_add(U256::from(i));
+            let chunk = bridge_sload(ctx, chunk_key);
+            let chunk_bytes = chunk.to_be_bytes::<32>();
+            let remaining = len - result.len();
+            let to_take = std::cmp::min(32, remaining);
+            result.extend_from_slice(&chunk_bytes[..to_take]);
+        }
+        result
+    }
+}
+
+/// Store a variable-length byte array at a named key.
+pub fn bridge_store_bytes_named<CTX: ContextTr>(ctx: &mut CTX, key_name: &str, value: &[u8]) {
+    let key = bridge_storage_key(key_name);
+    bridge_store_bytes(ctx, key, value);
+}
+
+/// Load a variable-length byte array from a named key.
+pub fn bridge_load_bytes_named<CTX: ContextTr>(ctx: &mut CTX, key_name: &str) -> Vec<u8> {
+    let key = bridge_storage_key(key_name);
+    bridge_load_bytes(ctx, key)
+}
+
 /// Transfer amount from Bridge contract to recipient.
 pub fn bridge_transfer<CTX: ContextTr>(ctx: &mut CTX, recipient: Address, amount: U256) -> bool {
     if amount.is_zero() {

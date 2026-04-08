@@ -974,8 +974,10 @@ async fn test_following_switches_to_sync_on_large_gap() {
 
     service.check_follow_gap().await;
 
-    assert!(matches!(service.state, SyncState::DownloadingSkeleton { .. }),
-        "Expected DownloadingSkeleton after large gap in Following, got {:?}", service.state);
+    assert!(
+        matches!(service.state, SyncState::DownloadingSkeleton { .. } | SyncState::FindingConnectionPoint { .. }),
+        "Expected DownloadingSkeleton or FindingConnectionPoint after large gap in Following, got {:?}", service.state
+    );
 }
 
 #[tokio::test]

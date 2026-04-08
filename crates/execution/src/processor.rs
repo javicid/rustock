@@ -3,7 +3,7 @@
 /// Orchestrates sender recovery, EVM execution, state application,
 /// receipt construction, and validation against the block header.
 use alloy_primitives::{Address, Bloom, B256};
-use rustock_core::{Block, Log, Receipt, Transaction, ordered_trie_root};
+use rustock_core::{Block, Log, Receipt, Transaction, ordered_trie_root, ordered_tx_trie_root};
 use rustock_storage::BlockStore;
 use rustock_trie::{TrieNode, TrieStore};
 use std::sync::Arc;
@@ -25,6 +25,12 @@ pub enum ProcessError {
     StateRootMismatch { header: B256, computed: B256 },
     #[error("receipts root mismatch: header={header}, computed={computed}")]
     ReceiptsRootMismatch { header: B256, computed: B256 },
+    #[error("transactions root mismatch: header={header}, computed={computed}")]
+    TransactionsRootMismatch { header: B256, computed: B256 },
+    #[error("ommers hash mismatch: header={header}, computed={computed}")]
+    OmmersHashMismatch { header: B256, computed: B256 },
+    #[error("logs bloom mismatch")]
+    LogsBloomMismatch,
     #[error("storage error: {0}")]
     Storage(#[from] anyhow::Error),
 }
@@ -37,6 +43,7 @@ pub struct ProcessedBlock {
     pub new_state_root: TrieNode,
     pub state_root_hash: B256,
     pub receipts_root: B256,
+    pub logs_bloom: Bloom,
 }
 
 /// Processes blocks by executing transactions and validating results against headers.
@@ -55,10 +62,10 @@ impl BlockProcessor {
         Self { executor, hardfork_cfg, block_store }
     }
 
-    /// Execute all transactions in a block and validate results against the header.
+    /// Execute all transactions in a block without validating results against the header.
     ///
-    /// Returns the processed block with receipts and new state root if validation passes.
-    pub fn process_block(
+    /// Returns the processed block with receipts and new state root.
+    pub fn execute_block(
         &self,
         block: &Block,
         state_root: &TrieNode,
@@ -117,43 +124,108 @@ impl BlockProcessor {
         let state_root_hash = new_state_root.compute_hash(trie_store.as_ref());
         let receipts_root = ordered_trie_root(&receipts);
 
-        if exec_result.gas_used != header.gas_used {
-            return Err(ProcessError::GasUsedMismatch {
-                header: header.gas_used,
-                computed: exec_result.gas_used,
-            });
-        }
-
-        debug!(
-            number = header.number,
-            gas_used = exec_result.gas_used,
-            tx_count = receipts.len(),
-            "block processed successfully"
-        );
-
         Ok(ProcessedBlock {
             receipts,
             gas_used: exec_result.gas_used,
             new_state_root,
             state_root_hash,
             receipts_root,
+            logs_bloom: block_bloom,
         })
     }
 
-    /// Process and fully commit a block: store receipts and update state.
+    /// Execute all transactions in a block and validate results against the header.
+    ///
+    /// Validates transactions root, ommers hash, gas used, state root,
+    /// receipts root, and logs bloom against the block header.
+    pub fn process_block(
+        &self,
+        block: &Block,
+        state_root: &TrieNode,
+        trie_store: Arc<dyn TrieStore>,
+    ) -> Result<ProcessedBlock, ProcessError> {
+        let header = &block.header;
+
+        let computed_tx_root = ordered_tx_trie_root(&block.transactions);
+        if computed_tx_root != header.transactions_root {
+            return Err(ProcessError::TransactionsRootMismatch {
+                header: header.transactions_root,
+                computed: computed_tx_root,
+            });
+        }
+
+        let computed_ommers_hash = compute_ommers_hash(&block.ommers);
+        if computed_ommers_hash != header.ommers_hash {
+            return Err(ProcessError::OmmersHashMismatch {
+                header: header.ommers_hash,
+                computed: computed_ommers_hash,
+            });
+        }
+
+        let result = self.execute_block(block, state_root, trie_store)?;
+
+        if result.gas_used != header.gas_used {
+            return Err(ProcessError::GasUsedMismatch {
+                header: header.gas_used,
+                computed: result.gas_used,
+            });
+        }
+
+        if result.state_root_hash != header.state_root {
+            return Err(ProcessError::StateRootMismatch {
+                header: header.state_root,
+                computed: result.state_root_hash,
+            });
+        }
+
+        if result.receipts_root != header.receipts_root {
+            return Err(ProcessError::ReceiptsRootMismatch {
+                header: header.receipts_root,
+                computed: result.receipts_root,
+            });
+        }
+
+        if result.logs_bloom != header.logs_bloom {
+            return Err(ProcessError::LogsBloomMismatch);
+        }
+
+        debug!(
+            number = header.number,
+            gas_used = result.gas_used,
+            tx_count = result.receipts.len(),
+            "block processed successfully"
+        );
+
+        Ok(result)
+    }
+
+    /// Execute and commit a block without header validation: store receipts.
+    pub fn execute_and_commit(
+        &self,
+        block: &Block,
+        state_root: &TrieNode,
+        trie_store: Arc<dyn TrieStore>,
+    ) -> Result<ProcessedBlock, ProcessError> {
+        let result = self.execute_block(block, state_root, trie_store)?;
+        let hash = block.hash();
+        self.block_store
+            .put_receipts(hash, &result.receipts)
+            .map_err(ProcessError::Storage)?;
+        Ok(result)
+    }
+
+    /// Validate, execute, and commit a block: store receipts and update state.
     pub fn process_and_commit(
         &self,
         block: &Block,
         state_root: &TrieNode,
         trie_store: Arc<dyn TrieStore>,
     ) -> Result<ProcessedBlock, ProcessError> {
-        let result = self.process_block(block, state_root, trie_store.clone())?;
-
+        let result = self.process_block(block, state_root, trie_store)?;
         let hash = block.hash();
         self.block_store
             .put_receipts(hash, &result.receipts)
             .map_err(ProcessError::Storage)?;
-
         Ok(result)
     }
 
@@ -171,6 +243,23 @@ impl BlockProcessor {
         }
         Ok(senders)
     }
+}
+
+/// Compute the Keccak256 hash of the RLP-encoded list of ommer headers.
+fn compute_ommers_hash(ommers: &[rustock_core::Header]) -> B256 {
+    use alloy_rlp::Encodable;
+    use sha3::{Digest, Keccak256};
+
+    let mut list_buf = Vec::new();
+    let mut items_buf = Vec::new();
+    for ommer in ommers {
+        ommer.encode(&mut items_buf);
+    }
+    let header = alloy_rlp::Header { list: true, payload_length: items_buf.len() };
+    header.encode(&mut list_buf);
+    list_buf.extend_from_slice(&items_buf);
+
+    B256::from_slice(&Keccak256::digest(&list_buf))
 }
 
 /// Accrue a single log into a bloom filter (EIP-2718 bloom algorithm).
@@ -262,7 +351,7 @@ mod tests {
     }
 
     #[test]
-    fn test_process_block_empty() {
+    fn test_execute_block_empty() {
         let store = Arc::new(MemoryTrieStore::new());
         let root = TrieNode::empty();
         let block_store = Arc::new(
@@ -277,14 +366,14 @@ mod tests {
         };
 
         let processor = BlockProcessor::new(test_hardfork_cfg(), block_store);
-        let result = processor.process_block(&block, &root, store).unwrap();
+        let result = processor.execute_block(&block, &root, store).unwrap();
 
         assert_eq!(result.gas_used, 0);
         assert!(result.receipts.is_empty());
     }
 
     #[test]
-    fn test_process_block_with_signed_tx() {
+    fn test_execute_block_with_signed_tx() {
         let store = Arc::new(MemoryTrieStore::new());
         let root = TrieNode::empty();
         let chain_id = 33u64;
@@ -323,7 +412,7 @@ mod tests {
         };
 
         let processor = BlockProcessor::new(test_hardfork_cfg(), block_store);
-        let result = processor.process_block(&block, &root, store).unwrap();
+        let result = processor.execute_block(&block, &root, store).unwrap();
 
         assert_eq!(result.gas_used, 21_000);
         assert_eq!(result.receipts.len(), 1);
@@ -362,6 +451,8 @@ mod tests {
 
         let mut header = dummy_header(8_000_000);
         header.gas_used = 99_999; // wrong gas
+        header.transactions_root = ordered_tx_trie_root(&[tx.clone()]);
+        header.ommers_hash = compute_ommers_hash(&[]);
 
         let block = Block {
             header,
@@ -401,7 +492,7 @@ mod tests {
         block_store.put_header(&header).unwrap();
 
         let processor = BlockProcessor::new(test_hardfork_cfg(), block_store.clone());
-        let _result = processor.process_and_commit(&block, &root, store).unwrap();
+        let _result = processor.execute_and_commit(&block, &root, store).unwrap();
 
         let stored_receipts = block_store.receipts(hash).unwrap();
         assert!(stored_receipts.is_some());
@@ -448,7 +539,7 @@ mod tests {
         };
 
         let processor = BlockProcessor::new(test_hardfork_cfg(), block_store);
-        let result = processor.process_block(&block, &root, store).unwrap();
+        let result = processor.execute_block(&block, &root, store).unwrap();
 
         assert_ne!(
             result.state_root_hash, initial_hash,
@@ -540,6 +631,8 @@ mod tests {
 
         let mut header = dummy_header(8_000_000);
         header.gas_used = 0; // incorrect — should be 21_000
+        header.transactions_root = ordered_tx_trie_root(&[tx.clone()]);
+        header.ommers_hash = compute_ommers_hash(&[]);
 
         let block = Block {
             header,
@@ -602,7 +695,7 @@ mod tests {
         };
 
         let processor = BlockProcessor::new(test_hardfork_cfg(), block_store);
-        let result = processor.process_block(&block, &root, store.clone()).unwrap();
+        let result = processor.execute_block(&block, &root, store.clone()).unwrap();
 
         assert_eq!(result.gas_used, 21_000);
         assert_eq!(result.receipts.len(), 1);
@@ -633,5 +726,132 @@ mod tests {
             .step_by(2)
             .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn test_process_block_validates_tx_root() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+        let block_store = Arc::new(
+            BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
+        );
+
+        let mut header = dummy_header(8_000_000);
+        header.ommers_hash = compute_ommers_hash(&[]);
+        header.transactions_root = B256::repeat_byte(0xFF); // wrong
+
+        let block = Block {
+            header,
+            transactions: vec![],
+            ommers: vec![],
+        };
+
+        let processor = BlockProcessor::new(test_hardfork_cfg(), block_store);
+        let result = processor.process_block(&block, &root, store);
+        assert!(matches!(
+            result.unwrap_err(),
+            ProcessError::TransactionsRootMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn test_process_block_validates_ommers_hash() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+        let block_store = Arc::new(
+            BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
+        );
+
+        let mut header = dummy_header(8_000_000);
+        header.transactions_root = ordered_tx_trie_root(&[]);
+        header.ommers_hash = B256::repeat_byte(0xFF); // wrong
+
+        let block = Block {
+            header,
+            transactions: vec![],
+            ommers: vec![],
+        };
+
+        let processor = BlockProcessor::new(test_hardfork_cfg(), block_store);
+        let result = processor.process_block(&block, &root, store);
+        assert!(matches!(
+            result.unwrap_err(),
+            ProcessError::OmmersHashMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn test_process_block_validates_state_root() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+        let block_store = Arc::new(
+            BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
+        );
+
+        let processor = BlockProcessor::new(test_hardfork_cfg(), block_store);
+
+        // First, compute the correct values
+        let block = Block {
+            header: dummy_header(8_000_000),
+            transactions: vec![],
+            ommers: vec![],
+        };
+        let correct = processor.execute_block(&block, &root, store.clone()).unwrap();
+
+        // Now create a block with correct tx/ommers but wrong state root
+        let mut header = dummy_header(8_000_000);
+        header.transactions_root = ordered_tx_trie_root(&[]);
+        header.ommers_hash = compute_ommers_hash(&[]);
+        header.receipts_root = correct.receipts_root;
+        header.state_root = B256::repeat_byte(0xFF); // wrong
+
+        let block = Block {
+            header,
+            transactions: vec![],
+            ommers: vec![],
+        };
+
+        let result = processor.process_block(&block, &root, store);
+        assert!(matches!(
+            result.unwrap_err(),
+            ProcessError::StateRootMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn test_process_block_full_validation_passes() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+        let block_store = Arc::new(
+            BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
+        );
+
+        let processor = BlockProcessor::new(test_hardfork_cfg(), block_store);
+
+        // Compute correct header values using execute_block
+        let block = Block {
+            header: dummy_header(8_000_000),
+            transactions: vec![],
+            ommers: vec![],
+        };
+        let result = processor.execute_block(&block, &root, store.clone()).unwrap();
+
+        // Build a header with all correct values
+        let mut header = dummy_header(8_000_000);
+        header.transactions_root = ordered_tx_trie_root(&[]);
+        header.ommers_hash = compute_ommers_hash(&[]);
+        header.state_root = result.state_root_hash;
+        header.receipts_root = result.receipts_root;
+        header.logs_bloom = result.logs_bloom;
+
+        let block = Block {
+            header,
+            transactions: vec![],
+            ommers: vec![],
+        };
+
+        // Full validation should pass
+        let validated = processor.process_block(&block, &root, store).unwrap();
+        assert_eq!(validated.gas_used, 0);
     }
 }

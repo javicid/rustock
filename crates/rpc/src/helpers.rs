@@ -72,8 +72,42 @@ pub struct BlockResultDto {
 
 impl BlockResultDto {
     pub fn from_header(header: &Header, hash: B256, total_difficulty: U256) -> Self {
+        Self::from_header_with_body(header, hash, total_difficulty, None, false)
+    }
+
+    pub fn from_header_with_body(
+        header: &Header,
+        hash: B256,
+        total_difficulty: U256,
+        body: Option<&(Vec<rustock_core::Transaction>, Vec<Header>)>,
+        full_txs: bool,
+    ) -> Self {
         let mut rlp_buf = Vec::new();
         alloy_rlp::Encodable::encode(header, &mut rlp_buf);
+
+        let transactions = if let Some((txs, _)) = body {
+            txs.iter()
+                .enumerate()
+                .map(|(i, tx)| {
+                    if full_txs {
+                        tx_to_json(tx, &hash, header.number, i)
+                    } else {
+                        let h = tx_hash(tx);
+                        serde_json::Value::String(to_hex_b256(&h))
+                    }
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+
+        let uncles = if let Some((_, ommers)) = body {
+            ommers.iter().map(|o| {
+                serde_json::Value::String(to_hex_b256(&o.hash()))
+            }).collect()
+        } else {
+            vec![]
+        };
 
         Self {
             number: to_hex_u64(header.number),
@@ -92,11 +126,40 @@ impl BlockResultDto {
             timestamp: to_hex_u64(header.timestamp),
             extra_data: to_hex_bytes(&header.extra_data),
             minimum_gas_price: to_hex_u256(&header.minimum_gas_price),
-            transactions: vec![],
-            uncles: vec![],
+            transactions,
+            uncles,
             size: to_hex_u64(rlp_buf.len() as u64),
         }
     }
+}
+
+/// Compute the keccak256 hash of a transaction's RLP encoding.
+fn tx_hash(tx: &rustock_core::Transaction) -> B256 {
+    use sha3::{Digest, Keccak256};
+    let mut buf = Vec::new();
+    alloy_rlp::Encodable::encode(tx, &mut buf);
+    B256::from_slice(&Keccak256::digest(&buf))
+}
+
+/// Format a transaction as a JSON object for `eth_getBlockBy*` (full tx mode).
+fn tx_to_json(tx: &rustock_core::Transaction, block_hash: &B256, block_number: u64, index: usize) -> serde_json::Value {
+    let hash = tx_hash(tx);
+    serde_json::json!({
+        "hash": to_hex_b256(&hash),
+        "nonce": to_hex_u64(tx.nonce),
+        "blockHash": to_hex_b256(block_hash),
+        "blockNumber": to_hex_u64(block_number),
+        "transactionIndex": to_hex_u64(index as u64),
+        "from": "0x0000000000000000000000000000000000000000",
+        "to": to_hex_bytes(&tx.to),
+        "value": to_hex_u256(&tx.value),
+        "gasPrice": to_hex_u256(&tx.gas_price),
+        "gas": to_hex_u256(&tx.gas_limit),
+        "input": to_hex_bytes(&tx.input),
+        "v": to_hex_u64(tx.v),
+        "r": to_hex_u256(&tx.r),
+        "s": to_hex_u256(&tx.s),
+    })
 }
 
 #[cfg(test)]

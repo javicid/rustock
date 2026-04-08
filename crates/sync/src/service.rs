@@ -231,15 +231,36 @@ impl SyncService {
 
         self.progress.reset(head.number);
 
-        let cp = head.number;
-        debug!(target: "rustock::sync", "Connection point: #{} (head)", cp);
-        self.state = SyncState::DownloadingSkeleton {
-            peer: peer_id,
-            peer_best: metadata.best_number,
-            connection_point: cp,
-        };
-        self.last_progress = Instant::now();
-        self.send_skeleton_request_to(&peer_id, cp).await;
+        // If the peer's best hash matches our chain, use our head as connection point.
+        // Otherwise, use binary search to find where our chain diverges from the peer.
+        let peer_hash_known = self.manager.store.has_block(metadata.best_hash)
+            .unwrap_or(false);
+
+        if peer_hash_known || head.number == 0 {
+            let cp = head.number;
+            debug!(target: "rustock::sync", "Connection point: #{} (head)", cp);
+            self.state = SyncState::DownloadingSkeleton {
+                peer: peer_id,
+                peer_best: metadata.best_number,
+                connection_point: cp,
+            };
+            self.last_progress = Instant::now();
+            self.send_skeleton_request_to(&peer_id, cp).await;
+        } else {
+            debug!(
+                target: "rustock::sync",
+                "Peer best hash unknown, searching for connection point (0..{})",
+                head.number
+            );
+            self.state = SyncState::FindingConnectionPoint {
+                peer: peer_id,
+                peer_best: metadata.best_number,
+                start: 0,
+                end: head.number,
+            };
+            self.last_progress = Instant::now();
+            self.send_connection_point_probe().await;
+        }
     }
 
     async fn send_connection_point_probe(&self) {

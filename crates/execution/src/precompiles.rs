@@ -1096,12 +1096,15 @@ impl RskPrecompileProvider {
         input: &[u8],
         gas_limit: u64,
     ) -> Result<PrecompileOutput, PrecompileError> {
+        let block_number = context.block().number().to::<u64>();
+        let use_v2 = self.hardfork_cfg.has_stored_block_v2(block_number);
         crate::bridge::execute_bridge(
             context,
             input,
             gas_limit,
             &self.bridge_config,
             self.block_store.as_ref(),
+            use_v2,
         )
     }
 

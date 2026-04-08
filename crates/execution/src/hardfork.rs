@@ -51,6 +51,21 @@ pub const MAINNET_ACTIVATIONS: &[(u64, RskNetworkUpgrade)] = &[
     (8_052_200, RskNetworkUpgrade::Reed800),
 ];
 
+/// Testnet activation heights.
+pub const TESTNET_ACTIVATIONS: &[(u64, RskNetworkUpgrade)] = &[
+    (0, RskNetworkUpgrade::Genesis),
+    (0, RskNetworkUpgrade::Orchid),
+    (863_000, RskNetworkUpgrade::Wasabi100),
+    (1_580_000, RskNetworkUpgrade::Papyrus200),
+    (2_060_500, RskNetworkUpgrade::Iris300),
+    (3_103_000, RskNetworkUpgrade::Hop400),
+    (4_015_800, RskNetworkUpgrade::Fingerroot500),
+    (4_927_100, RskNetworkUpgrade::Arrowhead600),
+    (5_254_700, RskNetworkUpgrade::Arrowhead631),
+    (5_735_824, RskNetworkUpgrade::Lovell700),
+    (6_420_700, RskNetworkUpgrade::Reed800),
+];
+
 /// Configuration that determines which RSK features are active at a given block.
 #[derive(Debug, Clone)]
 pub struct RskHardforkConfig {
@@ -68,10 +83,23 @@ impl RskHardforkConfig {
 
     pub fn testnet() -> Self {
         Self {
-            activations: vec![
-                (0, RskNetworkUpgrade::Genesis),
-            ],
+            activations: TESTNET_ACTIVATIONS.to_vec(),
             chain_id: RSK_TESTNET_CHAIN_ID,
+        }
+    }
+
+    pub fn regtest() -> Self {
+        Self {
+            activations: vec![(0, RskNetworkUpgrade::Reed800)],
+            chain_id: 33,
+        }
+    }
+
+    pub fn for_network(network_id: u64) -> Self {
+        match network_id {
+            30 => Self::mainnet(),
+            31 => Self::testnet(),
+            _ => Self::regtest(),
         }
     }
 
@@ -113,6 +141,11 @@ impl RskHardforkConfig {
 
     /// Whether initcode metering is active (RSKIP438, Lovell700).
     pub fn has_initcode_metering(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Lovell700
+    }
+
+    /// Whether StoredBlock V2 format is active (RSKIP454, Lovell700).
+    pub fn has_stored_block_v2(&self, block_number: u64) -> bool {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Lovell700
     }
 }

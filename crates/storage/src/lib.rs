@@ -46,6 +46,7 @@ impl BlockStore {
             ColumnFamilyDescriptor::new(CF_BODIES, Options::default()),
             ColumnFamilyDescriptor::new(CF_RECEIPTS, Options::default()),
             ColumnFamilyDescriptor::new(CF_TX_INDEX, Options::default()),
+            ColumnFamilyDescriptor::new("trie_nodes", Options::default()),
         ];
 
         let db = DB::open_cf_descriptors(&opts, path, cfs).context("Failed to open RocksDB")?;

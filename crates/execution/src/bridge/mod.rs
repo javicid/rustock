@@ -208,6 +208,7 @@ pub fn execute_bridge<CTX: ContextTr>(
     gas_limit: u64,
     _config: &BridgeConstants,
     _block_store: Option<&Arc<BlockStore>>,
+    use_v2: bool,
 ) -> Result<PrecompileOutput, PrecompileError> {
     // Empty input → releaseBtc (legacy behavior matching rskj)
     if input.is_empty() {
@@ -215,7 +216,7 @@ pub fn execute_bridge<CTX: ContextTr>(
         if gas_limit < gas_cost {
             return Err(PrecompileError::OutOfGas);
         }
-        return execute_method(ctx, "releaseBtc", &[], gas_cost, _config, _block_store);
+        return execute_method(ctx, "releaseBtc", &[], gas_cost, _config, _block_store, use_v2);
     }
 
     if input.len() < 4 {
@@ -243,7 +244,7 @@ pub fn execute_bridge<CTX: ContextTr>(
     }
 
     let args = &input[4..];
-    execute_method(ctx, method.name, args, gas_cost, _config, _block_store)
+    execute_method(ctx, method.name, args, gas_cost, _config, _block_store, use_v2)
 }
 
 /// Dispatch to individual method handlers.
@@ -254,9 +255,8 @@ fn execute_method<CTX: ContextTr>(
     gas_cost: u64,
     config: &BridgeConstants,
     _block_store: Option<&Arc<BlockStore>>,
+    use_v2: bool,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    // TODO: determine V2 from activation (RSKIP454). For now use legacy.
-    let use_v2 = false;
 
     match method_name {
         // Phase 2: BTC header chain

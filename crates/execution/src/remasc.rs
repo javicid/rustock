@@ -44,6 +44,8 @@ pub struct RemascConfig {
     pub rsk_labs_address: Address,
     /// RSK Labs reward address (post-RSKIP218).
     pub rsk_labs_address_rskip218: Address,
+    /// Block height at which RSKIP218 activates (changes the labs payout address).
+    pub rskip218_activation_height: u64,
 }
 
 impl RemascConfig {
@@ -62,6 +64,7 @@ impl RemascConfig {
             rsk_labs_address_rskip218: "dcb12179ba4697350f66224c959bdd9c282818df"
                 .parse()
                 .unwrap(),
+            rskip218_activation_height: 6_223_700, // Arrowhead600
         }
     }
 
@@ -80,6 +83,7 @@ impl RemascConfig {
             rsk_labs_address_rskip218: "dabadabadabadabadabadabadabadabadaba0003"
                 .parse()
                 .unwrap(),
+            rskip218_activation_height: 4_927_100, // Arrowhead600
         }
     }
 
@@ -98,6 +102,16 @@ impl RemascConfig {
             rsk_labs_address_rskip218: "dabadabadabadabadabadabadabadabadaba0001"
                 .parse()
                 .unwrap(),
+            rskip218_activation_height: 0,
+        }
+    }
+
+    /// Returns the correct RSK Labs address for the given block height.
+    pub fn labs_address_at(&self, block_number: u64) -> Address {
+        if block_number >= self.rskip218_activation_height {
+            self.rsk_labs_address_rskip218
+        } else {
+            self.rsk_labs_address
         }
     }
 }
@@ -382,9 +396,10 @@ pub fn process_miners_fees<CTX: ContextTr>(
     reward_balance -= synthetic_reward;
     remasc_sstore(ctx, reward_key, reward_balance);
 
-    // Pay RSK Labs
+    // Pay RSK Labs (use RSKIP218 address if active)
     let rsk_labs_pay = synthetic_reward / U256::from(config.rsk_labs_divisor);
-    remasc_transfer(ctx, config.rsk_labs_address, rsk_labs_pay);
+    let labs_addr = config.labs_address_at(current_number);
+    remasc_transfer(ctx, labs_addr, rsk_labs_pay);
     let mut remaining = synthetic_reward - rsk_labs_pay;
 
     // Federation reward: store in federationBalance

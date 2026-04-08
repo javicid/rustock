@@ -77,8 +77,9 @@ pub fn eth_get_block_by_hash(
     let Some(hash) = params.get(0).and_then(|v| v.as_str()).and_then(parse_b256) else {
         return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid block hash");
     };
+    let full_txs = params.get(1).and_then(|v| v.as_bool()).unwrap_or(false);
 
-    match build_block_dto(store, hash) {
+    match build_block_dto_with_full_txs(store, hash, full_txs) {
         Some(dto) => JsonRpcResponse::success(id, serde_json::to_value(dto).unwrap()),
         None => JsonRpcResponse::success(id, Value::Null),
     }
@@ -96,13 +97,14 @@ pub fn eth_get_block_by_number(
     let Some(number) = parse_block_number(bn_str, head_num) else {
         return JsonRpcResponse::error(id, INVALID_PARAMS, "Invalid block number");
     };
+    let full_txs = params.get(1).and_then(|v| v.as_bool()).unwrap_or(false);
 
     let hash = match store.canonical_hash(number) {
         Ok(Some(h)) => h,
         _ => return JsonRpcResponse::success(id, Value::Null),
     };
 
-    match build_block_dto(store, hash) {
+    match build_block_dto_with_full_txs(store, hash, full_txs) {
         Some(dto) => JsonRpcResponse::success(id, serde_json::to_value(dto).unwrap()),
         None => JsonRpcResponse::success(id, Value::Null),
     }
@@ -112,9 +114,17 @@ pub fn eth_get_block_transaction_count_by_hash(id: Value, params: &Value, store:
     let Some(hash) = params.get(0).and_then(|v| v.as_str()).and_then(parse_b256) else {
         return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid block hash");
     };
-    match store.has_block(hash) {
-        Ok(true) => JsonRpcResponse::success(id, json!("0x0")),
-        _ => JsonRpcResponse::success(id, Value::Null),
+    match store.body(hash) {
+        Ok(Some((txs, _))) => JsonRpcResponse::success(id, json!(to_hex_u64(txs.len() as u64))),
+        Ok(None) => {
+            // No body stored, but block may exist (header-only)
+            if store.has_block(hash).unwrap_or(false) {
+                JsonRpcResponse::success(id, json!("0x0"))
+            } else {
+                JsonRpcResponse::success(id, Value::Null)
+            }
+        }
+        Err(_) => JsonRpcResponse::success(id, Value::Null),
     }
 }
 
@@ -126,9 +136,13 @@ pub fn eth_get_block_transaction_count_by_number(id: Value, params: &Value, stor
     let Some(number) = parse_block_number(bn_str, head_num) else {
         return JsonRpcResponse::error(id, INVALID_PARAMS, "Invalid block number");
     };
-    match store.canonical_hash(number) {
-        Ok(Some(_)) => JsonRpcResponse::success(id, json!("0x0")),
-        _ => JsonRpcResponse::success(id, Value::Null),
+    let hash = match store.canonical_hash(number) {
+        Ok(Some(h)) => h,
+        _ => return JsonRpcResponse::success(id, Value::Null),
+    };
+    match store.body(hash) {
+        Ok(Some((txs, _))) => JsonRpcResponse::success(id, json!(to_hex_u64(txs.len() as u64))),
+        _ => JsonRpcResponse::success(id, json!("0x0")),
     }
 }
 
@@ -173,13 +187,15 @@ fn head_header(store: &BlockStore) -> Option<rustock_core::types::header::Header
         .and_then(|h| store.header(h).ok().flatten())
 }
 
-fn build_block_dto(
+fn build_block_dto_with_full_txs(
     store: &BlockStore,
     hash: alloy_primitives::B256,
+    full_txs: bool,
 ) -> Option<BlockResultDto> {
     let header = store.header(hash).ok()??;
     let td = store.total_difficulty(hash).ok()?.unwrap_or_default();
-    Some(BlockResultDto::from_header(&header, hash, td))
+    let body = store.body(hash).ok().flatten();
+    Some(BlockResultDto::from_header_with_body(&header, hash, td, body.as_ref(), full_txs))
 }
 
 pub async fn eth_send_raw_transaction(

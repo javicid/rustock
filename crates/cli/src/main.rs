@@ -206,8 +206,21 @@ async fn main() -> Result<()> {
         trie_store_for_pool,
     ));
 
+    let hardfork_cfg = rustock_execution::RskHardforkConfig::for_network(config.network_id);
+    let block_processor = rustock_execution::BlockProcessor::new(
+        hardfork_cfg.clone(),
+        store.clone(),
+    );
+    info!("Block processor wired (hardfork config: {:?})", hardfork_cfg);
+
+    let trie_store_for_exec: Arc<dyn rustock_trie::TrieStore> =
+        Arc::new(rustock_storage::RocksDbTrieStore::from_db(store.db().clone()));
+
+    let genesis_state_root = rustock_trie::TrieNode::empty();
+
     let sync_service = SyncService::new(sync_manager.clone(), peer_store.clone(), event_rx)
-        .with_tx_pool(pool.clone());
+        .with_tx_pool(pool.clone())
+        .with_block_processor(block_processor, trie_store_for_exec, genesis_state_root);
     let tx_relay = Arc::new(TxRelay::with_pool(peer_store.clone(), pool.clone()));
 
     let mut node = Node::with_peer_store(node_config, peer_store.clone());
@@ -219,7 +232,6 @@ async fn main() -> Result<()> {
     if !args.no_rpc {
         let trie_store: Arc<dyn rustock_trie::TrieStore> =
             Arc::new(rustock_storage::RocksDbTrieStore::from_db(store.db().clone()));
-        let hardfork_cfg = rustock_execution::RskHardforkConfig::mainnet();
 
         let rpc_state = rustock_rpc::server::RpcState {
             store: store.clone(),
