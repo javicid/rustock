@@ -30,6 +30,7 @@ use rustock_storage::BlockStore;
 use std::sync::Arc;
 
 use crate::hardfork::{RskHardforkConfig, RskNetworkUpgrade};
+use crate::remasc::RemascConfig;
 
 // ---------------------------------------------------------------------------
 // RSK-specific precompile addresses
@@ -804,6 +805,7 @@ pub struct RskPrecompileProvider {
     hardfork_cfg: RskHardforkConfig,
     spec: SpecId,
     block_store: Option<Arc<BlockStore>>,
+    remasc_config: RemascConfig,
 }
 
 impl std::fmt::Debug for RskPrecompileProvider {
@@ -833,12 +835,14 @@ impl RskPrecompileProvider {
         precompiles: Precompiles,
         hardfork_cfg: &RskHardforkConfig,
         block_store: Option<Arc<BlockStore>>,
+        remasc_config: RemascConfig,
     ) -> Self {
         Self {
             precompiles,
             hardfork_cfg: hardfork_cfg.clone(),
             spec: SpecId::default(),
             block_store,
+            remasc_config,
         }
     }
 
@@ -1075,13 +1079,17 @@ impl RskPrecompileProvider {
 
     /// REMASC precompile (0x01000008).
     /// Distributes miner fees with delayed maturity. Gas: 0.
-    /// Stub — actual implementation in Stage 6 will use journal storage.
     fn run_remasc<CTX: ContextTr>(
         &self,
-        _context: &mut CTX,
+        context: &mut CTX,
         _input: &[u8],
         _gas_limit: u64,
     ) -> Result<PrecompileOutput, PrecompileError> {
+        crate::remasc::process_miners_fees(
+            context,
+            &self.remasc_config,
+            self.block_store.as_ref(),
+        )?;
         Ok(PrecompileOutput::new(0, Vec::new().into()))
     }
 }
@@ -1093,6 +1101,7 @@ impl Clone for RskPrecompileProvider {
             hardfork_cfg: self.hardfork_cfg.clone(),
             spec: self.spec,
             block_store: self.block_store.clone(),
+            remasc_config: self.remasc_config.clone(),
         }
     }
 }
@@ -1667,7 +1676,7 @@ mod tests {
     fn test_provider_contains_stateful_addresses() {
         let cfg = RskHardforkConfig::all_active(33);
         let precompiles = rsk_precompiles(&cfg, 0);
-        let provider = RskPrecompileProvider::new(precompiles, &cfg, None);
+        let provider = RskPrecompileProvider::new(precompiles, &cfg, None, RemascConfig::regtest());
 
         assert!(provider.precompiles.contains(&ENVIRONMENT_ADDR));
         assert!(provider.precompiles.contains(&BLOCK_HEADER_ADDR));

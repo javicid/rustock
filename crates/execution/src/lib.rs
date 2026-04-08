@@ -4,6 +4,7 @@ pub mod executor;
 pub mod hardfork;
 pub mod precompiles;
 pub mod processor;
+pub mod remasc;
 pub mod state;
 
 pub use database::RskDatabase;
@@ -14,4 +15,5 @@ pub use precompiles::{
     BRIDGE_ADDR, REMASC_ADDR,
 };
 pub use processor::{BlockProcessor, ProcessError, ProcessedBlock};
+pub use remasc::RemascConfig;
 pub use state::apply_state_changes;

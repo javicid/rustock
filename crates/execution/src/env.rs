@@ -9,8 +9,15 @@ use revm::primitives::TxKind;
 use revm::primitives::hardfork::SpecId;
 use rustock_core::Header;
 use crate::hardfork::RskHardforkConfig;
+use crate::precompiles::REMASC_ADDR;
 
 /// Build a revm `BlockEnv` from an RSK block header.
+///
+/// In RSK, transaction fees are credited to the REMASC contract rather than the
+/// miner directly. REMASC later distributes rewards with delayed maturity. We
+/// set `beneficiary` to `REMASC_ADDR` so revm routes all gas-fee payments to
+/// the REMASC account; the actual miner (`header.beneficiary`) is paid later
+/// when REMASC runs.
 pub fn block_env_from_header(header: &Header, hardfork_cfg: &RskHardforkConfig) -> BlockEnv {
     let spec = hardfork_cfg.spec_id(header.number);
     let prevrandao = if spec.is_enabled_in(SpecId::MERGE) {
@@ -21,7 +28,7 @@ pub fn block_env_from_header(header: &Header, hardfork_cfg: &RskHardforkConfig) 
 
     BlockEnv {
         number: U256::from(header.number),
-        beneficiary: header.beneficiary,
+        beneficiary: REMASC_ADDR,
         timestamp: U256::from(header.timestamp),
         // RSK stores gas_limit as U256 but revm expects u64
         gas_limit: header.gas_limit.to::<u64>(),
@@ -109,7 +116,7 @@ mod tests {
         let env = block_env_from_header(&header, &cfg);
 
         assert_eq!(env.number, U256::from(7_500_000u64));
-        assert_eq!(env.beneficiary, Address::repeat_byte(0x01));
+        assert_eq!(env.beneficiary, REMASC_ADDR);
         assert_eq!(env.gas_limit, 6_800_000);
         assert_eq!(env.difficulty, U256::from(1_000_000u64));
         assert_eq!(env.basefee, 59_240_000);

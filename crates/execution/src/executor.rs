@@ -41,11 +41,18 @@ pub struct BlockExecutionResult {
 pub struct RskExecutor {
     hardfork_cfg: RskHardforkConfig,
     block_store: Arc<BlockStore>,
+    remasc_config: crate::remasc::RemascConfig,
 }
 
 impl RskExecutor {
     pub fn new(hardfork_cfg: RskHardforkConfig, block_store: Arc<BlockStore>) -> Self {
-        Self { hardfork_cfg, block_store }
+        let remasc_config = crate::remasc::RemascConfig::mainnet();
+        Self { hardfork_cfg, block_store, remasc_config }
+    }
+
+    pub fn with_remasc_config(mut self, config: crate::remasc::RemascConfig) -> Self {
+        self.remasc_config = config;
+        self
     }
 
     /// Execute a single transaction against the given state root.
@@ -73,6 +80,7 @@ impl RskExecutor {
             rsk_precompiles(&self.hardfork_cfg, header.number),
             &self.hardfork_cfg,
             Some(self.block_store.clone()),
+            self.remasc_config.clone(),
         );
         let mut evm = ctx.build_mainnet().with_precompiles(precompile_provider);
 
@@ -117,6 +125,7 @@ impl RskExecutor {
             rsk_precompiles(&self.hardfork_cfg, header.number),
             &self.hardfork_cfg,
             Some(self.block_store.clone()),
+            self.remasc_config.clone(),
         );
         let mut evm = ctx.build_mainnet().with_precompiles(precompile_provider);
 
@@ -974,7 +983,9 @@ mod tests {
 
     /// Verifies that the beneficiary (coinbase) receives gas fees in state changes.
     #[test]
-    fn test_beneficiary_receives_fees() {
+    fn test_fees_routed_to_remasc() {
+        use crate::precompiles::REMASC_ADDR;
+
         let store = Arc::new(MemoryTrieStore::new());
         let root = TrieNode::empty();
 
@@ -1015,13 +1026,19 @@ mod tests {
 
         assert!(result.tx_results[0].success);
 
-        // Beneficiary should receive gas_used * gas_price = 21000 * 100 = 2_100_000
-        let ben_state = result.state_changes.get(&beneficiary)
-            .expect("beneficiary should appear in state changes");
+        // Fees are routed to REMASC, not the miner. gas_used * gas_price = 21000 * 100
+        let remasc_state = result.state_changes.get(&REMASC_ADDR)
+            .expect("REMASC should appear in state changes");
         assert_eq!(
-            ben_state.info.balance,
+            remasc_state.info.balance,
             U256::from(2_100_000u64),
-            "beneficiary receives 21000 * 100 = 2_100_000"
+            "REMASC receives 21000 * 100 = 2_100_000"
+        );
+
+        // The miner (header.beneficiary) should NOT receive fees directly
+        assert!(
+            result.state_changes.get(&beneficiary).is_none(),
+            "miner should not receive fees directly; REMASC distributes later"
         );
     }
 
@@ -1031,6 +1048,7 @@ mod tests {
 
     /// Direct tx to REMASC precompile (0x01000008).
     /// REMASC costs 0 gas — total should be only intrinsic gas (21000).
+    /// Uses a low block number (below maturity) so process_miners_fees is a no-op.
     #[test]
     fn test_remasc_precompile_direct_call() {
         let store = Arc::new(MemoryTrieStore::new());
@@ -1044,7 +1062,8 @@ mod tests {
             BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
         );
 
-        let header = dummy_header(8_000_000);
+        // Block 100 is below mainnet maturity (4000), so REMASC is a no-op
+        let header = dummy_header(100);
 
         let remasc_addr = crate::precompiles::REMASC_ADDR;
 
@@ -2533,5 +2552,737 @@ mod tests {
         assert!(result.success, "depth exceeding chain length should succeed with empty");
         let decoded = decode_abi_bytes(&result.output);
         assert!(decoded.is_empty(), "depth 500 in 10-block chain → empty");
+    }
+
+    // -----------------------------------------------------------------------
+    // REMASC fee distribution tests (Stage 6b)
+    //
+    // Port of rskj's RemascProcessMinerFeesTest using regtest config:
+    //   maturity=10, syntheticSpan=5, rskLabsDivisor=5,
+    //   federationDivisor=100, punishmentDivisor=10
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a block store populated with a chain of headers.
+    /// Each header at height `i` has parent_hash pointing to the previous hash.
+    /// Returns (block_store, hashes) where hashes[i] is the canonical hash at block i.
+    fn build_chain_store(
+        count: u64,
+        miner: Address,
+        paid_fees_at: &[(u64, U256)],
+    ) -> (Arc<BlockStore>, Vec<B256>) {
+        let dir = tempfile::tempdir().unwrap();
+        let bs = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+        let mut hashes = Vec::new();
+        let mut parent_hash = B256::ZERO;
+
+        for i in 0..count {
+            let mut h = dummy_header(i);
+            h.beneficiary = miner;
+            h.parent_hash = parent_hash;
+            // Set paid_fees for specified blocks
+            for &(block, ref fees) in paid_fees_at {
+                if block == i {
+                    h.paid_fees = *fees;
+                }
+            }
+            let hash = h.hash();
+            bs.put_header_with_hash(hash, &h).unwrap();
+            bs.put_canonical_hash(i, hash).unwrap();
+            hashes.push(hash);
+            parent_hash = hash;
+        }
+
+        (bs, hashes)
+    }
+
+    /// Helper: execute a REMASC call at the given block height and return state changes.
+    /// `remasc_balance` simulates the fees already accumulated in REMASC from prior blocks.
+    fn execute_remasc_at(
+        block_store: &Arc<BlockStore>,
+        block_number: u64,
+        sender_balance: U256,
+        remasc_config: crate::remasc::RemascConfig,
+    ) -> crate::executor::BlockExecutionResult {
+        execute_remasc_at_with_balance(block_store, block_number, sender_balance, remasc_config, U256::ZERO)
+    }
+
+    fn execute_remasc_at_with_balance(
+        block_store: &Arc<BlockStore>,
+        block_number: u64,
+        sender_balance: U256,
+        remasc_config: crate::remasc::RemascConfig,
+        remasc_balance: U256,
+    ) -> crate::executor::BlockExecutionResult {
+        let trie_store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+
+        let sender = Address::repeat_byte(0xAA);
+        let root = put_account(&root, trie_store.as_ref(), &sender, 0, sender_balance);
+
+        let remasc_addr = crate::precompiles::REMASC_ADDR;
+
+        // Pre-seed REMASC with accumulated fees balance
+        let root = if !remasc_balance.is_zero() {
+            put_account(&root, trie_store.as_ref(), &remasc_addr, 0, remasc_balance)
+        } else {
+            root
+        };
+
+        let mut header = dummy_header(block_number);
+        header.beneficiary = Address::repeat_byte(0x99); // actual miner (not used for fee routing)
+
+        let remasc_tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(remasc_addr.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::new(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+        };
+
+        let executor = RskExecutor::new(
+            RskHardforkConfig::all_active(33),
+            block_store.clone(),
+        ).with_remasc_config(remasc_config);
+
+        executor
+            .execute_block(&header, &[(remasc_tx, sender)], &root, trie_store)
+            .unwrap()
+    }
+
+    /// Before maturity is reached, no distribution should happen.
+    /// Matches rskj's `processMinersFeesWithoutRequiredMaturity`.
+    #[test]
+    fn remasc_no_distribution_before_maturity() {
+        let miner = Address::repeat_byte(0x11);
+        let config = crate::remasc::RemascConfig::regtest(); // maturity=10
+        let paid_fees = U256::from(21_000);
+
+        // Chain: block 5 has paid_fees=21000, blocks 0..12 exist
+        let (bs, _) = build_chain_store(12, miner, &[(5, paid_fees)]);
+
+        // Execute REMASC at block 12 (only 7 blocks since fee block → maturity not reached)
+        let result = execute_remasc_at(&bs, 12, U256::from(10u64).pow(U256::from(18)), config);
+        assert!(result.tx_results[0].success);
+
+        // Miner should not have received anything
+        assert!(
+            result.state_changes.get(&miner).is_none(),
+            "miner should not be paid before maturity"
+        );
+    }
+
+    /// After maturity but before syntheticSpan, fees accrue but no payout.
+    /// Matches rskj's `processMinersFeesWithoutMinimumSyntheticSpan`.
+    #[test]
+    fn remasc_fees_accrue_before_synthetic_span() {
+        let miner = Address::repeat_byte(0x11);
+        let config = crate::remasc::RemascConfig::regtest(); // maturity=10, syntheticSpan=5
+        let paid_fees = U256::from(21_000);
+
+        // Block 3 has paid_fees=21000. Execute REMASC at block 13 (candidateBlock=3, < syntheticSpan=5)
+        let (bs, _) = build_chain_store(14, miner, &[(3, paid_fees)]);
+
+        let result = execute_remasc_at(&bs, 13, U256::from(10u64).pow(U256::from(18)), config);
+        assert!(result.tx_results[0].success);
+
+        // REMASC storage should have rewardBalance = 21000
+        let remasc_addr = crate::precompiles::REMASC_ADDR;
+        let remasc_state = result.state_changes.get(&remasc_addr);
+        assert!(remasc_state.is_some(), "REMASC account should exist in state changes");
+
+        // Check storage: rewardBalance key
+        let reward_key = crate::remasc::remasc_storage_key(crate::remasc::REWARD_BALANCE_KEY);
+        let reward_slot = remasc_state.unwrap().storage.get(&reward_key);
+        assert!(reward_slot.is_some(), "rewardBalance should be set in storage");
+        assert_eq!(
+            reward_slot.unwrap().present_value,
+            paid_fees,
+            "rewardBalance should equal the processing block's paid_fees"
+        );
+
+        // Miner should NOT be paid (syntheticSpan not reached)
+        assert!(
+            result.state_changes.get(&miner).is_none(),
+            "miner should not be paid before syntheticSpan"
+        );
+    }
+
+    /// Full distribution with no siblings. Matches rskj's `processMinersFeesWithNoSiblings`.
+    ///
+    /// regtest: maturity=10, syntheticSpan=5, rskLabsDivisor=5, federationDivisor=100
+    /// minerFee=21000 at block 5. Execute REMASC at block 16.
+    ///   candidateBlock = 16 - 10 = 6 → but we use block 5 for fees
+    ///   Actually: we need candidateBlock = 5, so execution at block 15.
+    ///   15 - 10 = 5 ≥ 1 ✓, 5 - 5 = 0 ≥ 0 ✓
+    ///
+    /// Expected math:
+    ///   rewardBalance = 0 + 21000 = 21000
+    ///   syntheticReward = 21000 / 5 = 4200
+    ///   rewardBalance = 21000 - 4200 = 16800
+    ///   rskLabsPay = 4200 / 5 = 840
+    ///   remaining = 4200 - 840 = 3360
+    ///   federationReward = 3360 / 100 = 33
+    ///   remaining = 3360 - 33 = 3327
+    ///   miner gets 3327
+    #[test]
+    fn remasc_basic_distribution_no_siblings() {
+        let miner = Address::repeat_byte(0x11);
+        let config = crate::remasc::RemascConfig::regtest();
+        let rsk_labs = config.rsk_labs_address;
+        let paid_fees = U256::from(21_000);
+
+        // 16 blocks (0..15). Block 5 has paid_fees=21000.
+        let (bs, _) = build_chain_store(16, miner, &[(5, paid_fees)]);
+
+        // REMASC has 21000 balance from the fees accumulated when block 5 was executed
+        let result = execute_remasc_at_with_balance(
+            &bs, 15,
+            U256::from(10u64).pow(U256::from(18)),
+            config,
+            paid_fees,
+        );
+        assert!(result.tx_results[0].success);
+
+        let remasc_addr = crate::precompiles::REMASC_ADDR;
+
+        // RSK Labs should receive 840
+        let labs_state = result.state_changes.get(&rsk_labs)
+            .expect("RSK Labs should appear in state changes");
+        assert_eq!(
+            labs_state.info.balance,
+            U256::from(840),
+            "RSK Labs receives syntheticReward / rskLabsDivisor = 4200 / 5 = 840"
+        );
+
+        // Miner should receive 3327
+        let miner_state = result.state_changes.get(&miner)
+            .expect("miner should appear in state changes");
+        assert_eq!(
+            miner_state.info.balance,
+            U256::from(3327),
+            "miner receives remainder: 4200 - 840 - 33 = 3327"
+        );
+
+        // REMASC storage: rewardBalance = 16800
+        let remasc_state = result.state_changes.get(&remasc_addr).unwrap();
+        let reward_key = crate::remasc::remasc_storage_key(crate::remasc::REWARD_BALANCE_KEY);
+        assert_eq!(
+            remasc_state.storage.get(&reward_key).unwrap().present_value,
+            U256::from(16_800),
+            "rewardBalance = 21000 - 4200 = 16800"
+        );
+
+        // REMASC storage: federationBalance = 33
+        let fed_key = crate::remasc::remasc_storage_key(crate::remasc::FEDERATION_BALANCE_KEY);
+        assert_eq!(
+            remasc_state.storage.get(&fed_key).unwrap().present_value,
+            U256::from(33),
+            "federationBalance = 3360 / 100 = 33"
+        );
+
+        // REMASC storage: burnedBalance = 0
+        let burned_key = crate::remasc::remasc_storage_key(crate::remasc::BURNED_BALANCE_KEY);
+        let burned_slot = remasc_state.storage.get(&burned_key);
+        let burned = burned_slot.map(|s| s.present_value).unwrap_or(U256::ZERO);
+        assert_eq!(burned, U256::ZERO, "no burns without broken selection rule");
+    }
+
+    /// Distribution with previous broken selection rule should apply punishment burn.
+    ///
+    /// We pre-seed the brokenSelectionRule storage flag to true, then verify
+    /// that `punishment = remaining / punishmentDivisor` is burned.
+    ///
+    /// With regtest config and 21000 fees:
+    ///   remaining (after labs + federation) = 3327
+    ///   punishment = 3327 / 10 = 332
+    ///   miner gets 3327 - 332 = 2995
+    ///   burnedBalance = 332
+    #[test]
+    fn remasc_distribution_with_broken_selection_punishment() {
+        let miner = Address::repeat_byte(0x11);
+        let config = crate::remasc::RemascConfig::regtest();
+        let paid_fees = U256::from(21_000);
+
+        let (bs, _) = build_chain_store(16, miner, &[(5, paid_fees)]);
+
+        let trie_store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, trie_store.as_ref(), &sender, 0, one_rbtc);
+
+        // Pre-seed brokenSelectionRule = true in REMASC's storage
+        let remasc_addr = crate::precompiles::REMASC_ADDR;
+        let broken_key = crate::remasc::remasc_storage_key(crate::remasc::BROKEN_SELECTION_RULE_KEY);
+        let root = {
+            use rustock_trie::TrieKeySlice;
+            let slot = B256::from(broken_key);
+            let storage_key_bytes = rustock_trie::storage_key(&remasc_addr, &slot);
+            let key = TrieKeySlice::from_key(&storage_key_bytes);
+            let value = U256::from(1);
+            let mut buf = [0u8; 32];
+            buf.copy_from_slice(&value.to_be_bytes::<32>());
+            root.put(&key, &buf, trie_store.as_ref())
+        };
+
+        // Pre-seed REMASC with accumulated fees balance (21000 from block 5)
+        let root = put_account(&root, trie_store.as_ref(), &remasc_addr, 0, paid_fees);
+
+        let mut header = dummy_header(15);
+        header.beneficiary = Address::repeat_byte(0x99);
+
+        let remasc_tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(remasc_addr.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::new(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+        };
+
+        let executor = RskExecutor::new(
+            RskHardforkConfig::all_active(33),
+            bs.clone(),
+        ).with_remasc_config(config);
+
+        let result = executor
+            .execute_block(&header, &[(remasc_tx, sender)], &root, trie_store)
+            .unwrap();
+
+        assert!(result.tx_results[0].success);
+
+        // Miner receives 3327 - 332 = 2995
+        let miner_state = result.state_changes.get(&miner)
+            .expect("miner should appear in state changes");
+        assert_eq!(
+            miner_state.info.balance,
+            U256::from(2995),
+            "miner receives 3327 - punishment(332) = 2995"
+        );
+
+        // burnedBalance = 332
+        let remasc_state = result.state_changes.get(&remasc_addr).unwrap();
+        let burned_key = crate::remasc::remasc_storage_key(crate::remasc::BURNED_BALANCE_KEY);
+        assert_eq!(
+            remasc_state.storage.get(&burned_key).unwrap().present_value,
+            U256::from(332),
+            "burnedBalance = 3327 / 10 = 332"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Stage 6c tests – siblings / uncles
+    // -----------------------------------------------------------------------
+
+    struct ChainBlock {
+        miner: Address,
+        paid_fees: U256,
+        uncle_count: u64,
+        ommers: Vec<rustock_core::Header>,
+    }
+
+    fn build_chain_store_ext(blocks: &[ChainBlock]) -> Arc<BlockStore> {
+        let dir = tempfile::tempdir().unwrap();
+        let bs = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+        let mut parent_hash = B256::ZERO;
+
+        for (i, cb) in blocks.iter().enumerate() {
+            let mut h = dummy_header(i as u64);
+            h.beneficiary = cb.miner;
+            h.parent_hash = parent_hash;
+            h.paid_fees = cb.paid_fees;
+            h.uncle_count = cb.uncle_count;
+
+            let hash = h.hash();
+            bs.put_header_with_hash(hash, &h).unwrap();
+            bs.put_canonical_hash(i as u64, hash).unwrap();
+
+            if !cb.ommers.is_empty() {
+                bs.put_body(hash, &[], &cb.ommers).unwrap();
+            }
+
+            parent_hash = hash;
+        }
+
+        bs
+    }
+
+    fn simple_block(miner: Address) -> ChainBlock {
+        ChainBlock { miner, paid_fees: U256::ZERO, uncle_count: 0, ommers: vec![] }
+    }
+
+    fn make_uncle(number: u64, coinbase: Address, paid_fees: U256, uncle_count: u64) -> rustock_core::Header {
+        let mut h = dummy_header(number);
+        h.beneficiary = coinbase;
+        h.paid_fees = paid_fees;
+        h.uncle_count = uncle_count;
+        // Give it a distinct extra_data so its hash differs from the canonical block
+        h.extra_data = Bytes::copy_from_slice(coinbase.as_slice());
+        h
+    }
+
+    /// Port of rskj's `processMinersFeesWithOneSibling`.
+    ///
+    /// Chain (regtest: maturity=10, syntheticSpan=5):
+    ///   blocks 0-4: simple
+    ///   block 5: coinbaseA, paid_fees=21000
+    ///   block 5' (uncle): coinbaseB, paid_fees=31500
+    ///   block 6: coinbaseC, includes uncle 5'
+    ///   blocks 7-14: simple
+    ///   block 15: REMASC executes
+    ///
+    /// Expected (fullBlockReward = 3327, 1 sibling, previousBroken=false):
+    ///   publishersReward = 3327/10 = 332 → coinbaseC
+    ///   minersReward = 3327 - 332 = 2995
+    ///   individualMiner = 2995/2 = 1497
+    ///   minersSurplus = 2995%2 = 1 → burned
+    ///   coinbaseA (main miner): 1497
+    ///   coinbaseB (sibling miner): 1497 (late=0)
+    ///   burnedBalance = 1
+    #[test]
+    fn remasc_with_one_sibling() {
+        let coinbase_a = Address::repeat_byte(0x11); // main miner
+        let coinbase_b = Address::repeat_byte(0x22); // sibling miner
+        let coinbase_c = Address::repeat_byte(0x33); // uncle includer (publisher)
+        let default_miner = Address::repeat_byte(0x01);
+        let config = crate::remasc::RemascConfig::regtest();
+        let rsk_labs = config.rsk_labs_address;
+        let paid_fees = U256::from(21_000u64);
+
+        let uncle = make_uncle(5, coinbase_b, U256::from(31_500u64), 0);
+
+        let mut chain: Vec<ChainBlock> = Vec::new();
+        // Blocks 0-4: simple
+        for _ in 0..5 {
+            chain.push(simple_block(default_miner));
+        }
+        // Block 5: coinbaseA, paid_fees=21000
+        chain.push(ChainBlock {
+            miner: coinbase_a,
+            paid_fees,
+            uncle_count: 0,
+            ommers: vec![],
+        });
+        // Block 6: coinbaseC, includes uncle (block 5')
+        chain.push(ChainBlock {
+            miner: coinbase_c,
+            paid_fees: U256::ZERO,
+            uncle_count: 0,
+            ommers: vec![uncle],
+        });
+        // Blocks 7-14: simple
+        for _ in 0..8 {
+            chain.push(simple_block(default_miner));
+        }
+
+        let bs = build_chain_store_ext(&chain);
+
+        let result = execute_remasc_at_with_balance(
+            &bs, 15,
+            U256::from(10u64).pow(U256::from(18)),
+            config,
+            paid_fees, // REMASC balance = accumulated fees
+        );
+        assert!(result.tx_results[0].success);
+
+        let remasc_addr = crate::precompiles::REMASC_ADDR;
+
+        // RSK Labs: 840
+        let labs_state = result.state_changes.get(&rsk_labs)
+            .expect("RSK Labs should appear");
+        assert_eq!(labs_state.info.balance, U256::from(840));
+
+        // Publisher (coinbaseC): 332
+        let pub_state = result.state_changes.get(&coinbase_c)
+            .expect("publisher should appear");
+        assert_eq!(pub_state.info.balance, U256::from(332),
+            "publisher gets publishersReward / siblings = 332");
+
+        // Main miner (coinbaseA): 1497
+        let miner_a = result.state_changes.get(&coinbase_a)
+            .expect("main miner should appear");
+        assert_eq!(miner_a.info.balance, U256::from(1497),
+            "main miner gets individualMinerReward = 2995/2 = 1497");
+
+        // Sibling miner (coinbaseB): 1497 (no late penalty, included 1 block after)
+        let miner_b = result.state_changes.get(&coinbase_b)
+            .expect("sibling miner should appear");
+        assert_eq!(miner_b.info.balance, U256::from(1497),
+            "sibling miner gets 1497 (0 blocks late)");
+
+        // Storage checks
+        let remasc_state = result.state_changes.get(&remasc_addr).unwrap();
+
+        // rewardBalance = 21000 - 4200 = 16800
+        let reward_key = crate::remasc::remasc_storage_key(crate::remasc::REWARD_BALANCE_KEY);
+        assert_eq!(
+            remasc_state.storage.get(&reward_key).unwrap().present_value,
+            U256::from(16_800),
+        );
+
+        // burnedBalance = minersSurplus = 1
+        let burned_key = crate::remasc::remasc_storage_key(crate::remasc::BURNED_BALANCE_KEY);
+        assert_eq!(
+            remasc_state.storage.get(&burned_key).unwrap().present_value,
+            U256::from(1),
+            "burned = minersSurplus = 2995 % 2 = 1"
+        );
+
+        // federationBalance = 33
+        let fed_key = crate::remasc::remasc_storage_key(crate::remasc::FEDERATION_BALANCE_KEY);
+        assert_eq!(
+            remasc_state.storage.get(&fed_key).unwrap().present_value,
+            U256::from(33),
+        );
+    }
+
+    /// Test late uncle inclusion penalty.
+    ///
+    /// Same as one-sibling test but uncle is included 3 blocks later (block 8 instead of 6).
+    /// blocks_late = 8 - 5 - 1 = 2
+    /// late_punishment = 1497 * 2 / 20 = 149
+    /// sibling miner gets 1497 - 149 = 1348
+    /// burned = minersSurplus(1) + late_punishment(149) = 150
+    #[test]
+    fn remasc_late_uncle_inclusion_penalty() {
+        let coinbase_a = Address::repeat_byte(0x11);
+        let coinbase_b = Address::repeat_byte(0x22);
+        let coinbase_c = Address::repeat_byte(0x33);
+        let default_miner = Address::repeat_byte(0x01);
+        let config = crate::remasc::RemascConfig::regtest();
+        let paid_fees = U256::from(21_000u64);
+
+        let uncle = make_uncle(5, coinbase_b, U256::from(31_500u64), 0);
+
+        let mut chain: Vec<ChainBlock> = Vec::new();
+        for _ in 0..5 { chain.push(simple_block(default_miner)); }
+        // Block 5: main block
+        chain.push(ChainBlock {
+            miner: coinbase_a, paid_fees, uncle_count: 0, ommers: vec![],
+        });
+        // Blocks 6-7: simple
+        for _ in 0..2 { chain.push(simple_block(default_miner)); }
+        // Block 8: includes uncle (3 blocks after block 5)
+        chain.push(ChainBlock {
+            miner: coinbase_c, paid_fees: U256::ZERO, uncle_count: 0,
+            ommers: vec![uncle],
+        });
+        // Blocks 9-14: simple
+        for _ in 0..6 { chain.push(simple_block(default_miner)); }
+
+        let bs = build_chain_store_ext(&chain);
+
+        let result = execute_remasc_at_with_balance(
+            &bs, 15,
+            U256::from(10u64).pow(U256::from(18)),
+            config,
+            paid_fees,
+        );
+        assert!(result.tx_results[0].success);
+
+        // blocks_late = 8 - 5 - 1 = 2
+        // late_punishment = 1497 * 2 / 20 = 149
+        let miner_b = result.state_changes.get(&coinbase_b)
+            .expect("sibling miner should appear");
+        assert_eq!(miner_b.info.balance, U256::from(1497 - 149),
+            "sibling miner gets 1497 - 149(late penalty) = 1348");
+
+        // Main miner still gets full share
+        let miner_a = result.state_changes.get(&coinbase_a)
+            .expect("main miner should appear");
+        assert_eq!(miner_a.info.balance, U256::from(1497));
+
+        // burned = minersSurplus(1) + late_punishment(149) = 150
+        let remasc_addr = crate::precompiles::REMASC_ADDR;
+        let remasc_state = result.state_changes.get(&remasc_addr).unwrap();
+        let burned_key = crate::remasc::remasc_storage_key(crate::remasc::BURNED_BALANCE_KEY);
+        assert_eq!(
+            remasc_state.storage.get(&burned_key).unwrap().present_value,
+            U256::from(150),
+        );
+    }
+
+    /// Test broken selection rule with siblings.
+    ///
+    /// When previousBrokenSelectionRule=true and siblings exist:
+    ///   punishment = individualMinerReward_base / punishmentDivisor
+    ///   individualMinerReward = base - punishment
+    ///   total_punishment_burn = punishment * (siblings + 1)
+    ///
+    /// With regtest (fullBlockReward=3327, 1 sibling):
+    ///   base = 2995/2 = 1497
+    ///   punishment = 1497/10 = 149
+    ///   individualMinerReward = 1497 - 149 = 1348
+    ///   total_punishment_burn = 149 * 2 = 298
+    ///   burned = publishersSurplus(0) + minersSurplus(1) + 298 = 299
+    #[test]
+    fn remasc_sibling_with_previous_broken_selection() {
+        let coinbase_a = Address::repeat_byte(0x11);
+        let coinbase_b = Address::repeat_byte(0x22);
+        let coinbase_c = Address::repeat_byte(0x33);
+        let default_miner = Address::repeat_byte(0x01);
+        let config = crate::remasc::RemascConfig::regtest();
+        let paid_fees = U256::from(21_000u64);
+
+        let uncle = make_uncle(5, coinbase_b, U256::from(31_500u64), 0);
+
+        let mut chain: Vec<ChainBlock> = Vec::new();
+        for _ in 0..5 { chain.push(simple_block(default_miner)); }
+        chain.push(ChainBlock {
+            miner: coinbase_a, paid_fees, uncle_count: 0, ommers: vec![],
+        });
+        chain.push(ChainBlock {
+            miner: coinbase_c, paid_fees: U256::ZERO, uncle_count: 0,
+            ommers: vec![uncle],
+        });
+        for _ in 0..8 { chain.push(simple_block(default_miner)); }
+
+        let bs = build_chain_store_ext(&chain);
+
+        // Build state with brokenSelectionRule = true pre-seeded
+        let trie_store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+        let sender = Address::repeat_byte(0xAA);
+        let root = put_account(&root, trie_store.as_ref(), &sender, 0,
+            U256::from(10u64).pow(U256::from(18)));
+        let remasc_addr = crate::precompiles::REMASC_ADDR;
+        let root = put_account(&root, trie_store.as_ref(), &remasc_addr, 0, paid_fees);
+
+        // Pre-seed brokenSelectionRule = true
+        let broken_key = crate::remasc::remasc_storage_key(crate::remasc::BROKEN_SELECTION_RULE_KEY);
+        let root = {
+            use rustock_trie::TrieKeySlice;
+            let slot = B256::from(broken_key);
+            let storage_key_bytes = rustock_trie::storage_key(&remasc_addr, &slot);
+            let key = TrieKeySlice::from_key(&storage_key_bytes);
+            let mut buf = [0u8; 32];
+            buf.copy_from_slice(&U256::from(1).to_be_bytes::<32>());
+            root.put(&key, &buf, trie_store.as_ref())
+        };
+
+        let mut header = dummy_header(15);
+        header.beneficiary = Address::repeat_byte(0x99);
+
+        let remasc_tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(remasc_addr.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::new(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+        };
+
+        let executor = RskExecutor::new(
+            RskHardforkConfig::all_active(33),
+            bs.clone(),
+        ).with_remasc_config(config);
+
+        let result = executor
+            .execute_block(&header, &[(remasc_tx, sender)], &root, trie_store)
+            .unwrap();
+        assert!(result.tx_results[0].success);
+
+        // Both miners get 1348 (1497 - 149 punishment)
+        let miner_a = result.state_changes.get(&coinbase_a)
+            .expect("main miner");
+        assert_eq!(miner_a.info.balance, U256::from(1348),
+            "miner gets 1497 - 149(punishment) = 1348");
+
+        let miner_b = result.state_changes.get(&coinbase_b)
+            .expect("sibling miner");
+        assert_eq!(miner_b.info.balance, U256::from(1348),
+            "sibling miner also punished: 1348");
+
+        // burned = minersSurplus(1) + total_punishment(149*2=298) = 299
+        let remasc_state = result.state_changes.get(&remasc_addr).unwrap();
+        let burned_key = crate::remasc::remasc_storage_key(crate::remasc::BURNED_BALANCE_KEY);
+        assert_eq!(
+            remasc_state.storage.get(&burned_key).unwrap().present_value,
+            U256::from(299),
+        );
+    }
+
+    /// Test that brokenSelectionRule flag is set when a sibling has > 2x fees.
+    #[test]
+    fn remasc_broken_selection_rule_higher_fees() {
+        let coinbase_a = Address::repeat_byte(0x11);
+        let coinbase_b = Address::repeat_byte(0x22);
+        let coinbase_c = Address::repeat_byte(0x33);
+        let default_miner = Address::repeat_byte(0x01);
+        let config = crate::remasc::RemascConfig::regtest();
+        let paid_fees = U256::from(10_000u64);
+
+        // Uncle paid > 2x processing block's fees → broken selection rule
+        let uncle = make_uncle(5, coinbase_b, U256::from(25_000u64), 0);
+
+        let mut chain: Vec<ChainBlock> = Vec::new();
+        for _ in 0..5 { chain.push(simple_block(default_miner)); }
+        chain.push(ChainBlock {
+            miner: coinbase_a, paid_fees, uncle_count: 0, ommers: vec![],
+        });
+        chain.push(ChainBlock {
+            miner: coinbase_c, paid_fees: U256::ZERO, uncle_count: 0,
+            ommers: vec![uncle],
+        });
+        for _ in 0..8 { chain.push(simple_block(default_miner)); }
+
+        let bs = build_chain_store_ext(&chain);
+
+        let result = execute_remasc_at_with_balance(
+            &bs, 15,
+            U256::from(10u64).pow(U256::from(18)),
+            config,
+            paid_fees,
+        );
+        assert!(result.tx_results[0].success);
+
+        // brokenSelectionRule should be set to true
+        let remasc_addr = crate::precompiles::REMASC_ADDR;
+        let remasc_state = result.state_changes.get(&remasc_addr).unwrap();
+        let broken_key = crate::remasc::remasc_storage_key(crate::remasc::BROKEN_SELECTION_RULE_KEY);
+        assert_eq!(
+            remasc_state.storage.get(&broken_key).unwrap().present_value,
+            U256::from(1),
+            "brokenSelectionRule should be true when sibling fees > 2x"
+        );
+    }
+
+    /// Test no siblings → brokenSelectionRule stays false.
+    #[test]
+    fn remasc_no_siblings_selection_rule_false() {
+        let miner = Address::repeat_byte(0x11);
+        let config = crate::remasc::RemascConfig::regtest();
+        let paid_fees = U256::from(21_000);
+
+        let (bs, _) = build_chain_store(16, miner, &[(5, paid_fees)]);
+
+        let result = execute_remasc_at_with_balance(
+            &bs, 15,
+            U256::from(10u64).pow(U256::from(18)),
+            config,
+            paid_fees,
+        );
+        assert!(result.tx_results[0].success);
+
+        let remasc_addr = crate::precompiles::REMASC_ADDR;
+        let remasc_state = result.state_changes.get(&remasc_addr).unwrap();
+        let broken_key = crate::remasc::remasc_storage_key(crate::remasc::BROKEN_SELECTION_RULE_KEY);
+        let broken = remasc_state.storage.get(&broken_key)
+            .map(|s| s.present_value)
+            .unwrap_or(U256::ZERO);
+        assert_eq!(broken, U256::ZERO, "no siblings → brokenSelectionRule = false");
     }
 }
