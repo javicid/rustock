@@ -1135,8 +1135,8 @@ mod tests {
         assert!(result.success, "Bridge direct call should succeed");
         assert_eq!(
             result.gas_used,
-            21_000 + 10_000,
-            "Bridge charges 10k gas on top of intrinsic"
+            21_000 + 23_000,
+            "Empty Bridge call dispatches releaseBtc (23k gas) on top of intrinsic"
         );
     }
 

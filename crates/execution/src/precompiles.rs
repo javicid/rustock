@@ -29,6 +29,7 @@ use revm::primitives::hardfork::SpecId;
 use rustock_storage::BlockStore;
 use std::sync::Arc;
 
+use crate::bridge::constants::BridgeConstants;
 use crate::hardfork::{RskHardforkConfig, RskNetworkUpgrade};
 use crate::remasc::RemascConfig;
 
@@ -806,6 +807,7 @@ pub struct RskPrecompileProvider {
     spec: SpecId,
     block_store: Option<Arc<BlockStore>>,
     remasc_config: RemascConfig,
+    bridge_config: BridgeConstants,
 }
 
 impl std::fmt::Debug for RskPrecompileProvider {
@@ -819,7 +821,7 @@ impl std::fmt::Debug for RskPrecompileProvider {
 }
 
 /// Addresses handled via the stateful dispatch path (have access to &mut CTX).
-const STATEFUL_PRECOMPILES: [Address; 3] = [ENVIRONMENT_ADDR, BLOCK_HEADER_ADDR, REMASC_ADDR];
+const STATEFUL_PRECOMPILES: [Address; 4] = [ENVIRONMENT_ADDR, BLOCK_HEADER_ADDR, REMASC_ADDR, BRIDGE_ADDR];
 
 /// Maximum ancestor depth supported by BlockHeaderContract (REMASC maturity).
 const MAX_BLOCK_DEPTH: i16 = 4000;
@@ -843,7 +845,14 @@ impl RskPrecompileProvider {
             spec: SpecId::default(),
             block_store,
             remasc_config,
+            bridge_config: BridgeConstants::mainnet(),
         }
+    }
+
+    /// Override Bridge configuration (for testnet/regtest).
+    pub fn with_bridge_config(mut self, config: BridgeConstants) -> Self {
+        self.bridge_config = config;
+        self
     }
 
     /// Dispatch stateful RSK precompiles that need access to the execution context.
@@ -878,6 +887,8 @@ impl RskPrecompileProvider {
             self.run_environment(context, &input_bytes, inputs.gas_limit)
         } else if *addr == BLOCK_HEADER_ADDR {
             self.run_block_header(context, &input_bytes, inputs.gas_limit)
+        } else if *addr == BRIDGE_ADDR {
+            self.run_bridge(context, &input_bytes, inputs.gas_limit)
         } else {
             self.run_remasc(context, &input_bytes, inputs.gas_limit)
         };
@@ -1077,6 +1088,23 @@ impl RskPrecompileProvider {
         Ok(PrecompileOutput::new(gas_cost, abi_encode_bytes(&result_bytes).into()))
     }
 
+    /// Bridge precompile (0x01000006).
+    /// BTC–RSK two-way peg with 69 ABI methods.
+    fn run_bridge<CTX: ContextTr>(
+        &self,
+        context: &mut CTX,
+        input: &[u8],
+        gas_limit: u64,
+    ) -> Result<PrecompileOutput, PrecompileError> {
+        crate::bridge::execute_bridge(
+            context,
+            input,
+            gas_limit,
+            &self.bridge_config,
+            self.block_store.as_ref(),
+        )
+    }
+
     /// REMASC precompile (0x01000008).
     /// Distributes miner fees with delayed maturity. Gas: 0.
     fn run_remasc<CTX: ContextTr>(
@@ -1102,6 +1130,7 @@ impl Clone for RskPrecompileProvider {
             spec: self.spec,
             block_store: self.block_store.clone(),
             remasc_config: self.remasc_config.clone(),
+            bridge_config: self.bridge_config.clone(),
         }
     }
 }
@@ -1658,7 +1687,7 @@ mod tests {
         assert!(STATEFUL_PRECOMPILES.contains(&ENVIRONMENT_ADDR));
         assert!(STATEFUL_PRECOMPILES.contains(&BLOCK_HEADER_ADDR));
         assert!(STATEFUL_PRECOMPILES.contains(&REMASC_ADDR));
-        assert!(!STATEFUL_PRECOMPILES.contains(&BRIDGE_ADDR));
+        assert!(STATEFUL_PRECOMPILES.contains(&BRIDGE_ADDR));
         assert!(!STATEFUL_PRECOMPILES.contains(&SECP256K1_ADD_ADDR));
     }
 

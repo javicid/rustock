@@ -1,3 +1,4 @@
+pub mod bridge;
 pub mod database;
 pub mod env;
 pub mod executor;
