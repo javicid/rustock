@@ -120,8 +120,9 @@ impl BlockProcessor {
             ));
         }
 
-        let new_state_root = apply_state_changes(state_root, trie_store.as_ref(), &exec_result.state_changes);
+        let mut new_state_root = apply_state_changes(state_root, trie_store.as_ref(), &exec_result.state_changes);
         let state_root_hash = new_state_root.compute_hash(trie_store.as_ref());
+        new_state_root.save(trie_store.as_ref(), true);
         let receipts_root = ordered_trie_root(&receipts);
 
         Ok(ProcessedBlock {

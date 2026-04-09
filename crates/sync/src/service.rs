@@ -67,6 +67,7 @@ pub struct SyncService {
     last_body_height: u64,
     pending_follow_bodies: HashMap<u64, (B256, Header)>,
     tx_pool: Option<Arc<crate::TransactionPool>>,
+    blocks_since_flush: u64,
 }
 
 impl SyncService {
@@ -88,6 +89,7 @@ impl SyncService {
             last_body_height: 0,
             pending_follow_bodies: HashMap::new(),
             tx_pool: None,
+            blocks_since_flush: 0,
         }
     }
 
@@ -983,6 +985,11 @@ impl SyncService {
                 Ok(result) => {
                     current_root = result.new_state_root;
                     processed += 1;
+                    self.blocks_since_flush += 1;
+                    if self.blocks_since_flush >= 100 {
+                        trie_store.flush();
+                        self.blocks_since_flush = 0;
+                    }
                     if processed.is_multiple_of(100) {
                         debug!(
                             target: "rustock::sync",
@@ -1003,6 +1010,8 @@ impl SyncService {
         }
 
         if processed > 0 {
+            trie_store.flush();
+            self.blocks_since_flush = 0;
             info!(
                 target: "rustock::sync",
                 "Processed {} blocks, state root: {:?}",
@@ -1042,6 +1051,7 @@ impl SyncService {
 
         match processor.process_and_commit(&block, &state_root, trie_store.clone()) {
             Ok(result) => {
+                trie_store.flush();
                 info!(
                     target: "rustock::sync",
                     "Executed block #{}, state root: {:?}",

@@ -9,6 +9,9 @@ use std::sync::Mutex;
 pub trait TrieStore: Send + Sync {
     fn get(&self, key: &[u8]) -> Option<Vec<u8>>;
     fn put(&self, key: &[u8], value: &[u8]);
+    /// Durably flush any buffered writes to the underlying storage.
+    /// Default implementation is a no-op (suitable for stores that write synchronously).
+    fn flush(&self) {}
 }
 
 /// In-memory store for testing.

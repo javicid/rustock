@@ -1,5 +1,7 @@
 pub mod trie_store;
+pub mod cached_trie_store;
 pub use trie_store::RocksDbTrieStore;
+pub use cached_trie_store::CachedTrieStore;
 
 use rocksdb::{DB, Options, ColumnFamilyDescriptor};
 use rustock_core::{Block, Header, Receipt, Transaction};

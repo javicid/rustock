@@ -215,14 +215,14 @@ async fn main() -> Result<()> {
     info!("Block processor wired (hardfork config: {:?})", hardfork_cfg);
 
     let trie_store_for_exec: Arc<dyn rustock_trie::TrieStore> =
-        Arc::new(rustock_storage::RocksDbTrieStore::from_db(store.db().clone()));
+        Arc::new(rustock_storage::CachedTrieStore::with_defaults(store.db().clone()));
 
-    let genesis_state_root = build_genesis_state(&config, trie_store_for_exec.as_ref())?;
-    info!("Genesis state root: {:?}", genesis_state_root.compute_hash(trie_store_for_exec.as_ref()));
+    let initial_state_root = load_or_build_state(&store, &config, trie_store_for_exec.as_ref())?;
+    info!("Initial state root: {:?}", initial_state_root.compute_hash(trie_store_for_exec.as_ref()));
 
     let sync_service = SyncService::new(sync_manager.clone(), peer_store.clone(), event_rx)
         .with_tx_pool(pool.clone())
-        .with_block_processor(block_processor, trie_store_for_exec, genesis_state_root);
+        .with_block_processor(block_processor, trie_store_for_exec, initial_state_root);
     let tx_relay = Arc::new(TxRelay::with_pool(peer_store.clone(), pool.clone()));
 
     let mut node = Node::with_peer_store(node_config, peer_store.clone());
@@ -257,6 +257,48 @@ async fn main() -> Result<()> {
     node.start().await?;
 
     Ok(())
+}
+
+/// Try to resume from persisted state, falling back to genesis if unavailable.
+///
+/// On restart, loads the state root from the last processed block's header
+/// and reconstructs the trie root from disk. Children resolve lazily via
+/// `NodeRef::Hash` lookups against the trie store.
+fn load_or_build_state(
+    store: &BlockStore,
+    config: &ChainConfig,
+    trie_store: &dyn TrieStore,
+) -> Result<TrieNode> {
+    if let Some(head_hash) = store.head()? {
+        if let Some(header) = store.header(head_hash)? {
+            if header.number > 0 {
+                let state_root = header.state_root;
+                if let Some(data) = trie_store.get(state_root.as_slice()) {
+                    let root = TrieNode::from_message(&data, trie_store);
+                    let verified = root.compute_hash(trie_store);
+                    if verified == state_root {
+                        info!(
+                            "Resuming from block #{} (state root: {:?})",
+                            header.number, state_root
+                        );
+                        return Ok(root);
+                    }
+                    tracing::warn!(
+                        "State root verification failed: computed={verified:?}, \
+                         expected={state_root:?}. Rebuilding from genesis."
+                    );
+                } else {
+                    tracing::warn!(
+                        "State root {:?} not found in trie store for block #{}. \
+                         Rebuilding from genesis.",
+                        state_root, header.number
+                    );
+                }
+            }
+        }
+    }
+
+    build_genesis_state(config, trie_store)
 }
 
 /// Build the genesis state trie from the chain config's alloc entries.
