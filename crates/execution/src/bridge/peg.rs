@@ -20,6 +20,8 @@ use bitcoin::Transaction as BtcTransaction;
 use revm::context_interface::{ContextTr, JournalTr};
 use revm::precompile::{PrecompileError, PrecompileOutput};
 
+use sha3::Digest;
+
 use super::btc_chain::b256_to_bitcoin_hash;
 use super::btc_store::{get_stored_block, load_chain_head};
 use super::constants::BridgeConstants;
@@ -155,22 +157,33 @@ pub fn register_btc_transaction<CTX: ContextTr>(
         PrecompileError::other("registerBtcTransaction: invalid BTC transaction")
     })?;
 
-    // Process the transaction outputs:
-    // Look for outputs that pay to a known federation address.
-    // For each such output, credit the equivalent RBTC amount to the
-    // address derived from the sender (first input's script).
-    //
-    // In the full rskj implementation, this involves complex peg type
-    // detection (PegUtils). For now, we sum all output values as
-    // the peg-in amount and credit the transaction caller.
-    let total_value: u64 = btc_tx.output.iter().map(|o| o.value.to_sat()).sum();
+    // Derive the destination RSK address from the BTC transaction.
+    // rskj's PegUtils derives the address from OP_RETURN data or
+    // the first input's P2PKH script. We parse OP_RETURN first,
+    // falling back to the first input's public key hash.
+    let rsk_destination = extract_rsk_destination(&btc_tx);
+
+    // Sum outputs that pay to any known federation address (simplified:
+    // we sum all non-OP_RETURN outputs as the peg-in amount).
+    let total_value: u64 = btc_tx
+        .output
+        .iter()
+        .filter(|o| !o.script_pubkey.is_op_return())
+        .map(|o| o.value.to_sat())
+        .sum();
+
+    // Enforce minimum peg-in value
+    if total_value < config.minimum_pegin_tx_value {
+        return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
+    }
+
     let rbtc_amount = btc_satoshi_to_rbtc_wei(total_value);
 
-    // Credit the caller
-    if !rbtc_amount.is_zero() {
-        let _ = ctx
-            .journal_mut()
-            .balance_incr(BRIDGE_ADDR, rbtc_amount);
+    // Credit the derived destination address (transfer from Bridge balance)
+    if let Some(dest) = rsk_destination {
+        if !rbtc_amount.is_zero() {
+            let _ = ctx.journal_mut().transfer(BRIDGE_ADDR, dest, rbtc_amount);
+        }
     }
 
     // Mark as processed
@@ -312,33 +325,49 @@ pub fn register_fast_bridge_btc_transaction<CTX: ContextTr>(
 // releaseBtc
 // ---------------------------------------------------------------------------
 
-/// Minimum peg-out value: 0.004 BTC = 400,000 satoshis = 4 * 10^15 wei.
-#[allow(dead_code)]
-const MIN_PEGOUT_VALUE_WEI: u128 = 4_000_000_000_000_000;
-
 /// `releaseBtc()` — enqueue a peg-out request.
 ///
 /// The caller sends RBTC to the Bridge address. This method enqueues a
 /// release request that will be batched and signed by `updateCollections`.
 ///
 /// Matches rskj's `BridgeSupport.releaseBtc()`:
-/// - Reads the call value and caller from the journal context
+/// - Reads the call value from the Bridge's received balance delta
 /// - Validates minimum peg-out amount
 /// - Queues the release request with (rskAddress, amount)
 /// - The queue is serialized as RLP and stored in multi-slot Bridge storage
 pub fn release_btc<CTX: ContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
-    _config: &BridgeConstants,
+    config: &BridgeConstants,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    // Read call value: the RBTC sent to the Bridge
-    // For now, use the release request counter approach since extracting
-    // msg.value from the revm precompile context requires deeper integration.
-    //
-    // Track pending release count (incremented here, processed by updateCollections)
-    let key = bridge_storage_key(NEXT_PEGOUT_HEIGHT_KEY);
-    let queue_count = bridge_sload(ctx, key);
-    bridge_sstore(ctx, key, queue_count.wrapping_add(U256::from(1)));
+    // Read the call value from the transaction environment.
+    // In the precompile context, msg.value has already been transferred
+    // to the Bridge address by revm. We read it from the tx env.
+    let call_value = revm::context_interface::Transaction::value(ctx.tx());
+
+    if call_value.is_zero() {
+        return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
+    }
+
+    // Enforce minimum pegout value (convert satoshis to wei)
+    let min_value_wei = U256::from(config.minimum_pegout_tx_value) * U256::from(10_000_000_000u64);
+    if call_value < min_value_wei {
+        return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
+    }
+
+    // Get the caller (msg.sender) for the release request
+    let caller = revm::context_interface::Transaction::caller(ctx.tx());
+
+    // Load existing queue, append new entry, store back
+    let queue_key = bridge_storage_key(RELEASE_REQUEST_QUEUE_KEY);
+    let existing_data = bridge_load_bytes(ctx, queue_key);
+    let mut queue = deserialize_release_queue(&existing_data);
+    queue.push(ReleaseRequest {
+        rsk_address: caller,
+        amount: call_value,
+    });
+    let updated = serialize_release_queue(&queue);
+    bridge_store_bytes(ctx, queue_key, &updated);
 
     Ok(PrecompileOutput::new(gas_cost, Bytes::new()))
 }
@@ -430,6 +459,47 @@ pub fn add_signature<CTX: ContextTr>(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Extract the RSK destination address from a BTC peg-in transaction.
+///
+/// Checks for OP_RETURN data first (20-byte RSK address embedded after
+/// the OP_RETURN opcode). Falls back to deriving the address from the
+/// first input's P2PKH public key (matching rskj's PegUtils).
+fn extract_rsk_destination(btc_tx: &BtcTransaction) -> Option<RskAddress> {
+    // 1. Check OP_RETURN outputs for embedded RSK address
+    for output in &btc_tx.output {
+        if output.script_pubkey.is_op_return() {
+            let script_bytes = output.script_pubkey.as_bytes();
+            // OP_RETURN (0x6a) + push opcode + data
+            // The RSK address is typically 20 bytes following the push
+            if script_bytes.len() >= 22 {
+                let data_start = 2; // skip OP_RETURN + push opcode
+                if script_bytes.len() >= data_start + 20 {
+                    return Some(RskAddress::from_slice(
+                        &script_bytes[data_start..data_start + 20],
+                    ));
+                }
+            }
+        }
+    }
+
+    // 2. Fall back to deriving from first input's scriptSig (P2PKH)
+    if let Some(first_input) = btc_tx.input.first() {
+        let script_bytes = first_input.script_sig.as_bytes();
+        // P2PKH scriptSig: <sig> <pubkey>
+        // The public key is the last push (33 bytes compressed, 65 uncompressed)
+        if script_bytes.len() >= 34 {
+            let pubkey_len = script_bytes[script_bytes.len() - 34] as usize;
+            if pubkey_len == 33 && script_bytes.len() >= 34 {
+                let pubkey = &script_bytes[script_bytes.len() - 33..];
+                let hash = sha3::Keccak256::digest(pubkey);
+                return Some(RskAddress::from_slice(&hash[12..]));
+            }
+        }
+    }
+
+    None
+}
+
 /// Convert BTC satoshis to RBTC wei.
 /// 1 BTC = 10^8 satoshis = 10^18 wei RBTC, so 1 satoshi = 10^10 wei.
 fn btc_satoshi_to_rbtc_wei(satoshis: u64) -> U256 {
@@ -438,7 +508,6 @@ fn btc_satoshi_to_rbtc_wei(satoshis: u64) -> U256 {
 
 /// Serialize the release request queue as an RLP list.
 /// Each entry: RLP([rskAddress(20 bytes), amount(BE trimmed bytes)]).
-#[allow(dead_code)]
 fn serialize_release_queue(entries: &[ReleaseRequest]) -> Vec<u8> {
     use super::serialization::{rlp_encode_element, rlp_encode_list};
 
@@ -455,7 +524,6 @@ fn serialize_release_queue(entries: &[ReleaseRequest]) -> Vec<u8> {
 }
 
 /// Deserialize the release request queue from RLP.
-#[allow(dead_code)]
 fn deserialize_release_queue(data: &[u8]) -> Vec<ReleaseRequest> {
     use super::serialization::rlp_decode_list;
 
@@ -497,7 +565,6 @@ fn deserialize_release_queue(data: &[u8]) -> Vec<ReleaseRequest> {
 }
 
 /// Trim leading zero bytes from a U256's big-endian representation.
-#[allow(dead_code)]
 fn u256_to_trimmed_be(val: &U256) -> Vec<u8> {
     let bytes = val.to_be_bytes::<32>();
     let start = bytes.iter().position(|&b| b != 0).unwrap_or(32);
@@ -573,5 +640,84 @@ mod tests {
     #[test]
     fn satoshi_to_wei_zero() {
         assert_eq!(btc_satoshi_to_rbtc_wei(0), U256::ZERO);
+    }
+
+    // -----------------------------------------------------------------------
+    // Release queue serialization tests — ported from rskj
+    // BridgeSerializationUtilsTest / BridgeSupportReleaseBtcTest patterns
+    // -----------------------------------------------------------------------
+
+    /// Roundtrip: serialize → deserialize an empty release queue.
+    #[test]
+    fn rskj_release_queue_empty_roundtrip() {
+        let queue: Vec<ReleaseRequest> = vec![];
+        let encoded = serialize_release_queue(&queue);
+        let decoded = deserialize_release_queue(&encoded);
+        assert!(decoded.is_empty());
+    }
+
+    /// Roundtrip: single entry in release queue.
+    #[test]
+    fn rskj_release_queue_single_entry_roundtrip() {
+        let addr = RskAddress::repeat_byte(0xAA);
+        let amount = U256::from(250_000u64) * U256::from(10_000_000_000u64); // min pegout in wei
+        let queue = vec![ReleaseRequest { rsk_address: addr, amount }];
+
+        let encoded = serialize_release_queue(&queue);
+        let decoded = deserialize_release_queue(&encoded);
+
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].rsk_address, addr);
+        assert_eq!(decoded[0].amount, amount);
+    }
+
+    /// Roundtrip: multiple entries preserves order.
+    #[test]
+    fn rskj_release_queue_multiple_entries_roundtrip() {
+        let entries = vec![
+            ReleaseRequest {
+                rsk_address: RskAddress::repeat_byte(0x11),
+                amount: U256::from(1_000_000u64),
+            },
+            ReleaseRequest {
+                rsk_address: RskAddress::repeat_byte(0x22),
+                amount: U256::from(2_000_000u64),
+            },
+            ReleaseRequest {
+                rsk_address: RskAddress::repeat_byte(0x33),
+                amount: U256::from(3_000_000u64),
+            },
+        ];
+
+        let encoded = serialize_release_queue(&entries);
+        let decoded = deserialize_release_queue(&encoded);
+
+        assert_eq!(decoded.len(), 3);
+        for (orig, dec) in entries.iter().zip(decoded.iter()) {
+            assert_eq!(orig.rsk_address, dec.rsk_address);
+            assert_eq!(orig.amount, dec.amount);
+        }
+    }
+
+    /// Deserializing empty/null data yields empty queue (matching rskj behavior).
+    #[test]
+    fn rskj_release_queue_deserialize_empty() {
+        assert!(deserialize_release_queue(&[]).is_empty());
+    }
+
+    /// Verify U256 trimming: large values preserve full precision.
+    #[test]
+    fn rskj_release_queue_large_amount_roundtrip() {
+        let amount = U256::from(21_000_000u64) * U256::from(10u64).pow(U256::from(18));
+        let queue = vec![ReleaseRequest {
+            rsk_address: RskAddress::repeat_byte(0xFF),
+            amount,
+        }];
+
+        let encoded = serialize_release_queue(&queue);
+        let decoded = deserialize_release_queue(&encoded);
+
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].amount, amount, "21M RBTC should survive roundtrip");
     }
 }

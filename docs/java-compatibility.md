@@ -112,7 +112,7 @@ leading zeros. The rskj node inherited this behavior.
 
 ### Rust mitigations
 
-**Lenient decoding** (`crates/networking/src/protocol/rlp_compat.rs`):
+**Lenient decoding** (`crates/core/src/rlp_compat.rs`):
 
 - `decode_u8_lenient`, `decode_u32_lenient`, `decode_u64_lenient`,
   `decode_u256_lenient`

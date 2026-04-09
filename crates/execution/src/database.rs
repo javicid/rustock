@@ -14,6 +14,8 @@ use rustock_trie::{
     AccountState,
 };
 use rustock_storage::BlockStore;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::Arc;
 use sha3::{Digest, Keccak256};
 
@@ -34,6 +36,9 @@ pub struct RskDatabase {
     root: TrieNode,
     store: Arc<dyn TrieStore>,
     block_store: Arc<BlockStore>,
+    /// Cache of code by hash, populated during `basic_ref` calls.
+    /// Uses `RefCell` because `DatabaseRef` methods take `&self`.
+    code_cache: RefCell<HashMap<B256, Bytecode>>,
 }
 
 impl RskDatabase {
@@ -42,7 +47,7 @@ impl RskDatabase {
         store: Arc<dyn TrieStore>,
         block_store: Arc<BlockStore>,
     ) -> Self {
-        Self { root, store, block_store }
+        Self { root, store, block_store, code_cache: RefCell::new(HashMap::new()) }
     }
 
     fn trie_get(&self, key: &[u8]) -> Option<Vec<u8>> {
@@ -76,6 +81,12 @@ impl DatabaseRef for RskDatabase {
             None => Bytecode::default(),
         };
 
+        if code_hash != revm::primitives::KECCAK_EMPTY {
+            self.code_cache
+                .borrow_mut()
+                .insert(code_hash, bytecode.clone());
+        }
+
         Ok(Some(AccountInfo {
             balance: acct.balance,
             nonce: acct.nonce.to::<u64>(),
@@ -85,10 +96,10 @@ impl DatabaseRef for RskDatabase {
         }))
     }
 
-    fn code_by_hash_ref(&self, _code_hash: B256) -> Result<Bytecode, Self::Error> {
-        // Code is always returned inline via basic_ref, so this is rarely called.
-        // If revm does call it, we can't efficiently look up by hash in the Unitrie
-        // (the trie is keyed by address, not code hash). Return empty.
+    fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        if let Some(code) = self.code_cache.borrow().get(&code_hash) {
+            return Ok(code.clone());
+        }
         Ok(Bytecode::default())
     }
 
@@ -247,6 +258,70 @@ mod tests {
 
         let val = db.storage_ref(Address::repeat_byte(0xFF), U256::from(99)).unwrap();
         assert_eq!(val, U256::ZERO);
+    }
+
+    // -----------------------------------------------------------------------
+    // Code-by-hash cache tests — inspired by rskj RepositoryTest.testGetCodeHash
+    // -----------------------------------------------------------------------
+
+    /// Ported from rskj RepositoryTest.testGetCodeHash
+    /// Verifies that code_by_hash_ref returns cached bytecode after basic_ref
+    /// populates the cache.
+    #[test]
+    fn rskj_code_by_hash_cache_populated_by_basic_ref() {
+        let (store, root) = make_store_and_root();
+        let addr = Address::repeat_byte(0xDD);
+        let code = b"a-great-code".to_vec(); // same string as rskj test
+
+        let root = put_account(&root, store.as_ref(), &addr, 0, U256::ZERO);
+        let root = put_code(&root, store.as_ref(), &addr, &code);
+
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let db = RskDatabase::new(root, store, block_store);
+
+        let info = db.basic_ref(addr).unwrap().unwrap();
+        let code_hash = info.code_hash;
+        assert_ne!(code_hash, revm::primitives::KECCAK_EMPTY);
+
+        let expected_hash = B256::from_slice(&Keccak256::digest(&code));
+        assert_eq!(code_hash, expected_hash);
+
+        let cached = db.code_by_hash_ref(code_hash).unwrap();
+        assert_eq!(cached.original_bytes().as_ref(), &code,
+            "code_by_hash_ref should return cached code after basic_ref");
+    }
+
+    /// Ported from rskj: code_by_hash for an account without code returns empty.
+    /// Matches rskj's behavior where getCodeHashNonStandard on a non-contract
+    /// account returns KECCAK_EMPTY.
+    #[test]
+    fn rskj_code_by_hash_no_code_returns_default() {
+        let (store, root) = make_store_and_root();
+        let addr = Address::repeat_byte(0xEE);
+        let root = put_account(&root, store.as_ref(), &addr, 0, U256::from(1000));
+
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let db = RskDatabase::new(root, store, block_store);
+
+        let info = db.basic_ref(addr).unwrap().unwrap();
+        assert_eq!(info.code_hash, revm::primitives::KECCAK_EMPTY);
+
+        let cached = db.code_by_hash_ref(revm::primitives::KECCAK_EMPTY).unwrap();
+        assert!(cached.original_bytes().is_empty(),
+            "KECCAK_EMPTY should return default (empty) bytecode");
+    }
+
+    /// Ported from rskj: code_by_hash for non-existent hash returns default.
+    /// Matches rskj behavior where repository has no entry for a random hash.
+    #[test]
+    fn rskj_code_by_hash_unknown_hash_returns_default() {
+        let (store, root) = make_store_and_root();
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let db = RskDatabase::new(root, store, block_store);
+
+        let random_hash = B256::repeat_byte(0x42);
+        let result = db.code_by_hash_ref(random_hash).unwrap();
+        assert!(result.original_bytes().is_empty());
     }
 
     #[test]

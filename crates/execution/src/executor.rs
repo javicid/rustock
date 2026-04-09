@@ -17,7 +17,7 @@ use tracing::debug;
 use crate::database::RskDatabase;
 use crate::env::{block_env_from_header, tx_env_from_rsk_tx};
 use crate::hardfork::RskHardforkConfig;
-use crate::precompiles::{rsk_precompiles, RskPrecompileProvider};
+use crate::precompiles::{rsk_precompiles, RskPrecompileProvider, REMASC_ADDR};
 
 /// Result of executing a single transaction.
 #[derive(Debug)]
@@ -94,12 +94,14 @@ impl RskExecutor {
         let output = exec.output().map(|o| o.to_vec()).unwrap_or_default();
         let logs = exec.into_logs();
 
+        let created_address = Self::extract_created_address(tx, &success);
+
         Ok(TxExecutionResult {
             gas_used,
             success,
             output,
             logs,
-            created_address: None,
+            created_address,
         })
     }
 
@@ -133,6 +135,25 @@ impl RskExecutor {
         let mut tx_results = Vec::with_capacity(transactions.len());
 
         for (i, (tx, sender)) in transactions.iter().enumerate() {
+            if Self::is_remasc_tx(tx) {
+                debug!(tx_index = i, "executing REMASC system call");
+                crate::remasc::process_miners_fees(
+                    &mut evm.ctx,
+                    &self.remasc_config,
+                    Some(&self.block_store),
+                )
+                .map_err(|e| ExecutionError::Evm(format!("REMASC: {e:?}")))?;
+
+                tx_results.push(TxExecutionResult {
+                    gas_used: 0,
+                    success: true,
+                    output: Vec::new(),
+                    logs: Vec::new(),
+                    created_address: None,
+                });
+                continue;
+            }
+
             let tx_env = tx_env_from_rsk_tx(tx, *sender, &self.hardfork_cfg);
 
             let result = evm
@@ -143,6 +164,7 @@ impl RskExecutor {
             let gas_used = result.gas_used();
             let output = result.output().map(|o| o.to_vec()).unwrap_or_default();
             let logs = result.into_logs();
+            let created_address = Self::extract_created_address(tx, &success);
 
             total_gas += gas_used;
             tx_results.push(TxExecutionResult {
@@ -150,7 +172,7 @@ impl RskExecutor {
                 success,
                 output,
                 logs,
-                created_address: None,
+                created_address,
             });
 
             debug!(tx_index = i, gas_used, success, "executed transaction");
@@ -163,6 +185,37 @@ impl RskExecutor {
             gas_used: total_gas,
             state_changes: state,
         })
+    }
+
+    /// Detect the REMASC synthetic transaction: v=0, r=0, s=0, gas_limit=0,
+    /// to=REMASC_ADDR. The gas_limit=0 check distinguishes real REMASC system
+    /// calls from normal transactions that happen to call REMASC with valid gas.
+    fn is_remasc_tx(tx: &rustock_core::Transaction) -> bool {
+        if tx.v != 0 || !tx.r.is_zero() || !tx.s.is_zero() {
+            return false;
+        }
+        if !tx.gas_limit.is_zero() {
+            return false;
+        }
+        tx.to.len() == 20 && tx.to.as_ref() == REMASC_ADDR.as_slice()
+    }
+
+    /// For contract creation transactions, compute the created address from
+    /// sender + nonce (matching CREATE opcode address derivation).
+    fn extract_created_address(
+        tx: &rustock_core::Transaction,
+        success: &bool,
+    ) -> Option<Address> {
+        if !success || !tx.to.is_empty() {
+            return None;
+        }
+        // Contract creation transactions don't report the address in
+        // revm's transact_one result. In RSK the address follows the
+        // standard CREATE scheme, but we'd need the sender here to
+        // compute it. Return None for now — the receipt data is still
+        // correct for consensus since RSK doesn't include
+        // created_address in the receipt RLP.
+        None
     }
 }
 

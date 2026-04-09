@@ -4,8 +4,9 @@ use rustock_core::validation::HeaderVerifier;
 use rustock_storage::BlockStore;
 use rustock_networking::node::{Node, NodeConfig};
 use rustock_sync::{SyncManager, SyncHandler, SyncService, TxRelay};
+use rustock_trie::{AccountState, TrieKeySlice, TrieNode, TrieStore, account_key};
 use std::sync::Arc;
-use alloy_primitives::U256;
+use alloy_primitives::{B256, U256};
 use anyhow::{Result, Context};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -216,7 +217,8 @@ async fn main() -> Result<()> {
     let trie_store_for_exec: Arc<dyn rustock_trie::TrieStore> =
         Arc::new(rustock_storage::RocksDbTrieStore::from_db(store.db().clone()));
 
-    let genesis_state_root = rustock_trie::TrieNode::empty();
+    let genesis_state_root = build_genesis_state(&config, trie_store_for_exec.as_ref())?;
+    info!("Genesis state root: {:?}", genesis_state_root.compute_hash(trie_store_for_exec.as_ref()));
 
     let sync_service = SyncService::new(sync_manager.clone(), peer_store.clone(), event_rx)
         .with_tx_pool(pool.clone())
@@ -255,6 +257,57 @@ async fn main() -> Result<()> {
     node.start().await?;
 
     Ok(())
+}
+
+/// Build the genesis state trie from the chain config's alloc entries.
+///
+/// Each alloc entry becomes an account in the Unitrie. Bridge storage
+/// entries (feePerKb, lockingCap) are also written. The resulting trie's
+/// hash must match `genesis_header().state_root` for mainnet/testnet.
+fn build_genesis_state(config: &ChainConfig, trie_store: &dyn TrieStore) -> Result<TrieNode> {
+    let alloc = config.genesis_alloc();
+    if alloc.is_empty() {
+        return Ok(TrieNode::empty());
+    }
+
+    let mut root = TrieNode::empty();
+
+    // Write account balances
+    for entry in &alloc {
+        let key_bytes = account_key(&entry.address);
+        let key = TrieKeySlice::from_key(&key_bytes);
+        let acct = AccountState::new(entry.nonce, entry.balance);
+        root = root.put(&key, &acct.encode(), trie_store);
+    }
+
+    // Write Bridge storage entries (feePerKb, lockingCap)
+    let bridge_addr: alloy_primitives::Address =
+        "0000000000000000000000000000000001000006".parse().unwrap();
+    for (slot_key, value) in config.genesis_bridge_storage() {
+        if value.is_empty() {
+            continue;
+        }
+        let slot_b256 = alloy_primitives::B256::from(slot_key.to_be_bytes::<32>());
+        let storage_key_bytes = rustock_trie::storage_key(&bridge_addr, &slot_b256);
+        let key = TrieKeySlice::from_key(&storage_key_bytes);
+        root = root.put(&key, &value, trie_store);
+    }
+
+    let computed = root.compute_hash(trie_store);
+    let expected = config.genesis_header().state_root;
+
+    // For mainnet/testnet, verify the state root matches. If it doesn't,
+    // log a warning but proceed — we may need to adjust the alloc to match
+    // the exact rskj genesis.
+    if expected != B256::ZERO && computed != expected {
+        tracing::warn!(
+            "Genesis state root mismatch: computed={computed:?}, expected={expected:?}. \
+             The node may fail to validate block 1."
+        );
+    }
+
+    root.save(trie_store, true);
+    Ok(root)
 }
 
 fn setup_genesis(store: &BlockStore, config: &ChainConfig) -> Result<alloy_primitives::B256> {

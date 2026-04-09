@@ -351,6 +351,24 @@ fn test_difficulty_rskip156_divisor_change() {
 }
 
 #[test]
+fn test_difficulty_equal_timestamps_increases() {
+    // Java's DifficultyCalculator: when curBlockTS == parentBlockTS, delta = 0.
+    // calcDur = (1 + uncleCount) * duration > 0 = delta → sign = 1 → increase.
+    let config = Arc::new(crate::config::ChainConfig::regtest());
+    let rule = DifficultyRule { config: config.clone() };
+
+    let mut parent = create_dummy_header(10, 1000, B256::ZERO);
+    parent.difficulty = U256::from(20480);
+
+    // Same timestamp as parent: delta = 0, calcDur = 10 > 0 → increase
+    let expected = U256::from(20480 + (20480 / 2048));
+    let mut header = create_dummy_header(11, 1000, parent.hash());
+    header.difficulty = expected;
+
+    assert!(rule.validate_with_parent(&header, &parent).is_ok());
+}
+
+#[test]
 fn test_merged_mining_skipped_before_orchid() {
     let config = Arc::new(crate::config::ChainConfig::mainnet());
     let rule = MergedMiningRule { config };

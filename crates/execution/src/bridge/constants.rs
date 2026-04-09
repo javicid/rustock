@@ -155,4 +155,43 @@ mod tests {
         assert_eq!(c.legacy_minimum_pegin_tx_value, 1_000_000);
         assert_eq!(c.minimum_pegin_tx_value, 500_000);
     }
+
+    // -----------------------------------------------------------------------
+    // Tests ported from rskj BridgeConstantsTest.java
+    // -----------------------------------------------------------------------
+
+    /// Ported from rskj BridgeConstantsTest.getMinimumPegoutTxValue
+    /// Mainnet: 400_000 sat, Testnet: 250_000 sat, Regtest: 250_000 sat
+    #[test]
+    fn rskj_minimum_pegout_tx_value_mainnet() {
+        assert_eq!(BridgeConstants::mainnet().minimum_pegout_tx_value, 400_000);
+    }
+
+    #[test]
+    fn rskj_minimum_pegout_tx_value_testnet() {
+        assert_eq!(BridgeConstants::testnet().minimum_pegout_tx_value, 250_000);
+    }
+
+    #[test]
+    fn rskj_minimum_pegout_tx_value_regtest() {
+        assert_eq!(BridgeConstants::regtest().minimum_pegout_tx_value, 250_000);
+    }
+
+    /// Ported from rskj BridgeConstantsTest.minimumPeginTxValueArgProvider
+    /// Legacy: 1_000_000 sat (0.01 BTC), Post-RSKIP219: 500_000 sat (0.005 BTC)
+    #[test]
+    fn rskj_minimum_pegin_values() {
+        for c in [BridgeConstants::mainnet(), BridgeConstants::testnet(), BridgeConstants::regtest()] {
+            assert_eq!(c.legacy_minimum_pegin_tx_value, 1_000_000, "legacy pegin min");
+            assert_eq!(c.minimum_pegin_tx_value, 500_000, "RSKIP219 pegin min");
+        }
+    }
+
+    /// Ported from rskj BridgeConstantsTest — legacy pegout values
+    #[test]
+    fn rskj_legacy_minimum_pegout_values() {
+        assert_eq!(BridgeConstants::mainnet().legacy_minimum_pegout_tx_value, 800_000);
+        assert_eq!(BridgeConstants::testnet().legacy_minimum_pegout_tx_value, 500_000);
+        assert_eq!(BridgeConstants::regtest().legacy_minimum_pegout_tx_value, 500_000);
+    }
 }

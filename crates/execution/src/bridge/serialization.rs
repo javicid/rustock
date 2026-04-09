@@ -562,6 +562,78 @@ mod tests {
         assert_eq!(deserialize_optional_long(&[0x82, 0x13, 0x88]), Some(5000));
     }
 
+    // -----------------------------------------------------------------------
+    // Federation RLP golden vectors — ported from rskj
+    // BridgeSerializationUtilsTest.deserializeFederationOnlyBtcKeys_ok
+    // -----------------------------------------------------------------------
+
+    /// Ported from rskj BridgeSerializationUtilsTest.deserializeFederationOnlyBtcKeys_ok
+    ///
+    /// Validates that the rskj federation format:
+    ///   RLP([creation_time_ms, block_number, [key1, key2, ...]])
+    /// decodes correctly to the expected values.
+    ///
+    /// Input: creation_time=5000ms (0x1388), block_number=42 (0x002a), 6 keys
+    #[test]
+    fn rskj_federation_rlp_golden_vector_decode() {
+        let creation_time_rlp = rlp_encode_element(&[0x13, 0x88]); // 5000
+        let block_number_rlp = rlp_encode_element(&[0x00, 0x2a]); // 42
+
+        let dummy_keys: Vec<Vec<u8>> = (0..6).map(|i| vec![0x02 + i; 33]).collect();
+        let encoded_keys: Vec<Vec<u8>> = dummy_keys.iter()
+            .map(|k| rlp_encode_element(k))
+            .collect();
+        let keys_list = rlp_encode_list(&encoded_keys);
+
+        let federation_rlp = rlp_encode_list(&[
+            creation_time_rlp,
+            block_number_rlp,
+            keys_list,
+        ]);
+
+        let items = rlp_decode_list(&federation_rlp).unwrap();
+        assert_eq!(items.len(), 3, "federation should have 3 top-level items");
+
+        let creation_time = rlp_decode_u64(&items[0]);
+        assert_eq!(creation_time, 5000, "creation_time should be 5000ms");
+
+        let block_number = rlp_decode_u64(&items[1]);
+        assert_eq!(block_number, 42, "block_number should be 42");
+
+        let keys = rlp_decode_list(&items[2]).unwrap();
+        assert_eq!(keys.len(), 6, "should have 6 federation member keys");
+        for (i, key) in keys.iter().enumerate() {
+            assert_eq!(key.len(), 33, "key {i} should be 33 bytes");
+        }
+    }
+
+    /// Ported from rskj: federation with known creation time hex encoding.
+    /// Verifies that 0x1388 round-trips as creation_time=5000 and 0x002a as block=42.
+    #[test]
+    fn rskj_federation_creation_time_encoding() {
+        assert_eq!(rlp_encode_element(&[0x13, 0x88]), vec![0x82, 0x13, 0x88]);
+        let decoded = rlp_decode_u64(&[0x13, 0x88]);
+        assert_eq!(decoded, 5000);
+
+        assert_eq!(rlp_encode_element(&[0x00, 0x2a]), vec![0x82, 0x00, 0x2a]);
+        let decoded = rlp_decode_u64(&[0x00, 0x2a]);
+        assert_eq!(decoded, 42);
+    }
+
+    /// Ported from rskj: empty federation list should decode cleanly.
+    #[test]
+    fn rskj_empty_federation_keys_list() {
+        let keys_list = rlp_encode_list(&[]);
+        let creation_rlp = rlp_encode_u64(0);
+        let block_rlp = rlp_encode_u64(0);
+        let data = rlp_encode_list(&[creation_rlp, block_rlp, keys_list]);
+
+        let items = rlp_decode_list(&data).unwrap();
+        assert_eq!(items.len(), 3);
+        let keys = rlp_decode_list(&items[2]).unwrap();
+        assert!(keys.is_empty());
+    }
+
     /// Verify the full RLP list prefix for a list with > 55 bytes payload.
     #[test]
     fn rlp_long_list_prefix() {

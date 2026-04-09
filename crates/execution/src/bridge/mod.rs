@@ -14,6 +14,7 @@ pub mod btc_chain;
 pub mod btc_store;
 pub mod constants;
 pub mod federation;
+pub mod getters;
 pub mod governance;
 pub mod peg;
 pub mod pmt;
@@ -303,7 +304,22 @@ fn execute_method<CTX: ContextTr>(
         "getQueuedPegoutsCount" => peg::get_queued_pegouts_count(ctx, gas_cost),
         "getEstimatedFeesForNextPegOutEvent" => peg::get_estimated_fees_for_next_pegout(ctx, gas_cost),
 
-        // Local-only getters (no-op stubs for now)
+        // Local-only getters with real storage reads
+        "getFederationAddress" => getters::get_federation_address(ctx, gas_cost),
+        "getFederationSize" => getters::get_federation_size(ctx, gas_cost),
+        "getFederationThreshold" => getters::get_federation_threshold(ctx, gas_cost),
+        "getFederationCreationBlockNumber" => getters::get_federation_creation_block_number(ctx, gas_cost),
+        "getFederationCreationTime" => getters::get_federation_creation_time(ctx, gas_cost),
+        "getFederatorPublicKey" => getters::get_federator_public_key(ctx, args, gas_cost),
+        "getFederatorPublicKeyOfType" => getters::get_federator_public_key_of_type(ctx, args, gas_cost),
+        "getFeePerKb" => getters::get_fee_per_kb(ctx, gas_cost),
+        "getLockingCap" => getters::get_locking_cap(ctx, gas_cost),
+        "getMinimumLockTxValue" => getters::get_minimum_lock_tx_value(gas_cost, config),
+        "getRetiringFederationAddress" => getters::get_retiring_federation_address(ctx, gas_cost),
+        "getRetiringFederationSize" => getters::get_retiring_federation_size(ctx, gas_cost),
+        "getRetiringFederationThreshold" => getters::get_retiring_federation_threshold(ctx, gas_cost),
+        "getPendingFederationSize" => getters::get_pending_federation_size(ctx, gas_cost),
+        "isBtcTxHashAlreadyProcessed" => getters::is_btc_tx_hash_already_processed(ctx, args, gas_cost),
         _ => Ok(PrecompileOutput::new(gas_cost, Bytes::new())),
     }
 }

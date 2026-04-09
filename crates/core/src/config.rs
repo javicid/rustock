@@ -1,6 +1,22 @@
-use alloy_primitives::{Address, B256, Bytes, U256};
+use alloy_primitives::{Address, B256, Bytes, U256, address};
 
 use crate::types::header::Header;
+
+/// Pre-funded account in the genesis state.
+#[derive(Debug, Clone)]
+pub struct GenesisAlloc {
+    pub address: Address,
+    pub balance: U256,
+    pub nonce: U256,
+}
+
+/// Pre-initialized storage entry in the genesis state.
+#[derive(Debug, Clone)]
+pub struct GenesisStorage {
+    pub address: Address,
+    pub key: B256,
+    pub value: Vec<u8>,
+}
 
 /// Hardfork activation heights for a given network.
 /// A value of `u64::MAX` means "not yet activated".
@@ -196,6 +212,53 @@ impl ChainConfig {
         }
     }
 
+    /// Returns the genesis state allocations for this network.
+    ///
+    /// For mainnet/testnet, the Bridge contract (0x01000006) is pre-funded with
+    /// 21 million RBTC (matching Bitcoin's total supply). This is the only
+    /// genesis allocation; all other accounts start empty.
+    pub fn genesis_alloc(&self) -> Vec<GenesisAlloc> {
+        const BRIDGE: Address = address!("0000000000000000000000000000000001000006");
+        // 21_000_000 RBTC = 21_000_000 * 10^18 wei
+        let twenty_one_million_rbtc = U256::from(21_000_000u64) * U256::from(10u64).pow(U256::from(18));
+
+        match self.chain_id {
+            30 | 31 => vec![GenesisAlloc {
+                address: BRIDGE,
+                balance: twenty_one_million_rbtc,
+                nonce: U256::ZERO,
+            }],
+            _ => vec![],
+        }
+    }
+
+    /// Returns genesis Bridge storage entries for this network.
+    ///
+    /// rskj initializes the Bridge with federation data, feePerKb, and
+    /// lockingCap at genesis. Without these, Bridge getters return empty
+    /// and the first `updateCollections` starts from a blank slate.
+    ///
+    /// Returns `(slot_key_as_U256, raw_value_bytes)` pairs.
+    pub fn genesis_bridge_storage(&self) -> Vec<(U256, Vec<u8>)> {
+        match self.chain_id {
+            30 | 31 => {
+                // Default fee per KB: 10000 satoshis (matching rskj)
+                let fee_per_kb_key = bridge_storage_key_ascii("feePerKb");
+                let fee_per_kb_value = U256::from(10_000u64);
+
+                // Default locking cap: 21M RBTC in wei
+                let locking_cap_key = bridge_storage_key_ascii("lockingCap");
+                let locking_cap_value = U256::from(21_000_000u64) * U256::from(10u64).pow(U256::from(18));
+
+                vec![
+                    (fee_per_kb_key, u256_to_storage_bytes(fee_per_kb_value)),
+                    (locking_cap_key, u256_to_storage_bytes(locking_cap_value)),
+                ]
+            }
+            _ => vec![],
+        }
+    }
+
     /// Returns the bootstrap node enode URLs for this network.
     pub fn bootnodes(&self) -> Vec<String> {
         match self.chain_id {
@@ -212,6 +275,22 @@ impl ChainConfig {
             _ => vec![],
         }
     }
+}
+
+/// Encode a short storage key name (≤32 bytes) as rskj's `DataWord.fromString`.
+fn bridge_storage_key_ascii(name: &str) -> U256 {
+    let bytes = name.as_bytes();
+    debug_assert!(bytes.len() <= 32);
+    let mut buf = [0u8; 32];
+    buf[32 - bytes.len()..].copy_from_slice(bytes);
+    U256::from_be_bytes(buf)
+}
+
+/// Convert a U256 to trimmed big-endian bytes for storage.
+fn u256_to_storage_bytes(val: U256) -> Vec<u8> {
+    let be = val.to_be_bytes::<32>();
+    let start = be.iter().position(|&b| b != 0).unwrap_or(32);
+    be[start..].to_vec()
 }
 
 #[cfg(test)]
@@ -321,5 +400,82 @@ mod tests {
     fn test_regtest_bootnodes() {
         let config = ChainConfig::regtest();
         assert!(config.bootnodes().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Genesis allocation tests — ported from rskj genesis JSON + GenesisJsonTest
+    // -----------------------------------------------------------------------
+
+    /// Ported from rskj rsk-mainnet.json + BridgeSupportIT.
+    /// The Bridge (0x01000006) receives exactly 21M RBTC at genesis.
+    #[test]
+    fn rskj_genesis_bridge_balance_21m() {
+        let config = ChainConfig::mainnet();
+        let alloc = config.genesis_alloc();
+
+        assert_eq!(alloc.len(), 1, "mainnet genesis should have exactly 1 allocation");
+
+        let bridge = &alloc[0];
+        let expected_addr: Address = address!("0000000000000000000000000000000001000006");
+        assert_eq!(bridge.address, expected_addr, "allocation should go to Bridge");
+
+        let expected_balance = U256::from(21_000_000u64) * U256::from(10u64).pow(U256::from(18));
+        assert_eq!(bridge.balance, expected_balance,
+            "Bridge should receive 21000000000000000000000000 wei (21M RBTC)");
+        assert_eq!(bridge.nonce, U256::ZERO);
+    }
+
+    /// Ported from rskj: testnet uses the same 21M alloc.
+    #[test]
+    fn rskj_genesis_bridge_balance_testnet() {
+        let config = ChainConfig::testnet();
+        let alloc = config.genesis_alloc();
+        assert_eq!(alloc.len(), 1);
+        assert_eq!(
+            alloc[0].balance,
+            U256::from(21_000_000u64) * U256::from(10u64).pow(U256::from(18))
+        );
+    }
+
+    /// Regtest has no pre-funded allocations (tests build their own state).
+    #[test]
+    fn rskj_genesis_regtest_no_alloc() {
+        let config = ChainConfig::regtest();
+        let alloc = config.genesis_alloc();
+        assert!(alloc.is_empty(), "regtest should have no genesis allocations");
+    }
+
+    /// Ported from rskj: genesis Bridge storage includes feePerKb and lockingCap.
+    #[test]
+    fn rskj_genesis_bridge_storage_fee_and_cap() {
+        let config = ChainConfig::mainnet();
+        let storage = config.genesis_bridge_storage();
+
+        assert_eq!(storage.len(), 2, "should have feePerKb and lockingCap");
+
+        let fee_per_kb_value = U256::from_be_slice(&storage[0].1);
+        assert_eq!(fee_per_kb_value, U256::from(10_000u64),
+            "feePerKb should be 10000 satoshis");
+
+        let locking_cap_value = U256::from_be_slice(&storage[1].1);
+        let expected_cap = U256::from(21_000_000u64) * U256::from(10u64).pow(U256::from(18));
+        assert_eq!(locking_cap_value, expected_cap,
+            "lockingCap should be 21M RBTC in wei");
+    }
+
+    /// Ported from rskj GenesisHashesTest: verify known mainnet genesis hash.
+    #[test]
+    fn rskj_known_mainnet_genesis_hash() {
+        let config = ChainConfig::mainnet();
+        let hash = config.known_genesis_hash();
+        assert!(hash.is_some(), "mainnet should have a known genesis hash");
+    }
+
+    /// Ported from rskj GenesisHashesTest: verify known testnet genesis hash.
+    #[test]
+    fn rskj_known_testnet_genesis_hash() {
+        let config = ChainConfig::testnet();
+        let hash = config.known_genesis_hash();
+        assert!(hash.is_some(), "testnet should have a known genesis hash");
     }
 }

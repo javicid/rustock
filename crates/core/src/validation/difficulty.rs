@@ -41,7 +41,11 @@ impl DifficultyRule {
 
         let delta = header.timestamp.saturating_sub(parent.timestamp);
 
-        if delta == 0 && header.timestamp <= parent.timestamp {
+        // Java's DifficultyCalculator: `if (delta < 0) return pd;`
+        // With u64 saturating_sub, negative delta becomes 0 — detect via
+        // the original timestamps.  Equal timestamps (delta == 0) must NOT
+        // short-circuit: Java continues and sign becomes 1 (calcDur > 0).
+        if header.timestamp < parent.timestamp {
             return parent.difficulty;
         }
 
