@@ -8,6 +8,7 @@ use revm::context::CfgEnv;
 use revm::database::WrapDatabaseRef;
 use revm::primitives::hardfork::SpecId;
 use revm::{ExecuteEvm, MainBuilder, MainContext};
+use sha3::Digest as _;
 use rustock_core::Header;
 use rustock_storage::BlockStore;
 use rustock_trie::{TrieNode, TrieStore};
@@ -17,7 +18,7 @@ use tracing::debug;
 use crate::database::RskDatabase;
 use crate::env::{block_env_from_header, tx_env_from_rsk_tx};
 use crate::hardfork::RskHardforkConfig;
-use crate::precompiles::{rsk_precompiles, RskPrecompileProvider, REMASC_ADDR};
+use crate::precompiles::{rsk_precompiles, BridgeTxContext, RskPrecompileProvider, REMASC_ADDR};
 
 /// Result of executing a single transaction.
 #[derive(Debug)]
@@ -129,6 +130,10 @@ impl RskExecutor {
             Some(self.block_store.clone()),
             self.remasc_config.clone(),
         );
+        // Shared slot for per-transaction Bridge context (tx hash + BTC destination).
+        // We clone the Arc before moving the provider into the EVM so we can update
+        // it between transactions.
+        let bridge_ctx_slot = precompile_provider.bridge_tx_context_slot();
         let mut evm = ctx.build_mainnet().with_precompiles(precompile_provider);
 
         let mut total_gas = 0u64;
@@ -152,6 +157,24 @@ impl RskExecutor {
                     created_address: None,
                 });
                 continue;
+            }
+
+            // Update per-transaction Bridge context before execution.
+            // This provides the Bridge precompile with:
+            //   - rsk_tx_hash: used for RSKIP146 release queue entries
+            //   - btc_sender_hash160: used as BTC peg-out destination (matches rskj's
+            //     BridgeUtils.recoverBtcAddressFromEthTransaction)
+            {
+                let rsk_tx_hash: [u8; 32] = {
+                    let rlp = tx.rlp_for_trie();
+                    sha3::Keccak256::digest(&rlp).into()
+                };
+                let btc_sender_hash160 = tx
+                    .btc_sender_hash160(self.hardfork_cfg.chain_id)
+                    .unwrap_or([0u8; 20]);
+                if let Ok(mut guard) = bridge_ctx_slot.lock() {
+                    *guard = BridgeTxContext { rsk_tx_hash, btc_sender_hash160 };
+                }
             }
 
             let tx_env = tx_env_from_rsk_tx(tx, *sender, &self.hardfork_cfg);
@@ -309,6 +332,7 @@ mod tests {
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,
+            cached_rlp: None,
         };
 
         let executor = RskExecutor::new(
@@ -350,6 +374,7 @@ mod tests {
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,
+            cached_rlp: None,
         };
 
         let executor = RskExecutor::new(
@@ -389,6 +414,7 @@ mod tests {
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,
+            cached_rlp: None,
         };
 
         let executor = RskExecutor::new(
@@ -432,6 +458,7 @@ mod tests {
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,
+            cached_rlp: None,
         };
 
         let tx2 = rustock_core::Transaction {
@@ -444,6 +471,7 @@ mod tests {
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,
+            cached_rlp: None,
         };
 
         let transactions = vec![(tx1, sender), (tx2, sender)];
@@ -507,6 +535,7 @@ mod tests {
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,
+            cached_rlp: None,
         };
 
         let executor = RskExecutor::new(
@@ -573,6 +602,7 @@ mod tests {
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,
+            cached_rlp: None,
         };
 
         let executor = RskExecutor::new(
@@ -616,6 +646,7 @@ mod tests {
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,
+            cached_rlp: None,
         };
 
         let executor = RskExecutor::new(
@@ -662,6 +693,7 @@ mod tests {
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,
+            cached_rlp: None,
         };
 
         let executor = RskExecutor::new(
@@ -710,6 +742,7 @@ mod tests {
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,
+            cached_rlp: None,
         };
 
         let executor = RskExecutor::new(
@@ -845,6 +878,7 @@ mod tests {
                 v: 0,
                 r: U256::ZERO,
                 s: U256::ZERO,
+                cached_rlp: None,
             }
         };
 
@@ -926,6 +960,7 @@ mod tests {
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,
+            cached_rlp: None,
         };
 
         let executor = RskExecutor::new(
@@ -970,6 +1005,7 @@ mod tests {
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,
+            cached_rlp: None,
         };
 
         let executor = RskExecutor::new(
@@ -1018,6 +1054,7 @@ mod tests {
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,
+            cached_rlp: None,
         };
 
         let executor = RskExecutor::new(
@@ -1066,6 +1103,7 @@ mod tests {
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,
+            cached_rlp: None,
         };
 
         let executor = RskExecutor::new(
@@ -1130,6 +1168,7 @@ mod tests {
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,
+            cached_rlp: None,
         };
 
         let executor = RskExecutor::new(
@@ -1174,6 +1213,7 @@ mod tests {
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,
+            cached_rlp: None,
         };
 
         let executor = RskExecutor::new(
@@ -1224,6 +1264,7 @@ mod tests {
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,
+            cached_rlp: None,
         };
 
         let executor = RskExecutor::new(
@@ -1277,6 +1318,7 @@ mod tests {
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,
+            cached_rlp: None,
         };
 
         let executor = RskExecutor::new(
@@ -1332,6 +1374,7 @@ mod tests {
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,
+            cached_rlp: None,
         };
 
         let executor = RskExecutor::new(
@@ -1434,6 +1477,7 @@ mod tests {
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,
+            cached_rlp: None,
         };
 
         let executor = RskExecutor::new(
@@ -1484,6 +1528,7 @@ mod tests {
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,
+            cached_rlp: None,
         };
 
         let call_result = executor
@@ -1530,6 +1575,7 @@ mod tests {
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,
+            cached_rlp: None,
         };
 
         let executor = RskExecutor::new(
@@ -1587,6 +1633,7 @@ mod tests {
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,
+            cached_rlp: None,
         };
 
         let executor = RskExecutor::new(
@@ -1676,6 +1723,7 @@ mod tests {
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,
+            cached_rlp: None,
         };
 
         let executor = RskExecutor::new(
@@ -1724,6 +1772,7 @@ mod tests {
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,
+            cached_rlp: None,
         };
 
         let call_result = executor
@@ -1830,7 +1879,7 @@ mod tests {
             to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
             value: U256::ZERO,
             input: Bytes::from(input),
-            v: 0, r: U256::ZERO, s: U256::ZERO,
+            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
         };
 
         let executor = RskExecutor::new(
@@ -1887,7 +1936,7 @@ mod tests {
             to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
             value: U256::ZERO,
             input: Bytes::from(input),
-            v: 0, r: U256::ZERO, s: U256::ZERO,
+            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
         };
 
         let executor = RskExecutor::new(
@@ -1932,7 +1981,7 @@ mod tests {
             to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
             value: U256::ZERO,
             input: Bytes::from(input),
-            v: 0, r: U256::ZERO, s: U256::ZERO,
+            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
         };
 
         let executor = RskExecutor::new(
@@ -1979,7 +2028,7 @@ mod tests {
             to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
             value: U256::ZERO,
             input: Bytes::from(input),
-            v: 0, r: U256::ZERO, s: U256::ZERO,
+            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
         };
 
         let executor = RskExecutor::new(
@@ -2026,7 +2075,7 @@ mod tests {
             to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
             value: U256::ZERO,
             input: Bytes::from(input),
-            v: 0, r: U256::ZERO, s: U256::ZERO,
+            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
         };
 
         let executor = RskExecutor::new(
@@ -2072,7 +2121,7 @@ mod tests {
             to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
             value: U256::ZERO,
             input: Bytes::from(input),
-            v: 0, r: U256::ZERO, s: U256::ZERO,
+            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
         };
 
         let executor = RskExecutor::new(
@@ -2111,7 +2160,7 @@ mod tests {
             to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
             value: U256::ZERO,
             input: Bytes::from(input),
-            v: 0, r: U256::ZERO, s: U256::ZERO,
+            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
         };
 
         let executor = RskExecutor::new(
@@ -2148,7 +2197,7 @@ mod tests {
             to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
             value: U256::ZERO,
             input: Bytes::from(input),
-            v: 0, r: U256::ZERO, s: U256::ZERO,
+            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
         };
 
         let executor = RskExecutor::new(
@@ -2190,7 +2239,7 @@ mod tests {
             to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
             value: U256::ZERO,
             input: Bytes::from(input),
-            v: 0, r: U256::ZERO, s: U256::ZERO,
+            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
         };
 
         let executor = RskExecutor::new(
@@ -2238,7 +2287,7 @@ mod tests {
             to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
             value: U256::ZERO,
             input: Bytes::from(input),
-            v: 0, r: U256::ZERO, s: U256::ZERO,
+            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
         };
 
         let executor = RskExecutor::new(
@@ -2285,7 +2334,7 @@ mod tests {
             to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
             value: U256::ZERO,
             input: Bytes::from(input),
-            v: 0, r: U256::ZERO, s: U256::ZERO,
+            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
         };
 
         let executor = RskExecutor::new(
@@ -2337,7 +2386,7 @@ mod tests {
             to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
             value: U256::ZERO,
             input: Bytes::from(input),
-            v: 0, r: U256::ZERO, s: U256::ZERO,
+            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
         };
 
         let executor = RskExecutor::new(
@@ -2405,7 +2454,7 @@ mod tests {
             to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
             value: U256::ZERO,
             input: Bytes::from(input.clone()),
-            v: 0, r: U256::ZERO, s: U256::ZERO,
+            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
         };
         let result = executor.execute_tx(&header, &tx, sender, &root, store.clone()).unwrap();
         assert!(result.success, "uncle index 0 should succeed");
@@ -2423,7 +2472,7 @@ mod tests {
             to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
             value: U256::ZERO,
             input: Bytes::from(input1),
-            v: 0, r: U256::ZERO, s: U256::ZERO,
+            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
         };
         let root1 = put_account(&TrieNode::empty(), store.as_ref(), &sender, 1, one_rbtc);
         let result1 = executor.execute_tx(&header, &tx1, sender, &root1, store.clone()).unwrap();
@@ -2442,7 +2491,7 @@ mod tests {
             to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
             value: U256::ZERO,
             input: Bytes::from(input2),
-            v: 0, r: U256::ZERO, s: U256::ZERO,
+            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
         };
         let root2 = put_account(&TrieNode::empty(), store.as_ref(), &sender, 2, one_rbtc);
         let result2 = executor.execute_tx(&header, &tx2, sender, &root2, store.clone()).unwrap();
@@ -2488,7 +2537,7 @@ mod tests {
             to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
             value: U256::ZERO,
             input: Bytes::from(input),
-            v: 0, r: U256::ZERO, s: U256::ZERO,
+            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
         };
 
         let executor = RskExecutor::new(
@@ -2534,7 +2583,7 @@ mod tests {
             to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
             value: U256::ZERO,
             input: Bytes::from(input),
-            v: 0, r: U256::ZERO, s: U256::ZERO,
+            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
         };
 
         let executor = RskExecutor::new(
@@ -2593,7 +2642,7 @@ mod tests {
             to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
             value: U256::ZERO,
             input: Bytes::from(input),
-            v: 0, r: U256::ZERO, s: U256::ZERO,
+            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
         };
 
         let executor = RskExecutor::new(
@@ -2695,6 +2744,7 @@ mod tests {
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,
+            cached_rlp: None,
         };
 
         let executor = RskExecutor::new(
@@ -2900,6 +2950,7 @@ mod tests {
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,
+            cached_rlp: None,
         };
 
         let executor = RskExecutor::new(
@@ -3236,6 +3287,7 @@ mod tests {
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,
+            cached_rlp: None,
         };
 
         let executor = RskExecutor::new(

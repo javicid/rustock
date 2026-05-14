@@ -100,5 +100,6 @@ fn build_call_tx(req: &CallRequest, header: &rustock_core::Header) -> Transactio
         v: 0,
         r: U256::ZERO,
         s: U256::ZERO,
+        cached_rlp: None,
     }
 }

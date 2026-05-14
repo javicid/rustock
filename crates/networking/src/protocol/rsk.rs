@@ -861,6 +861,7 @@ mod tests {
             v: 27,
             r: U256::from(88),
             s: U256::from(99),
+            cached_rlp: None,
         };
 
         let resp = BodyResponse {
@@ -902,6 +903,7 @@ mod tests {
                 v: 27,
                 r: U256::from(nonce + 100),
                 s: U256::from(nonce + 200),
+                cached_rlp: None,
             }
         }
 

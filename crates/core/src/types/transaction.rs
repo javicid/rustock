@@ -1,9 +1,11 @@
 use alloy_primitives::{Address, B256, U256, Bytes};
-use alloy_rlp::{Encodable, RlpDecodable, RlpEncodable};
+use alloy_rlp::{Decodable, Encodable, RlpEncodable};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, RlpDecodable, RlpEncodable)]
+use crate::rlp_compat::{decode_u64_lenient, decode_u256_lenient};
+
+#[derive(Clone, Debug, Serialize, Deserialize, RlpEncodable)]
 pub struct Transaction {
     pub nonce: u64,
     pub gas_price: U256,
@@ -14,6 +16,88 @@ pub struct Transaction {
     pub v: u64,
     pub r: U256,
     pub s: U256,
+
+    /// Original RLP bytes received from the peer. Java's RLP encoding differs
+    /// from Rust's canonical encoding (leading-zero BigIntegers), so we cache
+    /// the original bytes and use them for transactions_root computation.
+    #[serde(skip)]
+    #[rlp(skip)]
+    pub cached_rlp: Option<Vec<u8>>,
+}
+
+impl PartialEq for Transaction {
+    fn eq(&self, other: &Self) -> bool {
+        self.nonce == other.nonce
+            && self.gas_price == other.gas_price
+            && self.gas_limit == other.gas_limit
+            && self.to == other.to
+            && self.value == other.value
+            && self.input == other.input
+            && self.v == other.v
+            && self.r == other.r
+            && self.s == other.s
+    }
+}
+
+impl Eq for Transaction {}
+
+impl Default for Transaction {
+    fn default() -> Self {
+        Self {
+            nonce: 0,
+            gas_price: U256::ZERO,
+            gas_limit: U256::ZERO,
+            to: Bytes::new(),
+            value: U256::ZERO,
+            input: Bytes::new(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        }
+    }
+}
+
+impl Decodable for Transaction {
+    fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
+        let original = *buf;
+        let h = alloy_rlp::Header::decode(buf)?;
+        if !h.list {
+            return Err(alloy_rlp::Error::UnexpectedString);
+        }
+        let mut body = &buf[..h.payload_length];
+        *buf = &buf[h.payload_length..];
+
+        let consumed = original.len() - buf.len();
+        let cached = original[..consumed].to_vec();
+
+        Ok(Self {
+            nonce: decode_u64_lenient(&mut body)?,
+            gas_price: decode_u256_lenient(&mut body)?,
+            gas_limit: decode_u256_lenient(&mut body)?,
+            to: Bytes::decode(&mut body)?,
+            value: decode_u256_lenient(&mut body)?,
+            input: Bytes::decode(&mut body)?,
+            v: decode_u64_lenient(&mut body)?,
+            r: decode_u256_lenient(&mut body)?,
+            s: decode_u256_lenient(&mut body)?,
+            cached_rlp: Some(cached),
+        })
+    }
+}
+
+impl Transaction {
+    /// Returns the RLP encoding to use for trie root computation.
+    /// Prefers the original bytes (from peer) to match Java's encoding;
+    /// falls back to re-encoding if no cached bytes are available.
+    pub fn rlp_for_trie(&self) -> Vec<u8> {
+        if let Some(ref cached) = self.cached_rlp {
+            return cached.clone();
+        }
+        let mut buf = Vec::new();
+        self.encode(&mut buf);
+        buf
+    }
 }
 
 impl Transaction {
@@ -103,6 +187,65 @@ impl Transaction {
     pub fn is_eip155(&self, chain_id: u64) -> bool {
         self.v != 27 && self.v != 28 && self.v >= chain_id * 2 + 35
     }
+
+    /// Recover the compressed (33-byte) secp256k1 public key from the transaction signature.
+    ///
+    /// Used to derive the BTC P2PKH address for peg-out destination:
+    /// `RIPEMD160(SHA256(compressed_pubkey))` = BTC hash160.
+    ///
+    /// Returns `None` if the signature is invalid or missing.
+    pub fn recover_compressed_pubkey(&self, chain_id: u64) -> Option<[u8; 33]> {
+        let hash = self.signing_hash(chain_id);
+
+        let recovery_id = if self.is_eip155(chain_id) {
+            let rid = self.v as i64 - chain_id as i64 * 2 - 35;
+            if !(0..=1).contains(&rid) { return None; }
+            rid as u8
+        } else {
+            if self.v != 27 && self.v != 28 { return None; }
+            (self.v - 27) as u8
+        };
+
+        let mut sig_bytes = [0u8; 64];
+        sig_bytes[..32].copy_from_slice(&self.r.to_be_bytes::<32>());
+        sig_bytes[32..].copy_from_slice(&self.s.to_be_bytes::<32>());
+
+        let signature = k256::ecdsa::Signature::from_slice(&sig_bytes).ok()?;
+        let recid = k256::ecdsa::RecoveryId::from_byte(recovery_id)?;
+
+        let vk = k256::ecdsa::VerifyingKey::recover_from_prehash(
+            hash.as_slice(),
+            &signature,
+            recid,
+        ).ok()?;
+
+        let compressed = vk.to_encoded_point(true);
+        let mut arr = [0u8; 33];
+        arr.copy_from_slice(compressed.as_bytes());
+        Some(arr)
+    }
+
+    /// Compute the Keccak256 hash of this transaction's RLP bytes.
+    /// This is the standard Ethereum/RSK transaction hash.
+    pub fn tx_hash(&self) -> B256 {
+        let rlp = self.rlp_for_trie();
+        B256::from_slice(&Keccak256::digest(&rlp))
+    }
+
+    /// Derive the BTC P2PKH destination hash160 for this transaction's sender.
+    ///
+    /// Matches rskj's `BridgeUtils.recoverBtcAddressFromEthTransaction`:
+    /// recovers the compressed public key from the ECDSA signature, then computes
+    /// `RIPEMD160(SHA256(compressed_pubkey))`.
+    pub fn btc_sender_hash160(&self, chain_id: u64) -> Option<[u8; 20]> {
+        use sha2::Digest as Sha2Digest;
+        let compressed = self.recover_compressed_pubkey(chain_id)?;
+        let sha256_hash = sha2::Sha256::digest(&compressed);
+        let hash160 = ripemd::Ripemd160::digest(sha256_hash);
+        let mut arr = [0u8; 20];
+        arr.copy_from_slice(&hash160);
+        Some(arr)
+    }
 }
 
 #[cfg(test)]
@@ -123,6 +266,7 @@ mod tests {
             v: 1,
             r: U256::from(123),
             s: U256::from(456),
+            cached_rlp: None,
         };
 
         let mut buffer = Vec::new();
@@ -144,6 +288,7 @@ mod tests {
             v: 95, // chain_id=30: 30*2+35=95
             r: U256::from(1),
             s: U256::from(1),
+            cached_rlp: None,
         };
         assert!(tx.is_eip155(30));
 
@@ -170,6 +315,7 @@ mod tests {
             v: 27,
             r: U256::from(1),
             s: U256::from(1),
+            cached_rlp: None,
         };
 
         let hash = tx.signing_hash(30);
@@ -193,6 +339,7 @@ mod tests {
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,
+            cached_rlp: None,
         };
 
         // Compute signing hash before v/r/s are set — use EIP-155 variant directly

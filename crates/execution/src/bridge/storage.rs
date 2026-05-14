@@ -70,8 +70,21 @@ pub const SVP_FUND_TX_SIGNED_KEY: &str = "svpFundTxSigned";
 pub const SVP_SPEND_TX_HASH_UNSIGNED_KEY: &str = "svpSpendTxHashUnsigned";
 pub const SVP_SPEND_TX_WAITING_FOR_SIGNATURES_KEY: &str = "svpSpendTxWaitingForSignatures";
 
+// ---------------------------------------------------------------------------
+// Whitelist storage keys (from rskj WhitelistStorageIndexKey)
+// ---------------------------------------------------------------------------
+
+/// One-off lock whitelist key ("lockWhitelist" = 13 bytes, fromString encoding).
+pub const LOCK_WHITELIST_KEY: &str = "lockWhitelist";
+/// Unlimited lock whitelist key ("unlimitedLockWhitelist" = 22 bytes, fromString encoding).
+/// Active post-RSKIP87 (Orchid).
+pub const UNLIMITED_LOCK_WHITELIST_KEY: &str = "unlimitedLockWhitelist";
+
 // BTC block store
 pub const BLOCK_STORE_CHAIN_HEAD_KEY: &str = "blockStoreChainHead";
+
+// Fee governance
+pub const FEE_PER_KB_KEY: &str = "feePerKb";
 
 // ---------------------------------------------------------------------------
 // Federation storage index keys (from rskj FederationStorageIndexKey)
@@ -263,6 +276,300 @@ pub fn bridge_transfer<CTX: ContextTr>(ctx: &mut CTX, recipient: Address, amount
 }
 
 // ---------------------------------------------------------------------------
+// Whitelist serialization helpers
+//
+// Format (rskj BridgeSerializationUtils.serializeOneOffLockWhitelist):
+//   RLP_list [ hash160_0, bigint(maxVal_0), hash160_1, bigint(maxVal_1), ..., bigint(disableBlockHeight) ]
+//
+// Format (rskj BridgeSerializationUtils.serializeUnlimitedLockWhitelist):
+//   RLP_list [ hash160_0, hash160_1, ... ]
+// ---------------------------------------------------------------------------
+
+/// Serialize one-off whitelist entries with disable block height.
+///
+/// Matches rskj's `BridgeSerializationUtils.serializeOneOffLockWhitelist`.
+/// `entries`: (BTC hash160, max transfer value in satoshis)
+/// `disable_height`: block height at which this whitelist is disabled (-1 = never set)
+pub fn serialize_one_off_whitelist(entries: &[([u8; 20], u64)], disable_height: i32) -> Vec<u8> {
+    use super::serialization::{rlp_encode_element, rlp_encode_list, rlp_encode_u64};
+
+    let size = entries.len() * 2 + 1;
+    let mut items = Vec::with_capacity(size);
+
+    for (hash160, max_val) in entries {
+        items.push(rlp_encode_element(hash160));
+        items.push(rlp_encode_u64(*max_val));
+    }
+
+    // Disable block height: stored as RLP-encoded BigInteger (same as rlp_encode_u64 but signed)
+    if disable_height >= 0 {
+        items.push(rlp_encode_u64(disable_height as u64));
+    } else {
+        // Negative disable_height (never disabled): encode as 0
+        items.push(rlp_encode_u64(0));
+    }
+
+    rlp_encode_list(&items)
+}
+
+/// Deserialize one-off whitelist entries with disable block height.
+///
+/// Returns (entries: Vec<(hash160, max_val_satoshis)>, disable_height).
+pub fn deserialize_one_off_whitelist(data: &[u8]) -> Option<(Vec<([u8; 20], u64)>, i32)> {
+    use super::serialization::{rlp_decode_list, rlp_decode_u64};
+
+    if data.is_empty() {
+        return Some((Vec::new(), i32::MIN));
+    }
+
+    let items = rlp_decode_list(data)?;
+    if items.is_empty() {
+        return Some((Vec::new(), i32::MIN));
+    }
+
+    // Last item is disable block height; rest are (hash160, max_val) pairs
+    let entry_count = (items.len() - 1) / 2;
+    let mut entries = Vec::with_capacity(entry_count);
+
+    for i in 0..entry_count {
+        let hash_bytes = &items[i * 2];
+        let val_bytes = &items[i * 2 + 1];
+        if hash_bytes.len() != 20 {
+            return None;
+        }
+        let mut hash160 = [0u8; 20];
+        hash160.copy_from_slice(hash_bytes);
+        let max_val = rlp_decode_u64(val_bytes);
+        entries.push((hash160, max_val));
+    }
+
+    let disable_height = rlp_decode_u64(items.last()?) as i32;
+
+    Some((entries, disable_height))
+}
+
+/// Serialize unlimited whitelist entries.
+///
+/// Matches rskj's `BridgeSerializationUtils.serializeUnlimitedLockWhitelist`.
+pub fn serialize_unlimited_whitelist(entries: &[[u8; 20]]) -> Vec<u8> {
+    use super::serialization::{rlp_encode_element, rlp_encode_list};
+
+    let items: Vec<Vec<u8>> = entries.iter().map(|h| rlp_encode_element(h)).collect();
+    rlp_encode_list(&items)
+}
+
+/// Deserialize unlimited whitelist entries.
+///
+/// Returns Vec of BTC hash160 values.
+pub fn deserialize_unlimited_whitelist(data: &[u8]) -> Vec<[u8; 20]> {
+    use super::serialization::rlp_decode_list;
+
+    if data.is_empty() {
+        return Vec::new();
+    }
+
+    let items = match rlp_decode_list(data) {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+
+    items
+        .into_iter()
+        .filter_map(|b| {
+            if b.len() == 20 {
+                let mut arr = [0u8; 20];
+                arr.copy_from_slice(&b);
+                Some(arr)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Load the one-off lock whitelist from Bridge storage.
+pub fn load_one_off_whitelist<CTX: ContextTr>(ctx: &mut CTX) -> (Vec<([u8; 20], u64)>, i32) {
+    let data = bridge_load_bytes_named(ctx, LOCK_WHITELIST_KEY);
+    deserialize_one_off_whitelist(&data).unwrap_or((Vec::new(), i32::MIN))
+}
+
+/// Store the one-off lock whitelist into Bridge storage.
+pub fn store_one_off_whitelist<CTX: ContextTr>(
+    ctx: &mut CTX,
+    entries: &[([u8; 20], u64)],
+    disable_height: i32,
+) {
+    let data = serialize_one_off_whitelist(entries, disable_height);
+    bridge_store_bytes_named(ctx, LOCK_WHITELIST_KEY, &data);
+}
+
+/// Load the unlimited lock whitelist from Bridge storage.
+pub fn load_unlimited_whitelist<CTX: ContextTr>(ctx: &mut CTX) -> Vec<[u8; 20]> {
+    let data = bridge_load_bytes_named(ctx, UNLIMITED_LOCK_WHITELIST_KEY);
+    deserialize_unlimited_whitelist(&data)
+}
+
+/// Store the unlimited lock whitelist into Bridge storage.
+pub fn store_unlimited_whitelist<CTX: ContextTr>(ctx: &mut CTX, entries: &[[u8; 20]]) {
+    let data = serialize_unlimited_whitelist(entries);
+    bridge_store_bytes_named(ctx, UNLIMITED_LOCK_WHITELIST_KEY, &data);
+}
+
+// ---------------------------------------------------------------------------
+// UTXO serialization
+//
+// Format matches co.rsk.bitcoinj.core.UTXO.serializeToStream:
+//   value        (8 bytes, little-endian int64)
+//   script_len   (1 byte for scripts ≤ 252 bytes; varint otherwise)
+//   script       (N bytes)
+//   hash         (32 bytes, as stored — big-endian SHA256d)
+//   index        (4 bytes, little-endian uint32)
+//   height       (4 bytes, little-endian int32)
+//   coinbase     (1 byte, 0 = false)
+// ---------------------------------------------------------------------------
+
+/// A Bitcoin UTXO (unspent transaction output) stored in Bridge contract storage.
+#[derive(Debug, Clone)]
+pub struct BridgeUtxo {
+    /// SHA256d hash of the transaction containing this output (big-endian internal bytes).
+    pub tx_hash: [u8; 32],
+    /// Output index in the transaction.
+    pub vout: u32,
+    /// Value in satoshis.
+    pub value_satoshis: u64,
+    /// Height of the block containing this UTXO.
+    pub height: u32,
+    /// ScriptPubKey of the output.
+    pub script: Vec<u8>,
+    /// Whether this output is a coinbase output.
+    pub coinbase: bool,
+}
+
+/// Serialize a UTXO to bytes (bitcoinj UTXO.serializeToStream format).
+fn serialize_utxo(utxo: &BridgeUtxo) -> Vec<u8> {
+    let mut buf = Vec::new();
+
+    // value: 8 bytes little-endian
+    buf.extend_from_slice(&utxo.value_satoshis.to_le_bytes());
+
+    // script length varint + script bytes
+    let script_len = utxo.script.len();
+    if script_len < 0xfd {
+        buf.push(script_len as u8);
+    } else if script_len <= 0xffff {
+        buf.push(0xfd);
+        buf.extend_from_slice(&(script_len as u16).to_le_bytes());
+    } else {
+        buf.push(0xfe);
+        buf.extend_from_slice(&(script_len as u32).to_le_bytes());
+    }
+    buf.extend_from_slice(&utxo.script);
+
+    // hash: 32 bytes as-is (big-endian internal representation)
+    buf.extend_from_slice(&utxo.tx_hash);
+
+    // index: 4 bytes little-endian
+    buf.extend_from_slice(&utxo.vout.to_le_bytes());
+
+    // height: 4 bytes little-endian
+    buf.extend_from_slice(&utxo.height.to_le_bytes());
+
+    // coinbase: 1 byte
+    buf.push(if utxo.coinbase { 1 } else { 0 });
+
+    buf
+}
+
+/// Deserialize a UTXO from bytes.
+fn deserialize_utxo(data: &[u8]) -> Option<BridgeUtxo> {
+    if data.len() < 8 + 1 + 0 + 32 + 4 + 4 + 1 {
+        return None;
+    }
+
+    let mut pos = 0;
+
+    // value: 8 bytes LE
+    let value_satoshis = u64::from_le_bytes(data[pos..pos + 8].try_into().ok()?);
+    pos += 8;
+
+    // script length varint
+    let (script_len, varint_size) = if data[pos] < 0xfd {
+        (data[pos] as usize, 1)
+    } else if data[pos] == 0xfd {
+        if pos + 3 > data.len() { return None; }
+        (u16::from_le_bytes([data[pos + 1], data[pos + 2]]) as usize, 3)
+    } else {
+        if pos + 5 > data.len() { return None; }
+        (u32::from_le_bytes(data[pos + 1..pos + 5].try_into().ok()?) as usize, 5)
+    };
+    pos += varint_size;
+
+    if pos + script_len > data.len() { return None; }
+    let script = data[pos..pos + script_len].to_vec();
+    pos += script_len;
+
+    if pos + 32 > data.len() { return None; }
+    let tx_hash: [u8; 32] = data[pos..pos + 32].try_into().ok()?;
+    pos += 32;
+
+    if pos + 4 > data.len() { return None; }
+    let vout = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?);
+    pos += 4;
+
+    if pos + 4 > data.len() { return None; }
+    let height = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?);
+    pos += 4;
+
+    if pos >= data.len() { return None; }
+    let coinbase = data[pos] != 0;
+
+    Some(BridgeUtxo { tx_hash, vout, value_satoshis, height, script, coinbase })
+}
+
+/// Serialize a list of UTXOs (RLP list of RLP-encoded UTXO blobs).
+///
+/// Matches rskj's `BridgeSerializationUtils.serializeUTXOList`.
+pub fn serialize_utxo_list(utxos: &[BridgeUtxo]) -> Vec<u8> {
+    use super::serialization::{rlp_encode_element, rlp_encode_list};
+
+    let items: Vec<Vec<u8>> = utxos
+        .iter()
+        .map(|u| rlp_encode_element(&serialize_utxo(u)))
+        .collect();
+    rlp_encode_list(&items)
+}
+
+/// Deserialize a list of UTXOs from RLP.
+///
+/// Matches rskj's `BridgeSerializationUtils.deserializeUTXOList`.
+pub fn deserialize_utxo_list(data: &[u8]) -> Vec<BridgeUtxo> {
+    use super::serialization::rlp_decode_list;
+
+    if data.is_empty() {
+        return Vec::new();
+    }
+
+    let items = match rlp_decode_list(data) {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+
+    items.into_iter().filter_map(|b| deserialize_utxo(&b)).collect()
+}
+
+/// Load the active federation's BTC UTXOs from Bridge storage.
+pub fn load_federation_utxos<CTX: ContextTr>(ctx: &mut CTX) -> Vec<BridgeUtxo> {
+    let data = bridge_load_bytes_named(ctx, NEW_FEDERATION_BTC_UTXOS_KEY);
+    deserialize_utxo_list(&data)
+}
+
+/// Store the active federation's BTC UTXOs into Bridge storage.
+pub fn store_federation_utxos<CTX: ContextTr>(ctx: &mut CTX, utxos: &[BridgeUtxo]) {
+    let data = serialize_utxo_list(utxos);
+    bridge_store_bytes_named(ctx, NEW_FEDERATION_BTC_UTXOS_KEY, &data);
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -420,16 +727,148 @@ mod tests {
             ("oldFederation", 13),
             ("pendingFederation", 17),
             ("federationElection", 18),
+            ("lockWhitelist", 13),
+            ("unlimitedLockWhitelist", 22),
         ];
         for (name, expected_len) in &keys_and_lengths {
             assert_eq!(name.len(), *expected_len, "key length mismatch for {name}");
             let key = bridge_storage_key(name);
             let bytes = key.to_be_bytes::<32>();
             assert_eq!(&bytes[32 - expected_len..], name.as_bytes());
-            // Leading bytes must be zero
             for &b in &bytes[..32 - expected_len] {
                 assert_eq!(b, 0, "non-zero leading byte for key {name}");
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Whitelist serialization tests — ported from rskj
+    // WhitelistStorageProviderImplTest.java
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rskj_whitelist_one_off_empty_roundtrip() {
+        let data = serialize_one_off_whitelist(&[], 0);
+        let (entries, disable_h) = deserialize_one_off_whitelist(&data).unwrap();
+        assert!(entries.is_empty());
+        assert_eq!(disable_h, 0);
+    }
+
+    #[test]
+    fn rskj_whitelist_one_off_single_entry_roundtrip() {
+        let hash160 = [0x11u8; 20];
+        let max_val = 1_000_000u64;
+        let disable_h = 42i32;
+
+        let data = serialize_one_off_whitelist(&[(hash160, max_val)], disable_h);
+        let (entries, dh) = deserialize_one_off_whitelist(&data).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, hash160);
+        assert_eq!(entries[0].1, max_val);
+        assert_eq!(dh, disable_h);
+    }
+
+    #[test]
+    fn rskj_whitelist_one_off_two_entries_roundtrip() {
+        let hash1 = [0xAAu8; 20];
+        let hash2 = [0xBBu8; 20];
+        let entries_in = [(hash1, 500_000u64), (hash2, 2_000_000u64)];
+        let disable_h = 100i32;
+
+        let data = serialize_one_off_whitelist(&entries_in, disable_h);
+        let (entries_out, dh) = deserialize_one_off_whitelist(&data).unwrap();
+
+        assert_eq!(entries_out.len(), 2);
+        assert_eq!(entries_out[0].0, hash1);
+        assert_eq!(entries_out[0].1, 500_000);
+        assert_eq!(entries_out[1].0, hash2);
+        assert_eq!(entries_out[1].1, 2_000_000);
+        assert_eq!(dh, disable_h);
+    }
+
+    #[test]
+    fn rskj_whitelist_unlimited_empty_roundtrip() {
+        let data = serialize_unlimited_whitelist(&[]);
+        let entries = deserialize_unlimited_whitelist(&data);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn rskj_whitelist_unlimited_two_entries_roundtrip() {
+        let hash1 = [0xAAu8; 20];
+        let hash2 = [0xBBu8; 20];
+        let data = serialize_unlimited_whitelist(&[hash1, hash2]);
+        let entries = deserialize_unlimited_whitelist(&data);
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], hash1);
+        assert_eq!(entries[1], hash2);
+    }
+
+    #[test]
+    fn rskj_whitelist_empty_data() {
+        let (entries, _) = deserialize_one_off_whitelist(&[]).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // UTXO serialization tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rskj_utxo_roundtrip() {
+        // P2SH script: OP_HASH160 <20 bytes> OP_EQUAL (23 bytes)
+        let mut script = vec![0xa9u8, 0x14];
+        script.extend_from_slice(&[0x42u8; 20]);
+        script.push(0x87);
+
+        let utxo = BridgeUtxo {
+            tx_hash: [0xCCu8; 32],
+            vout: 1,
+            value_satoshis: 500_000,
+            height: 700_000,
+            script,
+            coinbase: false,
+        };
+
+        let encoded = serialize_utxo(&utxo);
+        let decoded = deserialize_utxo(&encoded).unwrap();
+
+        assert_eq!(decoded.tx_hash, utxo.tx_hash);
+        assert_eq!(decoded.vout, utxo.vout);
+        assert_eq!(decoded.value_satoshis, utxo.value_satoshis);
+        assert_eq!(decoded.height, utxo.height);
+        assert_eq!(decoded.script, utxo.script);
+        assert_eq!(decoded.coinbase, utxo.coinbase);
+    }
+
+    #[test]
+    fn rskj_utxo_list_roundtrip() {
+        let utxos: Vec<BridgeUtxo> = (0..3u8).map(|i| BridgeUtxo {
+            tx_hash: [i; 32],
+            vout: i as u32,
+            value_satoshis: (i as u64 + 1) * 100_000,
+            height: 100_000 + i as u32,
+            script: vec![0xa9, 0x14, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, 0x87],
+            coinbase: false,
+        }).collect();
+
+        let data = serialize_utxo_list(&utxos);
+        let decoded = deserialize_utxo_list(&data);
+
+        assert_eq!(decoded.len(), 3);
+        for (orig, dec) in utxos.iter().zip(decoded.iter()) {
+            assert_eq!(dec.tx_hash, orig.tx_hash);
+            assert_eq!(dec.vout, orig.vout);
+            assert_eq!(dec.value_satoshis, orig.value_satoshis);
+        }
+    }
+
+    #[test]
+    fn rskj_utxo_list_empty_roundtrip() {
+        let data = serialize_utxo_list(&[]);
+        let decoded = deserialize_utxo_list(&data);
+        assert!(decoded.is_empty());
     }
 }

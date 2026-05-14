@@ -796,6 +796,24 @@ pub fn rsk_precompiles(hardfork_cfg: &RskHardforkConfig, block_number: u64) -> P
 // PrecompileProvider implementation for revm integration
 // ---------------------------------------------------------------------------
 
+/// Context about the currently-executing transaction, used by Bridge precompile.
+///
+/// The Bridge's `releaseBtc` method needs:
+/// - The RSK tx hash (for RSKIP146 release queue format)
+/// - The BTC destination hash160 (derived from the sender's compressed pubkey)
+///
+/// This context is set by the executor before each `transact_one` call and
+/// read by the Bridge precompile inside `run_bridge`.
+#[derive(Debug, Clone, Default)]
+pub struct BridgeTxContext {
+    /// Keccak256 of the RLP-encoded transaction.
+    pub rsk_tx_hash: [u8; 32],
+    /// BTC P2PKH destination: RIPEMD160(SHA256(compressed_pubkey)).
+    /// Derived from the RSK transaction's secp256k1 signature.
+    /// Zero bytes if the pubkey cannot be recovered (system/REMASC transactions).
+    pub btc_sender_hash160: [u8; 20],
+}
+
 /// Wraps an owned `Precompiles` set to implement revm's `PrecompileProvider`.
 ///
 /// Unlike `EthPrecompiles` which holds a `&'static Precompiles`, this owns the
@@ -808,6 +826,9 @@ pub struct RskPrecompileProvider {
     block_store: Option<Arc<BlockStore>>,
     remasc_config: RemascConfig,
     bridge_config: BridgeConstants,
+    /// Shared slot for per-transaction context used by Bridge precompile.
+    /// Updated by the executor before each `transact_one`.
+    bridge_tx_context: std::sync::Arc<std::sync::Mutex<BridgeTxContext>>,
 }
 
 impl std::fmt::Debug for RskPrecompileProvider {
@@ -817,6 +838,14 @@ impl std::fmt::Debug for RskPrecompileProvider {
             .field("spec", &self.spec)
             .field("block_store", &self.block_store.as_ref().map(|_| "BlockStore"))
             .finish()
+    }
+}
+
+impl RskPrecompileProvider {
+    /// Returns the shared bridge tx context Arc, allowing the executor to update
+    /// per-transaction context before each `transact_one` call.
+    pub fn bridge_tx_context_slot(&self) -> std::sync::Arc<std::sync::Mutex<BridgeTxContext>> {
+        std::sync::Arc::clone(&self.bridge_tx_context)
     }
 }
 
@@ -846,6 +875,7 @@ impl RskPrecompileProvider {
             block_store,
             remasc_config,
             bridge_config: BridgeConstants::mainnet(),
+            bridge_tx_context: std::sync::Arc::new(std::sync::Mutex::new(BridgeTxContext::default())),
         }
     }
 
@@ -854,6 +884,7 @@ impl RskPrecompileProvider {
         self.bridge_config = config;
         self
     }
+
 
     /// Dispatch stateful RSK precompiles that need access to the execution context.
     ///
@@ -1098,6 +1129,9 @@ impl RskPrecompileProvider {
     ) -> Result<PrecompileOutput, PrecompileError> {
         let block_number = context.block().number().to::<u64>();
         let use_v2 = self.hardfork_cfg.has_stored_block_v2(block_number);
+        let tx_ctx = self.bridge_tx_context.lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
         crate::bridge::execute_bridge(
             context,
             input,
@@ -1105,6 +1139,8 @@ impl RskPrecompileProvider {
             &self.bridge_config,
             self.block_store.as_ref(),
             use_v2,
+            &self.hardfork_cfg,
+            &tx_ctx,
         )
     }
 
@@ -1134,6 +1170,7 @@ impl Clone for RskPrecompileProvider {
             block_store: self.block_store.clone(),
             remasc_config: self.remasc_config.clone(),
             bridge_config: self.bridge_config.clone(),
+            bridge_tx_context: std::sync::Arc::clone(&self.bridge_tx_context),
         }
     }
 }

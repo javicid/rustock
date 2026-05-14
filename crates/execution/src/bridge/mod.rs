@@ -30,6 +30,8 @@ use sha3::{Digest, Keccak256};
 use std::sync::Arc;
 
 use constants::BridgeConstants;
+use crate::hardfork::RskHardforkConfig;
+use crate::precompiles::BridgeTxContext;
 
 // ---------------------------------------------------------------------------
 // ABI selector helper
@@ -207,9 +209,11 @@ pub fn execute_bridge<CTX: ContextTr>(
     ctx: &mut CTX,
     input: &[u8],
     gas_limit: u64,
-    _config: &BridgeConstants,
-    _block_store: Option<&Arc<BlockStore>>,
+    config: &BridgeConstants,
+    block_store: Option<&Arc<BlockStore>>,
     use_v2: bool,
+    hardfork_cfg: &RskHardforkConfig,
+    tx_ctx: &BridgeTxContext,
 ) -> Result<PrecompileOutput, PrecompileError> {
     // Empty input → releaseBtc (legacy behavior matching rskj)
     if input.is_empty() {
@@ -217,7 +221,7 @@ pub fn execute_bridge<CTX: ContextTr>(
         if gas_limit < gas_cost {
             return Err(PrecompileError::OutOfGas);
         }
-        return execute_method(ctx, "releaseBtc", &[], gas_cost, _config, _block_store, use_v2);
+        return execute_method(ctx, "releaseBtc", &[], gas_cost, config, block_store, use_v2, hardfork_cfg, tx_ctx);
     }
 
     if input.len() < 4 {
@@ -245,7 +249,7 @@ pub fn execute_bridge<CTX: ContextTr>(
     }
 
     let args = &input[4..];
-    execute_method(ctx, method.name, args, gas_cost, _config, _block_store, use_v2)
+    execute_method(ctx, method.name, args, gas_cost, config, block_store, use_v2, hardfork_cfg, tx_ctx)
 }
 
 /// Dispatch to individual method handlers.
@@ -257,6 +261,8 @@ fn execute_method<CTX: ContextTr>(
     config: &BridgeConstants,
     _block_store: Option<&Arc<BlockStore>>,
     use_v2: bool,
+    hardfork_cfg: &RskHardforkConfig,
+    tx_ctx: &BridgeTxContext,
 ) -> Result<PrecompileOutput, PrecompileError> {
 
     match method_name {
@@ -279,9 +285,9 @@ fn execute_method<CTX: ContextTr>(
         "registerFastBridgeBtcTransaction" => peg::register_fast_bridge_btc_transaction(ctx, args, gas_cost, config),
 
         // Phase 5: Peg-out
-        "releaseBtc" => peg::release_btc(ctx, gas_cost, config),
-        "updateCollections" => peg::update_collections(ctx, gas_cost, config),
-        "addSignature" => peg::add_signature(ctx, args, gas_cost),
+        "releaseBtc" => peg::release_btc(ctx, gas_cost, config, hardfork_cfg, tx_ctx),
+        "updateCollections" => peg::update_collections(ctx, gas_cost, config, hardfork_cfg, tx_ctx),
+        "addSignature" => peg::add_signature(ctx, args, gas_cost, hardfork_cfg),
 
         // Phase 6: Governance
         "createFederation" => governance::create_federation(ctx, gas_cost),

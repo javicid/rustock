@@ -2946,6 +2946,7 @@ dependencies = [
  "hex",
  "hex-literal",
  "k256",
+ "ripemd",
  "rustock-trie",
  "serde",
  "sha2",

@@ -32,21 +32,23 @@ const LONG_SYNC_LIMIT: u64 = 24;
 
 fn create_block_hash_request(height: u64) -> P2pMessage {
     let req = BlockHashRequest {
-        id: rand::random(),
+        id: rand::random::<u64>() & 0x7FFFFFFFFFFFFFFF,
         height,
     };
     P2pMessage::RskMessage(RskMessage::new(RskSubMessage::BlockHashRequest(req)))
 }
 
 fn create_body_request(hash: B256) -> (u64, P2pMessage) {
-    let id: u64 = rand::random();
+    // Mask to 63 bits: RSKj uses Java's signed long, so IDs > 2^63 get
+    // sign-mangled when echoed back via BigInteger.valueOf(long).
+    let id: u64 = rand::random::<u64>() & 0x7FFFFFFFFFFFFFFF;
     let req = BodyRequest { id, hash };
     (id, P2pMessage::RskMessage(RskMessage::new(RskSubMessage::BodyRequest(req))))
 }
 
 fn create_skeleton_request(start_number: u64) -> P2pMessage {
     let req = SkeletonRequest {
-        id: rand::random(),
+        id: rand::random::<u64>() & 0x7FFFFFFFFFFFFFFF,
         start_number,
     };
     P2pMessage::RskMessage(RskMessage::new(RskSubMessage::SkeletonRequest(req)))
@@ -127,7 +129,16 @@ impl SyncService {
                 event = self.event_rx.recv() => {
                     match event {
                         Some(e) => {
-                            self.last_progress = Instant::now();
+                            let is_progress = matches!(
+                                &e,
+                                SyncEvent::HeadersResponse { .. }
+                                | SyncEvent::BodyResponse { .. }
+                                | SyncEvent::SkeletonResponse { .. }
+                                | SyncEvent::BlockHashResponse { .. }
+                            );
+                            if is_progress {
+                                self.last_progress = Instant::now();
+                            }
                             self.handle_event(e).await;
                         }
                         None => break,
@@ -144,6 +155,18 @@ impl SyncService {
             }
             SyncState::Following => {
                 self.check_follow_gap().await;
+            }
+            SyncState::DownloadingBodies { .. } => {
+                if self.last_progress.elapsed() > REQUEST_TIMEOUT {
+                    warn!(
+                        target: "rustock::sync",
+                        "Body download timed out, retrying stalled requests"
+                    );
+                    self.retry_body_requests().await;
+                    self.last_progress = Instant::now();
+                } else {
+                    self.log_progress().await;
+                }
             }
             _ => {
                 if self.last_progress.elapsed() > REQUEST_TIMEOUT {
@@ -820,17 +843,68 @@ impl SyncService {
         {
             let peers = self.peer_store.peers().await;
             if peers.is_empty() {
+                debug!(target: "rustock::sync", "No connected peers for body requests");
                 return;
             }
 
+            let mut sent = 0u32;
             while in_flight.len() < MAX_BODY_IN_FLIGHT && *next_request < pending_headers.len() {
                 let (hash, _header) = &pending_headers[*next_request];
                 let (req_id, msg) = create_body_request(*hash);
                 let peer = &peers[*next_request % peers.len()];
-                self.peer_store.send_to_peer(peer, msg).await;
-                in_flight.insert(req_id, *next_request);
+                let ok = self.peer_store.send_to_peer(peer, msg).await;
+                if ok {
+                    in_flight.insert(req_id, *next_request);
+                    sent += 1;
+                } else {
+                    debug!(
+                        target: "rustock::sync",
+                        "Failed to send body request to peer {:?}, skipping",
+                        &peer.0[..4]
+                    );
+                }
                 *next_request += 1;
             }
+            if sent > 0 {
+                debug!(
+                    target: "rustock::sync",
+                    "Sent {sent} body requests ({} in-flight, {} pending)",
+                    in_flight.len(),
+                    pending_headers.len().saturating_sub(*next_request)
+                );
+            }
+        }
+    }
+
+    /// Re-send all in-flight body requests (they timed out without response).
+    async fn retry_body_requests(&mut self) {
+        if let SyncState::DownloadingBodies {
+            pending_headers,
+            in_flight,
+            ..
+        } = &mut self.state
+        {
+            let peers = self.peer_store.peers().await;
+            if peers.is_empty() {
+                warn!(target: "rustock::sync", "No peers for body retry");
+                return;
+            }
+
+            let stalled: Vec<(u64, usize)> = in_flight.drain().collect();
+            let count = stalled.len();
+            for (i, (_old_id, idx)) in stalled.into_iter().enumerate() {
+                let (hash, _header) = &pending_headers[idx];
+                let (req_id, msg) = create_body_request(*hash);
+                let peer = &peers[i % peers.len()];
+                if self.peer_store.send_to_peer(peer, msg).await {
+                    in_flight.insert(req_id, idx);
+                }
+            }
+            info!(
+                target: "rustock::sync",
+                "Retried {count} stalled body requests across {} peers",
+                peers.len()
+            );
         }
     }
 
@@ -851,9 +925,11 @@ impl SyncService {
                 let idx = match in_flight.remove(&request_id) {
                     Some(i) => i,
                     None => {
+                        let known_ids: Vec<u64> = in_flight.keys().copied().collect();
                         warn!(
                             target: "rustock::sync",
-                            "Received body response for unknown request {}", request_id
+                            "Received body response for unknown request {}. In-flight IDs: {:?}",
+                            request_id, known_ids
                         );
                         self.state = SyncState::DownloadingBodies {
                             peer_best,

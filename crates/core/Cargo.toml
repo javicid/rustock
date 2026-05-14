@@ -12,6 +12,7 @@ hex = "0.4.3"
 hex-literal = "0.4.1"
 k256 = { version = "0.13.4", features = ["ecdsa"] }
 serde = { workspace = true }
+ripemd = "0.1"
 sha2 = "0.10.9"
 sha3 = "0.10"
 rustock-trie = { version = "0.1.0", path = "../trie" }

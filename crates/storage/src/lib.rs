@@ -259,6 +259,8 @@ impl BlockStore {
 
 impl BlockStore {
     /// Stores a block body (transactions + ommers) keyed by block hash.
+    /// Uses the original peer-received RLP when available to preserve Java's
+    /// non-canonical encoding (leading zeros in BigIntegers).
     pub fn put_body(
         &self,
         hash: B256,
@@ -267,7 +269,7 @@ impl BlockStore {
     ) -> Result<()> {
         let mut txs_payload = Vec::new();
         for tx in transactions {
-            tx.encode(&mut txs_payload);
+            txs_payload.extend_from_slice(&tx.rlp_for_trie());
         }
         let mut ommers_payload = Vec::new();
         for uncle in ommers {
@@ -451,6 +453,7 @@ mod tests {
             v: 27,
             r: U256::from(nonce + 100),
             s: U256::from(nonce + 200),
+            cached_rlp: None,
         }
     }
 

@@ -203,7 +203,7 @@ impl SyncManager {
     /// Helper to create a headers request message.
     pub fn create_headers_request(&self, start_hash: B256, count: u32) -> P2pMessage {
         let req = BlockHeadersRequest {
-            id: rand::random(),
+            id: rand::random::<u64>() & 0x7FFFFFFFFFFFFFFF,
             query: BlockHeadersQuery {
                 hash: start_hash,
                 count,

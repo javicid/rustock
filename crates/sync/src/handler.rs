@@ -234,6 +234,11 @@ impl P2pHandler for SyncHandler {
                 }
 
                 RskSubMessage::BodyResponse(r) => {
+                    trace!(
+                        target: "rustock::sync",
+                        "Received BodyResponse id={} ({} txs, {} uncles) from {:?}",
+                        r.id, r.transactions.len(), r.uncles.len(), &id.0[..4]
+                    );
                     let _ = self.event_tx.send(SyncEvent::BodyResponse {
                         peer: id,
                         id: r.id,

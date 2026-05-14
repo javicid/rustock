@@ -1708,6 +1708,7 @@ async fn test_sync_handler_serves_body_request() {
         v: 27,
         r: U256::from(88),
         s: U256::from(99),
+        cached_rlp: None,
     };
     store.put_body(genesis_hash, &[tx], &[]).unwrap();
 

@@ -129,6 +129,13 @@ impl RskHardforkConfig {
         upgrade_to_spec_id(self.active_upgrade(block_number))
     }
 
+    /// Whether the Unitrie state root is used in headers (RSKIP126, Wasabi100).
+    /// Before this, headers contain a legacy Ethereum-style state root that
+    /// doesn't match the Unitrie hash.
+    pub fn has_unitrie_state_root(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Wasabi100
+    }
+
     /// Whether CHAINID opcode is available (RSKIP152, activated at Papyrus200).
     pub fn has_chainid(&self, block_number: u64) -> bool {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Papyrus200
@@ -147,6 +154,36 @@ impl RskHardforkConfig {
     /// Whether StoredBlock V2 format is active (RSKIP454, Lovell700).
     pub fn has_stored_block_v2(&self, block_number: u64) -> bool {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Lovell700
+    }
+
+    /// RSKIP87: unlimited lock whitelist entries (Orchid, mainnet 729_000).
+    pub fn has_rskip87(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Orchid
+    }
+
+    /// RSKIP146: release request queue stores RSK tx hash (Papyrus200, mainnet 2_392_700).
+    pub fn has_rskip146(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Papyrus200
+    }
+
+    /// RSKIP176: use updateCollections tx hash as pegouts-waiting-for-signatures key (Iris300).
+    pub fn has_rskip176(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Iris300
+    }
+
+    /// RSKIP185: peg-out refund to sender on rejection (Iris300).
+    pub fn has_rskip185(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Iris300
+    }
+
+    /// RSKIP219: updated minimum peg-in tx value (Iris300).
+    pub fn has_rskip219(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Iris300
+    }
+
+    /// RSKIP271: peg-out batching and nextPegoutHeight tracking (Hop400, mainnet 4_598_500).
+    pub fn has_rskip271(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Hop400
     }
 }
 
@@ -220,5 +257,55 @@ mod tests {
         assert!(RskNetworkUpgrade::Papyrus200 < RskNetworkUpgrade::Arrowhead600);
         assert!(RskNetworkUpgrade::Arrowhead600 < RskNetworkUpgrade::Lovell700);
         assert!(RskNetworkUpgrade::Lovell700 < RskNetworkUpgrade::Reed800);
+    }
+
+    // -----------------------------------------------------------------------
+    // RSKIP activation tests — ported from rskj activation height tables
+    // -----------------------------------------------------------------------
+
+    /// RSKIP87 (unlimited whitelist) activates at Orchid (mainnet 729_000).
+    #[test]
+    fn test_rskip87_mainnet() {
+        let cfg = RskHardforkConfig::mainnet();
+        assert!(!cfg.has_rskip87(728_999));
+        assert!(cfg.has_rskip87(729_000));
+    }
+
+    /// RSKIP146 (queue with tx hash) activates at Papyrus200 (mainnet 2_392_700).
+    #[test]
+    fn test_rskip146_mainnet() {
+        let cfg = RskHardforkConfig::mainnet();
+        assert!(!cfg.has_rskip146(2_392_699));
+        assert!(cfg.has_rskip146(2_392_700));
+    }
+
+    /// RSKIP271 (peg-out batching) activates at Hop400 (mainnet 4_598_500).
+    #[test]
+    fn test_rskip271_mainnet() {
+        let cfg = RskHardforkConfig::mainnet();
+        assert!(!cfg.has_rskip271(4_598_499));
+        assert!(cfg.has_rskip271(4_598_500));
+    }
+
+    /// RSKIP185 and RSKIP176 activate at Iris300 (mainnet 3_614_800).
+    #[test]
+    fn test_rskip185_rskip176_mainnet() {
+        let cfg = RskHardforkConfig::mainnet();
+        assert!(!cfg.has_rskip185(3_614_799));
+        assert!(cfg.has_rskip185(3_614_800));
+        assert!(!cfg.has_rskip176(3_614_799));
+        assert!(cfg.has_rskip176(3_614_800));
+    }
+
+    /// All RSKIPs active with all_active config.
+    #[test]
+    fn test_all_rskips_active() {
+        let cfg = RskHardforkConfig::all_active(33);
+        assert!(cfg.has_rskip87(0));
+        assert!(cfg.has_rskip146(0));
+        assert!(cfg.has_rskip176(0));
+        assert!(cfg.has_rskip185(0));
+        assert!(cfg.has_rskip219(0));
+        assert!(cfg.has_rskip271(0));
     }
 }

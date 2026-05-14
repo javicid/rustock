@@ -641,6 +641,7 @@ fn setup_state_with_tx() -> (RpcState, tempfile::TempDir, B256) {
         v: 27,
         r: U256::from(100),
         s: U256::from(200),
+        cached_rlp: None,
     };
 
     let mut tx_buf = Vec::new();
@@ -985,6 +986,7 @@ async fn test_receipt_dto_failed_status() {
         v: 27,
         r: U256::from(100),
         s: U256::from(200),
+        cached_rlp: None,
     };
 
     let mut tx_buf = Vec::new();

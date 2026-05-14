@@ -150,6 +150,7 @@ mod tests {
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,
+            cached_rlp: None,
         };
 
         let sender = Address::repeat_byte(0xBB);
@@ -175,6 +176,7 @@ mod tests {
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,
+            cached_rlp: None,
         };
 
         let sender = Address::repeat_byte(0xCC);

@@ -582,6 +582,7 @@ mod tests {
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,
+            cached_rlp: None,
         }
     }
 
@@ -775,6 +776,7 @@ mod tests {
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,
+            cached_rlp: None,
         };
         sign_tx(&mut tx, &key, 33);
         let err = pool.add_transaction(&encode_tx(&tx)).unwrap_err();

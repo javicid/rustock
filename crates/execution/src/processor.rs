@@ -172,11 +172,13 @@ impl BlockProcessor {
             });
         }
 
-        if result.state_root_hash != header.state_root {
-            return Err(ProcessError::StateRootMismatch {
-                header: header.state_root,
-                computed: result.state_root_hash,
-            });
+        if self.hardfork_cfg.has_unitrie_state_root(header.number) {
+            if result.state_root_hash != header.state_root {
+                return Err(ProcessError::StateRootMismatch {
+                    header: header.state_root,
+                    computed: result.state_root_hash,
+                });
+            }
         }
 
         if result.receipts_root != header.receipts_root {
@@ -417,6 +419,7 @@ mod tests {
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,
+            cached_rlp: None,
         };
         sign_tx(&mut tx, &key, chain_id);
 
@@ -464,6 +467,7 @@ mod tests {
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,
+            cached_rlp: None,
         };
         sign_tx(&mut tx, &key, chain_id);
 
@@ -544,6 +548,7 @@ mod tests {
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,
+            cached_rlp: None,
         };
         sign_tx(&mut tx, &key, chain_id);
 
@@ -644,6 +649,7 @@ mod tests {
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,
+            cached_rlp: None,
         };
         sign_tx(&mut tx, &key, chain_id);
 
@@ -700,6 +706,7 @@ mod tests {
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,
+            cached_rlp: None,
         };
         sign_tx(&mut tx, &key, chain_id);
 
@@ -852,6 +859,7 @@ mod tests {
             v: 0,
             r: U256::ZERO,
             s: U256::ZERO,
+            cached_rlp: None,
         }
     }
 

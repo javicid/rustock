@@ -7,7 +7,7 @@ use crate::handshake::HandshakeCodec;
 use alloy_primitives::B512;
 use anyhow::Result;
 use std::sync::Arc;
-use tracing::trace;
+use tracing::{trace, debug};
 
 use tokio::sync::mpsc;
 
@@ -58,8 +58,8 @@ impl PeerSession {
                     let msg = match msg_res {
                         Ok(m) => m,
                         Err(e) => {
-                            trace!(target: "rustock::net", "Decode error from {:?}: {:?}, skipping", self.peer_id, e);
-                            continue; // Skip decode errors instead of crashing the session
+                            debug!(target: "rustock::net", "Decode error from {:?}: {:?}, skipping", self.peer_id, e);
+                            continue;
                         }
                     };
                     trace!(target: "rustock::net", "Inbound message from {:?}: {:?}", self.peer_id, msg);

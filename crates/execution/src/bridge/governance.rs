@@ -15,6 +15,17 @@
 //! - `addOneOffLockWhitelistAddress` / `addUnlimitedLockWhitelistAddress`
 //!   / `removeLockWhitelistAddress` / `setLockWhitelistDisableBlockDelay`
 //! - `increaseLockingCap(int256)` — increase the RBTC locking cap
+//!
+//! ## Lock whitelist
+//!
+//! The lock whitelist controls which BTC addresses can participate in peg-in.
+//! Two whitelist variants:
+//! - One-off: each address has a maximum transfer value and is removed after use.
+//!   Stored under `lockWhitelist` key (pre and post-RSKIP87).
+//! - Unlimited: no transfer limit. Stored under `unlimitedLockWhitelist` key (post-RSKIP87).
+//!
+//! Serialization matches rskj `BridgeSerializationUtils.serializeOneOffLockWhitelist`:
+//!   RLP_list [ hash160_0, bigint(maxVal_0), ..., bigint(disableBlockHeight) ]
 
 use alloy_primitives::{Bytes, U256};
 use revm::context_interface::ContextTr;
@@ -24,10 +35,64 @@ use super::serialization;
 use super::storage::*;
 
 // ---------------------------------------------------------------------------
+// BTC address ABI decoding helpers
+// ---------------------------------------------------------------------------
+
+/// ABI-decode a `string` argument at the given parameter slot.
+/// Returns the decoded UTF-8 string or an error.
+fn abi_decode_string_arg(args: &[u8], slot: usize) -> Result<String, PrecompileError> {
+    if args.len() < (slot + 1) * 32 {
+        return Err(PrecompileError::other("governance: args too short for string param"));
+    }
+    let offset = U256::from_be_slice(&args[slot * 32..(slot + 1) * 32]).to::<usize>();
+    if offset + 32 > args.len() {
+        return Err(PrecompileError::other("governance: string offset out of bounds"));
+    }
+    let len = U256::from_be_slice(&args[offset..offset + 32]).to::<usize>();
+    let data_start = offset + 32;
+    if data_start + len > args.len() {
+        return Err(PrecompileError::other("governance: string data out of bounds"));
+    }
+    String::from_utf8(args[data_start..data_start + len].to_vec())
+        .map_err(|_| PrecompileError::other("governance: invalid UTF-8 in string"))
+}
+
+/// Decode a BTC address string (Base58Check) to its 20-byte hash160.
+///
+/// Matches rskj's `BridgeUtils.parseBtcAddressFromHex` / Address.fromBase58:
+/// Base58Check decode → version byte + 20-byte hash160 + 4-byte checksum.
+fn btc_address_to_hash160(addr_str: &str) -> Result<[u8; 20], PrecompileError> {
+    let decoded = bitcoin::base58::decode_check(addr_str)
+        .map_err(|_| PrecompileError::other("governance: invalid BTC address (bad Base58Check)"))?;
+    if decoded.len() != 21 {
+        return Err(PrecompileError::other("governance: BTC address decoded to wrong length"));
+    }
+    let mut hash160 = [0u8; 20];
+    hash160.copy_from_slice(&decoded[1..21]);
+    Ok(hash160)
+}
+
+/// ABI-decode an `int256` argument at the given parameter slot as a u64.
+fn abi_decode_int256_as_u64(args: &[u8], slot: usize) -> Option<u64> {
+    if args.len() < (slot + 1) * 32 {
+        return None;
+    }
+    let word = &args[slot * 32..(slot + 1) * 32];
+    // Only accept non-negative values that fit in u64 (leading bytes must be 0x00)
+    if word[..24].iter().any(|&b| b != 0) {
+        return None;
+    }
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&word[24..32]);
+    Some(u64::from_be_bytes(buf))
+}
+
+// ---------------------------------------------------------------------------
 // Storage key constants for governance
 // ---------------------------------------------------------------------------
 
-const FEE_PER_KB_KEY: &str = "feePerKb";
+// Use the shared constant from storage.rs
+use super::storage::FEE_PER_KB_KEY;
 const LOCKING_CAP_KEY: &str = "lockingCap";
 const LOCK_WHITELIST_DISABLE_BLOCK_DELAY_KEY: &str = "lockWhitelistDisDelay";
 
@@ -238,41 +303,143 @@ pub fn increase_locking_cap<CTX: ContextTr>(
 // ---------------------------------------------------------------------------
 
 /// `addLockWhitelistAddress(string address, int256 maxTransferValue)` → int256
+///
+/// Legacy alias for `addOneOffLockWhitelistAddress` (per rskj BridgeMethods.java).
+/// Adds a one-off entry with the given max transfer value.
+///
+/// Returns:
+///   1  = success
+///  -1  = address already in whitelist
+///  -2  = invalid address
 pub fn add_lock_whitelist_address<CTX: ContextTr>(
-    _ctx: &mut CTX,
-    _args: &[u8],
+    ctx: &mut CTX,
+    args: &[u8],
     gas_cost: u64,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    // Whitelist management is authorized-only.
-    // For now, return success stub.
-    Ok(encode_int_result(gas_cost, 1))
+    add_one_off_lock_whitelist_address(ctx, args, gas_cost)
 }
 
 /// `addOneOffLockWhitelistAddress(string address, int256 maxTransferValue)` → int256
+///
+/// Adds a one-off entry to the lock whitelist.
+/// The entry allows one peg-in up to `maxTransferValue` satoshis.
+///
+/// Returns:
+///   1  = success
+///  -1  = address already in whitelist
+///  -2  = invalid address
 pub fn add_one_off_lock_whitelist_address<CTX: ContextTr>(
-    _ctx: &mut CTX,
-    _args: &[u8],
+    ctx: &mut CTX,
+    args: &[u8],
     gas_cost: u64,
 ) -> Result<PrecompileOutput, PrecompileError> {
+    let addr_str = match abi_decode_string_arg(args, 0) {
+        Ok(s) => s,
+        Err(_) => return Ok(encode_int_result(gas_cost, -2)),
+    };
+
+    let hash160 = match btc_address_to_hash160(&addr_str) {
+        Ok(h) => h,
+        Err(_) => return Ok(encode_int_result(gas_cost, -2)),
+    };
+
+    let max_val = match abi_decode_int256_as_u64(args, 1) {
+        Some(v) => v,
+        None => return Ok(encode_int_result(gas_cost, -2)),
+    };
+
+    let (mut entries, disable_h) = load_one_off_whitelist(ctx);
+
+    // Check for duplicate
+    if entries.iter().any(|(h, _)| h == &hash160) {
+        return Ok(encode_int_result(gas_cost, -1));
+    }
+
+    entries.push((hash160, max_val));
+    store_one_off_whitelist(ctx, &entries, disable_h);
+
     Ok(encode_int_result(gas_cost, 1))
 }
 
 /// `addUnlimitedLockWhitelistAddress(string address)` → int256
+///
+/// Adds an unlimited entry to the lock whitelist (active post-RSKIP87).
+/// Unlimited entries have no transfer cap and are never consumed.
+///
+/// Returns:
+///   1  = success
+///  -1  = address already in unlimited whitelist
+///  -2  = invalid address
 pub fn add_unlimited_lock_whitelist_address<CTX: ContextTr>(
-    _ctx: &mut CTX,
-    _args: &[u8],
+    ctx: &mut CTX,
+    args: &[u8],
     gas_cost: u64,
 ) -> Result<PrecompileOutput, PrecompileError> {
+    let addr_str = match abi_decode_string_arg(args, 0) {
+        Ok(s) => s,
+        Err(_) => return Ok(encode_int_result(gas_cost, -2)),
+    };
+
+    let hash160 = match btc_address_to_hash160(&addr_str) {
+        Ok(h) => h,
+        Err(_) => return Ok(encode_int_result(gas_cost, -2)),
+    };
+
+    let mut entries = load_unlimited_whitelist(ctx);
+
+    // Check for duplicate
+    if entries.iter().any(|h| h == &hash160) {
+        return Ok(encode_int_result(gas_cost, -1));
+    }
+
+    entries.push(hash160);
+    store_unlimited_whitelist(ctx, &entries);
+
     Ok(encode_int_result(gas_cost, 1))
 }
 
 /// `removeLockWhitelistAddress(string address)` → int256
+///
+/// Removes an address from either the one-off or unlimited lock whitelist.
+///
+/// Returns:
+///   1  = success
+///  -1  = address not found
+///  -2  = invalid address
 pub fn remove_lock_whitelist_address<CTX: ContextTr>(
-    _ctx: &mut CTX,
-    _args: &[u8],
+    ctx: &mut CTX,
+    args: &[u8],
     gas_cost: u64,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    Ok(encode_int_result(gas_cost, 1))
+    let addr_str = match abi_decode_string_arg(args, 0) {
+        Ok(s) => s,
+        Err(_) => return Ok(encode_int_result(gas_cost, -2)),
+    };
+
+    let hash160 = match btc_address_to_hash160(&addr_str) {
+        Ok(h) => h,
+        Err(_) => return Ok(encode_int_result(gas_cost, -2)),
+    };
+
+    // Try to remove from one-off whitelist first
+    let (mut one_off, disable_h) = load_one_off_whitelist(ctx);
+    let before_len = one_off.len();
+    one_off.retain(|(h, _)| h != &hash160);
+    if one_off.len() < before_len {
+        store_one_off_whitelist(ctx, &one_off, disable_h);
+        return Ok(encode_int_result(gas_cost, 1));
+    }
+
+    // Try unlimited whitelist
+    let mut unlimited = load_unlimited_whitelist(ctx);
+    let before_len = unlimited.len();
+    unlimited.retain(|h| h != &hash160);
+    if unlimited.len() < before_len {
+        store_unlimited_whitelist(ctx, &unlimited);
+        return Ok(encode_int_result(gas_cost, 1));
+    }
+
+    Ok(encode_int_result(gas_cost, -1))
 }
 
 /// `setLockWhitelistDisableBlockDelay(int256 delay)` → int256

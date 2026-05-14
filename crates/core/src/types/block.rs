@@ -63,6 +63,7 @@ mod tests {
             v: 27,
             r: U256::from(88),
             s: U256::from(99),
+            cached_rlp: None,
         };
 
         let block = Block {

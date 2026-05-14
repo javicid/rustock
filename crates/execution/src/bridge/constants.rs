@@ -57,6 +57,12 @@ pub struct BridgeConstants {
 
     /// BTC transaction confirmation max depth.
     pub btc_transaction_confirmation_max_depth: u32,
+
+    // -- Fee parameters --
+
+    /// Genesis fee per KB in satoshis (used when no vote has set it yet).
+    /// Mainnet: 5 × MILLICOIN = 500_000 sat/KB.
+    pub genesis_fee_per_kb: u64,
 }
 
 /// BTC network selection.
@@ -86,6 +92,8 @@ impl BridgeConstants {
             btc_height_when_block_index_activates: 696_000,
             max_depth_to_search_blocks_below_index_activation: 4320,
             btc_transaction_confirmation_max_depth: 4320,
+            // 5 × MILLICOIN = 5 × 100_000 = 500_000 sat/KB
+            genesis_fee_per_kb: 500_000,
         }
     }
 
@@ -107,6 +115,8 @@ impl BridgeConstants {
             btc_height_when_block_index_activates: 2_000_000,
             max_depth_to_search_blocks_below_index_activation: 4320,
             btc_transaction_confirmation_max_depth: 4320,
+            // 1 × MILLICOIN = 100_000 sat/KB
+            genesis_fee_per_kb: 100_000,
         }
     }
 
@@ -128,6 +138,7 @@ impl BridgeConstants {
             btc_height_when_block_index_activates: 0,
             max_depth_to_search_blocks_below_index_activation: 4320,
             btc_transaction_confirmation_max_depth: 4320,
+            genesis_fee_per_kb: 100_000,
         }
     }
 }

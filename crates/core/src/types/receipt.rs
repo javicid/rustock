@@ -216,8 +216,7 @@ pub fn ordered_tx_trie_root(transactions: &[super::transaction::Transaction]) ->
     for (i, tx) in transactions.iter().enumerate() {
         let key_bytes = rlp_encode_int(i as u32);
         let key = TrieKeySlice::from_key(&key_bytes);
-        let mut encoded = Vec::new();
-        tx.encode(&mut encoded);
+        let encoded = tx.rlp_for_trie();
         root = root.put(&key, &encoded, &store);
     }
 
