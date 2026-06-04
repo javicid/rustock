@@ -223,9 +223,23 @@ impl SyncService {
             None => return,
         };
 
-        let head_hash = match self.manager.store.head().ok().flatten() {
-            Some(h) => h,
-            None => return,
+        // A full node syncs from its EXECUTED head: blocks past it are
+        // downloaded but have no state, so execution must resume there.
+        // Without a block processor (no execution), fall back to the
+        // download head.
+        let head_hash = if self.block_processor.is_some() {
+            match self.manager.store.exec_head().ok().flatten() {
+                Some((h, _)) => h,
+                None => match self.manager.store.canonical_hash(0).ok().flatten() {
+                    Some(h) => h,
+                    None => return,
+                },
+            }
+        } else {
+            match self.manager.store.head().ok().flatten() {
+                Some(h) => h,
+                None => return,
+            }
         };
         let head = match self.manager.store.header(head_hash).ok().flatten() {
             Some(h) => h,
@@ -963,12 +977,22 @@ impl SyncService {
                         "All {} block bodies downloaded",
                         pending_headers.len()
                     );
-                    self.process_downloaded_blocks(&pending_headers).await;
-                    self.last_body_height = pending_headers
-                        .last()
-                        .map(|(_, h)| h.number)
-                        .unwrap_or(self.last_body_height);
-                    self.continue_after_bodies(peer_best).await;
+                    if self.process_downloaded_blocks(&pending_headers).await {
+                        self.last_body_height = pending_headers
+                            .last()
+                            .map(|(_, h)| h.number)
+                            .unwrap_or(self.last_body_height);
+                        self.continue_after_bodies(peer_best).await;
+                    } else {
+                        // A block failed to execute: do not advance past it.
+                        // Go idle; the next sync round restarts from the
+                        // executed head and retries.
+                        error!(
+                            target: "rustock::sync",
+                            "Sync halted: block execution failed; will retry from the executed head"
+                        );
+                        self.state = SyncState::Idle;
+                    }
                 } else {
                     self.state = SyncState::DownloadingBodies {
                         peer_best,
@@ -1005,10 +1029,13 @@ impl SyncService {
 
     /// Process blocks that have been downloaded (headers + bodies).
     /// Executes each block in order, applying state changes to the trie.
+    ///
+    /// Returns `false` when a block failed to execute; the sync must not
+    /// advance past it (rskj treats such a block as invalid and stops there).
     async fn process_downloaded_blocks(
         &mut self,
         pending_headers: &[(B256, Header)],
-    ) {
+    ) -> bool {
         let (processor, trie_store, state_root) = match (
             &self.block_processor,
             &self.trie_store,
@@ -1020,29 +1047,35 @@ impl SyncService {
                     target: "rustock::sync",
                     "No block processor configured, skipping execution"
                 );
-                return;
+                return true;
             }
         };
 
         let mut current_root = state_root;
         let mut processed = 0u64;
+        let mut all_ok = true;
+        let mut last_executed: Option<(B256, B256)> = None;
 
         for (hash, header) in pending_headers {
             let (transactions, ommers) = match self.manager.store.body(*hash) {
                 Ok(Some(body)) => body,
                 Ok(None) => {
+                    // Executing past a missing body would apply the next block
+                    // to the wrong parent state — halt here instead.
                     warn!(
                         target: "rustock::sync",
-                        "Body not found for block #{} ({:?}), skipping execution",
+                        "Body not found for block #{} ({:?}); halting sync at this block",
                         header.number, hash
                     );
-                    continue;
+                    all_ok = false;
+                    break;
                 }
                 Err(e) => {
                     error!(
                         target: "rustock::sync",
                         "Failed to read body for block #{}: {:?}", header.number, e
                     );
+                    all_ok = false;
                     break;
                 }
             };
@@ -1060,11 +1093,13 @@ impl SyncService {
             match processor.process_and_commit(&block, &current_root, trie_store.clone()) {
                 Ok(result) => {
                     current_root = result.new_state_root;
+                    last_executed = Some((*hash, result.state_root_hash));
                     processed += 1;
                     self.blocks_since_flush += 1;
                     if self.blocks_since_flush >= 100 {
                         trie_store.flush();
                         self.blocks_since_flush = 0;
+                        let _ = self.manager.store.set_exec_head(*hash, result.state_root_hash);
                     }
                     if processed.is_multiple_of(100) {
                         debug!(
@@ -1075,11 +1110,12 @@ impl SyncService {
                     }
                 }
                 Err(e) => {
-                    warn!(
+                    error!(
                         target: "rustock::sync",
-                        "Block #{} execution failed: {}, skipping remaining blocks",
+                        "Block #{} execution failed: {}; halting sync at this block",
                         header.number, e
                     );
+                    all_ok = false;
                     break;
                 }
             }
@@ -1088,6 +1124,9 @@ impl SyncService {
         if processed > 0 {
             trie_store.flush();
             self.blocks_since_flush = 0;
+            if let Some((hash, root_hash)) = last_executed {
+                let _ = self.manager.store.set_exec_head(hash, root_hash);
+            }
             info!(
                 target: "rustock::sync",
                 "Processed {} blocks, state root: {:?}",
@@ -1095,6 +1134,8 @@ impl SyncService {
             );
             self.current_state_root = Some(current_root);
         }
+
+        all_ok
     }
 
     /// Process a single block received in follow mode.

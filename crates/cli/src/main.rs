@@ -261,40 +261,37 @@ async fn main() -> Result<()> {
 
 /// Try to resume from persisted state, falling back to genesis if unavailable.
 ///
-/// On restart, loads the state root from the last processed block's header
-/// and reconstructs the trie root from disk. Children resolve lazily via
-/// `NodeRef::Hash` lookups against the trie store.
+/// On restart, loads the Unitrie root recorded at the last EXECUTED block
+/// (`exec_head`). The header's state_root cannot be used: before RSKIP126 it
+/// holds the legacy Orchid root, and the download head may be far past the
+/// executed head. Children resolve lazily via `NodeRef::Hash` lookups.
 fn load_or_build_state(
     store: &BlockStore,
     config: &ChainConfig,
     trie_store: &dyn TrieStore,
 ) -> Result<TrieNode> {
-    if let Some(head_hash) = store.head()? {
-        if let Some(header) = store.header(head_hash)? {
-            if header.number > 0 {
-                let state_root = header.state_root;
-                if let Some(data) = trie_store.get(state_root.as_slice()) {
-                    let root = TrieNode::from_message(&data, trie_store);
-                    let verified = root.compute_hash(trie_store);
-                    if verified == state_root {
-                        info!(
-                            "Resuming from block #{} (state root: {:?})",
-                            header.number, state_root
-                        );
-                        return Ok(root);
-                    }
-                    tracing::warn!(
-                        "State root verification failed: computed={verified:?}, \
-                         expected={state_root:?}. Rebuilding from genesis."
-                    );
-                } else {
-                    tracing::warn!(
-                        "State root {:?} not found in trie store for block #{}. \
-                         Rebuilding from genesis.",
-                        state_root, header.number
-                    );
-                }
+    if let Some((exec_hash, state_root)) = store.exec_head()? {
+        if let Some(data) = trie_store.get(state_root.as_slice()) {
+            let root = TrieNode::from_message(&data, trie_store);
+            let verified = root.compute_hash(trie_store);
+            if verified == state_root {
+                let number = store.header(exec_hash)?.map(|h| h.number).unwrap_or(0);
+                info!(
+                    "Resuming from executed block #{} (state root: {:?})",
+                    number, state_root
+                );
+                return Ok(root);
             }
+            tracing::warn!(
+                "Exec head state root verification failed: computed={verified:?}, \
+                 expected={state_root:?}. Rebuilding from genesis."
+            );
+        } else {
+            tracing::warn!(
+                "Exec head state root {:?} not found in trie store. \
+                 Rebuilding from genesis.",
+                state_root
+            );
         }
     }
 

@@ -19,6 +19,7 @@ const CF_BODIES: &str = "block_bodies";
 const CF_RECEIPTS: &str = "receipts";
 const CF_TX_INDEX: &str = "tx_index";
 const KEY_HEAD: &[u8] = b"head";
+const KEY_EXEC_HEAD: &[u8] = b"exec_head";
 
 /// Safety limit: refuse to reorg deeper than this many blocks.
 const MAX_REORG_DEPTH: u64 = 1000;
@@ -129,8 +130,28 @@ impl BlockStore {
     pub fn head(&self) -> Result<Option<B256>> {
         let bytes = self.db.get(KEY_HEAD)
             .context("Failed to read head")?;
-            
+
         Ok(bytes.map(|b| B256::from_slice(&b)))
+    }
+
+    /// Records the last EXECUTED block (hash) and its post-execution Unitrie
+    /// state root. Distinct from `head`, which tracks the best downloaded
+    /// block; the executed head is where block execution must resume.
+    pub fn set_exec_head(&self, hash: B256, state_root: B256) -> Result<()> {
+        let mut buf = Vec::with_capacity(64);
+        buf.extend_from_slice(hash.as_slice());
+        buf.extend_from_slice(state_root.as_slice());
+        self.db.put(KEY_EXEC_HEAD, &buf)
+            .context("Failed to set exec head")
+    }
+
+    /// Returns the last executed block hash and its Unitrie state root.
+    pub fn exec_head(&self) -> Result<Option<(B256, B256)>> {
+        let bytes = self.db.get(KEY_EXEC_HEAD)
+            .context("Failed to read exec head")?;
+        Ok(bytes.filter(|b| b.len() == 64).map(|b| {
+            (B256::from_slice(&b[..32]), B256::from_slice(&b[32..]))
+        }))
     }
 
     // --- Batch / High Level Operations ---
@@ -510,6 +531,13 @@ mod tests {
         // 5. Total Difficulty
         store.put_total_difficulty(hash, U256::from(100)).unwrap();
         assert_eq!(store.total_difficulty(hash).unwrap(), Some(U256::from(100)));
+
+        // 6. Executed head (hash + unitrie state root), independent of head
+        assert_eq!(store.exec_head().unwrap(), None);
+        let state_root = B256::repeat_byte(0x42);
+        store.set_exec_head(hash, state_root).unwrap();
+        assert_eq!(store.exec_head().unwrap(), Some((hash, state_root)));
+        assert_eq!(store.head().unwrap(), Some(hash)); // unchanged
     }
 
     #[test]
