@@ -123,7 +123,7 @@ impl ChainConfig {
     pub fn known_genesis_hash(&self) -> Option<B256> {
         match self.chain_id {
             30 => Some("0xf88529d4ab262c0f4d042e9d8d3f2472848eaafe1a9b7213f57617eb40a9f9e0".parse().unwrap()),
-            31 => Some("0xcabb7fbe562a6e2e1a8d8df0f4f8b19c4a76c22fe1e6b9a1dc45a0e4d8e0e2c4".parse().unwrap()),
+            31 => Some("0xcabb7fbe88cd6d922042a32ffc08ce8b1fbb37d650b9d4e7dbfe2a7469adfa42".parse().unwrap()),
             _ => None,
         }
     }
@@ -467,15 +467,17 @@ mod tests {
     #[test]
     fn rskj_known_mainnet_genesis_hash() {
         let config = ChainConfig::mainnet();
-        let hash = config.known_genesis_hash();
-        assert!(hash.is_some(), "mainnet should have a known genesis hash");
+        let expected: B256 = "0xf88529d4ab262c0f4d042e9d8d3f2472848eaafe1a9b7213f57617eb40a9f9e0".parse().unwrap();
+        assert_eq!(config.known_genesis_hash(), Some(expected),
+            "mainnet genesis hash must match rskj GenesisHashesTest");
     }
 
     /// Ported from rskj GenesisHashesTest: verify known testnet genesis hash.
     #[test]
     fn rskj_known_testnet_genesis_hash() {
         let config = ChainConfig::testnet();
-        let hash = config.known_genesis_hash();
-        assert!(hash.is_some(), "testnet should have a known genesis hash");
+        let expected: B256 = "0xcabb7fbe88cd6d922042a32ffc08ce8b1fbb37d650b9d4e7dbfe2a7469adfa42".parse().unwrap();
+        assert_eq!(config.known_genesis_hash(), Some(expected),
+            "testnet genesis hash must match rskj GenesisHashesTest");
     }
 }

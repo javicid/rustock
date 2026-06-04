@@ -1693,7 +1693,7 @@ mod tests {
 
         assert_eq!(decoded.len(), 2);
         // Keys should be sorted: hash1 (0x01...) < hash2 (0x02...)
-        let mut keys: Vec<[u8; 32]> = decoded.keys().cloned().collect();
+        let keys: Vec<[u8; 32]> = decoded.keys().cloned().collect();
         assert_eq!(keys[0], hash1, "hash1 should come first (BTreeMap sorted)");
         assert_eq!(keys[1], hash2, "hash2 should come second");
         assert_eq!(decoded[&hash1], btc1);
