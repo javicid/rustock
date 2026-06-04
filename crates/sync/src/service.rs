@@ -246,6 +246,13 @@ impl SyncService {
             None => return,
         };
 
+        // Keep the body/execution cursor aligned with the sync head: a
+        // stale (or zero, after restart) cursor would queue blocks below
+        // or above the executed head.
+        if self.block_processor.is_some() {
+            self.last_body_height = head.number;
+        }
+
         if head.number >= metadata.best_number {
             self.state = SyncState::Following;
             return;
@@ -755,18 +762,21 @@ impl SyncService {
     }
 
     /// After all headers in a skeleton round are downloaded, transition to
-    /// body downloading for any headers that don't already have bodies stored.
+    /// body downloading. ALL blocks past the cursor are queued so they are
+    /// executed in order; bodies already in the store are not re-requested.
     pub(crate) async fn start_body_downloads(&mut self, peer_best: u64) {
         let our_height = self.our_head_number();
         let start = self.last_body_height + 1;
 
         let mut pending = Vec::new();
+        let mut missing_bodies = 0usize;
         for num in start..=our_height {
             if let Ok(Some(hash)) = self.manager.store.canonical_hash(num) {
-                if let Ok(None) = self.manager.store.body(hash) {
-                    if let Ok(Some(header)) = self.manager.store.header(hash) {
-                        pending.push((hash, header));
+                if let Ok(Some(header)) = self.manager.store.header(hash) {
+                    if matches!(self.manager.store.body(hash), Ok(None)) {
+                        missing_bodies += 1;
                     }
+                    pending.push((hash, header));
                 }
             }
         }
@@ -774,19 +784,29 @@ impl SyncService {
         if pending.is_empty() {
             debug!(
                 target: "rustock::sync",
-                "All bodies already stored up to #{}", our_height
+                "No blocks pending past #{}", self.last_body_height
             );
             self.last_body_height = our_height;
             self.continue_after_bodies(peer_best).await;
             return;
         }
 
+        if missing_bodies == 0 {
+            debug!(
+                target: "rustock::sync",
+                "All {} bodies already stored, executing", pending.len()
+            );
+            self.finish_batch(&pending, peer_best).await;
+            return;
+        }
+
         info!(
             target: "rustock::sync",
-            "Starting body download for {} blocks (#{} to #{})",
+            "Starting body download for {} blocks (#{} to #{}, {} bodies to fetch)",
             pending.len(),
             pending.first().map(|(_, h)| h.number).unwrap_or(0),
             pending.last().map(|(_, h)| h.number).unwrap_or(0),
+            missing_bodies,
         );
 
         self.state = SyncState::DownloadingBodies {
@@ -797,6 +817,37 @@ impl SyncService {
         };
         self.last_progress = Instant::now();
         self.send_body_requests().await;
+    }
+
+    /// Execute a fully-downloaded batch and advance (or halt) the sync.
+    async fn finish_batch(&mut self, pending: &[(B256, Header)], peer_best: u64) {
+        if self.process_downloaded_blocks(pending).await {
+            self.last_body_height = pending
+                .last()
+                .map(|(_, h)| h.number)
+                .unwrap_or(self.last_body_height);
+            self.continue_after_bodies(peer_best).await;
+        } else {
+            // A block failed to execute: do not advance past it. Reset the
+            // body cursor to the executed head so the retry re-downloads
+            // and re-executes from there — a stale cursor would skip the
+            // failed range and execute later blocks on the wrong parent state.
+            let exec_number = self
+                .manager
+                .store
+                .exec_head()
+                .ok()
+                .flatten()
+                .and_then(|(hash, _)| self.manager.store.header(hash).ok().flatten())
+                .map(|h| h.number)
+                .unwrap_or(0);
+            self.last_body_height = exec_number;
+            error!(
+                target: "rustock::sync",
+                "Sync halted: block execution failed; will retry from executed head #{exec_number}"
+            );
+            self.state = SyncState::Idle;
+        }
     }
 
     /// After body downloads (or when no bodies needed), decide whether to
@@ -864,6 +915,11 @@ impl SyncService {
             let mut sent = 0u32;
             while in_flight.len() < MAX_BODY_IN_FLIGHT && *next_request < pending_headers.len() {
                 let (hash, _header) = &pending_headers[*next_request];
+                // Bodies already in the store don't need a request.
+                if matches!(self.manager.store.body(*hash), Ok(Some(_))) {
+                    *next_request += 1;
+                    continue;
+                }
                 let (req_id, msg) = create_body_request(*hash);
                 let peer = &peers[*next_request % peers.len()];
                 let ok = self.peer_store.send_to_peer(peer, msg).await;
@@ -969,7 +1025,17 @@ impl SyncService {
                     hash, transactions.len(), uncles.len()
                 );
 
-                // Check if all bodies are done
+                // Advance past entries whose bodies are already stored, then
+                // check whether the whole batch is downloaded.
+                let mut next_request = next_request;
+                while next_request < pending_headers.len()
+                    && matches!(
+                        self.manager.store.body(pending_headers[next_request].0),
+                        Ok(Some(_))
+                    )
+                {
+                    next_request += 1;
+                }
                 let all_done = next_request >= pending_headers.len() && in_flight.is_empty();
                 if all_done {
                     info!(
@@ -977,22 +1043,7 @@ impl SyncService {
                         "All {} block bodies downloaded",
                         pending_headers.len()
                     );
-                    if self.process_downloaded_blocks(&pending_headers).await {
-                        self.last_body_height = pending_headers
-                            .last()
-                            .map(|(_, h)| h.number)
-                            .unwrap_or(self.last_body_height);
-                        self.continue_after_bodies(peer_best).await;
-                    } else {
-                        // A block failed to execute: do not advance past it.
-                        // Go idle; the next sync round restarts from the
-                        // executed head and retries.
-                        error!(
-                            target: "rustock::sync",
-                            "Sync halted: block execution failed; will retry from the executed head"
-                        );
-                        self.state = SyncState::Idle;
-                    }
+                    self.finish_batch(&pending_headers, peer_best).await;
                 } else {
                     self.state = SyncState::DownloadingBodies {
                         peer_best,
@@ -1056,7 +1107,32 @@ impl SyncService {
         let mut all_ok = true;
         let mut last_executed: Option<(B256, B256)> = None;
 
+        // Lineage guard: the first block must extend the executed head and
+        // each block its predecessor; executing out of order would apply
+        // transactions to the wrong parent state.
+        let mut expected_parent = self
+            .manager
+            .store
+            .exec_head()
+            .ok()
+            .flatten()
+            .map(|(hash, _)| hash)
+            .or_else(|| self.manager.store.canonical_hash(0).ok().flatten());
+
         for (hash, header) in pending_headers {
+            if let Some(parent) = expected_parent {
+                if header.parent_hash != parent {
+                    error!(
+                        target: "rustock::sync",
+                        "Block #{} does not extend the executed head (parent {:?}, expected {:?}); halting sync",
+                        header.number, header.parent_hash, parent
+                    );
+                    all_ok = false;
+                    break;
+                }
+            }
+            expected_parent = Some(*hash);
+
             let (transactions, ommers) = match self.manager.store.body(*hash) {
                 Ok(Some(body)) => body,
                 Ok(None) => {
