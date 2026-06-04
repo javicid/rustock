@@ -31,6 +31,9 @@ pub enum RskNetworkUpgrade {
     Arrowhead631,
     Lovell700,
     Reed800,
+    /// Testnet-only on mainnet config (height -1 in rskj main.conf).
+    Reed810,
+    Vetiver900,
 }
 
 pub const RSK_MAINNET_CHAIN_ID: u64 = 30;
@@ -49,6 +52,8 @@ pub const MAINNET_ACTIVATIONS: &[(u64, RskNetworkUpgrade)] = &[
     (6_549_300, RskNetworkUpgrade::Arrowhead631),
     (7_338_024, RskNetworkUpgrade::Lovell700),
     (8_052_200, RskNetworkUpgrade::Reed800),
+    // reed810 = -1 on mainnet (testnet-only); vetiver900 skips over it.
+    (8_804_200, RskNetworkUpgrade::Vetiver900),
 ];
 
 /// Testnet activation heights.
@@ -64,6 +69,8 @@ pub const TESTNET_ACTIVATIONS: &[(u64, RskNetworkUpgrade)] = &[
     (5_254_700, RskNetworkUpgrade::Arrowhead631),
     (5_735_824, RskNetworkUpgrade::Lovell700),
     (6_420_700, RskNetworkUpgrade::Reed800),
+    (7_139_600, RskNetworkUpgrade::Reed810),
+    (7_604_200, RskNetworkUpgrade::Vetiver900),
 ];
 
 /// Configuration that determines which RSK features are active at a given block.
@@ -90,7 +97,7 @@ impl RskHardforkConfig {
 
     pub fn regtest() -> Self {
         Self {
-            activations: vec![(0, RskNetworkUpgrade::Reed800)],
+            activations: vec![(0, RskNetworkUpgrade::Vetiver900)],
             chain_id: 33,
         }
     }
@@ -106,7 +113,7 @@ impl RskHardforkConfig {
     /// Creates a config where all upgrades are active from genesis (useful for testing).
     pub fn all_active(chain_id: u64) -> Self {
         Self {
-            activations: vec![(0, RskNetworkUpgrade::Reed800)],
+            activations: vec![(0, RskNetworkUpgrade::Vetiver900)],
             chain_id,
         }
     }
@@ -185,6 +192,35 @@ impl RskHardforkConfig {
     pub fn has_rskip271(&self, block_number: u64) -> bool {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Hop400
     }
+
+    /// RSKIP536: additional BlockHeader precompile methods. Maps to reed810 in
+    /// reference.conf; mainnet overrides it to the vetiver900 height (8_804_200)
+    /// via main.conf consensusRules. `>= Reed810` is exact on both networks
+    /// because mainnet jumps Reed800 -> Vetiver900 at that height.
+    pub fn has_rskip536(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Reed810
+    }
+
+    /// RSKIP540: min pegout value as extra pegout in fee estimation;
+    /// enables getEstimatedFeesForPegOutAmount (Vetiver900).
+    pub fn has_rskip540(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Vetiver900
+    }
+
+    /// RSKIP544: EIP-3541, reject new contract code starting with 0xEF (Vetiver900).
+    pub fn has_rskip544(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Vetiver900
+    }
+
+    /// RSKIP551: disables RSKIP459 (Vetiver900).
+    pub fn has_rskip551(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Vetiver900
+    }
+
+    /// RSKIP552: Blake2F data handling improvements (Vetiver900).
+    pub fn has_rskip552(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Vetiver900
+    }
 }
 
 fn upgrade_to_spec_id(upgrade: RskNetworkUpgrade) -> SpecId {
@@ -202,7 +238,9 @@ fn upgrade_to_spec_id(upgrade: RskNetworkUpgrade) -> SpecId {
         | RskNetworkUpgrade::Arrowhead631 => SpecId::ISTANBUL,
 
         RskNetworkUpgrade::Lovell700
-        | RskNetworkUpgrade::Reed800 => SpecId::SHANGHAI,
+        | RskNetworkUpgrade::Reed800
+        | RskNetworkUpgrade::Reed810
+        | RskNetworkUpgrade::Vetiver900 => SpecId::SHANGHAI,
     }
 }
 
@@ -307,5 +345,47 @@ mod tests {
         assert!(cfg.has_rskip185(0));
         assert!(cfg.has_rskip219(0));
         assert!(cfg.has_rskip271(0));
+        assert!(cfg.has_rskip536(0));
+        assert!(cfg.has_rskip540(0));
+        assert!(cfg.has_rskip544(0));
+        assert!(cfg.has_rskip551(0));
+        assert!(cfg.has_rskip552(0));
+    }
+
+    /// Vetiver900 activates at mainnet 8_804_200 (rskj main.conf), skipping
+    /// reed810 which is -1 on mainnet.
+    #[test]
+    fn test_vetiver900_mainnet() {
+        let cfg = RskHardforkConfig::mainnet();
+        assert_eq!(cfg.active_upgrade(8_804_199), RskNetworkUpgrade::Reed800);
+        assert_eq!(cfg.active_upgrade(8_804_200), RskNetworkUpgrade::Vetiver900);
+        for has in [
+            RskHardforkConfig::has_rskip540,
+            RskHardforkConfig::has_rskip544,
+            RskHardforkConfig::has_rskip551,
+            RskHardforkConfig::has_rskip552,
+        ] {
+            assert!(!has(&cfg, 8_804_199));
+            assert!(has(&cfg, 8_804_200));
+        }
+        // rskip536 is overridden to the vetiver900 height on mainnet
+        // (main.conf consensusRules: rskip536 = 8804200).
+        assert!(!cfg.has_rskip536(8_804_199));
+        assert!(cfg.has_rskip536(8_804_200));
+    }
+
+    /// Testnet: reed810 at 7_139_600, vetiver900 at 7_604_200 (rskj testnet.conf).
+    #[test]
+    fn test_vetiver900_testnet() {
+        let cfg = RskHardforkConfig::testnet();
+        assert_eq!(cfg.active_upgrade(7_139_599), RskNetworkUpgrade::Reed800);
+        assert_eq!(cfg.active_upgrade(7_139_600), RskNetworkUpgrade::Reed810);
+        assert_eq!(cfg.active_upgrade(7_604_200), RskNetworkUpgrade::Vetiver900);
+        // rskip536 maps to reed810 on testnet (reference.conf).
+        assert!(!cfg.has_rskip536(7_139_599));
+        assert!(cfg.has_rskip536(7_139_600));
+        // vetiver900-mapped rskips activate later.
+        assert!(!cfg.has_rskip544(7_604_199));
+        assert!(cfg.has_rskip544(7_604_200));
     }
 }
