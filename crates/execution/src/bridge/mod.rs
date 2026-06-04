@@ -281,7 +281,7 @@ fn execute_method<CTX: ContextTr>(
         "getBtcTransactionConfirmations" => tx::get_btc_transaction_confirmations(ctx, args, gas_cost),
 
         // Phase 4: Peg-in
-        "registerBtcTransaction" => peg::register_btc_transaction(ctx, args, gas_cost, config),
+        "registerBtcTransaction" => peg::register_btc_transaction(ctx, args, gas_cost, config, hardfork_cfg),
         "registerFastBridgeBtcTransaction" => peg::register_fast_bridge_btc_transaction(ctx, args, gas_cost, config),
 
         // Phase 5: Peg-out

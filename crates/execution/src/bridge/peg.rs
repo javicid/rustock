@@ -70,11 +70,19 @@ pub struct ReleaseRequest {
 ///
 /// The core peg-in method. Verifies a BTC transaction is included in the
 /// BTC header chain, classifies it, and credits RBTC to the sender.
+/// rskj BridgeSupport.shouldMarkRejectedPeginAsProcessed: only between
+/// RSKIP459 (lovell700) and RSKIP551 (vetiver900) are rejected
+/// non-refundable peg-ins marked as processed.
+fn should_mark_rejected_pegin_as_processed(cfg: &RskHardforkConfig, block_number: u64) -> bool {
+    cfg.has_rskip459(block_number) && !cfg.has_rskip551(block_number)
+}
+
 pub fn register_btc_transaction<CTX: ContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     gas_cost: u64,
     config: &BridgeConstants,
+    hardfork_cfg: &RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
     if args.len() < 96 {
         return Err(PrecompileError::other(
@@ -197,8 +205,15 @@ pub fn register_btc_transaction<CTX: ContextTr>(
         .map(|o| o.value.to_sat())
         .sum();
 
-    // Enforce minimum peg-in value
+    // rskj marks processed txs with the RSK execution block number
+    // (BridgeSupport.markTxAsProcessed), not the BTC block height.
+    let rsk_height = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+
+    // Enforce minimum peg-in value (rskj handleNonRefundablePegin).
     if total_value < config.minimum_pegin_tx_value {
+        if should_mark_rejected_pegin_as_processed(hardfork_cfg, rsk_height) {
+            set_btc_tx_processed(ctx, &btc_tx_hash, rsk_height);
+        }
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     }
 
@@ -212,7 +227,6 @@ pub fn register_btc_transaction<CTX: ContextTr>(
     }
 
     // Mark as processed
-    let rsk_height = stored_block.height as u64;
     set_btc_tx_processed(ctx, &btc_tx_hash, rsk_height);
 
     Ok(PrecompileOutput::new(gas_cost, Bytes::new()))
@@ -1776,5 +1790,21 @@ mod tests {
         assert_eq!(btc_satoshi_to_rbtc_wei(1), U256::from(10_000_000_000u64));
         assert_eq!(btc_satoshi_to_rbtc_wei(100_000_000), U256::from(10u128.pow(18)));
         assert_eq!(btc_satoshi_to_rbtc_wei(0), U256::ZERO);
+    }
+
+    /// Ported from rskj BridgeSupportTestUtil.shouldMarkRejectedPeginAsProcessed
+    /// and BridgeSupportRejectedPeginTest activation matrix: rejected
+    /// non-refundable peg-ins are marked as processed only between RSKIP459
+    /// (lovell700, mainnet 7_338_024) and RSKIP551 (vetiver900, mainnet 8_804_200).
+    #[test]
+    fn test_should_mark_rejected_pegin_as_processed_window() {
+        let cfg = RskHardforkConfig::mainnet();
+        // Before lovell700: no marking.
+        assert!(!should_mark_rejected_pegin_as_processed(&cfg, 7_338_023));
+        // lovell700 .. vetiver900: marking active.
+        assert!(should_mark_rejected_pegin_as_processed(&cfg, 7_338_024));
+        assert!(should_mark_rejected_pegin_as_processed(&cfg, 8_804_199));
+        // From vetiver900 (RSKIP551): disabled again.
+        assert!(!should_mark_rejected_pegin_as_processed(&cfg, 8_804_200));
     }
 }

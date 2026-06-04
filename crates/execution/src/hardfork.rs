@@ -193,6 +193,12 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Hop400
     }
 
+    /// RSKIP459: mark rejected non-refundable peg-ins as processed (Lovell700).
+    /// Disabled again by RSKIP551 at Vetiver900.
+    pub fn has_rskip459(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Lovell700
+    }
+
     /// RSKIP536: additional BlockHeader precompile methods. Maps to reed810 in
     /// reference.conf; mainnet overrides it to the vetiver900 height (8_804_200)
     /// via main.conf consensusRules. `>= Reed810` is exact on both networks
