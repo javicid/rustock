@@ -188,7 +188,7 @@ impl RskExecutor {
                     .btc_sender_hash160(self.hardfork_cfg.chain_id)
                     .unwrap_or([0u8; 20]);
                 if let Ok(mut guard) = bridge_ctx_slot.lock() {
-                    *guard = BridgeTxContext { rsk_tx_hash, btc_sender_hash160 };
+                    *guard = BridgeTxContext { rsk_tx_hash, btc_sender_hash160, rsk_sender: *sender };
                 }
             }
 
@@ -240,11 +240,16 @@ impl RskExecutor {
                     }
                 };
 
+                // Bridge events emitted during the direct call accumulate in
+                // the journal; drain them into the receipt like revm does for
+                // normal transactions.
+                let logs = evm.ctx.journal_mut().take_logs();
+
                 tx_results.push(TxExecutionResult {
                     gas_used: 0,
                     success,
                     output,
-                    logs: Vec::new(),
+                    logs,
                     created_address: None,
                 });
                 continue;

@@ -829,6 +829,8 @@ pub struct BridgeTxContext {
     /// Derived from the RSK transaction's secp256k1 signature.
     /// Zero bytes if the pubkey cannot be recovered (system/REMASC transactions).
     pub btc_sender_hash160: [u8; 20],
+    /// RSK sender address of the executing transaction (Bridge event payloads).
+    pub rsk_sender: Address,
 }
 
 /// Wraps an owned `Precompiles` set to implement revm's `PrecompileProvider`.

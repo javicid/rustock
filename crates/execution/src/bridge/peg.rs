@@ -476,6 +476,12 @@ pub fn update_collections<CTX: ContextTr>(
     let use_tx_hash = hardfork_cfg.has_rskip146(block_number);
     let use_rskip271 = hardfork_cfg.has_rskip271(block_number);
 
+    // rskj BridgeSupport.updateCollections logs an update_collections event;
+    // the legacy single-topic format applies before RSKIP146.
+    if !use_tx_hash {
+        super::events::log_legacy_update_collections(ctx, tx_ctx.rsk_sender);
+    }
+
     // -----------------------------------------------------------------------
     // Step 1: Check if we should create a new peg-out batch this block
     // -----------------------------------------------------------------------
@@ -679,6 +685,23 @@ pub fn add_signature<CTX: ContextTr>(
     let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
     let redeem_script = build_federation_redeem_script(&federation_keys, threshold);
 
+    // rskj logs an add_signature event when the federator key belongs to the
+    // federation, BEFORE applying the new signatures — the logged BTC tx
+    // hash covers only previously-applied ones (BridgeSupport.addReleaseSignatures).
+    let legacy_events = !hardfork_cfg.has_rskip146(block_number);
+    let is_member = compress_pubkey(&fed_key)
+        .map(|k| federation_keys.contains(&k))
+        .unwrap_or(false);
+    if legacy_events && is_member {
+        let txid = btc_tx.compute_txid().to_string();
+        super::events::log_legacy_add_signature(
+            ctx,
+            &txid,
+            &pubkey_hash160(&fed_key),
+            &rsk_tx_hash,
+        );
+    }
+
     // Apply DER signatures to each input
     let _ = apply_signatures_to_tx(
         &mut btc_tx,
@@ -692,6 +715,11 @@ pub fn add_signature<CTX: ContextTr>(
     let sig_count = count_signatures_in_tx(&btc_tx, threshold);
 
     if sig_count >= threshold {
+        // Fully signed: rskj logs release_btc with the signed transaction.
+        if legacy_events {
+            let txid = btc_tx.compute_txid().to_string();
+            super::events::log_legacy_release_btc(ctx, &txid, &btc_serialize(&btc_tx));
+        }
         // Fully signed — remove from waiting map
         // (The BTC tx is broadcast off-chain by federation nodes)
         wfs.remove(&rsk_tx_hash);
@@ -710,8 +738,26 @@ pub fn add_signature<CTX: ContextTr>(
         bridge_store_bytes(ctx, wfs_key, &updated);
     }
 
-    let _ = (hardfork_cfg, block_number);
     Ok(PrecompileOutput::new(gas_cost, Bytes::new()))
+}
+
+/// Compress a SEC1 public key (33- or 65-byte) to its 33-byte form.
+fn compress_pubkey(key: &[u8]) -> Option<[u8; 33]> {
+    use k256::elliptic_curve::sec1::ToEncodedPoint;
+    let parsed = k256::PublicKey::from_sec1_bytes(key).ok()?;
+    let point = parsed.to_encoded_point(true);
+    point.as_bytes().try_into().ok()
+}
+
+/// RIPEMD160(SHA256(pubkey)) — bitcoinj `ECKey.getPubKeyHash` over the key
+/// bytes as provided.
+fn pubkey_hash160(key: &[u8]) -> [u8; 20] {
+    use sha2::Digest as Sha2Digest;
+    let sha256 = sha2::Sha256::digest(key);
+    let hash160 = ripemd::Ripemd160::digest(sha256);
+    let mut arr = [0u8; 20];
+    arr.copy_from_slice(&hash160);
+    arr
 }
 
 // ---------------------------------------------------------------------------
