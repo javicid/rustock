@@ -43,12 +43,27 @@ pub struct RskExecutor {
     hardfork_cfg: RskHardforkConfig,
     block_store: Arc<BlockStore>,
     remasc_config: crate::remasc::RemascConfig,
+    bridge_constants: crate::bridge::constants::BridgeConstants,
+    /// RSK addresses allowed to send free bridge txs (genesis federation +
+    /// authorizers), derived from the bridge constants' public keys.
+    free_bridge_senders: Vec<Address>,
 }
 
 impl RskExecutor {
     pub fn new(hardfork_cfg: RskHardforkConfig, block_store: Arc<BlockStore>) -> Self {
         let remasc_config = crate::remasc::RemascConfig::mainnet();
-        Self { hardfork_cfg, block_store, remasc_config }
+        let bridge_constants = match hardfork_cfg.chain_id {
+            crate::hardfork::RSK_TESTNET_CHAIN_ID => crate::bridge::constants::BridgeConstants::testnet(),
+            crate::hardfork::RSK_MAINNET_CHAIN_ID => crate::bridge::constants::BridgeConstants::mainnet(),
+            _ => crate::bridge::constants::BridgeConstants::regtest(),
+        };
+        let free_bridge_senders = bridge_constants
+            .genesis_federation_public_keys
+            .iter()
+            .chain(bridge_constants.authorized_free_tx_keys.iter())
+            .filter_map(|hex| rsk_address_from_pubkey_hex(hex))
+            .collect();
+        Self { hardfork_cfg, block_store, remasc_config, bridge_constants, free_bridge_senders }
     }
 
     pub fn with_remasc_config(mut self, config: crate::remasc::RemascConfig) -> Self {
@@ -177,6 +192,64 @@ impl RskExecutor {
                 }
             }
 
+            // Free bridge transactions (pre-areBridgeTxsPaid) carry
+            // gas_limit 0 and pay nothing; revm's gas validation would
+            // reject them, so call the Bridge directly like rskj's
+            // zero-cost path (Transaction.transactionCost == 0,
+            // Bridge.getGasForData == 0).
+            if self.is_free_bridge_tx(tx, *sender, header.number) {
+                debug!(tx_index = i, "executing free bridge transaction");
+                use revm::context_interface::journaled_state::account::JournaledAccountTr;
+                use revm::context_interface::{ContextTr, JournalTr};
+                // rskj increments the sender nonce in init() even for free
+                // txs, outside the execution rollback scope.
+                {
+                    let mut acc = evm.ctx.journal_mut().load_account_mut(*sender)
+                        .map_err(|e| ExecutionError::Evm(format!("{e:?}")))?;
+                    acc.data.bump_nonce();
+                }
+
+                // Warm the Bridge account: outside revm's transact flow the
+                // precompile warm-set is not populated and journal sloads on
+                // a cold account fail.
+                let _ = evm.ctx.journal_mut()
+                    .load_account(crate::precompiles::BRIDGE_ADDR);
+
+                let tx_ctx = bridge_ctx_slot.lock().map(|g| g.clone()).unwrap_or_default();
+                let use_v2 = self.hardfork_cfg.has_stored_block_v2(header.number);
+                let checkpoint = evm.ctx.journal_mut().checkpoint();
+                let outcome = crate::bridge::execute_bridge(
+                    &mut evm.ctx,
+                    tx.input.as_ref(),
+                    u64::MAX, // gas is not metered for free bridge txs
+                    &self.bridge_constants,
+                    Some(&self.block_store),
+                    use_v2,
+                    &self.hardfork_cfg,
+                    &tx_ctx,
+                );
+                let (success, output) = match outcome {
+                    Ok(out) => {
+                        evm.ctx.journal_mut().checkpoint_commit();
+                        (true, out.bytes.to_vec())
+                    }
+                    Err(e) => {
+                        evm.ctx.journal_mut().checkpoint_revert(checkpoint);
+                        debug!(tx_index = i, error = %e, "free bridge tx failed");
+                        (false, Vec::new())
+                    }
+                };
+
+                tx_results.push(TxExecutionResult {
+                    gas_used: 0,
+                    success,
+                    output,
+                    logs: Vec::new(),
+                    created_address: None,
+                });
+                continue;
+            }
+
             let tx_env = tx_env_from_rsk_tx(tx, *sender, &self.hardfork_cfg);
 
             let result = evm
@@ -208,6 +281,16 @@ impl RskExecutor {
             gas_used: total_gas,
             state_changes: state,
         })
+    }
+
+    /// rskj BridgeUtils.isFreeBridgeTx: before areBridgeTxsPaid activates,
+    /// transactions to the Bridge from the genesis federation or an
+    /// authorized sender execute for free (zero gas).
+    fn is_free_bridge_tx(&self, tx: &rustock_core::Transaction, sender: Address, block_number: u64) -> bool {
+        tx.to.len() == 20
+            && tx.to.as_ref() == crate::precompiles::BRIDGE_ADDR.as_slice()
+            && !self.hardfork_cfg.has_are_bridge_txs_paid(block_number)
+            && self.free_bridge_senders.contains(&sender)
     }
 
     /// Detect the REMASC synthetic transaction: v=0, r=0, s=0, gas_limit=0,
@@ -248,6 +331,18 @@ pub enum ExecutionError {
     Database(#[from] crate::database::RskDbError),
     #[error("evm error: {0}")]
     Evm(String),
+}
+
+/// Derives an RSK address from a secp256k1 public key in SEC1 hex
+/// (compressed or uncompressed): keccak256 of the uncompressed point's
+/// 64 coordinate bytes, last 20 bytes (rskj ECKey.getAddress).
+fn rsk_address_from_pubkey_hex(hex: &str) -> Option<Address> {
+    use k256::elliptic_curve::sec1::ToEncodedPoint;
+    let bytes = alloy_primitives::hex::decode(hex).ok()?;
+    let key = k256::PublicKey::from_sec1_bytes(&bytes).ok()?;
+    let point = key.to_encoded_point(false);
+    let digest = sha3::Keccak256::digest(&point.as_bytes()[1..]);
+    Some(Address::from_slice(&digest[12..]))
 }
 
 fn make_cfg_env(spec_id: SpecId, chain_id: u64, eip3541_active: bool) -> CfgEnv {
@@ -2115,6 +2210,96 @@ mod tests {
     fn test_rskip540_estimated_fees_for_pegout_amount_below_minimum_fails() {
         let result = call_estimated_fees_for_pegout_amount(8_804_200, U256::from(1));
         assert!(!result.success, "below-minimum amount must be rejected");
+    }
+
+    // -----------------------------------------------------------------------
+    // Free bridge transactions (rskj BridgeUtils.isFreeBridgeTx)
+    // -----------------------------------------------------------------------
+
+    /// Known vector: the address of private key 0x01. Its public key is
+    /// 0479be667e...f81798 / 483ada77...10d4b8 and the derived address is
+    /// 0x7e5f4552091a69125d5dfcb7b8c2659029395bdf.
+    #[test]
+    fn test_rsk_address_from_pubkey_hex() {
+        let uncompressed = "0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8";
+        let compressed = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        let expected: Address = "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf".parse().unwrap();
+        assert_eq!(rsk_address_from_pubkey_hex(uncompressed), Some(expected));
+        assert_eq!(rsk_address_from_pubkey_hex(compressed), Some(expected));
+        assert_eq!(rsk_address_from_pubkey_hex("zz"), None);
+    }
+
+    /// All mainnet free-bridge sender keys (15 federators + 7 authorizers)
+    /// derive to distinct addresses.
+    #[test]
+    fn test_mainnet_free_bridge_senders_derive() {
+        let executor = RskExecutor::new(
+            RskHardforkConfig::mainnet(),
+            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap()),
+        );
+        let senders = &executor.free_bridge_senders;
+        assert_eq!(senders.len(), 22);
+        let unique: std::collections::HashSet<_> = senders.iter().collect();
+        assert_eq!(unique.len(), 22);
+    }
+
+    /// Runs a gas_limit-0 tx to the Bridge through execute_block at the
+    /// given mainnet height from the given sender.
+    fn run_bridge_tx_gas0(block_number: u64, sender: Address) -> Result<crate::executor::BlockExecutionResult, ExecutionError> {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+        let root = put_account(&root, store.as_ref(), &sender, 0, U256::ZERO);
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let header = dummy_header(block_number);
+
+        // updateCollections() selector
+        let input = block_header_selector("updateCollections()").to_vec();
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(0),
+            to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::from(input),
+            v: 28, // free bridge txs are real signed txs, not remasc
+            r: U256::from(1),
+            s: U256::from(1),
+            cached_rlp: None,
+        };
+
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        executor.execute_block(&header, &[(tx, sender)], &root, store)
+    }
+
+    /// Before areBridgeTxsPaid (mainnet 370_000), a genesis federator's
+    /// gas_limit-0 bridge tx executes for free: receipt gas_used 0.
+    #[test]
+    fn test_free_bridge_tx_executes_with_zero_gas() {
+        let federator = rsk_address_from_pubkey_hex(
+            "03b53899c390573471ba30e5054f78376c5f797fda26dde7a760789f02908cbad2",
+        )
+        .unwrap();
+        let result = run_bridge_tx_gas0(457, federator).expect("free bridge tx must execute");
+        assert_eq!(result.tx_results.len(), 1);
+        assert_eq!(result.tx_results[0].gas_used, 0);
+        assert_eq!(result.gas_used, 0);
+    }
+
+    /// From areBridgeTxsPaid on, the same tx goes through normal gas
+    /// validation and is rejected (gas_limit 0 < intrinsic cost).
+    #[test]
+    fn test_bridge_tx_gas0_rejected_after_are_bridge_txs_paid() {
+        let federator = rsk_address_from_pubkey_hex(
+            "03b53899c390573471ba30e5054f78376c5f797fda26dde7a760789f02908cbad2",
+        )
+        .unwrap();
+        assert!(run_bridge_tx_gas0(370_000, federator).is_err());
+    }
+
+    /// A non-federation sender never gets the free path.
+    #[test]
+    fn test_bridge_tx_gas0_rejected_for_unknown_sender() {
+        assert!(run_bridge_tx_gas0(457, Address::repeat_byte(0xEE)).is_err());
     }
 
     /// getCoinbaseAddress at depth 1 returns the grandparent's coinbase.

@@ -199,6 +199,19 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Lovell700
     }
 
+    /// areBridgeTxsPaid (rskj reference.conf: afterBridgeSync — mainnet
+    /// 370_000, testnet 114_000). Before activation, federation/authorized
+    /// transactions to the Bridge execute for free with zero gas
+    /// (BridgeUtils.isFreeBridgeTx).
+    pub fn has_are_bridge_txs_paid(&self, block_number: u64) -> bool {
+        let height = match self.chain_id {
+            RSK_MAINNET_CHAIN_ID => 370_000,
+            RSK_TESTNET_CHAIN_ID => 114_000,
+            _ => 0,
+        };
+        block_number >= height
+    }
+
     /// RSKIP536: additional BlockHeader precompile methods. Maps to reed810 in
     /// reference.conf; mainnet overrides it to the vetiver900 height (8_804_200)
     /// via main.conf consensusRules. `>= Reed810` is exact on both networks
