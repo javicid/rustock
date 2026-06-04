@@ -719,12 +719,29 @@ fn parse_derivation_path(
 /// Starts with the Ethereum precompiles matching the block's SpecId,
 /// then adds RSK-specific precompiles gated by their activation RSKIPs.
 pub fn rsk_precompiles(hardfork_cfg: &RskHardforkConfig, block_number: u64) -> Precompiles {
-    let spec_id = hardfork_cfg.spec_id(block_number);
-    let precompile_spec = spec_id_to_precompile_spec(spec_id);
-
-    let mut precompiles = Precompiles::new(precompile_spec).clone();
-
     let upgrade = hardfork_cfg.active_upgrade(block_number);
+
+    // rskj gates each precompile on its own RSKIP rather than Ethereum spec
+    // buckets (PrecompiledContracts.getContractForAddress). From genesis:
+    // 0x01-0x04 (ecrecover, sha256, ripemd160, identity) plus 0x05 modexp
+    // with EIP-198 (Byzantium) pricing.
+    let mut precompiles = Precompiles::new(PrecompileSpecId::HOMESTEAD).clone();
+    precompiles.extend([revm::precompile::modexp::BYZANTIUM]);
+
+    // RSKIP137 (Papyrus200): BN128 add/mul/pairing, priced per EIP-1108
+    // (Istanbul: 150 / 6000 / 45000 + 34000 per pair) from activation.
+    if upgrade >= RskNetworkUpgrade::Papyrus200 {
+        precompiles.extend([
+            revm::precompile::bn254::add::ISTANBUL,
+            revm::precompile::bn254::mul::ISTANBUL,
+            revm::precompile::bn254::pair::ISTANBUL,
+        ]);
+    }
+
+    // RSKIP153 (Iris300): Blake2F
+    if upgrade >= RskNetworkUpgrade::Iris300 {
+        precompiles.extend([revm::precompile::blake2::FUN]);
+    }
 
     // Genesis precompiles: Bridge, REMASC (always active)
     precompiles.extend([
@@ -740,8 +757,8 @@ pub fn rsk_precompiles(hardfork_cfg: &RskHardforkConfig, block_number: u64) -> P
         ),
     ]);
 
-    // RSKIP106 (Orchid): HDWalletUtils
-    if upgrade >= RskNetworkUpgrade::Orchid {
+    // RSKIP106 (Wasabi100): HDWalletUtils
+    if upgrade >= RskNetworkUpgrade::Wasabi100 {
         precompiles.extend([
             Precompile::new(
                 PrecompileId::custom("rsk-hdwallet"),
@@ -762,8 +779,8 @@ pub fn rsk_precompiles(hardfork_cfg: &RskHardforkConfig, block_number: u64) -> P
         ]);
     }
 
-    // RSKIP203 (Iris300): Environment
-    if upgrade >= RskNetworkUpgrade::Iris300 {
+    // RSKIP203 (Arrowhead600): Environment
+    if upgrade >= RskNetworkUpgrade::Arrowhead600 {
         precompiles.extend([
             Precompile::new(
                 PrecompileId::custom("rsk-environment"),
@@ -1262,23 +1279,6 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for RskPrecompileProvider {
     }
 }
 
-fn spec_id_to_precompile_spec(spec_id: SpecId) -> PrecompileSpecId {
-    match spec_id {
-        SpecId::FRONTIER | SpecId::FRONTIER_THAWING | SpecId::HOMESTEAD
-        | SpecId::DAO_FORK | SpecId::TANGERINE | SpecId::SPURIOUS_DRAGON => {
-            PrecompileSpecId::HOMESTEAD
-        }
-        SpecId::BYZANTIUM | SpecId::CONSTANTINOPLE | SpecId::PETERSBURG => {
-            PrecompileSpecId::BYZANTIUM
-        }
-        SpecId::ISTANBUL | SpecId::MUIR_GLACIER => PrecompileSpecId::ISTANBUL,
-        SpecId::BERLIN | SpecId::LONDON | SpecId::ARROW_GLACIER
-        | SpecId::GRAY_GLACIER | SpecId::MERGE => PrecompileSpecId::BERLIN,
-        SpecId::SHANGHAI | SpecId::CANCUN => PrecompileSpecId::CANCUN,
-        _ => PrecompileSpecId::CANCUN,
-    }
-}
-
 /// Helper to check if an address is an RSK precompile at a given block.
 pub fn is_rsk_precompile(
     address: &Address,
@@ -1352,17 +1352,10 @@ mod tests {
     }
 
     #[test]
-    fn test_hdwallet_not_active_before_orchid() {
+    fn test_hdwallet_not_active_before_wasabi100() {
         let cfg = RskHardforkConfig::mainnet();
         let precompiles = rsk_precompiles(&cfg, 0);
         assert!(!precompiles.contains(&HD_WALLET_UTILS_ADDR));
-    }
-
-    #[test]
-    fn test_hdwallet_active_after_orchid() {
-        let cfg = RskHardforkConfig::mainnet();
-        let precompiles = rsk_precompiles(&cfg, 729_000);
-        assert!(precompiles.contains(&HD_WALLET_UTILS_ADDR));
     }
 
     #[test]
@@ -1376,15 +1369,84 @@ mod tests {
         assert!(post.contains(&BLOCK_HEADER_ADDR));
     }
 
+    /// rskj reference.conf: rskip203 = arrowhead600 (mainnet 6_223_700).
     #[test]
-    fn test_environment_active_after_iris() {
+    fn test_environment_active_after_arrowhead600() {
         let cfg = RskHardforkConfig::mainnet();
 
-        let pre = rsk_precompiles(&cfg, 3_614_799);
+        let pre = rsk_precompiles(&cfg, 6_223_699);
         assert!(!pre.contains(&ENVIRONMENT_ADDR));
 
-        let post = rsk_precompiles(&cfg, 3_614_800);
+        let post = rsk_precompiles(&cfg, 6_223_700);
         assert!(post.contains(&ENVIRONMENT_ADDR));
+    }
+
+    /// rskj reference.conf: rskip106 = wasabi100 (mainnet 1_591_000).
+    #[test]
+    fn test_hdwallet_active_after_wasabi100() {
+        let cfg = RskHardforkConfig::mainnet();
+
+        let pre = rsk_precompiles(&cfg, 1_590_999);
+        assert!(!pre.contains(&HD_WALLET_UTILS_ADDR));
+
+        let post = rsk_precompiles(&cfg, 1_591_000);
+        assert!(post.contains(&HD_WALLET_UTILS_ADDR));
+    }
+
+    /// rskj reference.conf: rskip137 = papyrus200 (mainnet 2_392_700).
+    /// BN128 uses EIP-1108 (Istanbul) pricing from activation: add = 150
+    /// (rskj BN128Addition.getGasForData groundtruth).
+    #[test]
+    fn test_bn128_active_after_papyrus200_with_istanbul_gas() {
+        let cfg = RskHardforkConfig::mainnet();
+        let bn_add: Address = revm::precompile::u64_to_address(6);
+        let bn_mul: Address = revm::precompile::u64_to_address(7);
+        let bn_pair: Address = revm::precompile::u64_to_address(8);
+
+        let pre = rsk_precompiles(&cfg, 2_392_699);
+        assert!(!pre.contains(&bn_add));
+        assert!(!pre.contains(&bn_mul));
+        assert!(!pre.contains(&bn_pair));
+
+        let post = rsk_precompiles(&cfg, 2_392_700);
+        assert!(post.contains(&bn_add));
+        assert!(post.contains(&bn_mul));
+        assert!(post.contains(&bn_pair));
+
+        // Istanbul pricing at activation: two valid points at infinity, add = 150 gas.
+        let out = post.get(&bn_add).unwrap().execute(&[0u8; 128], 200).unwrap();
+        assert_eq!(out.gas_used, 150, "rskj uses EIP-1108 pricing from rskip137");
+    }
+
+    /// rskj reference.conf: rskip153 = iris300 (mainnet 3_614_800).
+    #[test]
+    fn test_blake2f_active_after_iris300() {
+        let cfg = RskHardforkConfig::mainnet();
+        let blake2f: Address = revm::precompile::u64_to_address(9);
+
+        let pre = rsk_precompiles(&cfg, 3_614_799);
+        assert!(!pre.contains(&blake2f));
+
+        let post = rsk_precompiles(&cfg, 3_614_800);
+        assert!(post.contains(&blake2f));
+    }
+
+    /// RSK has no KZG point-evaluation precompile (Ethereum 0x0a, Cancun-only).
+    #[test]
+    fn test_no_kzg_precompile() {
+        let cfg = RskHardforkConfig::mainnet();
+        let kzg: Address = revm::precompile::u64_to_address(10);
+        assert!(!rsk_precompiles(&cfg, 8_804_200).contains(&kzg));
+    }
+
+    /// Ported from rskj Blake2fNullDataTest (post-RSKIP552 semantics): calling
+    /// Blake2F with empty input fails with an input-length error instead of
+    /// crashing — revm's blake2 run() returns an error for non-213-byte input,
+    /// matching rskj's VMException path.
+    #[test]
+    fn test_blake2f_empty_input_errors() {
+        let out = revm::precompile::blake2::run(&[], 100_000);
+        assert!(out.is_err(), "empty input must be rejected (213 bytes required)");
     }
 
     #[test]
