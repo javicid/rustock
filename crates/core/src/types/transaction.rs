@@ -105,11 +105,41 @@ impl Transaction {
     ///
     /// EIP-155 transactions include `[chainId, 0, 0]` in the RLP; legacy ones do not.
     pub fn signing_hash(&self, chain_id: u64) -> B256 {
+        if let Some(hash) = self.signing_hash_from_cached(chain_id) {
+            return hash;
+        }
         if self.is_eip155(chain_id) {
             self.signing_hash_eip155(chain_id)
         } else {
             self.signing_hash_legacy()
         }
+    }
+
+    /// Signing hash built from the ORIGINAL (network) encoding. rskj signs
+    /// over the raw decoded byte arrays (Transaction.getEncodedRaw), which
+    /// may use non-canonical zero encodings — e.g. a literal 0x00 byte for a
+    /// zero gasLimit. Re-encoding the parsed fields canonically changes the
+    /// hash and recovers the wrong sender, so the first six item encodings
+    /// are reused verbatim.
+    fn signing_hash_from_cached(&self, chain_id: u64) -> Option<B256> {
+        let cached = self.cached_rlp.as_ref()?;
+        let mut buf = cached.as_slice();
+        let header = alloy_rlp::Header::decode(&mut buf).ok()?;
+        if !header.list || buf.len() < header.payload_length {
+            return None;
+        }
+        let mut rest = &buf[..header.payload_length];
+        let mut inner = Vec::with_capacity(header.payload_length + 8);
+        for _ in 0..6 {
+            let item = take_rlp_item(&mut rest)?;
+            inner.extend_from_slice(item);
+        }
+        if self.is_eip155(chain_id) {
+            chain_id.encode(&mut inner);
+            0u8.encode(&mut inner);
+            0u8.encode(&mut inner);
+        }
+        Some(Self::rlp_wrap_and_hash(&inner))
     }
 
     /// EIP-155 signing hash: `keccak256(RLP([nonce, gasPrice, gasLimit, to, value, data, chainId, 0, 0]))`.
@@ -147,6 +177,23 @@ impl Transaction {
         buf.extend_from_slice(inner);
         B256::from_slice(&Keccak256::digest(&buf))
     }
+}
+
+/// Advance past one RLP item, returning its full encoding (header + payload).
+fn take_rlp_item<'a>(buf: &mut &'a [u8]) -> Option<&'a [u8]> {
+    let start = *buf;
+    let mut peek = *buf;
+    let header = alloy_rlp::Header::decode(&mut peek).ok()?;
+    let total = (start.len() - peek.len()) + header.payload_length;
+    if start.len() < total {
+        return None;
+    }
+    let (item, rest) = start.split_at(total);
+    *buf = rest;
+    Some(item)
+}
+
+impl Transaction {
 
     /// Recover the sender address from the transaction signature.
     ///
@@ -364,5 +411,49 @@ mod tests {
         );
 
         assert_eq!(recovered, expected_addr, "recovered sender should match signing key");
+    }
+
+    /// Regression for mainnet block #457: rskj signs over the ORIGINAL field
+    /// byte arrays, which may use non-canonical zero encodings (the free
+    /// bridge txs encode gasLimit as a literal 0x00 byte). The signing hash
+    /// must reuse the original encoding, not a canonical re-encoding.
+    #[test]
+    fn test_recover_sender_with_noncanonical_zero_gas_limit() {
+        use k256::ecdsa::SigningKey;
+
+        // [nonce=empty, gasPrice=0x01, gasLimit=0x00 (raw zero byte), to, value=empty, data=empty]
+        let mut fields = vec![0x80, 0x01, 0x00, 0x94];
+        fields.extend_from_slice(&[0x11u8; 20]);
+        fields.extend_from_slice(&[0x80, 0x80]);
+
+        // rskj getEncodedRaw with chainId 30: fields ++ [chainId, empty, empty]
+        let mut sign_inner = fields.clone();
+        sign_inner.extend_from_slice(&[30, 0x80, 0x80]);
+        let mut sign_buf = Vec::new();
+        alloy_rlp::Header { list: true, payload_length: sign_inner.len() }.encode(&mut sign_buf);
+        sign_buf.extend_from_slice(&sign_inner);
+        let sign_hash: [u8; 32] = Keccak256::digest(&sign_buf).into();
+
+        // Sign with private key 0x...01 (address 0x7e5f4552091a69125d5dfcb7b8c2659029395bdf)
+        let mut key_bytes = [0u8; 32];
+        key_bytes[31] = 1;
+        let sk = SigningKey::from_slice(&key_bytes).unwrap();
+        let (sig, rid) = sk.sign_prehash_recoverable(&sign_hash).unwrap();
+
+        // Assemble the signed tx: fields ++ [v, r, s] (EIP-155, chainId 30)
+        let mut inner = fields;
+        let v = 35u64 + 60 + rid.to_byte() as u64;
+        v.encode(&mut inner);
+        U256::from_be_slice(&sig.r().to_bytes()).encode(&mut inner);
+        U256::from_be_slice(&sig.s().to_bytes()).encode(&mut inner);
+        let mut raw = Vec::new();
+        alloy_rlp::Header { list: true, payload_length: inner.len() }.encode(&mut raw);
+        raw.extend_from_slice(&inner);
+
+        let tx = Transaction::decode(&mut raw.as_slice()).unwrap();
+        assert_eq!(tx.gas_limit, U256::ZERO);
+        let sender = tx.recover_sender(30).unwrap();
+        let expected: Address = "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf".parse().unwrap();
+        assert_eq!(sender, expected, "sender must recover from the original encoding");
     }
 }
