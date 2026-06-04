@@ -123,7 +123,8 @@ impl BlockProcessor {
         let mut new_state_root = apply_state_changes(state_root, trie_store.as_ref(), &exec_result.state_changes);
         let state_root_hash = new_state_root.compute_hash(trie_store.as_ref());
         new_state_root.save(trie_store.as_ref(), true);
-        let receipts_root = ordered_trie_root(&receipts);
+        let receipts_root =
+            ordered_trie_root(&receipts, self.hardfork_cfg.has_unitrie_state_root(header.number));
 
         Ok(ProcessedBlock {
             receipts,
@@ -147,7 +148,10 @@ impl BlockProcessor {
     ) -> Result<ProcessedBlock, ProcessError> {
         let header = &block.header;
 
-        let computed_tx_root = ordered_tx_trie_root(&block.transactions);
+        let computed_tx_root = ordered_tx_trie_root(
+            &block.transactions,
+            self.hardfork_cfg.has_unitrie_state_root(header.number),
+        );
         if computed_tx_root != header.transactions_root {
             return Err(ProcessError::TransactionsRootMismatch {
                 header: header.transactions_root,
@@ -473,7 +477,7 @@ mod tests {
 
         let mut header = dummy_header(8_000_000);
         header.gas_used = 99_999; // wrong gas
-        header.transactions_root = ordered_tx_trie_root(&[tx.clone()]);
+        header.transactions_root = ordered_tx_trie_root(&[tx.clone()], true);
         header.ommers_hash = compute_ommers_hash(&[]);
 
         let block = Block {
@@ -655,7 +659,7 @@ mod tests {
 
         let mut header = dummy_header(8_000_000);
         header.gas_used = 0; // incorrect — should be 21_000
-        header.transactions_root = ordered_tx_trie_root(&[tx.clone()]);
+        header.transactions_root = ordered_tx_trie_root(&[tx.clone()], true);
         header.ommers_hash = compute_ommers_hash(&[]);
 
         let block = Block {
@@ -788,7 +792,7 @@ mod tests {
         );
 
         let mut header = dummy_header(8_000_000);
-        header.transactions_root = ordered_tx_trie_root(&[]);
+        header.transactions_root = ordered_tx_trie_root(&[], true);
         header.ommers_hash = B256::repeat_byte(0xFF); // wrong
 
         let block = Block {
@@ -825,7 +829,7 @@ mod tests {
 
         // Now create a block with correct tx/ommers but wrong state root
         let mut header = dummy_header(8_000_000);
-        header.transactions_root = ordered_tx_trie_root(&[]);
+        header.transactions_root = ordered_tx_trie_root(&[], true);
         header.ommers_hash = compute_ommers_hash(&[]);
         header.receipts_root = correct.receipts_root;
         header.state_root = B256::repeat_byte(0xFF); // wrong
@@ -961,7 +965,7 @@ mod tests {
 
         // Build a header with all correct values
         let mut header = dummy_header(8_000_000);
-        header.transactions_root = ordered_tx_trie_root(&[]);
+        header.transactions_root = ordered_tx_trie_root(&[], true);
         header.ommers_hash = compute_ommers_hash(&[]);
         header.state_root = result.state_root_hash;
         header.receipts_root = result.receipts_root;

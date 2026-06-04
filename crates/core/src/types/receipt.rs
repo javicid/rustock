@@ -185,11 +185,14 @@ impl Decodable for Log {
     }
 }
 
-/// Compute the receipts trie root using the RSK Unitrie.
+/// Compute the receipts trie root, matching rskj's
+/// `BlockHashesHelper.calculateReceiptsTrieRoot`.
 ///
-/// Each receipt is keyed by `RLP.encodeInt(index)` and valued at `receipt.getEncoded()`.
-/// The root hash is the Unitrie hash of that trie — matching rskj's `BlockHashesHelper`.
-pub fn ordered_trie_root(receipts: &[Receipt]) -> B256 {
+/// Each receipt is keyed by `RLP.encodeInt(index)` and valued at
+/// `receipt.getEncoded()`. With RSKIP126 active the root is the Unitrie
+/// hash; before activation it is the legacy Orchid hash
+/// (`Trie.getHashOrchid(false)`).
+pub fn ordered_trie_root(receipts: &[Receipt], rskip126: bool) -> B256 {
     use rustock_trie::{MemoryTrieStore, TrieKeySlice, TrieNode};
 
     let store = MemoryTrieStore::new();
@@ -201,13 +204,17 @@ pub fn ordered_trie_root(receipts: &[Receipt]) -> B256 {
         root = root.put(&key, &receipt.rlp_encode(), &store);
     }
 
-    root.compute_hash(&store)
+    if rskip126 {
+        root.compute_hash(&store)
+    } else {
+        root.compute_hash_orchid(false, &store)
+    }
 }
 
-/// Compute the transactions trie root using the RSK Unitrie.
-///
-/// Matches rskj's `BlockHashesHelper.getTxTrieRoot`.
-pub fn ordered_tx_trie_root(transactions: &[super::transaction::Transaction]) -> B256 {
+/// Compute the transactions trie root, matching rskj's
+/// `BlockHashesHelper.getTxTrieRoot` (Unitrie hash from RSKIP126,
+/// Orchid hash before).
+pub fn ordered_tx_trie_root(transactions: &[super::transaction::Transaction], rskip126: bool) -> B256 {
     use rustock_trie::{MemoryTrieStore, TrieKeySlice, TrieNode};
 
     let store = MemoryTrieStore::new();
@@ -220,7 +227,11 @@ pub fn ordered_tx_trie_root(transactions: &[super::transaction::Transaction]) ->
         root = root.put(&key, &encoded, &store);
     }
 
-    root.compute_hash(&store)
+    if rskip126 {
+        root.compute_hash(&store)
+    } else {
+        root.compute_hash_orchid(false, &store)
+    }
 }
 
 /// RLP-encode an integer the same way rskj's `RLP.encodeInt(i)` does.
@@ -327,15 +338,15 @@ mod tests {
 
     #[test]
     fn test_ordered_trie_root_empty() {
-        let root = ordered_trie_root(&[]);
+        let root = ordered_trie_root(&[], true);
         assert_ne!(root, B256::ZERO, "empty trie root should not be all zeros");
     }
 
     #[test]
     fn test_ordered_trie_root_deterministic() {
         let receipts = vec![sample_receipt(), sample_receipt()];
-        let root1 = ordered_trie_root(&receipts);
-        let root2 = ordered_trie_root(&receipts);
+        let root1 = ordered_trie_root(&receipts, true);
+        let root2 = ordered_trie_root(&receipts, true);
         assert_eq!(root1, root2, "same receipts should produce same root");
     }
 
@@ -343,9 +354,42 @@ mod tests {
     fn test_ordered_trie_root_differs_on_content() {
         let r1 = Receipt::new(true, 21_000, 21_000, Bloom::ZERO, vec![]);
         let r2 = Receipt::new(true, 42_000, 42_000, Bloom::ZERO, vec![]);
-        let root_a = ordered_trie_root(&[r1]);
-        let root_b = ordered_trie_root(&[r2]);
+        let root_a = ordered_trie_root(&[r1], true);
+        let root_b = ordered_trie_root(&[r2], true);
         assert_ne!(root_a, root_b, "different receipts should produce different root");
+    }
+
+    /// Pre-RSKIP126 (Orchid) tx trie root for RSK MAINNET BLOCK #1, validated
+    /// against the live header's transactionsRoot. The block contains exactly
+    /// one transaction: the deterministic REMASC tx
+    /// (rskj RemascTransaction(blockNumber=1): nonce=empty, gasPrice/gasLimit/
+    /// value=0x00, to=REMASC, data=null, unsigned, chainId 0).
+    #[test]
+    fn test_mainnet_block_1_orchid_tx_trie_root() {
+        // RLP([<empty>, 0x00, 0x00, REMASC_ADDR, <0x80>, <empty>, <empty>, <empty>, <empty>])
+        // gasPrice/gasLimit use rskj's raw-zero-byte coin encoding (0x00);
+        // value uses encodeCoinNullZero -> encodeByte(0) -> 0x80.
+        let mut remasc_rlp = vec![0xDD, 0x80, 0x00, 0x00, 0x94];
+        remasc_rlp.extend_from_slice(&[0u8; 16]);
+        remasc_rlp.extend_from_slice(&[0x01, 0x00, 0x00, 0x08]); // ...01000008
+        remasc_rlp.extend_from_slice(&[0x80, 0x80, 0x80, 0x80, 0x80]);
+
+        let tx = super::super::transaction::Transaction::decode(&mut remasc_rlp.as_slice())
+            .expect("valid remasc tx rlp");
+
+        let root = ordered_tx_trie_root(&[tx], false);
+        let expected: B256 =
+            "0x1b4008e6fba070d33fb937e369ddbea5c2b66e5bcb12cfc829f15e1f25e568d0"
+                .parse()
+                .unwrap();
+        assert_eq!(root, expected, "mainnet block #1 transactionsRoot (live header groundtruth)");
+    }
+
+    /// Unitrie (post-RSKIP126) and Orchid roots must differ for the same content.
+    #[test]
+    fn test_orchid_root_differs_from_unitrie_root() {
+        let receipts = vec![sample_receipt()];
+        assert_ne!(ordered_trie_root(&receipts, true), ordered_trie_root(&receipts, false));
     }
 
     // -----------------------------------------------------------------------

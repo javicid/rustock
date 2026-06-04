@@ -113,6 +113,13 @@ impl NodeRef {
     }
 }
 
+/// Orchid hash of a child reference (rskj `NodeReference.getHashOrchid`):
+/// `None` for empty references.
+fn orchid_child_hash(child: &NodeRef, is_secure: bool, store: &dyn TrieStore) -> Option<B256> {
+    let node = child.resolve(store)?;
+    Some(node.compute_hash_orchid(is_secure, store))
+}
+
 #[derive(Clone, Debug)]
 pub struct TrieNode {
     pub shared_path: TrieKeySlice,
@@ -333,6 +340,68 @@ impl TrieNode {
             return empty_trie_hash();
         }
         keccak(&self.to_message(store))
+    }
+
+    /// Serializes this node in the pre-RSKIP107 ("Orchid") wire format
+    /// (rskj `Trie.toMessageOrchid`). Used for the tx/receipts trie roots in
+    /// block headers before RSKIP126 activated.
+    ///
+    /// Layout: arity(1) | flags(1) | child-bits(u16 BE) | lshared-in-bits(u16 BE)
+    /// | encoded path | left orchid hash | right orchid hash | value-or-valueHash.
+    pub fn to_message_orchid(&self, is_secure: bool, store: &dyn TrieStore) -> Vec<u8> {
+        let lshared = self.shared_path.length();
+        let has_long_val = self.has_long_value();
+        let left_hash = orchid_child_hash(&self.left, is_secure, store);
+        let right_hash = orchid_child_hash(&self.right, is_secure, store);
+
+        let mut bits = 0u16;
+        if left_hash.is_some() {
+            bits |= 0b01;
+        }
+        if right_hash.is_some() {
+            bits |= 0b10;
+        }
+
+        let mut out = Vec::new();
+        out.push(2); // ARITY
+        let mut flags = 0u8;
+        if is_secure {
+            flags |= 1;
+        }
+        if has_long_val {
+            flags |= 2;
+        }
+        out.push(flags);
+        out.extend_from_slice(&bits.to_be_bytes());
+        out.extend_from_slice(&(lshared as u16).to_be_bytes());
+
+        if lshared > 0 {
+            out.extend_from_slice(&self.shared_path.encode());
+        }
+        if let Some(h) = left_hash {
+            out.extend_from_slice(h.as_slice());
+        }
+        if let Some(h) = right_hash {
+            out.extend_from_slice(h.as_slice());
+        }
+
+        if self.value_length() > 0 {
+            if has_long_val {
+                out.extend_from_slice(self.get_value_hash().as_slice());
+            } else if let Some(ref v) = self.value {
+                out.extend_from_slice(v);
+            }
+        }
+
+        out
+    }
+
+    /// Keccak-256 of the Orchid serialization (rskj `Trie.getHashOrchid`).
+    pub fn compute_hash_orchid(&self, is_secure: bool, store: &dyn TrieStore) -> B256 {
+        if self.is_empty_trie() {
+            return empty_trie_hash();
+        }
+        keccak(&self.to_message_orchid(is_secure, store))
     }
 
     /// Retrieves the value at the given key, or None.

@@ -888,4 +888,70 @@ mod unit {
         assert!(!root.is_terminal());
         assert!(!root.is_embeddable(&store));
     }
+
+    // ═══════════════════════════════════════════════════════════════
+    // Orchid (pre-RSKIP107) serialization — ported from rskj
+    // TrieOrchidMessageTest groundtruth
+    // ═══════════════════════════════════════════════════════════════
+
+    #[test]
+    fn orchid_empty_trie_to_message() {
+        let store = MemoryTrieStore::new();
+        let msg = TrieNode::empty().to_message_orchid(false, &store);
+        assert_eq!(msg, vec![2, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn orchid_empty_trie_to_message_secure() {
+        let store = MemoryTrieStore::new();
+        let msg = TrieNode::empty().to_message_orchid(true, &store);
+        assert_eq!(msg, vec![2, 1, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn orchid_trie_with_value_to_message() {
+        let store = MemoryTrieStore::new();
+        let trie = TrieNode::empty().put(&TrieKeySlice::from_key(&[]), &[1, 2, 3, 4], &store);
+        let msg = trie.to_message_orchid(false, &store);
+        assert_eq!(msg, vec![2, 0, 0, 0, 0, 0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn orchid_trie_with_long_value_to_message() {
+        use sha3::{Digest, Keccak256};
+        let store = MemoryTrieStore::new();
+        let value = make_value(33);
+        let trie = TrieNode::empty().put(&TrieKeySlice::from_key(&[]), &value, &store);
+        let msg = trie.to_message_orchid(false, &store);
+        assert_eq!(msg.len(), 38);
+        assert_eq!(&msg[..6], &[2, 2, 0, 0, 0, 0]); // flags bit 2 = long value
+        let value_hash: [u8; 32] = Keccak256::digest(&value).into();
+        assert_eq!(&msg[6..38], &value_hash);
+    }
+
+    #[test]
+    fn orchid_trie_with_subtrie_and_no_value_to_message() {
+        let store = MemoryTrieStore::new();
+        let trie = TrieNode::empty().put(&TrieKeySlice::from_key(&[0x02]), &[1, 2, 3, 4], &store);
+        let msg = trie.to_message_orchid(false, &store);
+        assert_eq!(msg, vec![2, 0, 0, 0, 0, 8, 2, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn orchid_trie_with_subtries_and_no_value_to_message() {
+        let store = MemoryTrieStore::new();
+        let trie = TrieNode::empty()
+            .put(&TrieKeySlice::from_key(&[0x02]), &[1, 2, 3, 4], &store)
+            .put(&TrieKeySlice::from_key(&[0x12]), &[1, 2, 3, 4], &store);
+        let msg = trie.to_message_orchid(false, &store);
+        assert_eq!(msg.len(), 6 + 1 + 2 * 32);
+        // arity, flags, child bits = 3 (both), lshared = 3 bits, path byte 0
+        assert_eq!(&msg[..7], &[2, 0, 0, 3, 0, 3, 0]);
+    }
+
+    #[test]
+    fn orchid_empty_trie_hash_is_keccak_rlp_empty() {
+        let store = MemoryTrieStore::new();
+        assert_eq!(TrieNode::empty().compute_hash_orchid(false, &store), empty_trie_hash());
+    }
 }
