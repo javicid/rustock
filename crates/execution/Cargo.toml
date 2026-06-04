@@ -7,7 +7,7 @@ edition = "2021"
 rustock-core = { path = "../core" }
 rustock-trie = { path = "../trie" }
 rustock-storage = { path = "../storage" }
-revm = { version = "36", default-features = false, features = ["std", "secp256k1"] }
+revm = { version = "36", default-features = false, features = ["std", "secp256k1", "optional_eip3541"] }
 alloy-primitives = { workspace = true }
 alloy-rlp = { workspace = true }
 anyhow = { workspace = true }

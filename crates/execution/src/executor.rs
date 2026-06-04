@@ -70,7 +70,7 @@ impl RskExecutor {
         let tx_env = tx_env_from_rsk_tx(tx, sender, &self.hardfork_cfg);
         let db = RskDatabase::new(state_root.clone(), trie_store, self.block_store.clone());
 
-        let cfg = make_cfg_env(spec_id, self.hardfork_cfg.chain_id);
+        let cfg = make_cfg_env(spec_id, self.hardfork_cfg.chain_id, self.hardfork_cfg.has_rskip544(header.number));
 
         let ctx = revm::Context::mainnet()
             .with_db(WrapDatabaseRef(db))
@@ -117,7 +117,7 @@ impl RskExecutor {
         let spec_id = self.hardfork_cfg.spec_id(header.number);
         let block_env = block_env_from_header(header, &self.hardfork_cfg);
         let db = RskDatabase::new(state_root.clone(), trie_store, self.block_store.clone());
-        let cfg = make_cfg_env(spec_id, self.hardfork_cfg.chain_id);
+        let cfg = make_cfg_env(spec_id, self.hardfork_cfg.chain_id, self.hardfork_cfg.has_rskip544(header.number));
 
         let ctx = revm::Context::mainnet()
             .with_db(WrapDatabaseRef(db))
@@ -250,11 +250,14 @@ pub enum ExecutionError {
     Evm(String),
 }
 
-fn make_cfg_env(spec_id: SpecId, chain_id: u64) -> CfgEnv {
+fn make_cfg_env(spec_id: SpecId, chain_id: u64, eip3541_active: bool) -> CfgEnv {
     let mut cfg = CfgEnv::default();
     cfg.chain_id = chain_id;
     cfg.spec = spec_id;
     cfg.limit_contract_code_size = Some(0x6000);
+    // RSKIP544 (Vetiver900): rskj only rejects new contract code starting
+    // with 0xEF from vetiver900, while revm bundles EIP-3541 into LONDON+.
+    cfg.disable_eip3541 = !eip3541_active;
     cfg
 }
 
@@ -759,6 +762,77 @@ mod tests {
         // Note: this tx will revert because the initcode doesn't end with RETURN,
         // but we can still check gas_used >= intrinsic cost
         assert!(result.gas_used >= 32_066, "should include initcode metering cost");
+    }
+
+    /// Runs a contract-creation tx with the given initcode at the given mainnet height.
+    fn run_create_at(initcode: Vec<u8>, block_number: u64, gas_limit: u64) -> TxExecutionResult {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+        let sender = Address::repeat_byte(0xEE);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let header = dummy_header(block_number);
+
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(gas_limit),
+            to: Bytes::new(), // contract creation
+            value: U256::ZERO,
+            input: Bytes::from(initcode),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        executor.execute_tx(&header, &tx, sender, &root, store).unwrap()
+    }
+
+    /// Ported from rskj ContractCodePrefixDslTest
+    /// (dsl/contract_code_prefix_rskip544/create_fails_with_ef_byte_activated.txt):
+    /// after RSKIP544 (vetiver900), creating a contract whose code starts with
+    /// 0xEF fails and burns all gas.
+    #[test]
+    fn test_rskip544_create_ef_code_fails_after_vetiver900() {
+        // PUSH1 0xEF, PUSH1 0, MSTORE8, PUSH1 1, PUSH1 0, RETURN -> code = [0xEF]
+        let initcode = hex::decode("60ef60005360016000f3").unwrap();
+        let result = run_create_at(initcode, 8_804_200, 300_000);
+        assert!(!result.success, "0xEF-prefixed code must be rejected post-vetiver900");
+        assert_eq!(result.gas_used, 300_000, "all gas is consumed (rskj DSL groundtruth)");
+    }
+
+    /// Ported from rskj ContractCodePrefixDslTest
+    /// (testCreateSucceedsWithEFByteBeforeRSKIP544Activation): before vetiver900,
+    /// 0xEF-prefixed code is accepted — rskj only enforces EIP-3541 from RSKIP544.
+    #[test]
+    fn test_rskip544_create_ef_code_succeeds_before_vetiver900() {
+        let initcode = hex::decode("60ef60005360016000f3").unwrap();
+        let result = run_create_at(initcode, 8_804_199, 300_000);
+        assert!(result.success, "0xEF-prefixed code must be accepted pre-vetiver900");
+        assert!(result.gas_used > 21_000 && result.gas_used < 300_000);
+    }
+
+    /// Ported from rskj ContractCodePrefixDslTest (create_succeeds_with_fe_byte.txt):
+    /// 0xFE-prefixed code is fine even after RSKIP544.
+    #[test]
+    fn test_rskip544_create_fe_code_succeeds_after_vetiver900() {
+        let initcode = hex::decode("60fe60005360016000f3").unwrap();
+        let result = run_create_at(initcode, 8_804_200, 300_000);
+        assert!(result.success);
+        assert!(result.gas_used > 21_000 && result.gas_used < 300_000);
+    }
+
+    /// Ported from rskj ContractCodePrefixDslTest (create_succeeds_with_empty_code.txt):
+    /// empty contract code is allowed after RSKIP544.
+    #[test]
+    fn test_rskip544_create_empty_code_succeeds_after_vetiver900() {
+        let initcode = hex::decode("60006000f3").unwrap();
+        let result = run_create_at(initcode, 8_804_200, 300_000);
+        assert!(result.success);
+        assert!(result.gas_used > 21_000 && result.gas_used < 300_000);
     }
 
     /// Ported from rskj Create2Test patterns.
