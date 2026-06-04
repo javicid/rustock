@@ -6,7 +6,7 @@ use alloy_primitives::{B512, B256, U256};
 use anyhow::{Result, Context};
 use std::net::IpAddr;
 use std::sync::Arc;
-use tracing::{info, error, debug, trace};
+use tracing::{info, error, warn, debug, trace};
 
 /// A P2P Node that manages incoming connections and peer handshakes.
 pub struct Node {
@@ -76,13 +76,26 @@ impl Node {
                 }
             }
         }
-        for enode in &self.config.bootnodes {
+        for enode in self.config.bootnodes.iter().filter(|b| b.starts_with("enode://")) {
             if let Err(e) = table_lock.add_enode(enode) {
                 error!(target: "rustock::net", "Failed to add bootnode {}: {:?}", enode, e);
             }
         }
         drop(table_lock);
         table
+    }
+
+    /// Resolves `host:port` bootstrap entries (rskj `peer.discovery.ip.list`
+    /// style, no node ID) to socket addresses.
+    async fn resolve_bootstrap_addrs(&self) -> Vec<std::net::SocketAddr> {
+        let mut addrs = Vec::new();
+        for entry in self.config.bootnodes.iter().filter(|b| !b.starts_with("enode://")) {
+            match tokio::net::lookup_host(entry.as_str()).await {
+                Ok(resolved) => addrs.extend(resolved.filter(|a| a.is_ipv4())),
+                Err(e) => warn!(target: "rustock::net", "Failed to resolve bootstrap {}: {:?}", entry, e),
+            }
+        }
+        addrs
     }
 
     /// Starts the UDP discovery service and returns the shared table handle.
@@ -105,6 +118,7 @@ impl Node {
             id: self.config.id,
         };
 
+        let bootstrap_addrs = self.resolve_bootstrap_addrs().await;
         let discovery_addr = format!("0.0.0.0:{}", self.config.discovery_port);
         let discovery = Arc::new(crate::discovery::DiscoveryService::new(
             &discovery_addr,
@@ -112,6 +126,7 @@ impl Node {
             table,
             self.config.network_id as u32,
             local_node,
+            bootstrap_addrs,
         ).await?);
 
         tokio::spawn(discovery.start());

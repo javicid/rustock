@@ -17,7 +17,7 @@ async fn test_discovery_service_interaction() {
         id: id1,
     };
     let service1 = Arc::new(
-        DiscoveryService::new("127.0.0.1:0", key1, table1.clone(), 33, local_node1)
+        DiscoveryService::new("127.0.0.1:0", key1, table1.clone(), 33, local_node1, vec![])
             .await
             .unwrap(),
     );
@@ -43,7 +43,7 @@ async fn test_discovery_service_interaction() {
         id: id2,
     };
     let service2 = Arc::new(
-        DiscoveryService::new("127.0.0.1:0", key2, table2.clone(), 33, local_node2)
+        DiscoveryService::new("127.0.0.1:0", key2, table2.clone(), 33, local_node2, vec![])
             .await
             .unwrap(),
     );
@@ -64,11 +64,19 @@ async fn test_discovery_service_interaction() {
     }
     assert!(service1.bonded.lock().await.contains(&addr));
 
-    // 3. Service 2 receives Pong
+    // 3. Service 2 receives Pong and learns service 1's node from it
+    // (rskj PeerExplorer.handlePong — required for keyless bootstrap peers)
     let (n, addr) = service2.socket.recv_from(&mut buf).await.unwrap();
     let packet = DiscoveryPacket::decode(&buf[..n]).unwrap();
     assert!(matches!(packet.payload, DiscoveryPayload::Pong(_)));
     service2.handle_packet(&buf[..n], addr).await.unwrap();
+    {
+        let table = table2.read().await;
+        assert!(
+            table.all_nodes().iter().any(|n| n.id == id1),
+            "Service 2 should have learned service 1's node from its Pong"
+        );
+    }
 
     // 4. Service 2 receives FindNode (sent by service1 after bonding)
     let (n, addr) = service2.socket.recv_from(&mut buf).await.unwrap();

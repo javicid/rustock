@@ -37,6 +37,9 @@ pub struct DiscoveryService {
     bonded: Mutex<HashSet<std::net::SocketAddr>>,
     network_id: u32,
     local_node: DiscoveryNode,
+    /// Bootstrap peer addresses (rskj `peer.discovery.ip.list`). Node IDs are
+    /// unknown upfront; we ping these and learn IDs from their signed pongs.
+    bootstrap_addrs: Vec<std::net::SocketAddr>,
 }
 
 impl DiscoveryService {
@@ -46,6 +49,7 @@ impl DiscoveryService {
         table: Arc<RwLock<NodeTable>>,
         network_id: u32,
         local_node: DiscoveryNode,
+        bootstrap_addrs: Vec<std::net::SocketAddr>,
     ) -> Result<Self> {
         let socket = UdpSocket::bind(listen_addr).await?;
         Ok(Self {
@@ -55,6 +59,7 @@ impl DiscoveryService {
             bonded: Mutex::new(HashSet::new()),
             network_id,
             local_node,
+            bootstrap_addrs,
         })
     }
 
@@ -83,6 +88,22 @@ impl DiscoveryService {
         // Background discovery loop
         loop {
             let nodes = self.table.read().await.all_nodes();
+
+            // Ping bootstrap addresses we don't know yet (no node ID in the
+            // table for their address); their pongs/pings get them added.
+            let known_addrs: HashSet<std::net::SocketAddr> = nodes
+                .iter()
+                .filter_map(|n| {
+                    crate::utils::bytes_to_ip(&n.ip)
+                        .map(|ip| std::net::SocketAddr::new(ip, n.udp_port))
+                })
+                .collect();
+            for addr in &self.bootstrap_addrs {
+                if !known_addrs.contains(addr) {
+                    let _ = self.send_ping(*addr).await;
+                }
+            }
+
             let bonded = self.bonded.lock().await;
 
             trace!(
@@ -173,8 +194,18 @@ impl DiscoveryService {
                     let _ = self.send_find_node(self.local_node.id, addr).await;
                 }
             }
-            DiscoveryPayload::Pong(_) => {
+            DiscoveryPayload::Pong(pong) => {
                 trace!(target: "rustock::discovery", "Received Pong from {}", addr);
+                // Like rskj's PeerExplorer.handlePong: learn the node from the
+                // pong, recovering its ID from the packet signature.
+                let tcp_port = if pong.from.tcp_port != 0 { pong.from.tcp_port } else { addr.port() };
+                let node = DiscoveryNode {
+                    ip: crate::utils::ip_to_bytes(addr.ip()),
+                    udp_port: addr.port(),
+                    tcp_port,
+                    id: packet.recover_id()?,
+                };
+                self.table.write().await.add_node(node);
             }
             DiscoveryPayload::FindNode(find) => {
                 trace!(target: "rustock::discovery", "Received FindNode from {}", addr);

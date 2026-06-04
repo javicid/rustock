@@ -104,7 +104,7 @@ impl ChainConfig {
     pub fn regtest() -> Self {
         Self {
             chain_id: 33,
-            network_id: 33,
+            network_id: 7771,
             duration_limit: 10,
             difficulty_divisor: U256::from(2048),
             min_difficulty: U256::from(1),
@@ -259,19 +259,13 @@ impl ChainConfig {
         }
     }
 
-    /// Returns the bootstrap node enode URLs for this network.
+    /// Returns the bootstrap peer addresses for this network, as `host:port`
+    /// strings matching rskj's `peer.discovery.ip.list` (main.conf / testnet.conf).
+    /// Node IDs are not known upfront; discovery learns them from signed pongs.
     pub fn bootnodes(&self) -> Vec<String> {
         match self.chain_id {
-            30 => vec![
-                "enode://e3a25521354aa99424f5de89cdd2e36aa9b9a96d965d1f7f47d876be0cdbd29c7df327a74170f6a9ea44f54f6ab8ae0dae28e40bb89dbd572a617e2008cfc215@34.203.14.152:5050".into(),
-                "enode://f0093935353f94c723a9b67d143ad62464aaf3c959dc05a87f00b637f9c734513493d53f7223633514ea33f2a685878620f0d002cabc05d7f37e6c152774d5da@18.130.226.64:5050".into(),
-                "enode://668702f3d526e06b9b9409564f0b09426f84d693444053673c683b5443fa48a39a259c402120409a473a268a2bf62e3d3090ed596d07d1a296ba2925b4260aa7@48.246.52.203:50501".into(),
-                "enode://277884485741f237f3f15c7e424263304d9c0205d933ca373302bc6e2468351540f2f7902d33406df77d3419515967b5ae1537243c5b96715f5c9e2b02005470@137.66.19.167:50501".into(),
-            ],
-            31 => vec![
-                "enode://137eb4328a7c2298e26dd15bba4796a7cc30b5097f8a14b384c8dc78caab49fac7a897c39a5a7e87838ac6dc1a80b94891d274a85ac76e7342d66e8a9ed26bf5@snapshot-sync-euw1-1.testnet.rskcomputing.net:50505".into(),
-                "enode://fcbfbfce93671320d32ab36ab04ae1564a31892cba219f0a489337aad105dcfc0ebe7d7c2b109d1f4462e8e80588d8ef639b6f321cc1a3f51ec072bed3438105@snapshot-sync-usw2-1.testnet.rskcomputing.net:50505".into(),
-            ],
+            30 => (1..=16).map(|n| format!("bootstrap{n:02}.rsk.co:5050")).collect(),
+            31 => (1..=8).map(|n| format!("bootstrap{n:02}.testnet.rsk.co:50505")).collect(),
             _ => vec![],
         }
     }
@@ -336,7 +330,7 @@ mod tests {
     fn test_regtest_chain_config() {
         let config = ChainConfig::regtest();
         assert_eq!(config.chain_id, 33);
-        assert_eq!(config.network_id, 33);
+        assert_eq!(config.network_id, 7771); // rskj regtest.conf networkId
         assert_eq!(config.duration_limit, 10);
         assert_eq!(config.difficulty_divisor, U256::from(2048));
         assert_eq!(config.min_difficulty, U256::from(1));
@@ -383,17 +377,20 @@ mod tests {
 
     #[test]
     fn test_mainnet_bootnodes() {
-        let config = ChainConfig::mainnet();
-        let nodes = config.bootnodes();
-        assert_eq!(nodes.len(), 4);
-        assert!(nodes[0].starts_with("enode://"));
+        // rskj main.conf peer.discovery.ip.list: bootstrap01..16.rsk.co:5050
+        let nodes = ChainConfig::mainnet().bootnodes();
+        assert_eq!(nodes.len(), 16);
+        assert_eq!(nodes[0], "bootstrap01.rsk.co:5050");
+        assert_eq!(nodes[15], "bootstrap16.rsk.co:5050");
     }
 
     #[test]
     fn test_testnet_bootnodes() {
-        let config = ChainConfig::testnet();
-        let nodes = config.bootnodes();
-        assert_eq!(nodes.len(), 2);
+        // rskj testnet.conf peer.discovery.ip.list: bootstrap01..08.testnet.rsk.co:50505
+        let nodes = ChainConfig::testnet().bootnodes();
+        assert_eq!(nodes.len(), 8);
+        assert_eq!(nodes[0], "bootstrap01.testnet.rsk.co:50505");
+        assert_eq!(nodes[7], "bootstrap08.testnet.rsk.co:50505");
     }
 
     #[test]
