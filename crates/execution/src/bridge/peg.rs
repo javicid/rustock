@@ -1481,6 +1481,44 @@ pub fn get_estimated_fees_for_next_pegout<CTX: ContextTr>(
     Ok(PrecompileOutput::new(gas_cost, output.to_vec().into()))
 }
 
+/// `getEstimatedFeesForPegOutAmount(uint256 pegoutAmountInWeis)` → uint256
+///
+/// Enabled by RSKIP540 (Vetiver900). Validates the amount against the
+/// minimum peg-out value like rskj BridgeSupport.getEstimatedFeesForPegOutAmount;
+/// the fee simulation itself shares getEstimatedFeesForNextPegOutEvent's
+/// (stub) fidelity.
+pub fn get_estimated_fees_for_pegout_amount<CTX: ContextTr>(
+    ctx: &mut CTX,
+    args: &[u8],
+    gas_cost: u64,
+    config: &BridgeConstants,
+    hardfork_cfg: &RskHardforkConfig,
+) -> Result<PrecompileOutput, PrecompileError> {
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    if !hardfork_cfg.has_rskip540(block_number) {
+        return Err(PrecompileError::other(
+            "getEstimatedFeesForPegOutAmount: method not enabled",
+        ));
+    }
+    if args.len() < 32 {
+        return Err(PrecompileError::other(
+            "getEstimatedFeesForPegOutAmount: args too short",
+        ));
+    }
+
+    // co.rsk.core.Coin (wei) -> bitcoin Coin (satoshi): / 10^10
+    let wei = U256::from_be_slice(&args[0..32]);
+    let satoshis = wei / U256::from(10_000_000_000u64);
+    if satoshis < U256::from(config.minimum_pegout_tx_value) {
+        return Err(PrecompileError::other(
+            "getEstimatedFeesForPegOutAmount: peg-out amount is below the minimum peg-out value",
+        ));
+    }
+
+    let output = [0u8; 32];
+    Ok(PrecompileOutput::new(gas_cost, output.to_vec().into()))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

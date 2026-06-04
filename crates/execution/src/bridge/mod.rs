@@ -124,6 +124,7 @@ fn build_method_table() -> Vec<BridgeMethodInfo> {
         ("getNextPegoutCreationBlockNumber","getNextPegoutCreationBlockNumber()",                     Fixed(3000),  TransactionCallable),
         ("getQueuedPegoutsCount",       "getQueuedPegoutsCount()",                                   Fixed(3000),  TransactionCallable),
         ("getEstimatedFeesForNextPegOutEvent","getEstimatedFeesForNextPegOutEvent()",                 Fixed(10000), TransactionCallable),
+        ("getEstimatedFeesForPegOutAmount","getEstimatedFeesForPegOutAmount(uint256)",                Fixed(10000), TransactionCallable),
         // -- Dynamic permission --
         ("getBtcBlockchainBestChainHeight","getBtcBlockchainBestChainHeight()",                       Fixed(19000), DynamicRskip220),
         // -- Local-only getters (needed for completeness; not consensus-critical) --
@@ -309,6 +310,7 @@ fn execute_method<CTX: ContextTr>(
         "getNextPegoutCreationBlockNumber" => peg::get_next_pegout_creation_block_number(ctx, gas_cost),
         "getQueuedPegoutsCount" => peg::get_queued_pegouts_count(ctx, gas_cost),
         "getEstimatedFeesForNextPegOutEvent" => peg::get_estimated_fees_for_next_pegout(ctx, gas_cost),
+        "getEstimatedFeesForPegOutAmount" => peg::get_estimated_fees_for_pegout_amount(ctx, args, gas_cost, config, hardfork_cfg),
 
         // Local-only getters with real storage reads
         "getFederationAddress" => getters::get_federation_address(ctx, gas_cost),
@@ -339,13 +341,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn method_table_has_69_entries() {
-        assert_eq!(BRIDGE_METHODS.len(), 69);
+    fn method_table_has_70_entries() {
+        // 69 pre-vetiver methods + getEstimatedFeesForPegOutAmount (RSKIP540).
+        assert_eq!(BRIDGE_METHODS.len(), 70);
     }
 
     #[test]
-    fn selector_map_has_69_entries() {
-        assert_eq!(BRIDGE_SELECTOR_MAP.len(), 69);
+    fn selector_map_has_70_entries() {
+        assert_eq!(BRIDGE_SELECTOR_MAP.len(), 70);
     }
 
     #[test]
@@ -398,7 +401,7 @@ mod tests {
             .iter()
             .filter(|m| m.permission == BridgePermission::TransactionCallable)
             .count();
-        assert_eq!(count, 31, "31 methods with fixedPermission(false)");
+        assert_eq!(count, 32, "31 pre-vetiver methods with fixedPermission(false) + getEstimatedFeesForPegOutAmount");
     }
 
     #[test]

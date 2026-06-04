@@ -1972,6 +1972,151 @@ mod tests {
         assert_eq!(decoded, parent_coinbase.as_slice());
     }
 
+    /// Shared fixture for RSKIP536 tests: parent block #99 with difficulty 1,
+    /// two uncles of difficulty 1 each, and a stored total difficulty.
+    /// Mirrors rskj BlockHeaderContractTest (RSK_BLOCK_DIFFICULTY = 1,
+    /// RSK_BLOCK_WITH_UNCLES_DIFFICULTY = 3).
+    fn rskip536_call(sig: &str, cfg: RskHardforkConfig, current_number: u64) -> TxExecutionResult {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+
+        let parent_number = current_number - 1;
+        let mut parent_header = dummy_header(parent_number);
+        parent_header.difficulty = U256::from(1);
+        let parent_hash = parent_header.hash();
+        block_store.put_header(&parent_header).unwrap();
+        block_store.put_canonical_hash(parent_number, parent_hash).unwrap();
+
+        let mut uncle1 = dummy_header(parent_number - 1);
+        uncle1.difficulty = U256::from(1);
+        uncle1.beneficiary = Address::repeat_byte(0xD1);
+        let mut uncle2 = dummy_header(parent_number - 1);
+        uncle2.difficulty = U256::from(1);
+        uncle2.beneficiary = Address::repeat_byte(0xD2);
+        block_store.put_body(parent_hash, &[], &[uncle1, uncle2]).unwrap();
+        block_store.put_total_difficulty(parent_hash, U256::from(11_996)).unwrap();
+
+        let mut header = dummy_header(current_number);
+        header.parent_hash = parent_hash;
+
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::from(bh_input(sig, 0)),
+            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+        };
+
+        let executor = RskExecutor::new(cfg, block_store);
+        executor.execute_tx(&header, &tx, sender, &root, store).unwrap()
+    }
+
+    /// Ported from rskj BlockHeaderContractTest.getDifficultyWithUnclesDifficulty:
+    /// difficulty 1 + two uncles of difficulty 1 = 3.
+    #[test]
+    fn test_rskip536_get_difficulty_with_uncles() {
+        let result = rskip536_call(
+            "getDifficultyWithUncles(int256)",
+            RskHardforkConfig::all_active(33),
+            100,
+        );
+        assert!(result.success);
+        assert_eq!(decode_abi_bytes(&result.output), vec![3u8]);
+    }
+
+    /// Ported from rskj BlockHeaderContractTest.getCumulativeWork: returns the
+    /// block store's total difficulty for the block hash.
+    #[test]
+    fn test_rskip536_get_cumulative_work() {
+        let result = rskip536_call(
+            "getCumulativeWork(int256)",
+            RskHardforkConfig::all_active(33),
+            100,
+        );
+        assert!(result.success);
+        assert_eq!(decode_abi_bytes(&result.output), vec![0x2e, 0xdc]); // 11996
+    }
+
+    /// Ported from rskj BlockHeaderContractTest.*_whenMethodDisabled_shouldThrowVME:
+    /// both methods fail before RSKIP536 activates (mainnet vetiver900).
+    #[test]
+    fn test_rskip536_methods_disabled_before_activation() {
+        for sig in ["getDifficultyWithUncles(int256)", "getCumulativeWork(int256)"] {
+            let result = rskip536_call(sig, RskHardforkConfig::mainnet(), 8_804_199);
+            assert!(!result.success, "{sig} must fail before vetiver900");
+        }
+    }
+
+    /// Both methods work at the vetiver900 boundary on mainnet.
+    #[test]
+    fn test_rskip536_methods_enabled_at_vetiver900() {
+        for sig in ["getDifficultyWithUncles(int256)", "getCumulativeWork(int256)"] {
+            let result = rskip536_call(sig, RskHardforkConfig::mainnet(), 8_804_200);
+            assert!(result.success, "{sig} must work from vetiver900");
+        }
+    }
+
+    /// Calls the Bridge's getEstimatedFeesForPegOutAmount(uint256) at the
+    /// given mainnet height with the given amount in weis.
+    fn call_estimated_fees_for_pegout_amount(block_number: u64, wei: U256) -> TxExecutionResult {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let header = dummy_header(block_number);
+
+        let mut input = vec![0u8; 36];
+        input[..4].copy_from_slice(&block_header_selector("getEstimatedFeesForPegOutAmount(uint256)"));
+        input[4..36].copy_from_slice(&wei.to_be_bytes::<32>());
+
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::from(input),
+            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+        };
+
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        executor.execute_tx(&header, &tx, sender, &root, store).unwrap()
+    }
+
+    /// Ported from rskj BridgeTest.getEstimatedFeesForPegOutAmount_preRSKIP540__shouldThrowVMException.
+    #[test]
+    fn test_rskip540_estimated_fees_for_pegout_amount_disabled_before_vetiver900() {
+        // 0.004 BTC (mainnet minimum) in wei — valid amount, but method not enabled yet.
+        let amount = U256::from(400_000u64) * U256::from(10_000_000_000u64);
+        let result = call_estimated_fees_for_pegout_amount(8_804_199, amount);
+        assert!(!result.success, "method must not exist before vetiver900");
+    }
+
+    /// Ported from rskj BridgeTest.getEstimatedFeesForPegOutAmount_afterRSKIP540_shouldExecute.
+    #[test]
+    fn test_rskip540_estimated_fees_for_pegout_amount_executes_after_vetiver900() {
+        let amount = U256::from(400_000u64) * U256::from(10_000_000_000u64);
+        let result = call_estimated_fees_for_pegout_amount(8_804_200, amount);
+        assert!(result.success, "method must execute from vetiver900");
+    }
+
+    /// Ported from rskj BridgeTest.getEstimatedFeesForPegOutAmount_withAmountBelowMinimum_*:
+    /// amounts below the 0.004 BTC mainnet minimum are rejected.
+    #[test]
+    fn test_rskip540_estimated_fees_for_pegout_amount_below_minimum_fails() {
+        let result = call_estimated_fees_for_pegout_amount(8_804_200, U256::from(1));
+        assert!(!result.success, "below-minimum amount must be rejected");
+    }
+
     /// getCoinbaseAddress at depth 1 returns the grandparent's coinbase.
     #[test]
     fn test_block_header_get_coinbase_depth_1() {

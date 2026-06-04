@@ -1106,6 +1106,33 @@ impl RskPrecompileProvider {
                 .unwrap_or_default()
         } else if selector == selector_of("getMergedMiningTags(int256)") {
             extract_merged_mining_tags(&header)
+        } else if selector == selector_of("getDifficultyWithUncles(int256)") {
+            // RSKIP536: block difficulty including uncles
+            // (rskj Block.getCumulativeDifficulty).
+            if !self.hardfork_cfg.has_rskip536(current_number) {
+                return Err(PrecompileError::other("BlockHeader: method not enabled"));
+            }
+            let body = block_store
+                .body(hash)
+                .map_err(|e| PrecompileError::other(format!("BlockHeader: {e}")))?;
+            let (_, ommers) = body.unwrap_or_default();
+            let cumulative = ommers
+                .iter()
+                .fold(header.difficulty, |acc, o| acc.saturating_add(o.difficulty));
+            u256_to_java_bigint_bytes(cumulative)
+        } else if selector == selector_of("getCumulativeWork(int256)") {
+            // RSKIP536: chain work up to the block
+            // (rskj blockStore.getTotalDifficultyForHash).
+            if !self.hardfork_cfg.has_rskip536(current_number) {
+                return Err(PrecompileError::other("BlockHeader: method not enabled"));
+            }
+            match block_store
+                .total_difficulty(hash)
+                .map_err(|e| PrecompileError::other(format!("BlockHeader: {e}")))?
+            {
+                Some(td) => u256_to_java_bigint_bytes(td),
+                None => return Ok(empty_result()),
+            }
         } else if is_uncle {
             let uncle_idx = match parse_int256_as_depth(input.get(36..68).unwrap_or(&[])) {
                 Ok(d) => d,
