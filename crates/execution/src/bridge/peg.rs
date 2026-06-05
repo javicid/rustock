@@ -183,10 +183,13 @@ pub fn register_btc_transaction<CTX: ContextTr>(
         ));
     }
 
-    // Check confirmations
+    // Check confirmations (rskj BridgeUtils.validateHeightAndConfirmations:
+    // the block itself counts as one confirmation, and the CALLER-supplied
+    // height is what gets validated).
     let chain_head = load_chain_head(ctx);
     let best_height = chain_head.map(|h| h.height).unwrap_or(0);
-    if best_height < stored_block.height + config.btc2rsk_minimum_acceptable_confirmations {
+    let confirmations = best_height as i64 - btc_block_height as i64 + 1;
+    if confirmations < config.btc2rsk_minimum_acceptable_confirmations as i64 {
         return Err(PrecompileError::other(
             "registerBtcTransaction: insufficient confirmations",
         ));
