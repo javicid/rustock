@@ -99,6 +99,7 @@ impl RskExecutor {
             self.remasc_config.clone(),
         );
         let mut evm = ctx.build_mainnet().with_precompiles(precompile_provider);
+        crate::rsk_instructions::install(&mut evm.instruction);
 
         let result = evm
             .transact(tx_env)
@@ -150,6 +151,7 @@ impl RskExecutor {
         // it between transactions.
         let bridge_ctx_slot = precompile_provider.bridge_tx_context_slot();
         let mut evm = ctx.build_mainnet().with_precompiles(precompile_provider);
+        crate::rsk_instructions::install(&mut evm.instruction);
 
         let mut total_gas = 0u64;
         let mut tx_results = Vec::with_capacity(transactions.len());
@@ -410,6 +412,14 @@ fn make_cfg_env(spec_id: SpecId, chain_id: u64, eip3541_active: bool) -> CfgEnv 
     // default (latest-fork) table and mis-prices historical opcodes —
     // e.g. SSTORE reset was charged 2900 instead of 5000 at mainnet #1713.
     cfg.set_spec_and_mainnet_gas_params(spec_id);
+    // rskj never adopted EIP-150's 63/64 gas retention: CREATE forwards ALL
+    // remaining gas to the child (Program.createContract spends
+    // getRemainingGas()). A u64::MAX divisor makes the retention zero. The
+    // CALL family is fully replaced by rsk_instructions.
+    cfg.gas_params.override_gas([(
+        revm::context_interface::cfg::GasId::call_stipend_reduction(),
+        u64::MAX,
+    )]);
     cfg.limit_contract_code_size = Some(0x6000);
     // RSKIP544 (Vetiver900): rskj only rejects new contract code starting
     // with 0xEF from vetiver900, while revm bundles EIP-3541 into LONDON+.
@@ -462,6 +472,69 @@ mod tests {
         let key = TrieKeySlice::from_key(&key_bytes);
         let acct = AccountState::new(U256::from(nonce), balance);
         root.put(&key, &acct.encode(), store)
+    }
+
+    /// Regression for mainnet block #356,285 (gas used mismatch 65,024 vs
+    /// 62,724): rskj charges the 2,300 CALL stipend to the caller
+    /// (calleeGas = min(remaining, requested + stipend)), while canonical
+    /// EVM conjures it for free — making a `transfer()` to an EOA 2,300
+    /// cheaper. The contract performs CALL(gas=0, eoa, value=1) and stops:
+    ///   21,000 intrinsic + 21 (7 pushes) + 700 CALL + 9,000 VT = 30,721
+    /// (the charged stipend returns as the EOA child's unused gas).
+    #[test]
+    fn test_rskj_call_stipend_is_charged_to_caller() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+
+        let sender = Address::repeat_byte(0xAA);
+        let contract = Address::repeat_byte(0xCC);
+        let eoa = Address::repeat_byte(0xBB);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+        let root = put_account(&root, store.as_ref(), &eoa, 1, U256::from(5));
+        let root = put_account(&root, store.as_ref(), &contract, 1, U256::from(1_000));
+        // PUSH1 0 x4 (ret/args) PUSH1 1 (value) PUSH20 eoa PUSH1 0 (gas) CALL STOP
+        let mut code = vec![
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, // out/in offsets+sizes
+            0x60, 0x01, // value 1
+            0x73, // PUSH20
+        ];
+        code.extend_from_slice(eoa.as_slice());
+        code.extend_from_slice(&[0x60, 0x00, 0xF1, 0x00]); // gas 0, CALL, STOP
+        let code_key_bytes = rustock_trie::code_key(&contract);
+        let root = root.put(
+            &TrieKeySlice::from_key(&code_key_bytes),
+            &code,
+            store.as_ref(),
+        );
+
+        let block_store =
+            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let header = dummy_header(356_285);
+
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(600_000),
+            to: Bytes::copy_from_slice(contract.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::new(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        let result = executor
+            .execute_tx(&header, &tx, sender, &root, store)
+            .expect("execution succeeds");
+        assert!(result.success);
+        assert_eq!(
+            result.gas_used, 30_721,
+            "rskj charges the stipend through calleeGas; canonical EVM would yield 28,421"
+        );
     }
 
     /// Regression for mainnet block #1713 (gas used mismatch 26656 vs 24556):
