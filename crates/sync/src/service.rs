@@ -1176,12 +1176,26 @@ impl SyncService {
                         trie_store.flush();
                         self.blocks_since_flush = 0;
                         let _ = self.manager.store.set_exec_head(*hash, result.state_root_hash);
+                        // Let the event loop breathe: batch execution would
+                        // otherwise block ticks (progress reporting, request
+                        // timeouts) for the whole round.
+                        tokio::task::yield_now().await;
                     }
                     if processed.is_multiple_of(100) {
                         debug!(
                             target: "rustock::sync",
                             "Processed {} blocks (latest #{}, state root {:?})",
                             processed, header.number, result.state_root_hash
+                        );
+                    }
+                    // Mid-batch execution progress at INFO: the sync tick
+                    // (and its progress line) cannot run while a batch
+                    // executes in this same task.
+                    if processed.is_multiple_of(1000) {
+                        info!(
+                            target: "rustock::sync",
+                            "Executing batch: #{} ({}/{} blocks)",
+                            header.number, processed, pending_headers.len()
                         );
                     }
                 }
