@@ -268,7 +268,15 @@ pub fn register_btc_transaction<CTX: ContextTr>(
     // Lock whitelist gate (rskj verifyLockSenderIsWhitelisted): the matching
     // one-off entry is consumed on success; rejection generates a refund
     // peg-out back to the sender (generateRejectionRelease).
-    if !whitelist_allows_and_consume(ctx, &sender_hash160, total_value, btc_block_height) {
+    let wl_allowed = whitelist_allows_and_consume(ctx, &sender_hash160, total_value, btc_block_height);
+    tracing::debug!(
+        "pegin whitelist check: sender {} amount {} btc_height {} -> {}",
+        to_hex(&sender_hash160),
+        total_value,
+        btc_block_height,
+        wl_allowed
+    );
+    if !wl_allowed {
         let pegin_utxos: Vec<BridgeUtxo> = btc_tx
             .output
             .iter()
@@ -977,13 +985,20 @@ pub fn add_signature<CTX: ContextTr>(
                     .len()
             };
             let utxo_count = load_federation_utxos(ctx).len();
+            let (one_off, disable_h) = load_one_off_whitelist(ctx);
             tracing::debug!(
-                "addSignature: WFS miss for {} (wfs keys: {:?}; queue {} entries, wfc {} entries, {} federation utxos)",
+                "addSignature: WFS miss for {} (wfs keys: {:?}; queue {} entries, wfc {} entries, {} federation utxos; whitelist {:?} disable={} unlimited={})",
                 to_hex(&rsk_tx_hash),
                 wfs.keys().map(|k| to_hex(&k[..4])).collect::<Vec<_>>(),
                 queue_len,
                 wfc_len,
-                utxo_count
+                utxo_count,
+                one_off
+                    .iter()
+                    .map(|(h, v)| format!("{}:{}", to_hex(h), v))
+                    .collect::<Vec<_>>(),
+                disable_h,
+                load_unlimited_whitelist(ctx).len()
             );
             return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
         }

@@ -289,7 +289,8 @@ pub fn bridge_transfer<CTX: ContextTr>(ctx: &mut CTX, recipient: Address, amount
 ///
 /// Matches rskj's `BridgeSerializationUtils.serializeOneOffLockWhitelist`.
 /// `entries`: (BTC hash160, max transfer value in satoshis)
-/// `disable_height`: block height at which this whitelist is disabled (-1 = never set)
+/// `disable_height`: BTC height at which the whitelist turns off
+/// (`i32::MAX` = not set, matching rskj's LockWhitelist default).
 pub fn serialize_one_off_whitelist(entries: &[([u8; 20], u64)], disable_height: i32) -> Vec<u8> {
     use super::serialization::{rlp_encode_element, rlp_encode_list, rlp_encode_u64};
 
@@ -301,13 +302,9 @@ pub fn serialize_one_off_whitelist(entries: &[([u8; 20], u64)], disable_height: 
         items.push(rlp_encode_u64(*max_val));
     }
 
-    // Disable block height: stored as RLP-encoded BigInteger (same as rlp_encode_u64 but signed)
-    if disable_height >= 0 {
-        items.push(rlp_encode_u64(disable_height as u64));
-    } else {
-        // Negative disable_height (never disabled): encode as 0
-        items.push(rlp_encode_u64(0));
-    }
+    // rskj stores the raw disableBlockHeight int (Integer.MAX_VALUE when
+    // never set); it is never negative.
+    items.push(rlp_encode_u64(disable_height.max(0) as u64));
 
     rlp_encode_list(&items)
 }
@@ -318,13 +315,16 @@ pub fn serialize_one_off_whitelist(entries: &[([u8; 20], u64)], disable_height: 
 pub fn deserialize_one_off_whitelist(data: &[u8]) -> Option<(Vec<([u8; 20], u64)>, i32)> {
     use super::serialization::{rlp_decode_list, rlp_decode_u64};
 
+    // Missing/empty storage means the whitelist was never written: rskj's
+    // LockWhitelist then defaults disableBlockHeight to Integer.MAX_VALUE
+    // (whitelist ACTIVE and empty).
     if data.is_empty() {
-        return Some((Vec::new(), i32::MIN));
+        return Some((Vec::new(), i32::MAX));
     }
 
     let items = rlp_decode_list(data)?;
     if items.is_empty() {
-        return Some((Vec::new(), i32::MIN));
+        return Some((Vec::new(), i32::MAX));
     }
 
     // Last item is disable block height; rest are (hash160, max_val) pairs
