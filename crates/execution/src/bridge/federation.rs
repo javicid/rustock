@@ -180,6 +180,18 @@ pub enum FederationChangeResponseCode {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// RSK address of a federation member from its secp256k1 public key
+/// (compressed or uncompressed): keccak256 of the uncompressed point's
+/// 64 coordinate bytes, last 20 bytes (rskj ECKey.getAddress).
+pub fn rsk_address_from_public_key(key: &[u8]) -> Option<alloy_primitives::Address> {
+    use k256::elliptic_curve::sec1::ToEncodedPoint;
+    use sha3::Digest;
+    let parsed = k256::PublicKey::from_sec1_bytes(key).ok()?;
+    let point = parsed.to_encoded_point(false);
+    let digest = sha3::Keccak256::digest(&point.as_bytes()[1..]);
+    Some(alloy_primitives::Address::from_slice(&digest[12..]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

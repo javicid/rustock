@@ -170,11 +170,17 @@ impl RskExecutor {
                 )
                 .map_err(|e| ExecutionError::Evm(format!("REMASC: {e:?}")))?;
 
+                // Drain the mining_fee_topic logs into the receipt.
+                let logs = {
+                    use revm::context_interface::{ContextTr, JournalTr};
+                    evm.ctx.journal_mut().take_logs()
+                };
+
                 tx_results.push(TxExecutionResult {
                     gas_used: 0,
                     success: true,
                     output: Vec::new(),
-                    logs: Vec::new(),
+                    logs,
                     created_address: None,
                 });
                 continue;
@@ -393,12 +399,8 @@ pub enum ExecutionError {
 /// (compressed or uncompressed): keccak256 of the uncompressed point's
 /// 64 coordinate bytes, last 20 bytes (rskj ECKey.getAddress).
 fn rsk_address_from_pubkey_hex(hex: &str) -> Option<Address> {
-    use k256::elliptic_curve::sec1::ToEncodedPoint;
     let bytes = alloy_primitives::hex::decode(hex).ok()?;
-    let key = k256::PublicKey::from_sec1_bytes(&bytes).ok()?;
-    let point = key.to_encoded_point(false);
-    let digest = sha3::Keccak256::digest(&point.as_bytes()[1..]);
-    Some(Address::from_slice(&digest[12..]))
+    crate::bridge::federation::rsk_address_from_public_key(&bytes)
 }
 
 fn make_cfg_env(spec_id: SpecId, chain_id: u64, eip3541_active: bool) -> CfgEnv {

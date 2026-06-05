@@ -46,6 +46,15 @@ pub struct RemascConfig {
     pub rsk_labs_address_rskip218: Address,
     /// Block height at which RSKIP218 activates (changes the labs payout address).
     pub rskip218_activation_height: u64,
+    /// Block height at which RSKIP85 activates (minimum payable reward gates).
+    pub rskip85_activation_height: u64,
+    /// RSKIP85: synthetic reward must exceed mgp * this (rskj Constants 200_000).
+    pub minimum_payable_gas: u64,
+    /// RSKIP85: per-federator share must exceed mgp * this (rskj Constants 50_000).
+    pub federator_minimum_payable_gas: u64,
+    /// Genesis federation BTC public keys, used for federation payouts while
+    /// no federation is stored in the Bridge.
+    pub genesis_federation_public_keys: &'static [&'static str],
 }
 
 impl RemascConfig {
@@ -64,7 +73,12 @@ impl RemascConfig {
             rsk_labs_address_rskip218: "dcb12179ba4697350f66224c959bdd9c282818df"
                 .parse()
                 .unwrap(),
-            rskip218_activation_height: 6_223_700, // Arrowhead600
+            rskip218_activation_height: 3_614_800, // rskj: rskip218 = iris300
+            rskip85_activation_height: 729_000,     // rskj: rskip85 = orchid
+            minimum_payable_gas: 200_000,
+            federator_minimum_payable_gas: 50_000,
+            genesis_federation_public_keys:
+                crate::bridge::constants::BridgeConstants::mainnet().genesis_federation_public_keys,
         }
     }
 
@@ -83,7 +97,12 @@ impl RemascConfig {
             rsk_labs_address_rskip218: "dabadabadabadabadabadabadabadabadaba0003"
                 .parse()
                 .unwrap(),
-            rskip218_activation_height: 4_927_100, // Arrowhead600
+            rskip218_activation_height: 2_060_500, // rskj: rskip218 = iris300
+            rskip85_activation_height: 0,           // rskj: rskip85 = orchid (testnet 0)
+            minimum_payable_gas: 200_000,
+            federator_minimum_payable_gas: 50_000,
+            genesis_federation_public_keys:
+                crate::bridge::constants::BridgeConstants::testnet().genesis_federation_public_keys,
         }
     }
 
@@ -103,6 +122,11 @@ impl RemascConfig {
                 .parse()
                 .unwrap(),
             rskip218_activation_height: 0,
+            rskip85_activation_height: 0,
+            minimum_payable_gas: 200_000,
+            federator_minimum_payable_gas: 50_000,
+            genesis_federation_public_keys:
+                crate::bridge::constants::BridgeConstants::regtest().genesis_federation_public_keys,
         }
     }
 
@@ -339,6 +363,111 @@ impl SiblingPayment {
 // Core algorithm: processMinersFees
 // ---------------------------------------------------------------------------
 
+/// rskj `RemascFeesPayer.payMiningFees`: transfer plus a `mining_fee_topic`
+/// log (topics: [topic, payee-as-word], data: RLP([processingBlockHash, value])).
+/// Format groundtruthed by the mainnet #4010 REMASC receipt.
+fn pay_mining_fees<CTX: ContextTr>(
+    ctx: &mut CTX,
+    processing_block_hash: alloy_primitives::B256,
+    to: Address,
+    value: U256,
+) {
+    use alloy_rlp::Encodable;
+    use revm::context_interface::JournalTr;
+
+    remasc_transfer(ctx, to, value);
+
+    let mut topic_payee = [0u8; 32];
+    topic_payee[12..].copy_from_slice(to.as_slice());
+
+    let mut inner = Vec::with_capacity(40);
+    processing_block_hash.as_slice().encode(&mut inner);
+    value.encode(&mut inner); // RLP.encodeCoin: unsigned minimal, empty for zero
+    let mut data = Vec::with_capacity(inner.len() + 3);
+    alloy_rlp::Header { list: true, payload_length: inner.len() }.encode(&mut data);
+    data.extend_from_slice(&inner);
+
+    ctx.journal_mut().log(revm::primitives::Log::new_unchecked(
+        REMASC_ADDR,
+        vec![
+            crate::bridge::events::legacy_topic("mining_fee_topic"),
+            alloy_primitives::B256::new(topic_payee),
+        ],
+        alloy_primitives::Bytes::from(data),
+    ));
+}
+
+/// Active federation members as RSK addresses: the Bridge-stored federation,
+/// or the genesis federation while none is stored. Members are ordered by
+/// compressed BTC public key (rskj Federation constructor), groundtruthed by
+/// the mainnet #4010 payout order.
+fn federation_rsk_addresses<CTX: ContextTr>(ctx: &mut CTX, config: &RemascConfig) -> Vec<Address> {
+    // The Bridge account may be cold outside revm's transact flow; journal
+    // storage reads require the account to be loaded.
+    use revm::context_interface::JournalTr;
+    let _ = ctx.journal_mut().load_account(crate::precompiles::BRIDGE_ADDR);
+    let stored = crate::bridge::peg::load_federation_member_keys(ctx);
+    if !stored.is_empty() {
+        return stored
+            .iter()
+            .filter_map(|k| crate::bridge::federation::rsk_address_from_public_key(k))
+            .collect();
+    }
+    let mut keys: Vec<Vec<u8>> = config
+        .genesis_federation_public_keys
+        .iter()
+        .filter_map(|h| alloy_primitives::hex::decode(h).ok())
+        .collect();
+    keys.sort();
+    keys.iter()
+        .filter_map(|k| crate::bridge::federation::rsk_address_from_public_key(k))
+        .collect()
+}
+
+/// rskj `Remasc.payToFederation`: the accumulated federation balance plus this
+/// block's cut, split evenly across the federators (remainder to the last one)
+/// and paid every block before RSKIP85; afterwards it accrues until the
+/// per-federator share clears the minimum payable amount.
+fn pay_to_federation<CTX: ContextTr>(
+    ctx: &mut CTX,
+    config: &RemascConfig,
+    processing_block_hash: alloy_primitives::B256,
+    current_number: u64,
+    synthetic_reward: U256,
+) -> U256 {
+    let federation_reward = synthetic_reward / U256::from(config.federation_divisor);
+    let fed_key = remasc_storage_key(FEDERATION_BALANCE_KEY);
+    let pay_total = remasc_sload(ctx, fed_key) + federation_reward;
+
+    let federators = federation_rsk_addresses(ctx, config);
+    if federators.is_empty() {
+        remasc_sstore(ctx, fed_key, pay_total);
+        return federation_reward;
+    }
+
+    let n = U256::from(federators.len() as u64);
+    let per_federator = pay_total / n;
+    let remainder = pay_total % n;
+
+    if current_number >= config.rskip85_activation_height {
+        let min_payable = U256::from(ctx.block().basefee())
+            * U256::from(config.federator_minimum_payable_gas);
+        if per_federator < min_payable {
+            remasc_sstore(ctx, fed_key, pay_total);
+            return federation_reward;
+        }
+        remasc_sstore(ctx, fed_key, U256::ZERO);
+    }
+    // Before RSKIP85 the stored balance is never written and stays zero.
+
+    let last = federators.len() - 1;
+    for (k, federator) in federators.iter().enumerate() {
+        let amount = if k == last { per_federator + remainder } else { per_federator };
+        pay_mining_fees(ctx, processing_block_hash, *federator, amount);
+    }
+    federation_reward
+}
+
 /// Implements rskj's `Remasc.processMinersFees()`.
 ///
 /// This runs when the REMASC precompile is called (last tx of each block).
@@ -392,6 +521,16 @@ pub fn process_miners_fees<CTX: ContextTr>(
     // Calculate synthetic reward slice
     let synthetic_reward = reward_balance / U256::from(config.synthetic_span);
 
+    // RSKIP85: skip distribution while the synthetic reward is below the
+    // minimum payable amount (checked before debiting the reward balance).
+    if current_number >= config.rskip85_activation_height {
+        let min_payable =
+            U256::from(ctx.block().basefee()) * U256::from(config.minimum_payable_gas);
+        if synthetic_reward < min_payable {
+            return Ok(());
+        }
+    }
+
     // Debit from reward balance
     reward_balance -= synthetic_reward;
     remasc_sstore(ctx, reward_key, reward_balance);
@@ -399,18 +538,16 @@ pub fn process_miners_fees<CTX: ContextTr>(
     // Pay RSK Labs (use RSKIP218 address if active)
     let rsk_labs_pay = synthetic_reward / U256::from(config.rsk_labs_divisor);
     let labs_addr = config.labs_address_at(current_number);
-    remasc_transfer(ctx, labs_addr, rsk_labs_pay);
+    pay_mining_fees(ctx, processing_hash, labs_addr, rsk_labs_pay);
     let mut remaining = synthetic_reward - rsk_labs_pay;
 
-    // Federation reward: store in federationBalance
-    let federation_reward = remaining / U256::from(config.federation_divisor);
-    let fed_key = remasc_storage_key(FEDERATION_BALANCE_KEY);
-    let fed_balance = remasc_sload(ctx, fed_key);
-    remasc_sstore(ctx, fed_key, fed_balance + federation_reward);
+    // Pay the federation its cut (rskj Remasc.payToFederation)
+    let federation_reward =
+        pay_to_federation(ctx, config, processing_hash, current_number, remaining);
     remaining -= federation_reward;
 
     if !siblings.is_empty() {
-        pay_with_siblings(ctx, config, &processing_header, remaining, &siblings, previous_broken);
+        pay_with_siblings(ctx, config, processing_hash, &processing_header, remaining, &siblings, previous_broken);
     } else {
         // No-sibling path
         if previous_broken {
@@ -418,7 +555,7 @@ pub fn process_miners_fees<CTX: ContextTr>(
             remaining -= punishment;
             add_to_burned(ctx, punishment);
         }
-        remasc_transfer(ctx, processing_header.beneficiary, remaining);
+        pay_mining_fees(ctx, processing_hash, processing_header.beneficiary, remaining);
     }
 
     Ok(())
@@ -429,6 +566,7 @@ pub fn process_miners_fees<CTX: ContextTr>(
 fn pay_with_siblings<CTX: ContextTr>(
     ctx: &mut CTX,
     config: &RemascConfig,
+    processing_hash: alloy_primitives::B256,
     processing_header: &Header,
     full_block_reward: U256,
     siblings: &[Sibling],
@@ -443,7 +581,7 @@ fn pay_with_siblings<CTX: ContextTr>(
 
     // Pay publishers (each sibling's included_block_coinbase)
     for sibling in siblings {
-        remasc_transfer(ctx, sibling.included_block_coinbase, calc.individual_publisher_reward);
+        pay_mining_fees(ctx, processing_hash, sibling.included_block_coinbase, calc.individual_publisher_reward);
     }
     add_to_burned(ctx, calc.publishers_surplus);
     add_to_burned(ctx, calc.miners_surplus);
@@ -455,7 +593,7 @@ fn pay_with_siblings<CTX: ContextTr>(
         let blocks_late = sibling.included_height.saturating_sub(processing_number + 1);
         let late_punishment = calc.individual_miner_reward * U256::from(blocks_late) / late_divisor;
         let sibling_pay = calc.individual_miner_reward - late_punishment;
-        remasc_transfer(ctx, sibling.coinbase, sibling_pay);
+        pay_mining_fees(ctx, processing_hash, sibling.coinbase, sibling_pay);
         add_to_burned(ctx, late_punishment);
     }
 
@@ -466,7 +604,7 @@ fn pay_with_siblings<CTX: ContextTr>(
     }
 
     // Pay main chain miner
-    remasc_transfer(ctx, processing_header.beneficiary, calc.individual_miner_reward);
+    pay_mining_fees(ctx, processing_hash, processing_header.beneficiary, calc.individual_miner_reward);
 }
 
 /// Add amount to burnedBalance storage.
@@ -731,5 +869,53 @@ mod tests {
         // minersSurplus = 2995%3 = 1
         assert_eq!(calc.individual_miner_reward, U256::from(998));
         assert_eq!(calc.miners_surplus, U256::from(1));
+    }
+
+    /// Groundtruth from the mainnet #4010 REMASC receipt: the mining_fee_topic
+    /// word and the RLP data for a zero-value payment of block #10's hash.
+    #[test]
+    fn mining_fee_log_format_matches_mainnet_4010() {
+        use alloy_rlp::Encodable;
+
+        let topic = crate::bridge::events::legacy_topic("mining_fee_topic");
+        assert_eq!(
+            hex::encode(topic),
+            "000000000000000000000000000000006d696e696e675f6665655f746f706963"
+        );
+
+        let block_hash: alloy_primitives::B256 =
+            "0x6f086032613dfeb7f289c5d44c707a085d5b5b67b0139a5cdf70bbc9df46ff43".parse().unwrap();
+        let mut inner = Vec::new();
+        block_hash.as_slice().encode(&mut inner);
+        U256::ZERO.encode(&mut inner);
+        let mut data = Vec::new();
+        alloy_rlp::Header { list: true, payload_length: inner.len() }.encode(&mut data);
+        data.extend_from_slice(&inner);
+        assert_eq!(
+            hex::encode(&data),
+            "e2a06f086032613dfeb7f289c5d44c707a085d5b5b67b0139a5cdf70bbc9df46ff4380"
+        );
+    }
+
+    /// Groundtruth from the mainnet #4010 REMASC receipt: federators are paid
+    /// in compressed-BTC-pubkey order; the first payee is 0x1888fa... and the
+    /// last 0xf74b7e..., between the labs and miner payments.
+    #[test]
+    fn genesis_federation_payout_order_matches_mainnet_4010() {
+        let config = RemascConfig::mainnet();
+        let mut keys: Vec<Vec<u8>> = config
+            .genesis_federation_public_keys
+            .iter()
+            .filter_map(|h| alloy_primitives::hex::decode(h).ok())
+            .collect();
+        keys.sort();
+        let addrs: Vec<Address> = keys
+            .iter()
+            .filter_map(|k| crate::bridge::federation::rsk_address_from_public_key(k))
+            .collect();
+        assert_eq!(addrs.len(), 15);
+        assert_eq!(addrs[0], "0x1888fa870b97a4845a6a1f7eee4ebb507dbe0967".parse::<Address>().unwrap());
+        assert_eq!(addrs[1], "0x530aad5be57e9be2084881b1d84f2a30e896ae36".parse::<Address>().unwrap());
+        assert_eq!(addrs[14], "0xf74b7e0d5bdd14eaedf725bb1549ce14abeb71dd".parse::<Address>().unwrap());
     }
 }

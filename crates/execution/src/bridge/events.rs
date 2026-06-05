@@ -12,7 +12,7 @@ use revm::primitives::Log;
 use crate::precompiles::BRIDGE_ADDR;
 
 /// `DataWord.fromString(name)`: ASCII bytes right-aligned in a 32-byte word.
-fn legacy_topic(name: &str) -> B256 {
+pub(crate) fn legacy_topic(name: &str) -> B256 {
     let bytes = name.as_bytes();
     debug_assert!(bytes.len() <= 32);
     let mut buf = [0u8; 32];

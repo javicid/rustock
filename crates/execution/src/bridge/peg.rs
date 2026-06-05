@@ -1031,7 +1031,7 @@ fn redeem_script_hash160(redeem_script: &[u8]) -> [u8; 20] {
 
 /// Load federation member compressed public keys from Bridge storage.
 /// Returns sorted keys matching the federation's multisig ordering.
-fn load_federation_member_keys<CTX: ContextTr>(ctx: &mut CTX) -> Vec<[u8; 33]> {
+pub(crate) fn load_federation_member_keys<CTX: ContextTr>(ctx: &mut CTX) -> Vec<[u8; 33]> {
     let fed_data = bridge_load_bytes_named(ctx, NEW_FEDERATION_KEY);
     if fed_data.is_empty() {
         return Vec::new();
