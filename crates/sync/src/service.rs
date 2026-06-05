@@ -900,10 +900,11 @@ impl SyncService {
         }
     }
 
-    /// Send body requests for up to `MAX_BODY_REQUESTS` pending headers.
+    /// Send body requests for pending headers, keeping a window of requests
+    /// in flight scaled to the connected peer count. The RSK wire protocol
+    /// is one body per request, so throughput comes from pipelining:
+    /// ~8 outstanding requests per peer, bounded.
     async fn send_body_requests(&mut self) {
-        const MAX_BODY_IN_FLIGHT: usize = 8;
-
         if let SyncState::DownloadingBodies {
             pending_headers,
             next_request,
@@ -917,8 +918,9 @@ impl SyncService {
                 return;
             }
 
+            let max_in_flight = (peers.len() * 8).clamp(8, 96);
             let mut sent = 0u32;
-            while in_flight.len() < MAX_BODY_IN_FLIGHT && *next_request < pending_headers.len() {
+            while in_flight.len() < max_in_flight && *next_request < pending_headers.len() {
                 let (hash, _header) = &pending_headers[*next_request];
                 // Bodies already in the store don't need a request.
                 if matches!(self.manager.store.body(*hash), Ok(Some(_))) {
