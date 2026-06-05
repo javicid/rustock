@@ -62,6 +62,10 @@ pub struct SyncService {
     event_rx: mpsc::UnboundedReceiver<SyncEvent>,
     pub(crate) state: SyncState,
     pub(crate) last_progress: Instant,
+    /// Last time a BODY response arrived; drives the stalled-body retry.
+    /// Separate from `last_progress`, which any response resets (skeleton
+    /// pre-fetches were starving the retry path for minutes).
+    last_body_progress: Instant,
     progress: SyncProgress,
     block_processor: Option<BlockProcessor>,
     trie_store: Option<Arc<dyn TrieStore>>,
@@ -84,6 +88,7 @@ impl SyncService {
             event_rx,
             state: SyncState::Idle,
             last_progress: Instant::now(),
+            last_body_progress: Instant::now(),
             progress: SyncProgress::new(),
             block_processor: None,
             trie_store: None,
@@ -157,13 +162,13 @@ impl SyncService {
                 self.check_follow_gap().await;
             }
             SyncState::DownloadingBodies { .. } => {
-                if self.last_progress.elapsed() > REQUEST_TIMEOUT {
+                if self.last_body_progress.elapsed() > REQUEST_TIMEOUT {
                     warn!(
                         target: "rustock::sync",
                         "Body download timed out, retrying stalled requests"
                     );
                     self.retry_body_requests().await;
-                    self.last_progress = Instant::now();
+                    self.last_body_progress = Instant::now();
                 } else {
                     self.log_progress().await;
                 }
@@ -984,6 +989,7 @@ impl SyncService {
         transactions: Vec<Transaction>,
         uncles: Vec<Header>,
     ) {
+        self.last_body_progress = Instant::now();
         let old = std::mem::take(&mut self.state);
         match old {
             SyncState::DownloadingBodies {
