@@ -172,6 +172,7 @@ pub fn ensure_btc_chain_seeded<CTX: ContextTr>(
 pub fn receive_headers<CTX: ContextTr>(
     ctx: &mut CTX,
     args: &[u8],
+    gas_cost: u64,
     config: &BridgeConstants,
     use_v2: bool,
     hardfork_cfg: &RskHardforkConfig,
@@ -257,8 +258,7 @@ pub fn receive_headers<CTX: ContextTr>(
         processed += 1;
     }
 
-    let gas = 22_000u64 + 2 * args.len() as u64;
-    Ok(encode_int_result(gas, processed))
+    Ok(encode_int_result(gas_cost, processed))
 }
 
 // ---------------------------------------------------------------------------

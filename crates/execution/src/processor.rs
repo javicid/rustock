@@ -178,6 +178,9 @@ impl BlockProcessor {
         let result = self.execute_block(block, state_root, trie_store)?;
 
         if result.gas_used != header.gas_used {
+            for (i, r) in result.receipts.iter().enumerate() {
+                debug!("receipt[{i}]: status={} gas_used={}", r.status, r.gas_used);
+            }
             return Err(ProcessError::GasUsedMismatch {
                 header: header.gas_used,
                 computed: result.gas_used,

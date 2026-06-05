@@ -350,7 +350,7 @@ fn execute_method<CTX: ContextTr>(
     match method_name {
         // Phase 2: BTC header chain
         "receiveHeader" => btc_chain::receive_header(ctx, args, config, use_v2),
-        "receiveHeaders" => btc_chain::receive_headers(ctx, args, config, use_v2, hardfork_cfg),
+        "receiveHeaders" => btc_chain::receive_headers(ctx, args, gas_cost, config, use_v2, hardfork_cfg),
         "getBtcBlockchainBestChainHeight" => btc_chain::get_best_chain_height(ctx, gas_cost),
         "getBtcBlockchainBestBlockHeader" => btc_chain::get_best_block_header(ctx, gas_cost),
         "getBtcBlockchainBlockHeaderByHash" => btc_chain::get_block_header_by_hash(ctx, args, gas_cost),
