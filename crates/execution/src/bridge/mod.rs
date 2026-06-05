@@ -19,6 +19,7 @@ pub mod getters;
 pub mod governance;
 pub mod peg;
 pub mod pmt;
+pub mod release_tx;
 pub mod serialization;
 pub mod storage;
 pub mod tx;
@@ -368,7 +369,7 @@ fn execute_method<CTX: ContextTr>(
         // Phase 5: Peg-out
         "releaseBtc" => peg::release_btc(ctx, gas_cost, config, hardfork_cfg, tx_ctx),
         "updateCollections" => peg::update_collections(ctx, gas_cost, config, hardfork_cfg, tx_ctx),
-        "addSignature" => peg::add_signature(ctx, args, gas_cost, hardfork_cfg),
+        "addSignature" => peg::add_signature(ctx, args, gas_cost, config, hardfork_cfg),
 
         // Phase 6: Governance
         "createFederation" => governance::create_federation(ctx, gas_cost),

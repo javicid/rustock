@@ -188,9 +188,20 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Iris300
     }
 
+    /// RSKIP201: peg-out BTC transactions use version 2 (Iris300).
+    pub fn has_rskip201(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Iris300
+    }
+
     /// RSKIP271: peg-out batching and nextPegoutHeight tracking (Hop400, mainnet 4_598_500).
     pub fn has_rskip271(&self, block_number: u64) -> bool {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Hop400
+    }
+
+    /// RSKIP375: pegouts-waiting-for-signatures keyed by the pegout creation
+    /// RSK tx hash again (Fingerroot500).
+    pub fn has_rskip375(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Fingerroot500
     }
 
     /// RSKIP434: lifts the BTC chainwork-overflow header block (Arrowhead631).

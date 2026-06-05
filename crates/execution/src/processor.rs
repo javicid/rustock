@@ -194,6 +194,23 @@ impl BlockProcessor {
         }
 
         if result.receipts_root != header.receipts_root {
+            // Dump computed receipts to help pinpoint the diverging transaction.
+            for (i, r) in result.receipts.iter().enumerate() {
+                debug!(
+                    "receipt[{i}]: status={} gas_used={} logs={}",
+                    r.status,
+                    r.gas_used,
+                    r.logs.len()
+                );
+                for (j, l) in r.logs.iter().enumerate() {
+                    debug!(
+                        "  log[{j}]: addr={} topics={:?} data=0x{}",
+                        l.address,
+                        l.topics,
+                        alloy_primitives::hex::encode(&l.data)
+                    );
+                }
+            }
             return Err(ProcessError::ReceiptsRootMismatch {
                 header: header.receipts_root,
                 computed: result.receipts_root,

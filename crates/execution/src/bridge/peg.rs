@@ -206,18 +206,43 @@ pub fn register_btc_transaction<CTX: ContextTr>(
     // falling back to the first input's public key hash.
     let rsk_destination = extract_rsk_destination(&btc_tx);
 
-    // Sum outputs that pay to any known federation address (simplified:
-    // we sum all non-OP_RETURN outputs as the peg-in amount).
-    let total_value: u64 = btc_tx
-        .output
-        .iter()
-        .filter(|o| !o.script_pubkey.is_op_return())
-        .map(|o| o.value.to_sat())
-        .sum();
+    // The active federation's P2SH script identifies which outputs are
+    // peg-ins and which inputs make the tx a peg-out.
+    let federation_keys = federation_keys_or_genesis(ctx, config);
+    let threshold = (federation_keys.len() / 2) + 1;
+    let fed_redeem = build_federation_redeem_script(&federation_keys, threshold);
+    let fed_script = p2sh_output_script(&redeem_script_hash160(&fed_redeem));
 
     // rskj marks processed txs with the RSK execution block number
     // (BridgeSupport.markTxAsProcessed), not the BTC block height.
     let rsk_height = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+
+    // rskj BridgeUtils.isPegOutTx: an input spends the federation's P2SH
+    // (its scriptSig carries the federation redeem script). Peg-outs are
+    // registered to reclaim the change UTXOs; nothing is credited.
+    let is_pegout = btc_tx.input.iter().any(|i| {
+        super::release_tx::extract_redeem_script(i.script_sig.as_bytes())
+            .is_some_and(|r| r == fed_redeem)
+    });
+    if is_pegout {
+        register_new_utxos(ctx, &btc_tx, &fed_script);
+        set_btc_tx_processed(ctx, &btc_tx_hash, rsk_height);
+        return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
+    }
+
+    // Peg-in value: only the outputs paying the federation
+    // (rskj computeTotalAmountSent over the federation wallet).
+    let total_value: u64 = btc_tx
+        .output
+        .iter()
+        .filter(|o| o.script_pubkey == fed_script)
+        .map(|o| o.value.to_sat())
+        .sum();
+    if total_value == 0 {
+        // Neither a peg-in nor a peg-out for the active federation: ignore
+        // without marking as processed (rskj logs and returns).
+        return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
+    }
 
     // Enforce minimum peg-in value (rskj handleNonRefundablePegin).
     if total_value < config.minimum_pegin_tx_value {
@@ -246,10 +271,43 @@ pub fn register_btc_transaction<CTX: ContextTr>(
         }
     }
 
+    // rskj registerNewUtxos: the outputs paying the federation become
+    // spendable federation UTXOs for future peg-outs.
+    register_new_utxos(ctx, &btc_tx, &fed_script);
+
     // Mark as processed
     set_btc_tx_processed(ctx, &btc_tx_hash, rsk_height);
 
     Ok(PrecompileOutput::new(gas_cost, Bytes::new()))
+}
+
+/// rskj `BridgeSupport.registerNewUtxos`: register every output paying the
+/// active federation as a federation UTXO (height 0, original scriptPubKey).
+fn register_new_utxos<CTX: ContextTr>(
+    ctx: &mut CTX,
+    btc_tx: &BtcTransaction,
+    fed_script: &bitcoin::ScriptBuf,
+) {
+    let new_utxos: Vec<BridgeUtxo> = btc_tx
+        .output
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| o.script_pubkey == *fed_script)
+        .map(|(index, o)| BridgeUtxo {
+            tx_hash: btc_txid_event_bytes(btc_tx),
+            vout: index as u32,
+            value_satoshis: o.value.to_sat(),
+            height: 0,
+            script: o.script_pubkey.to_bytes(),
+            coinbase: btc_tx.is_coinbase(),
+        })
+        .collect();
+    if new_utxos.is_empty() {
+        return;
+    }
+    let mut utxos = load_federation_utxos(ctx);
+    utxos.extend(new_utxos);
+    store_federation_utxos(ctx, &utxos);
 }
 
 // ---------------------------------------------------------------------------
@@ -506,9 +564,9 @@ pub fn update_collections<CTX: ContextTr>(
     }
 
     // -----------------------------------------------------------------------
-    // Step 1: Check if we should create a new peg-out batch this block
+    // Step 1: Process peg-out requests (rskj processPegoutRequests)
     // -----------------------------------------------------------------------
-    let should_create_batch = if use_rskip271 {
+    let should_process_requests = if use_rskip271 {
         // RSKIP271: batching — only process when nextPegoutHeight ≤ current block
         let next_height_key = bridge_storage_key(NEXT_PEGOUT_HEIGHT_KEY);
         let next_height = bridge_sload(ctx, next_height_key).to::<u64>();
@@ -517,7 +575,7 @@ pub fn update_collections<CTX: ContextTr>(
         true // Pre-RSKIP271: process every block
     };
 
-    if should_create_batch {
+    if should_process_requests {
         // Load pending requests from the correct queue key
         let (pending, queue_key) = if use_tx_hash {
             let key = bridge_storage_key(RELEASE_REQUEST_QUEUE_WITH_TXHASH_KEY);
@@ -530,72 +588,150 @@ pub fn update_collections<CTX: ContextTr>(
         };
 
         if !pending.is_empty() {
-            // Build BTC peg-out transaction from federation UTXOs
-            let federation_keys = load_federation_member_keys(ctx);
-            let threshold = (federation_keys.len() / 2) + 1;
-            let fee_per_kb = get_effective_fee_per_kb(ctx, config);
+            let federation_keys = federation_keys_or_genesis(ctx, config);
+            if !federation_keys.is_empty() {
+                let threshold = (federation_keys.len() / 2) + 1;
+                let redeem_script = build_federation_redeem_script(&federation_keys, threshold);
+                let change_script = p2sh_output_script(&redeem_script_hash160(&redeem_script));
+                let fee_per_kb = get_effective_fee_per_kb(ctx, config);
+                let tx_version = if hardfork_cfg.has_rskip201(block_number) { 2 } else { 1 };
 
-            if let Some(btc_tx) = build_pegout_btc_tx(
-                ctx,
-                &pending,
-                &federation_keys,
-                threshold,
-                fee_per_kb,
-                config,
-            ) {
-                // Serialize the unsigned BTC transaction
-                let btc_tx_raw = btc_serialize(&btc_tx);
-
-                // Store in pegoutsWaitingForConfirmations
+                let mut available = load_federation_utxos(ctx);
                 let waiting_key = bridge_storage_key(PEGOUTS_WAITING_FOR_CONFIRMATIONS_KEY);
                 let existing_data = bridge_load_bytes(ctx, waiting_key);
-                let mut waiting = deserialize_pegouts_waiting_for_confirmations(&existing_data, use_tx_hash);
+                let mut waiting =
+                    deserialize_pegouts_waiting_for_confirmations(&existing_data, use_tx_hash);
+                let mut created_any = false;
 
-                // The RSK tx hash for the updateCollections call itself (for RSKIP176+)
-                let update_collections_rsk_hash = if hardfork_cfg.has_rskip176(block_number) {
-                    Some(tx_ctx.rsk_tx_hash)
-                } else {
-                    // Before RSKIP176, use the first release request's rsk_tx_hash
-                    pending.first().and_then(|r| r.rsk_tx_hash)
+                // Settle one successfully built peg-out: remove the spent
+                // UTXOs, queue it for confirmations, and (RSKIP146+) log
+                // release_requested with the creation RSK tx hash.
+                let settle = |ctx: &mut CTX,
+                                  built: super::release_tx::BuiltPegout,
+                                  rsk_tx_hash: Option<[u8; 32]>,
+                                  amount: u64,
+                                  available: &mut Vec<BridgeUtxo>,
+                                  waiting: &mut Vec<PegoutWaitingForConfirmations>| {
+                    available.retain(|u| {
+                        !built
+                            .used_utxos
+                            .iter()
+                            .any(|s| s.tx_hash == u.tx_hash && s.vout == u.vout)
+                    });
+                    waiting.push(PegoutWaitingForConfirmations {
+                        btc_tx_raw: btc_serialize(&built.tx),
+                        rsk_block_height: block_number,
+                        rsk_tx_hash: if use_tx_hash { rsk_tx_hash } else { None },
+                    });
+                    if use_tx_hash {
+                        if let Some(hash) = rsk_tx_hash {
+                            super::events::log_release_requested(
+                                ctx,
+                                &hash,
+                                &btc_txid_event_bytes(&built.tx),
+                                amount,
+                            );
+                        }
+                    }
                 };
 
-                waiting.push(PegoutWaitingForConfirmations {
-                    btc_tx_raw: btc_tx_raw.clone(),
-                    rsk_block_height: block_number,
-                    rsk_tx_hash: update_collections_rsk_hash,
-                });
+                if !use_rskip271 {
+                    // Pre-RSKIP271 (processPegoutsIndividually): one BTC tx
+                    // per request, up to MAX_RELEASE_ITERATIONS(30) per call;
+                    // failed builds are re-appended at the end of the queue.
+                    const MAX_RELEASE_ITERATIONS: usize = 30;
+                    let mut kept = Vec::new();
+                    let mut to_retry = Vec::new();
+                    for (i, request) in pending.iter().enumerate() {
+                        if i >= MAX_RELEASE_ITERATIONS {
+                            kept.push(request.clone());
+                            continue;
+                        }
+                        let outputs = [super::release_tx::PegoutOutput {
+                            script: p2pkh_output_script(&request.btc_dest_hash160),
+                            amount_satoshis: request.amount_satoshis,
+                        }];
+                        match super::release_tx::complete_pegout_tx(
+                            &available,
+                            &outputs,
+                            &change_script,
+                            &redeem_script,
+                            fee_per_kb,
+                            tx_version,
+                        ) {
+                            Some(built) => {
+                                settle(
+                                    ctx,
+                                    built,
+                                    request.rsk_tx_hash,
+                                    request.amount_satoshis,
+                                    &mut available,
+                                    &mut waiting,
+                                );
+                                created_any = true;
+                            }
+                            None => to_retry.push(request.clone()),
+                        }
+                    }
+                    kept.extend(to_retry);
+                    let updated_queue = if use_tx_hash {
+                        serialize_release_queue_with_hash(&kept)
+                    } else {
+                        serialize_release_queue_legacy(&kept)
+                    };
+                    bridge_store_bytes(ctx, queue_key, &updated_queue);
+                } else {
+                    // RSKIP271+ (processPegoutsInBatch): one batched BTC tx
+                    // for the whole queue, keyed by this updateCollections
+                    // call's tx hash.
+                    let outputs: Vec<super::release_tx::PegoutOutput> = pending
+                        .iter()
+                        .map(|r| super::release_tx::PegoutOutput {
+                            script: p2pkh_output_script(&r.btc_dest_hash160),
+                            amount_satoshis: r.amount_satoshis,
+                        })
+                        .collect();
+                    if let Some(built) = super::release_tx::complete_pegout_tx(
+                        &available,
+                        &outputs,
+                        &change_script,
+                        &redeem_script,
+                        fee_per_kb,
+                        tx_version,
+                    ) {
+                        let total: u64 = pending.iter().map(|r| r.amount_satoshis).sum();
+                        settle(
+                            ctx,
+                            built,
+                            Some(tx_ctx.rsk_tx_hash),
+                            total,
+                            &mut available,
+                            &mut waiting,
+                        );
+                        created_any = true;
+                        bridge_store_bytes(ctx, queue_key, &[]);
+                    }
 
-                let updated = serialize_pegouts_waiting_for_confirmations(&waiting, use_tx_hash);
-                bridge_store_bytes(ctx, waiting_key, &updated);
-
-                // rskj logReleaseBtcRequested (RSKIP146): fired when the
-                // peg-out BTC transaction is created.
-                if use_tx_hash {
-                    let total: u64 = pending.iter().map(|r| r.amount_satoshis).sum();
-                    let rsk_hash = update_collections_rsk_hash.unwrap_or([0u8; 32]);
-                    super::events::log_release_requested(
-                        ctx,
-                        &rsk_hash,
-                        &btc_txid_event_bytes(&btc_tx),
-                        total,
-                    );
+                    // Update nextPegoutHeight (RSKIP271)
+                    let next_height = block_number + config.number_of_blocks_between_pegouts;
+                    let next_height_key = bridge_storage_key(NEXT_PEGOUT_HEIGHT_KEY);
+                    bridge_sstore(ctx, next_height_key, U256::from(next_height));
                 }
 
-                // Clear the queue
-                bridge_store_bytes(ctx, queue_key, &[]);
-            }
-
-            // Update nextPegoutHeight (RSKIP271)
-            if use_rskip271 {
-                let next_height = block_number + config.number_of_blocks_between_pegouts;
-                let next_height_key = bridge_storage_key(NEXT_PEGOUT_HEIGHT_KEY);
-                bridge_sstore(ctx, next_height_key, U256::from(next_height));
+                if created_any {
+                    let updated =
+                        serialize_pegouts_waiting_for_confirmations(&waiting, use_tx_hash);
+                    bridge_store_bytes(ctx, waiting_key, &updated);
+                    store_federation_utxos(ctx, &available);
+                }
             }
         }
     }
 
     // -----------------------------------------------------------------------
-    // Step 2: Promote confirmed pegouts → waiting for signatures
+    // Step 2: Promote ONE confirmed pegout → waiting for signatures
+    // (rskj processConfirmedPegouts: getNextPegoutWithEnoughConfirmations
+    // promotes a single entry per updateCollections call)
     // -----------------------------------------------------------------------
     {
         let waiting_key = bridge_storage_key(PEGOUTS_WAITING_FOR_CONFIRMATIONS_KEY);
@@ -603,39 +739,60 @@ pub fn update_collections<CTX: ContextTr>(
         let mut waiting = deserialize_pegouts_waiting_for_confirmations(&waiting_data, use_tx_hash);
 
         let min_confirmations = config.rsk2btc_minimum_acceptable_confirmations as u64;
-        let mut promoted = Vec::new();
-        let mut remaining = Vec::new();
+        let confirmed_pos = waiting.iter().position(|e| {
+            block_number
+                .checked_sub(e.rsk_block_height)
+                .is_some_and(|d| d >= min_confirmations)
+        });
 
-        for entry in waiting.drain(..) {
-            if block_number >= entry.rsk_block_height + min_confirmations {
-                promoted.push(entry);
-            } else {
-                remaining.push(entry);
-            }
-        }
-
-        if !promoted.is_empty() {
-            // Update pegoutsWaitingForConfirmations (remove promoted entries)
-            let updated = serialize_pegouts_waiting_for_confirmations(&remaining, use_tx_hash);
+        if let Some(pos) = confirmed_pos {
+            let entry = waiting.remove(pos);
+            let updated = serialize_pegouts_waiting_for_confirmations(&waiting, use_tx_hash);
             bridge_store_bytes(ctx, waiting_key, &updated);
 
-            // Add promoted entries to rskTxsWaitingFS (pegoutsWaitingForSignatures)
+            // rskj getPegoutWaitingForSignatureKey:
+            // - RSKIP375+: the pegout creation RSK tx hash
+            // - RSKIP146..RSKIP176: creation hash, falling back to this tx
+            // - otherwise (incl. pre-RSKIP146): this updateCollections tx hash
+            let rsk_hash = if hardfork_cfg.has_rskip375(block_number) {
+                entry.rsk_tx_hash.unwrap_or(tx_ctx.rsk_tx_hash)
+            } else if use_tx_hash && !hardfork_cfg.has_rskip176(block_number) {
+                entry.rsk_tx_hash.unwrap_or(tx_ctx.rsk_tx_hash)
+            } else {
+                tx_ctx.rsk_tx_hash
+            };
+
             let wfs_key = bridge_storage_key(PEGOUTS_WAITING_FOR_SIGNATURES_KEY);
             let wfs_data = bridge_load_bytes(ctx, wfs_key);
             let mut wfs = deserialize_rsk_txs_waiting_for_signatures(&wfs_data);
-
-            for entry in promoted {
-                // Key: RSK tx hash (from the updateCollections call, or fallback)
-                let rsk_hash = entry.rsk_tx_hash.unwrap_or(tx_ctx.rsk_tx_hash);
-                wfs.insert(rsk_hash, entry.btc_tx_raw);
-            }
-
+            wfs.insert(rsk_hash, entry.btc_tx_raw);
             let updated_wfs = serialize_rsk_txs_waiting_for_signatures(&wfs);
             bridge_store_bytes(ctx, wfs_key, &updated_wfs);
         }
     }
 
     Ok(PrecompileOutput::new(gas_cost, Bytes::new()))
+}
+
+/// Active federation member keys: the committed federation from storage, or
+/// the genesis federation from the network constants when none was ever
+/// stored (rskj `FederationSupport.getActiveFederation` fallback).
+pub(crate) fn federation_keys_or_genesis<CTX: ContextTr>(
+    ctx: &mut CTX,
+    config: &BridgeConstants,
+) -> Vec<[u8; 33]> {
+    let stored = load_federation_member_keys(ctx);
+    if !stored.is_empty() {
+        return stored;
+    }
+    config
+        .genesis_federation_public_keys
+        .iter()
+        .filter_map(|hex| {
+            let bytes = alloy_primitives::hex::decode(hex).ok()?;
+            bytes.try_into().ok()
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -660,6 +817,7 @@ pub fn add_signature<CTX: ContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     gas_cost: u64,
+    config: &BridgeConstants,
     hardfork_cfg: &RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
     if args.len() < 96 {
@@ -710,33 +868,39 @@ pub fn add_signature<CTX: ContextTr>(
         Err(_) => return Ok(PrecompileOutput::new(gas_cost, Bytes::new())),
     };
 
-    // Get the federation redeem script to apply signatures
-    let federation_keys = load_federation_member_keys(ctx);
-    let threshold = (federation_keys.len() / 2) + 1;
+    // rskj areSignaturesEnoughToSignAllTxInputs: one signature per input.
+    if sigs.len() != btc_tx.input.len() {
+        return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
+    }
 
+    // Membership check against the active federation (genesis fallback).
+    // TODO(rustock): rskj also accepts retiring-federation members.
+    let federation_keys = federation_keys_or_genesis(ctx, config);
     if federation_keys.is_empty() {
+        return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
+    }
+    let Some(compressed_key) = compress_pubkey(&fed_key) else {
+        return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
+    };
+    if !federation_keys.contains(&compressed_key) {
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     }
 
     let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
-    let redeem_script = build_federation_redeem_script(&federation_keys, threshold);
 
-    // rskj logs an add_signature event when the federator key belongs to the
-    // federation: before RSKIP326 it fires BEFORE applying the signatures;
+    // rskj logs an add_signature event for a federation member: before
+    // RSKIP326 it fires BEFORE the signatures are verified and applied;
     // afterwards only when a signature was actually applied. The format is
     // legacy single-topic before RSKIP146 and Solidity afterwards.
     let legacy_events = !hardfork_cfg.has_rskip146(block_number);
     let log_only_when_applied = hardfork_cfg.has_rskip326(block_number);
-    let is_member = compress_pubkey(&fed_key)
-        .map(|k| federation_keys.contains(&k))
-        .unwrap_or(false);
     let emit_add_signature = |ctx: &mut CTX, btc_tx: &BtcTransaction| {
         if legacy_events {
             let txid = btc_tx.compute_txid().to_string();
             super::events::log_legacy_add_signature(
                 ctx,
                 &txid,
-                &pubkey_hash160(&fed_key),
+                &pubkey_hash160(&compressed_key),
                 &rsk_tx_hash,
             );
         } else {
@@ -746,45 +910,33 @@ pub fn add_signature<CTX: ContextTr>(
             }
         }
     };
-    if is_member && !log_only_when_applied {
+    if !log_only_when_applied {
         emit_add_signature(ctx, &btc_tx);
     }
 
-    // Apply DER signatures to each input
-    let applied = apply_signatures_to_tx(
-        &mut btc_tx,
-        &sigs,
-        &fed_key,
-        &federation_keys,
-        &redeem_script,
-    );
-    if is_member && log_only_when_applied && applied {
+    // rskj processSigning: verify every provided signature against its
+    // input's sighash before applying any, then insert each at the position
+    // determined by the key order in the redeem script.
+    let applied = apply_signatures_to_tx(&mut btc_tx, &sigs, &compressed_key);
+    if log_only_when_applied && applied {
         emit_add_signature(ctx, &btc_tx);
     }
 
-    // Count distinct sigs on the first input to determine if threshold is reached
-    let sig_count = count_signatures_in_tx(&btc_tx, threshold);
-
-    if sig_count >= threshold {
-        // Fully signed: rskj logs release_btc with the signed transaction.
+    if super::release_tx::has_enough_signatures(&btc_tx) {
+        // Fully signed: rskj logs release_btc with the signed transaction
+        // and removes it from the waiting map (the BTC tx is broadcast
+        // off-chain by the federation nodes).
         if legacy_events {
             let txid = btc_tx.compute_txid().to_string();
             super::events::log_legacy_release_btc(ctx, &txid, &btc_serialize(&btc_tx));
         } else {
             super::events::log_solidity_release_btc(ctx, &rsk_tx_hash, &btc_serialize(&btc_tx));
         }
-        // Fully signed — remove from waiting map
-        // (The BTC tx is broadcast off-chain by federation nodes)
         wfs.remove(&rsk_tx_hash);
         let updated = serialize_rsk_txs_waiting_for_signatures(&wfs);
         bridge_store_bytes(ctx, wfs_key, &updated);
-
-        // Also track the sig hash for RSKIP379+ (pegoutTxSigHash compound key)
-        let hash_hex = to_hex(&rsk_tx_hash);
-        let sig_key = compound_key(PEGOUT_TX_SIG_HASH_KEY, "-", &hash_hex);
-        bridge_sstore(ctx, sig_key, U256::from(sig_count as u64));
-    } else {
-        // Partially signed — update the map with new signatures
+    } else if applied {
+        // Partially signed — update the map with the new signatures.
         let updated_raw = btc_serialize(&btc_tx);
         wfs.insert(rsk_tx_hash, updated_raw);
         let updated = serialize_rsk_txs_waiting_for_signatures(&wfs);
@@ -914,6 +1066,11 @@ pub fn serialize_pegouts_waiting_for_confirmations(
     entries: &[PegoutWaitingForConfirmations],
     use_tx_hash: bool,
 ) -> Vec<u8> {
+    // rskj sorts entries by the serialized BTC transaction bytes
+    // (PegoutsWaitingForConfirmations.Entry.BTC_TX_COMPARATOR).
+    let mut entries: Vec<&PegoutWaitingForConfirmations> = entries.iter().collect();
+    entries.sort_by(|a, b| a.btc_tx_raw.cmp(&b.btc_tx_raw));
+
     let capacity = if use_tx_hash { entries.len() * 3 } else { entries.len() * 2 };
     let mut items = Vec::with_capacity(capacity);
     for entry in entries {
@@ -1150,31 +1307,6 @@ pub(crate) fn load_federation_member_keys<CTX: ContextTr>(ctx: &mut CTX) -> Vec<
     Vec::new()
 }
 
-/// Estimate BTC transaction vbytes for fee calculation.
-/// Matches rskj's BridgeUtils.getRegularPegoutTxSize:
-///   overhead + inputs * input_size + outputs * output_size
-///
-/// For P2SH m-of-n multisig with n keys:
-///   input size ≈ 41 + ceil((73*m + 34*n + 3) / 4) * 4 + overhead
-/// Standard approximation: ~300 bytes per input, 32 per output, 11 overhead.
-fn estimate_tx_vbytes(n_inputs: usize, n_outputs: usize, threshold: usize, n_keys: usize) -> usize {
-    // Base overhead (version 4 + locktime 4 + vin_count 1 + vout_count 1)
-    let overhead = 10;
-    // Input size: 36 (outpoint) + 4 (seq) + 1 (scriptLen) + P2SH-multisig scriptSig
-    // P2SH scriptSig ≈ OP_0 + threshold*73 (DER sig) + redeem_script(1 + 33*n + 3)
-    let redeem_size = 1 + 33 * n_keys + 3;
-    let scriptsig_size = 1 + threshold * 73 + redeem_size;
-    let input_size = 36 + 4 + varint_size(scriptsig_size) + scriptsig_size;
-    // Output size: 8 (value) + 1 (scriptLen) + 23 (P2SH) or 25 (P2PKH)
-    let output_size = 34;
-
-    overhead + n_inputs * input_size + n_outputs * output_size
-}
-
-fn varint_size(n: usize) -> usize {
-    if n < 0xfd { 1 } else if n <= 0xffff { 3 } else { 5 }
-}
-
 /// Read the effective fee per KB from storage, falling back to genesis value.
 fn get_effective_fee_per_kb<CTX: ContextTr>(ctx: &mut CTX, config: &BridgeConstants) -> u64 {
     let key = bridge_storage_key(super::storage::FEE_PER_KB_KEY);
@@ -1186,283 +1318,61 @@ fn get_effective_fee_per_kb<CTX: ContextTr>(ctx: &mut CTX, config: &BridgeConsta
     }
 }
 
-/// Build an unsigned BTC peg-out transaction.
+/// Apply a federator's DER signatures to a peg-out BTC transaction
+/// (rskj `BridgeSupport.processSigning` + `sign`).
 ///
-/// Matches rskj's ReleaseTransactionBuilder using DefaultCoinSelector:
-/// - Sort UTXOs from largest to smallest
-/// - Select greedily until sum ≥ outputs_total + fee
-/// - P2PKH outputs for each release request
-/// - P2SH change output to federation if remainder > dust (546 sat)
-/// - Transaction version = 2
-/// Returns None if no UTXOs available or insufficient funds.
-fn build_pegout_btc_tx<CTX: ContextTr>(
-    ctx: &mut CTX,
-    requests: &[ReleaseRequest],
-    federation_keys: &[[u8; 33]],
-    threshold: usize,
-    fee_per_kb: u64,
-    config: &BridgeConstants,
-) -> Option<BtcTransaction> {
-    use bitcoin::{Amount, OutPoint, TxIn, TxOut, Txid, Sequence, ScriptBuf};
-    use bitcoin::transaction::Version;
-
-    // Load federation UTXOs
-    let mut utxos = load_federation_utxos(ctx);
-    if utxos.is_empty() {
-        return None;
-    }
-
-    // Sort UTXOs largest first (DefaultCoinSelector)
-    utxos.sort_by(|a, b| b.value_satoshis.cmp(&a.value_satoshis));
-
-    // Limit inputs to max_inputs_per_pegout_transaction
-    utxos.truncate(config.max_inputs_per_pegout_transaction as usize);
-
-    let total_output: u64 = requests.iter().map(|r| r.amount_satoshis).sum();
-    let n_outputs_base = requests.len() + 1; // +1 for potential change
-
-    // Build the redeem script for fee estimation
-    let redeem_script = build_federation_redeem_script(federation_keys, threshold);
-    let fed_hash160 = redeem_script_hash160(&redeem_script);
-
-    // Greedy coin selection
-    let mut selected_utxos = Vec::new();
-    let mut selected_total = 0u64;
-
-    for utxo in &utxos {
-        selected_utxos.push(utxo.clone());
-        selected_total += utxo.value_satoshis;
-
-        let estimated_vbytes = estimate_tx_vbytes(
-            selected_utxos.len(),
-            n_outputs_base,
-            threshold,
-            federation_keys.len(),
-        );
-        let fee = (estimated_vbytes as u64 * fee_per_kb + 999) / 1000;
-
-        if selected_total >= total_output + fee {
-            // Build the transaction
-            let inputs: Vec<TxIn> = selected_utxos.iter().map(|u| {
-                let txid_bytes: [u8; 32] = {
-                    // Bitcoin txid is stored in reversed byte order
-                    let mut b = u.tx_hash;
-                    b.reverse();
-                    b
-                };
-                TxIn {
-                    previous_output: OutPoint {
-                        txid: Txid::from_byte_array(txid_bytes),
-                        vout: u.vout,
-                    },
-                    script_sig: ScriptBuf::new(),
-                    sequence: Sequence::MAX,
-                    witness: bitcoin::Witness::new(),
-                }
-            }).collect();
-
-            let mut outputs: Vec<TxOut> = requests.iter().map(|r| {
-                TxOut {
-                    value: Amount::from_sat(r.amount_satoshis),
-                    script_pubkey: p2pkh_output_script(&r.btc_dest_hash160),
-                }
-            }).collect();
-
-            let change = selected_total - total_output - fee;
-            const DUST_THRESHOLD: u64 = 546;
-            if change > DUST_THRESHOLD {
-                outputs.push(TxOut {
-                    value: Amount::from_sat(change),
-                    script_pubkey: p2sh_output_script(&fed_hash160),
-                });
-            }
-
-            let tx = BtcTransaction {
-                version: Version(2),
-                lock_time: bitcoin::absolute::LockTime::ZERO,
-                input: inputs,
-                output: outputs,
-            };
-
-            // Remove used UTXOs from federation storage
-            let used_keys: std::collections::HashSet<([u8; 32], u32)> =
-                selected_utxos.iter().map(|u| (u.tx_hash, u.vout)).collect();
-            let mut all_utxos = load_federation_utxos(ctx);
-            all_utxos.retain(|u| !used_keys.contains(&(u.tx_hash, u.vout)));
-            store_federation_utxos(ctx, &all_utxos);
-
-            return Some(tx);
-        }
-    }
-
-    None // Insufficient UTXOs
-}
-
-/// Apply DER signatures to a BTC P2SH-multisig transaction.
-///
-/// For each input, if the input's scriptSig doesn't yet have enough sigs,
-/// add the provided signatures at the correct position (ordered by key index
-/// in the federation's sorted key list).
-///
-/// The P2SH scriptSig format: `OP_0 <sig_1> ... <sig_m> <redeemScript>`
+/// All provided signatures are verified against their input's legacy
+/// SIGHASH_ALL hash (over the redeem script extracted from the placeholder
+/// scriptSig) before any is applied; a single invalid signature aborts the
+/// call. Each valid signature is then inserted at the position dictated by
+/// the key order in the redeem script, consuming one OP_0 placeholder.
+/// Returns whether at least one signature was applied.
 fn apply_signatures_to_tx(
     tx: &mut BtcTransaction,
     sigs: &[Vec<u8>],
-    fed_key: &[u8],
-    federation_keys: &[[u8; 33]],
-    redeem_script: &[u8],
+    fed_key: &[u8; 33],
 ) -> bool {
-    if sigs.is_empty() || tx.input.is_empty() {
-        return false;
-    }
+    use super::release_tx::{
+        extract_redeem_script, input_signed_by, legacy_sighash_all, sig_insertion_index,
+        update_script_with_signature, verify_der_signature,
+    };
 
-    // Find the position of this federator's key in the sorted key list
-    let mut sorted_keys = federation_keys.to_vec();
-    sorted_keys.sort();
-
-    let key_index = sorted_keys.iter().position(|k| k.as_slice() == fed_key || &k[1..] == &fed_key[1..]);
-    // Try partial match for compressed vs uncompressed
-    let _key_index = key_index.unwrap_or(0);
-
-    for (i, input) in tx.input.iter_mut().enumerate() {
-        let sig = if i < sigs.len() { &sigs[i] } else { &sigs[0] };
-        if sig.is_empty() {
-            continue;
-        }
-
-        // Build or extend the P2SH multisig scriptSig:
-        // OP_0 <sig1> ... <sigm> <redeemScript>
-        let current_script = input.script_sig.as_bytes().to_vec();
-
-        let new_script = if current_script.is_empty() {
-            // First signature: start with OP_0 + sig + redeemScript
-            build_p2sh_scriptsig(&[sig.clone()], redeem_script)
-        } else {
-            // Additional signature: insert before redeemScript
-            add_sig_to_p2sh_scriptsig(&current_script, sig, redeem_script)
+    let n = tx.input.len();
+    let mut redeems = Vec::with_capacity(n);
+    let mut sighashes = Vec::with_capacity(n);
+    for i in 0..n {
+        let Some(redeem) = extract_redeem_script(tx.input[i].script_sig.as_bytes()) else {
+            return false;
         };
-
-        input.script_sig = bitcoin::ScriptBuf::from_bytes(new_script);
+        sighashes.push(legacy_sighash_all(tx, i, &redeem));
+        redeems.push(redeem);
     }
 
-    true
-}
-
-/// Build a P2SH multisig scriptSig from signatures and redeem script.
-/// Format: OP_0 <sig1> ... <sigm> <redeemScript>
-fn build_p2sh_scriptsig(sigs: &[Vec<u8>], redeem_script: &[u8]) -> Vec<u8> {
-    let mut script = Vec::new();
-    script.push(0x00); // OP_0
-    for sig in sigs {
-        push_data(&mut script, sig);
-    }
-    push_data(&mut script, redeem_script);
-    script
-}
-
-/// Add a signature to an existing P2SH multisig scriptSig.
-/// Inserts before the redeemScript (the last pushed data item).
-fn add_sig_to_p2sh_scriptsig(
-    existing: &[u8],
-    new_sig: &[u8],
-    redeem_script: &[u8],
-) -> Vec<u8> {
-    // Parse existing sigs (skip OP_0 prefix and final redeemScript push)
-    let mut existing_sigs = parse_p2sh_scriptsig_sigs(existing, redeem_script);
-    existing_sigs.push(new_sig.to_vec());
-    build_p2sh_scriptsig(&existing_sigs, redeem_script)
-}
-
-/// Parse the signatures from an existing P2SH scriptsig, excluding the redeemScript.
-fn parse_p2sh_scriptsig_sigs(script: &[u8], redeem_script: &[u8]) -> Vec<Vec<u8>> {
-    let mut sigs = Vec::new();
-    let mut pos = 0;
-
-    // Skip OP_0
-    if pos < script.len() && script[pos] == 0x00 {
-        pos += 1;
-    }
-
-    while pos < script.len() {
-        let (data, consumed) = read_push_data(&script[pos..]);
-        if data == redeem_script {
-            break; // reached the redeemScript
+    // getTransactionSignatures: any malformed or non-verifying signature
+    // aborts without applying anything.
+    for (sig, sighash) in sigs.iter().zip(&sighashes) {
+        if !verify_der_signature(sig, sighash, fed_key) {
+            return false;
         }
-        if !data.is_empty() {
-            sigs.push(data);
-        }
-        pos += consumed;
     }
-    sigs
-}
 
-/// Read a Script push data item. Returns (data, bytes_consumed).
-fn read_push_data(script: &[u8]) -> (Vec<u8>, usize) {
-    if script.is_empty() {
-        return (Vec::new(), 0);
-    }
-    let opcode = script[0];
-    if opcode == 0x00 {
-        // OP_0
-        return (Vec::new(), 1);
-    }
-    if opcode <= 0x4b {
-        // OP_PUSHBYTES_N
-        let len = opcode as usize;
-        if 1 + len > script.len() {
-            return (Vec::new(), script.len());
+    // sign(): stop at the first input already signed by this federator.
+    let mut signed = false;
+    for i in 0..n {
+        if input_signed_by(tx, i, fed_key, &sighashes[i]) {
+            break;
         }
-        return (script[1..1 + len].to_vec(), 1 + len);
+        let mut encoded = sigs[i].clone();
+        encoded.push(0x01); // SIGHASH_ALL
+        let script_sig = tx.input[i].script_sig.as_bytes().to_vec();
+        let index = sig_insertion_index(&script_sig, &sighashes[i], fed_key, &redeems[i]);
+        let Some(updated) = update_script_with_signature(&script_sig, &encoded, index) else {
+            return false; // no placeholder left (bitcoinj throws)
+        };
+        tx.input[i].script_sig = bitcoin::ScriptBuf::from_bytes(updated);
+        signed = true;
     }
-    if opcode == 0x4c {
-        // OP_PUSHDATA1
-        if script.len() < 2 {
-            return (Vec::new(), script.len());
-        }
-        let len = script[1] as usize;
-        if 2 + len > script.len() {
-            return (Vec::new(), script.len());
-        }
-        return (script[2..2 + len].to_vec(), 2 + len);
-    }
-    if opcode == 0x4d {
-        // OP_PUSHDATA2
-        if script.len() < 3 {
-            return (Vec::new(), script.len());
-        }
-        let len = u16::from_le_bytes([script[1], script[2]]) as usize;
-        if 3 + len > script.len() {
-            return (Vec::new(), script.len());
-        }
-        return (script[3..3 + len].to_vec(), 3 + len);
-    }
-    (Vec::new(), 1)
-}
-
-/// Append a data push to a script.
-fn push_data(script: &mut Vec<u8>, data: &[u8]) {
-    let len = data.len();
-    if len <= 0x4b {
-        script.push(len as u8);
-    } else if len <= 0xff {
-        script.push(0x4c);
-        script.push(len as u8);
-    } else {
-        script.push(0x4d);
-        script.extend_from_slice(&(len as u16).to_le_bytes());
-    }
-    script.extend_from_slice(data);
-}
-
-/// Count the number of distinct DER signatures in the first input of a tx.
-fn count_signatures_in_tx(tx: &BtcTransaction, _threshold: usize) -> usize {
-    if tx.input.is_empty() {
-        return 0;
-    }
-    let script = tx.input[0].script_sig.as_bytes();
-    let sigs = parse_p2sh_scriptsig_sigs(script, &[]);
-    // Filter for valid-looking DER signatures (start with 0x30 and end with sighash byte)
-    sigs.iter().filter(|s| s.len() > 8 && s[0] == 0x30).count()
+    signed
 }
 
 /// Parse an array of dynamic bytes from ABI-encoded `bytes[]` argument.
@@ -1795,9 +1705,12 @@ mod tests {
         let decoded = deserialize_pegouts_waiting_for_confirmations(&encoded, false);
 
         assert_eq!(decoded.len(), 2);
-        assert_eq!(decoded[0].btc_tx_raw, vec![0xDE, 0xAD]);
-        assert_eq!(decoded[0].rsk_block_height, 1000);
-        assert_eq!(decoded[1].rsk_block_height, 2000);
+        // rskj sorts entries by serialized BTC tx bytes (BTC_TX_COMPARATOR):
+        // 0xBEEF < 0xDEAD.
+        assert_eq!(decoded[0].btc_tx_raw, vec![0xBE, 0xEF]);
+        assert_eq!(decoded[0].rsk_block_height, 2000);
+        assert_eq!(decoded[1].btc_tx_raw, vec![0xDE, 0xAD]);
+        assert_eq!(decoded[1].rsk_block_height, 1000);
     }
 
     /// PegoutsWaitingForConfirmations: RSKIP146 triple format roundtrip.
@@ -1945,16 +1858,6 @@ mod tests {
         assert_eq!(items[0], hash160.as_slice(), "first item is hash160");
         assert_eq!(items[2].len(), 32, "third item is RSK tx hash (32 bytes)");
         assert_eq!(items[2][0], 0x01, "RSK hash matches createHash3(1)");
-    }
-
-    /// BTC tx size estimation for fee calculation.
-    #[test]
-    fn rskj_estimate_tx_vbytes_1in_2out_2of3() {
-        // 2-of-3 multisig, 1 input, 2 outputs (payment + change)
-        let vbytes = estimate_tx_vbytes(1, 2, 2, 3);
-        // Should be a reasonable P2SH multisig tx size
-        assert!(vbytes > 100 && vbytes < 600,
-            "1-input 2-output P2SH 2-of-3 tx should be 100-600 vbytes, got {}", vbytes);
     }
 
     /// Conversion: 1 satoshi = 10^10 wei.
