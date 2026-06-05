@@ -157,6 +157,12 @@ impl RskExecutor {
         for (i, (tx, sender)) in transactions.iter().enumerate() {
             if Self::is_remasc_tx(tx) {
                 debug!(tx_index = i, "executing REMASC system call");
+                // Warm the REMASC account: outside revm's transact flow the
+                // journal rejects storage ops on accounts it has not loaded.
+                {
+                    use revm::context_interface::{ContextTr, JournalTr};
+                    let _ = evm.ctx.journal_mut().load_account(REMASC_ADDR);
+                }
                 crate::remasc::process_miners_fees(
                     &mut evm.ctx,
                     &self.remasc_config,
@@ -2404,6 +2410,41 @@ mod tests {
             .expect("pre-RSKIP136 direct bridge call is included, not rejected");
         assert!(!result.tx_results[0].success);
         assert_eq!(result.tx_results[0].gas_used, 0, "all of the zero gas limit consumed");
+    }
+
+    /// Regression for the silent stall at mainnet #4001: the REMASC maturity
+    /// is 4_000 blocks, so #4001 is the FIRST block whose system call touches
+    /// REMASC storage — on a journal that never loaded the account, the sload
+    /// panicked (ColdLoadSkipped) and killed the sync task.
+    #[test]
+    fn test_remasc_system_call_past_maturity_on_fresh_journal() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+
+        // The processing block (#1) whose fees REMASC distributes at #4001.
+        let processing = dummy_header(1);
+        let processing_hash = processing.hash();
+        block_store.put_header(&processing).unwrap();
+        block_store.put_canonical_hash(1, processing_hash).unwrap();
+
+        let header = dummy_header(4_001);
+        let remasc_tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::ZERO,
+            gas_limit: U256::ZERO,
+            to: Bytes::copy_from_slice(crate::precompiles::REMASC_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::new(),
+            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+        };
+
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        let result = executor
+            .execute_block(&header, &[(remasc_tx, Address::ZERO)], &root, store)
+            .expect("REMASC past maturity must execute on a fresh journal");
+        assert!(result.tx_results[0].success);
+        assert_eq!(result.gas_used, 0);
     }
 
     /// Regression for mainnet block #3307: before RSKIP136 (bahamas, 3_397)

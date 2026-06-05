@@ -229,7 +229,15 @@ async fn main() -> Result<()> {
     node.add_handler(sync_handler);
     node.add_handler(tx_relay.clone());
 
-    tokio::spawn(sync_service.start());
+    // Supervise the sync task: a panic inside it would otherwise be swallowed
+    // by tokio and leave the node running but silently stalled.
+    let sync_handle = tokio::spawn(sync_service.start());
+    tokio::spawn(async move {
+        if let Err(e) = sync_handle.await {
+            tracing::error!("Sync service terminated unexpectedly: {e}. Shutting down.");
+            std::process::exit(1);
+        }
+    });
 
     if !args.no_rpc {
         let trie_store: Arc<dyn rustock_trie::TrieStore> =
