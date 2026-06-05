@@ -200,12 +200,6 @@ pub fn register_btc_transaction<CTX: ContextTr>(
         PrecompileError::other("registerBtcTransaction: invalid BTC transaction")
     })?;
 
-    // Derive the destination RSK address from the BTC transaction.
-    // rskj's PegUtils derives the address from OP_RETURN data or
-    // the first input's P2PKH script. We parse OP_RETURN first,
-    // falling back to the first input's public key hash.
-    let rsk_destination = extract_rsk_destination(&btc_tx);
-
     // The active federation's P2SH script identifies which outputs are
     // peg-ins and which inputs make the tx a peg-out.
     let federation_keys = federation_keys_or_genesis(ctx, config);
@@ -329,6 +323,17 @@ pub fn register_btc_transaction<CTX: ContextTr>(
     }
 
     let rbtc_amount = btc_satoshi_to_rbtc_wei(total_value);
+
+    // RSK destination: rskj's legacy peg-in credits the address derived from
+    // the sender's public key (ethereumj ECKey.getAddress over the
+    // UNCOMPRESSED point — mainnet #267,460 used a 65-byte pubkey).
+    // OP_RETURN-embedded destinations are pegin v1, RSKIP170+.
+    let rsk_destination = if hardfork_cfg.has_rskip170(rsk_height) {
+        extract_rsk_destination(&btc_tx)
+            .or_else(|| super::federation::rsk_address_from_public_key(&sender_pubkey))
+    } else {
+        super::federation::rsk_address_from_public_key(&sender_pubkey)
+    };
 
     // Credit the derived destination address (transfer from Bridge balance)
     if let Some(dest) = rsk_destination {
@@ -1601,24 +1606,10 @@ fn extract_rsk_destination(btc_tx: &BtcTransaction) -> Option<RskAddress> {
         }
     }
 
-    // 2. Fall back to deriving from first input's scriptSig (P2PKH)
-    if let Some(first_input) = btc_tx.input.first() {
-        let script_bytes = first_input.script_sig.as_bytes();
-        // P2PKH scriptSig: <sig> <pubkey>
-        // The public key is the last push (33 bytes compressed, 65 uncompressed)
-        if script_bytes.len() >= 34 {
-            let pubkey_len = script_bytes[script_bytes.len() - 34] as usize;
-            if pubkey_len == 33 && script_bytes.len() >= 34 {
-                let pubkey = &script_bytes[script_bytes.len() - 33..];
-                // rskj derives the address from the UNCOMPRESSED point
-                // (ECKey.getAddress); hashing the compressed bytes would
-                // credit the wrong account.
-                return super::federation::rsk_address_from_public_key(pubkey);
-            }
-        }
-    }
-
-    None
+    // 2. Fall back to deriving from the first input's P2PKH public key
+    // (compressed or uncompressed).
+    btc_sender_pubkey(btc_tx)
+        .and_then(|pk| super::federation::rsk_address_from_public_key(&pk))
 }
 
 /// Convert BTC satoshis to RBTC wei.
@@ -2024,6 +2015,41 @@ mod tests {
         assert_eq!(items[0], hash160.as_slice(), "first item is hash160");
         assert_eq!(items[2].len(), 32, "third item is RSK tx hash (32 bytes)");
         assert_eq!(items[2][0], 0x01, "RSK hash matches createHash3(1)");
+    }
+
+    /// Mainnet #267,460: a peg-in from an UNCOMPRESSED-pubkey sender credits
+    /// the RSK address of the uncompressed point (ethereumj ECKey.getAddress).
+    /// Our 33-byte-only parser missed it, leaving the recipient at balance 0
+    /// until their first spend failed at #400,982.
+    #[test]
+    fn rskj_pegin_destination_from_uncompressed_pubkey() {
+        let pubkey = alloy_primitives::hex::decode(
+            "04869eeeb358fa4e76da63b1596a38305bdc1007b981b6d5c59f54156678280cc6120605a7c8492adb33ab50f529162c9554f5f9491faba644719517e36d12d64c",
+        )
+        .unwrap();
+        let addr = crate::bridge::federation::rsk_address_from_public_key(&pubkey).unwrap();
+        assert_eq!(
+            alloy_primitives::hex::encode(addr),
+            "95bf476114e3241b808e81144228fe833fd38887"
+        );
+
+        // And through the scriptSig parser: <72-byte sig> <65-byte pubkey>.
+        let mut script = vec![71u8];
+        script.extend_from_slice(&[0x30; 71]);
+        script.push(65);
+        script.extend_from_slice(&pubkey);
+        let tx = BtcTransaction {
+            version: bitcoin::transaction::Version(1),
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: Default::default(),
+                script_sig: bitcoin::ScriptBuf::from_bytes(script),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![],
+        };
+        assert_eq!(btc_sender_pubkey(&tx), Some(pubkey));
     }
 
     /// Conversion: 1 satoshi = 10^10 wei.
