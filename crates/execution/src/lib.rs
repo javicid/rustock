@@ -6,6 +6,7 @@ pub mod hardfork;
 pub mod precompiles;
 pub mod processor;
 pub mod remasc;
+pub mod rsk_handler;
 pub mod rsk_instructions;
 pub mod state;
 

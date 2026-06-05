@@ -933,6 +933,17 @@ impl RskPrecompileProvider {
             CallInput::Bytes(bytes) => bytes.to_vec(),
         };
 
+        // rskj Program.callToPrecompiledAddress: the zero-value transfer
+        // CREATES the precompile account node on first call (isExist becomes
+        // true, so NEW_ACCT_CALL is charged at most once per address ever).
+        // Touching the loaded account persists it under the pinned
+        // pre-spurious journal semantics.
+        {
+            use revm::context_interface::JournalTr;
+            let _ = context.journal_mut().load_account(*addr);
+            context.journal_mut().touch_account(*addr);
+        }
+
         let exec_result = if *addr == ENVIRONMENT_ADDR {
             self.run_environment(context, &input_bytes, inputs.gas_limit)
         } else if *addr == BLOCK_HEADER_ADDR {
@@ -1247,6 +1258,14 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for RskPrecompileProvider {
         let Some(precompile) = self.precompiles.get(&inputs.bytecode_address) else {
             return Ok(None);
         };
+
+        // rskj creates the precompile account node on first call (see the
+        // stateful path above).
+        {
+            use revm::context_interface::JournalTr;
+            let _ = context.journal_mut().load_account(inputs.bytecode_address);
+            context.journal_mut().touch_account(inputs.bytecode_address);
+        }
 
         let mut result = InterpreterResult {
             result: InstructionResult::Return,

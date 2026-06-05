@@ -101,9 +101,23 @@ impl RskExecutor {
         let mut evm = ctx.build_mainnet().with_precompiles(precompile_provider);
         crate::rsk_instructions::install(&mut evm.instruction);
 
-        let result = evm
-            .transact(tx_env)
-            .map_err(|e| ExecutionError::Evm(format!("{e:?}")))?;
+        let exec_out = {
+            use revm::context::ContextSetters;
+            use revm::handler::Handler;
+            evm.ctx.set_tx(tx_env);
+            let mut handler = crate::rsk_handler::RskHandler::default();
+            let out = handler
+                .run(&mut evm)
+                .map_err(|e: revm::context::result::EVMError<_>| {
+                    ExecutionError::Evm(format!("{e:?}"))
+                })?;
+            out
+        };
+        let state = {
+            use revm::context_interface::{ContextTr, JournalTr};
+            evm.ctx.journal_mut().finalize()
+        };
+        let result = revm::context::result::ExecResultAndState::new(exec_out, state);
 
         let exec = result.result;
         let success = exec.is_success();
@@ -316,9 +330,17 @@ impl RskExecutor {
 
             let tx_env = tx_env_from_rsk_tx(tx, *sender, &self.hardfork_cfg);
 
-            let result = evm
-                .transact_one(tx_env)
-                .map_err(|e| ExecutionError::Evm(format!("{e:?}")))?;
+            let result = {
+                use revm::context::ContextSetters;
+                use revm::handler::Handler;
+                evm.ctx.set_tx(tx_env);
+                let mut handler = crate::rsk_handler::RskHandler::default();
+                handler
+                    .run(&mut evm)
+                    .map_err(|e: revm::context::result::EVMError<_>| {
+                        ExecutionError::Evm(format!("{e:?}"))
+                    })?
+            };
 
             let success = result.is_success();
             let gas_used = result.gas_used();
@@ -552,6 +574,77 @@ mod tests {
         let ist = make_cfg_env(SpecId::ISTANBUL, 30, false);
         assert_eq!(ist.gas_params.sstore_static_gas(), 800);
         assert_eq!(ist.gas_params.sstore_reset_without_cold_load_cost(), 4_200);
+    }
+
+    /// Regression for mainnet #466,503: rskj charges NEW_ACCT_CALL (25,000)
+    /// on trie EXISTENCE — the first-ever internal call to a precompile
+    /// creates its account node (zero-value transfer), so the charge applies
+    /// once per address in the chain's lifetime, not once per call. The same
+    /// ecrecover call in the next block must cost exactly 25,000 less.
+    #[test]
+    fn test_precompile_new_account_charged_only_once_across_blocks() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+
+        let sender = Address::repeat_byte(0xAA);
+        let contract = Address::repeat_byte(0xCC);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+        let root = put_account(&root, store.as_ref(), &contract, 1, U256::ZERO);
+
+        // PUSH1 0 x4 (ret/args) PUSH1 0 (value) PUSH20 0x..01 PUSH2 3000 CALL STOP
+        let mut code = vec![0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x73];
+        let mut ecrecover = [0u8; 20];
+        ecrecover[19] = 0x01;
+        code.extend_from_slice(&ecrecover);
+        code.extend_from_slice(&[0x61, 0x0b, 0xb8, 0xf1, 0x00]); // PUSH2 3000, CALL, STOP
+        let code_key_bytes = rustock_trie::code_key(&contract);
+        let root = root.put(
+            &TrieKeySlice::from_key(&code_key_bytes),
+            &code,
+            store.as_ref(),
+        );
+
+        let block_store =
+            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+
+        let call_tx = |nonce: u64| rustock_core::Transaction {
+            nonce,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(200_000),
+            to: Bytes::copy_from_slice(contract.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::new(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+
+        let header = dummy_header(466_503);
+        let r1 = executor
+            .execute_block(&header, &[(call_tx(0), sender)], &root, store.clone())
+            .expect("block 1");
+        assert!(r1.tx_results[0].success);
+
+        // Apply to the trie: the ecrecover account node must now exist.
+        let root2 =
+            crate::state::apply_state_changes(&root, store.as_ref(), &r1.state_changes);
+
+        let header2 = dummy_header(466_504);
+        let r2 = executor
+            .execute_block(&header2, &[(call_tx(1), sender)], &root2, store.clone())
+            .expect("block 2");
+        assert!(r2.tx_results[0].success);
+
+        let g1 = r1.tx_results[0].gas_used;
+        let g2 = r2.tx_results[0].gas_used;
+        assert_eq!(
+            g1 - g2,
+            25_000,
+            "first call pays NEW_ACCT_CALL once (got {g1} then {g2})"
+        );
     }
 
     /// Multi-tx version of the #382,134 regression: a later transaction in
