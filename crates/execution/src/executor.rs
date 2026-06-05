@@ -353,7 +353,10 @@ fn rsk_address_from_pubkey_hex(hex: &str) -> Option<Address> {
 fn make_cfg_env(spec_id: SpecId, chain_id: u64, eip3541_active: bool) -> CfgEnv {
     let mut cfg = CfgEnv::default();
     cfg.chain_id = chain_id;
-    cfg.spec = spec_id;
+    // Gas params are spec-dependent: assigning `spec` alone keeps the
+    // default (latest-fork) table and mis-prices historical opcodes —
+    // e.g. SSTORE reset was charged 2900 instead of 5000 at mainnet #1713.
+    cfg.set_spec_and_mainnet_gas_params(spec_id);
     cfg.limit_contract_code_size = Some(0x6000);
     // RSKIP544 (Vetiver900): rskj only rejects new contract code starting
     // with 0xEF from vetiver900, while revm bundles EIP-3541 into LONDON+.
@@ -406,6 +409,23 @@ mod tests {
         let key = TrieKeySlice::from_key(&key_bytes);
         let acct = AccountState::new(U256::from(nonce), balance);
         root.put(&key, &acct.encode(), store)
+    }
+
+    /// Regression for mainnet block #1713 (gas used mismatch 26656 vs 24556):
+    /// cfg.spec alone leaves the latest-fork gas table in place; the params
+    /// must be derived per spec. Pre-Istanbul SSTORE: the 5000 reset cost is
+    /// fully carried by the static charge.
+    #[test]
+    fn test_cfg_env_gas_params_follow_spec() {
+        let byz = make_cfg_env(SpecId::BYZANTIUM, 30, false);
+        assert_eq!(byz.gas_params.sstore_static_gas(), 5000);
+        assert_eq!(byz.gas_params.sstore_reset_without_cold_load_cost(), 0);
+        assert_eq!(byz.gas_params.sstore_set_without_load_cost(), 15_000);
+
+        // Istanbul-mapped heights use EIP-2200 metering (static = 800).
+        let ist = make_cfg_env(SpecId::ISTANBUL, 30, false);
+        assert_eq!(ist.gas_params.sstore_static_gas(), 800);
+        assert_eq!(ist.gas_params.sstore_reset_without_cold_load_cost(), 4_200);
     }
 
     #[test]
