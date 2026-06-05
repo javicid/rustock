@@ -24,6 +24,7 @@ use super::btc_store::{
     store_chain_head, StoredBlock,
 };
 use super::constants::BridgeConstants;
+use crate::hardfork::RskHardforkConfig;
 use super::storage::{bridge_sload, bridge_sstore, bridge_storage_key};
 
 // Error codes
@@ -173,6 +174,7 @@ pub fn receive_headers<CTX: ContextTr>(
     args: &[u8],
     config: &BridgeConstants,
     use_v2: bool,
+    hardfork_cfg: &RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
     let headers = decode_abi_bytes_array(args).ok_or_else(|| {
         PrecompileError::other("receiveHeaders: invalid ABI encoding")
@@ -180,17 +182,13 @@ pub fn receive_headers<CTX: ContextTr>(
 
     ensure_btc_chain_seeded(ctx, config, use_v2);
 
-    // Rate limiting
-    let timestamp_key = bridge_storage_key(super::storage::RECEIVE_HEADERS_TIMESTAMP_KEY);
-    let last_timestamp = bridge_sload(ctx, timestamp_key).to::<u64>();
-    let current_timestamp = ctx.block().timestamp();
-
-    if config.min_seconds_between_calls_receive_header > 0
-        && current_timestamp < last_timestamp + config.min_seconds_between_calls_receive_header
-    {
-        let gas = 22_000u64 + 2 * args.len() as u64;
-        return Ok(encode_int_result(gas, ERR_TOO_SOON));
-    }
+    // NOTE: rskj's receiveHeaders has NO rate limiting — the
+    // minSecondsBetweenCallsToReceiveHeader window only applies to the
+    // singular receiveHeader (RSKIP200). The federation calls this every
+    // few blocks.
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let rskip434 = hardfork_cfg.has_rskip434(block_number);
+    let is_mainnet = matches!(config.btc_network, super::constants::BtcNetwork::Mainnet);
 
     let max_headers = config.max_btc_headers_per_rsk_block as usize;
     let count = headers.len().min(max_headers);
@@ -225,6 +223,16 @@ pub fn receive_headers<CTX: ContextTr>(
             None => continue,
         };
 
+        // rskj cannotProcessNextBlock: bitcoinj's 12-byte chainwork
+        // overflows at BTC mainnet #849,138; headers from there cannot be
+        // processed until RSKIP434.
+        if parent.height + 1 >= config.block_with_too_much_chain_work_height
+            && is_mainnet
+            && !rskip434
+        {
+            break;
+        }
+
         let work = compute_work(btc_header.bits);
         let new_chain_work = parent.chain_work.wrapping_add(work);
         let new_height = parent.height + 1;
@@ -248,9 +256,6 @@ pub fn receive_headers<CTX: ContextTr>(
 
         processed += 1;
     }
-
-    // Update timestamp
-    bridge_sstore(ctx, timestamp_key, U256::from(current_timestamp));
 
     let gas = 22_000u64 + 2 * args.len() as u64;
     Ok(encode_int_result(gas, processed))

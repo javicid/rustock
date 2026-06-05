@@ -75,6 +75,11 @@ pub struct BridgeConstants {
     /// (rskj BridgeUtils.isFromAuthorizedSender).
     pub authorized_free_tx_keys: &'static [&'static str],
 
+    /// BTC height from which headers cannot be processed until RSKIP434
+    /// (bitcoinj 12-byte chainwork overflow; rskj
+    /// blockWithTooMuchChainWorkHeight — mainnet 849,138).
+    pub block_with_too_much_chain_work_height: u32,
+
     /// Initial BTC chain checkpoint: (80-byte header hex, height, chain work
     /// hex). rskj seeds a fresh bridge BTC block store from the bitcoinj
     /// checkpoints file at the federation creation time minus one week
@@ -142,6 +147,7 @@ impl BridgeConstants {
                 "0484c66f75548baf93e322574adac4e4579b6a53f8d11fab640e14c90118e6983ef24b0de349a3e88f72e81e771ae1c897cef446fd7f4da71778c532aee3b6c41b",
                 "04bb6435dc1ea12da843ebe213893d136c1624acd681fff82551498ae00bf28e9323164b00daf925fa75177463b8254a2aae8a1713e4d851a84ea369c193e9ce51",
             ],
+            block_with_too_much_chain_work_height: 849_138,
             // bitcoinj checkpoint at BTC mainnet #499,968 (2017-12-18), hash
             // 000000000000000000296e10eb4987c4eb9b7ba0841102dec4480e5d6b89acb5
             btc_checkpoint: Some((
@@ -191,6 +197,7 @@ impl BridgeConstants {
                 "045ef89e4a5645dc68895dbc33b4c966c3a0a52bb837ecdd2ba448604c4f47266456d1191420e1d32bbe8741f8315fde4d1440908d400e5998dbed6549d499559b",
                 "0455db9b3867c14e84a6f58bd2165f13bfdba0703cb84ea85788373a6a109f3717e40483aa1f8ef947f435ccdf10e530dd8b3025aa2d4a7014f12180ee3a301d27",
             ],
+            block_with_too_much_chain_work_height: u32::MAX,
             // bitcoinj checkpoint at BTC testnet #1,413,216 (2018-09-13), hash
             // 000000000000001aa547c01c17edae35e21dd63fd7e6627daedf997bd3a54627
             btc_checkpoint: Some((
@@ -223,6 +230,7 @@ impl BridgeConstants {
             // Regtest has areBridgeTxsPaid from genesis; no free senders needed.
             genesis_federation_public_keys: &[],
             authorized_free_tx_keys: &[],
+            block_with_too_much_chain_work_height: u32::MAX,
             btc_checkpoint: None,
         }
     }

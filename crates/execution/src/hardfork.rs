@@ -66,7 +66,7 @@ pub const TESTNET_ACTIVATIONS: &[(u64, RskNetworkUpgrade)] = &[
     (3_103_000, RskNetworkUpgrade::Hop400),
     (4_015_800, RskNetworkUpgrade::Fingerroot500),
     (4_927_100, RskNetworkUpgrade::Arrowhead600),
-    (5_254_700, RskNetworkUpgrade::Arrowhead631),
+    // arrowhead631 = -1 on testnet (rskj testnet.conf)
     (5_735_824, RskNetworkUpgrade::Lovell700),
     (6_420_700, RskNetworkUpgrade::Reed800),
     (7_139_600, RskNetworkUpgrade::Reed810),
@@ -191,6 +191,11 @@ impl RskHardforkConfig {
     /// RSKIP271: peg-out batching and nextPegoutHeight tracking (Hop400, mainnet 4_598_500).
     pub fn has_rskip271(&self, block_number: u64) -> bool {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Hop400
+    }
+
+    /// RSKIP434: lifts the BTC chainwork-overflow header block (Arrowhead631).
+    pub fn has_rskip434(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Arrowhead631
     }
 
     /// RSKIP170: pegin_btc event replaces lock_btc (Iris300).
