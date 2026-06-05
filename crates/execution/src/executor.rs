@@ -2237,6 +2237,35 @@ mod tests {
         assert!(!result.success, "below-minimum amount must be rejected");
     }
 
+    /// Regression for mainnet block #2646 (gas used mismatch 31280 vs 31272):
+    /// rskj Bridge.getGasForData charges functionCost + data.length * 2.
+    /// getNextPegoutCreationBlockNumber: 21000 + 4*68 + 3000 + 4*2 = 24280.
+    #[test]
+    fn test_bridge_call_charges_rskj_data_cost() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let header = dummy_header(2_646);
+
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::from(block_header_selector("getNextPegoutCreationBlockNumber()").to_vec()),
+            v: 28, r: U256::from(1), s: U256::from(1), cached_rlp: None,
+        };
+
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        let result = executor.execute_tx(&header, &tx, sender, &root, store).unwrap();
+        assert!(result.success);
+        assert_eq!(result.gas_used, 24_280, "functionCost 3000 + data cost 4*2");
+    }
+
     // -----------------------------------------------------------------------
     // Free bridge transactions (rskj BridgeUtils.isFreeBridgeTx)
     // -----------------------------------------------------------------------

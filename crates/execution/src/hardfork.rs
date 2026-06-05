@@ -199,6 +199,20 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Lovell700
     }
 
+    /// RSKIP124: public receiveHeaders with header-count-based cost (Wasabi100).
+    pub fn has_rskip124(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Wasabi100
+    }
+
+    /// RSKIP132: recalculated receiveHeaders cost (Wasabi100; testnet
+    /// overrides the height to 43_550 in testnet.conf consensusRules).
+    pub fn has_rskip132(&self, block_number: u64) -> bool {
+        if self.chain_id == RSK_TESTNET_CHAIN_ID {
+            return block_number >= 43_550;
+        }
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Wasabi100
+    }
+
     /// areBridgeTxsPaid (rskj reference.conf: afterBridgeSync — mainnet
     /// 370_000, testnet 114_000). Before activation, federation/authorized
     /// transactions to the Bridge execute for free with zero gas

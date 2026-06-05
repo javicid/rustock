@@ -23,7 +23,7 @@ pub mod serialization;
 pub mod storage;
 pub mod tx;
 
-use alloy_primitives::Bytes;
+use alloy_primitives::{Bytes, U256};
 use revm::context_interface::ContextTr;
 use revm::precompile::{PrecompileError, PrecompileOutput};
 use rustock_storage::BlockStore;
@@ -234,24 +234,84 @@ pub fn execute_bridge<CTX: ContextTr>(
     let method = find_bridge_method(&selector)
         .ok_or_else(|| PrecompileError::other("Bridge: unknown method selector"))?;
 
-    let gas_cost = match method.gas_cost {
+    let args = &input[4..];
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+
+    let function_cost = match method.gas_cost {
         BridgeGasCost::Fixed(c) => c,
         BridgeGasCost::InputDependent => {
-            // receiveHeaders: cost scales with input
-            22_000u64.saturating_add(2 * input.len() as u64)
+            receive_headers_cost(args, hardfork_cfg, block_number)
         }
         BridgeGasCost::Dynamic => {
-            // getBtcTransactionConfirmations: base cost
-            22_000u64
+            btc_tx_confirmations_cost(ctx, args, config)
         }
     };
+    // rskj Bridge.getGasForData: totalCost = functionCost + data.length * 2
+    let gas_cost = function_cost.saturating_add(2 * input.len() as u64);
 
     if gas_limit < gas_cost {
         return Err(PrecompileError::OutOfGas);
     }
 
-    let args = &input[4..];
     execute_method(ctx, method.name, args, gas_cost, config, block_store, use_v2, hardfork_cfg, tx_ctx)
+}
+
+/// rskj `Bridge.receiveHeadersGetCost`: 22_000 before RSKIP124; afterwards a
+/// base cost plus a per-additional-header charge (recalculated by RSKIP132).
+fn receive_headers_cost(args: &[u8], hardfork_cfg: &RskHardforkConfig, block_number: u64) -> u64 {
+    if !hardfork_cfg.has_rskip124(block_number) {
+        return 22_000;
+    }
+    let rskip132 = hardfork_cfg.has_rskip132(block_number);
+    let base: u64 = if rskip132 { 25_000 } else { 66_000 };
+    let per_additional_header: u64 = if rskip132 { 3_500 } else { 1_650 };
+
+    match abi_array_len(args, 0) {
+        Some(n) if n > 0 => base.saturating_add((n - 1).saturating_mul(per_additional_header)),
+        _ => base,
+    }
+}
+
+/// rskj `BridgeSupport.getBtcTransactionConfirmationsGetCost`:
+/// 27_000 base + blockDepth * 315 + merkleBranchHashes * 144, falling back to
+/// the base cost when the block is unknown or too deep.
+fn btc_tx_confirmations_cost<CTX: ContextTr>(
+    ctx: &mut CTX,
+    args: &[u8],
+    config: &BridgeConstants,
+) -> u64 {
+    const BASIC_COST: u64 = 27_000;
+    const STEP_COST: u64 = 315;
+    const DOUBLE_HASH_COST: u64 = 144;
+
+    // args: bytes32 btcTxHash, bytes32 btcBlockHash, uint256 path, bytes32[] hashes
+    let (block_hash, branch_hashes) = match (args.get(32..64), abi_array_len(args, 96)) {
+        (Some(h), Some(n)) => (alloy_primitives::B256::from_slice(h), n),
+        _ => return BASIC_COST,
+    };
+
+    let block_hash = crate::bridge::btc_chain::b256_to_bitcoin_hash(&block_hash);
+    let Some(block) = crate::bridge::btc_store::get_stored_block(ctx, &block_hash) else {
+        return BASIC_COST;
+    };
+    let Some(head) = crate::bridge::btc_store::load_chain_head(ctx) else {
+        return BASIC_COST;
+    };
+
+    let depth = head.height.saturating_sub(block.height) as u64;
+    if depth > config.btc_transaction_confirmation_max_depth as u64 {
+        return BASIC_COST;
+    }
+
+    BASIC_COST + depth * STEP_COST + branch_hashes * DOUBLE_HASH_COST
+}
+
+/// Length of an ABI dynamic array whose offset word sits at `slot` in `args`.
+fn abi_array_len(args: &[u8], slot: usize) -> Option<u64> {
+    let offset = U256::from_be_slice(args.get(slot..slot + 32)?).try_into().ok()?;
+    let offset: usize = offset;
+    let len = args.get(offset..offset + 32)?;
+    Some(U256::from_be_slice(len).to::<u64>())
 }
 
 /// Dispatch to individual method handlers.
@@ -429,5 +489,24 @@ mod tests {
         let sel = compute_selector("releaseBtc()");
         let m = find_bridge_method(&sel).unwrap();
         assert_eq!(m.name, "releaseBtc");
+    }
+
+    /// rskj Bridge.receiveHeadersGetCost groundtruth: 22_000 pre-RSKIP124;
+    /// post-RSKIP132 (mainnet wasabi100) 25_000 + (n-1) * 3_500.
+    #[test]
+    fn receive_headers_cost_matches_rskj() {
+        let cfg = crate::hardfork::RskHardforkConfig::mainnet();
+
+        // ABI bytes[] with 3 entries: offset word + length word (entries not needed)
+        let mut args = vec![0u8; 64];
+        args[31] = 0x20; // offset 32
+        args[63] = 3;    // length 3
+
+        // Pre-wasabi100: flat 22_000 regardless of header count.
+        assert_eq!(receive_headers_cost(&args, &cfg, 1_590_999), 22_000);
+        // Post-wasabi100 (rskip124+132 both active on mainnet): 25_000 + 2*3_500.
+        assert_eq!(receive_headers_cost(&args, &cfg, 1_591_000), 32_000);
+        // Unparseable args fall back to the base cost.
+        assert_eq!(receive_headers_cost(&[], &cfg, 1_591_000), 25_000);
     }
 }
