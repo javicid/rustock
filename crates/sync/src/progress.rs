@@ -32,7 +32,12 @@ impl SyncProgress {
 
     /// Logs sync progress if enough time has elapsed since the last report.
     /// Returns without logging for `Idle` or `Following` states.
-    pub fn log(&mut self, state: &SyncState, current: u64, peer_count: usize) {
+    ///
+    /// `executed` is the executed-chain head (the true sync position);
+    /// `downloaded` the downloaded-header head, which runs ahead by design
+    /// (pipelined skeleton sync). Rates and ETA are based on execution.
+    pub fn log(&mut self, state: &SyncState, executed: u64, downloaded: u64, peer_count: usize) {
+        let current = executed;
         let peer_best = match state {
             SyncState::DownloadingHeaders { peer_best, .. } => *peer_best,
             SyncState::DownloadingSkeleton { peer_best, .. } => *peer_best,
@@ -93,8 +98,8 @@ impl SyncProgress {
 
         info!(
             target: "rustock::sync",
-            "Sync progress: #{} / #{} ({:.2}%) | {:.0} blk/s (avg {:.0}) | ETA {} | {} peers | {}",
-            current, peer_best, pct,
+            "Sync progress: exec #{} | dl #{} | peer #{} ({:.2}%) | {:.0} blk/s (avg {:.0}) | ETA {} | {} peers | {}",
+            executed, downloaded, peer_best, pct,
             recent_speed, avg_speed,
             eta, peer_count, state_label
         );

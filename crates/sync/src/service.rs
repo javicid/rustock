@@ -1263,9 +1263,18 @@ impl SyncService {
 
     /// Log sync progress: percentage, speed, ETA, peers.
     async fn log_progress(&mut self) {
-        let current = self.our_head_number();
+        let downloaded = self.our_head_number();
+        let executed = self
+            .manager
+            .store
+            .exec_head()
+            .ok()
+            .flatten()
+            .and_then(|(hash, _)| self.manager.store.header(hash).ok().flatten())
+            .map(|h| h.number)
+            .unwrap_or(downloaded);
         let peers = self.peer_store.peers().await.len();
-        self.progress.log(&self.state, current, peers);
+        self.progress.log(&self.state, executed, downloaded, peers);
     }
 }
 
