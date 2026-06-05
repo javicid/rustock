@@ -235,31 +235,154 @@ pub fn rollback_federation<CTX: ContextTr>(
 /// `voteFeePerKbChange(int256 feePerKb)` → int256
 ///
 /// Authorized vote to change the BTC fee per KB for peg-out transactions.
-/// Returns:
-///   1  = vote accepted
-///  -1  = unauthorized
-///  -2  = negative value
+///
+/// rskj FeePerKbSupportImpl.voteFeePerKbChange: votes accumulate in an
+/// ABICallElection stored under `feePerKbElection`; the fee only changes
+/// when a MAJORITY of the authorizer keys vote the same value, after which
+/// the election is cleared.
+/// Returns 1 successful vote/winner, -1 negative fee or duplicate vote,
+/// -2 fee above maximum, -10 unauthorized.
 pub fn vote_fee_per_kb_change<CTX: ContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     gas_cost: u64,
+    config: &super::constants::BridgeConstants,
+    tx_ctx: &crate::precompiles::BridgeTxContext,
 ) -> Result<PrecompileOutput, PrecompileError> {
     if args.len() < 32 {
         return Err(PrecompileError::other("voteFeePerKbChange: args too short"));
     }
 
-    let fee_value = U256::from_be_slice(&args[..32]);
-
-    // Check for negative (sign bit set in int256)
-    if args[0] & 0x80 != 0 {
-        return Ok(encode_int_result(gas_cost, -2));
+    let authorizers: Vec<alloy_primitives::Address> = config
+        .fee_per_kb_authorizer_keys
+        .iter()
+        .filter_map(|hex| {
+            alloy_primitives::hex::decode(hex)
+                .ok()
+                .and_then(|k| super::federation::rsk_address_from_public_key(&k))
+        })
+        .collect();
+    let sender = tx_ctx.rsk_sender;
+    if !authorizers.contains(&sender) {
+        return Ok(encode_int_result(gas_cost, -10));
     }
 
-    // Store the new fee
-    let key = bridge_storage_key(FEE_PER_KB_KEY);
-    bridge_sstore(ctx, key, fee_value);
+    // Negative (int256 sign bit) or zero is not a positive coin.
+    if args[0] & 0x80 != 0 {
+        return Ok(encode_int_result(gas_cost, -1));
+    }
+    let fee_value = U256::from_be_slice(&args[..32]);
+    if fee_value.is_zero() {
+        return Ok(encode_int_result(gas_cost, -1));
+    }
+    if fee_value > U256::from(config.max_fee_per_kb) {
+        return Ok(encode_int_result(gas_cost, -2));
+    }
+    let fee_satoshis = fee_value.to::<u64>();
+
+    // MAJORITY of the authorizer set must vote the same value.
+    let required = authorizers.len() / 2 + 1;
+    let mut election = load_fee_per_kb_election(ctx);
+    let entry = election
+        .iter_mut()
+        .find(|(value, _)| *value == fee_satoshis);
+    let voters = match entry {
+        Some((_, voters)) => voters,
+        None => {
+            election.push((fee_satoshis, Vec::new()));
+            &mut election.last_mut().expect("just pushed").1
+        }
+    };
+    if voters.contains(&sender) {
+        return Ok(encode_int_result(gas_cost, -1)); // duplicate vote
+    }
+    voters.push(sender);
+
+    if voters.len() >= required {
+        let key = bridge_storage_key(FEE_PER_KB_KEY);
+        bridge_sstore(ctx, key, U256::from(fee_satoshis));
+        store_fee_per_kb_election(ctx, &[]);
+    } else {
+        store_fee_per_kb_election(ctx, &election);
+    }
 
     Ok(encode_int_result(gas_cost, 1))
+}
+
+const FEE_PER_KB_ELECTION_KEY: &str = "feePerKbElection";
+
+/// rskj BridgeSerializationUtils.serializeElection for the feePerKb
+/// election: RLP list of (ABICallSpec, voters) pairs sorted by the
+/// serialized spec bytes. The spec is
+/// `RLP[ "setFeePerKb", RLP[ rlp(serializeCoin(fee)) ] ]` and the voters a
+/// sorted RLP list of 20-byte addresses.
+fn serialize_fee_per_kb_spec(fee_satoshis: u64) -> Vec<u8> {
+    use super::serialization::{rlp_encode_element, rlp_encode_list, rlp_encode_u64};
+    let coin = rlp_encode_u64(fee_satoshis); // serializeCoin
+    let args = rlp_encode_list(&[rlp_encode_element(&coin)]);
+    rlp_encode_list(&[rlp_encode_element(b"setFeePerKb"), args])
+}
+
+fn store_fee_per_kb_election<CTX: ContextTr>(
+    ctx: &mut CTX,
+    election: &[(u64, Vec<alloy_primitives::Address>)],
+) {
+    use super::serialization::{rlp_encode_element, rlp_encode_list};
+    let mut entries: Vec<(Vec<u8>, &Vec<alloy_primitives::Address>)> = election
+        .iter()
+        .map(|(fee, voters)| (serialize_fee_per_kb_spec(*fee), voters))
+        .collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut items = Vec::with_capacity(entries.len() * 2);
+    for (spec, voters) in entries {
+        items.push(spec);
+        let mut sorted: Vec<&alloy_primitives::Address> = voters.iter().collect();
+        sorted.sort();
+        let voter_items: Vec<Vec<u8>> = sorted
+            .iter()
+            .map(|v| rlp_encode_element(v.as_slice()))
+            .collect();
+        items.push(rlp_encode_list(&voter_items));
+    }
+    let data = rlp_encode_list(&items);
+    bridge_store_bytes_named(ctx, FEE_PER_KB_ELECTION_KEY, &data);
+}
+
+fn load_fee_per_kb_election<CTX: ContextTr>(
+    ctx: &mut CTX,
+) -> Vec<(u64, Vec<alloy_primitives::Address>)> {
+    use super::serialization::{rlp_decode_list, rlp_decode_u64};
+    let data = bridge_load_bytes_named(ctx, FEE_PER_KB_ELECTION_KEY);
+    if data.is_empty() {
+        return Vec::new();
+    }
+    let Some(items) = rlp_decode_list(&data) else {
+        return Vec::new();
+    };
+    let mut election = Vec::new();
+    let mut i = 0;
+    while i + 1 < items.len() {
+        // spec: RLP[function, RLP[args]]
+        let fee = rlp_decode_list(&items[i])
+            .filter(|spec| spec.len() == 2 && spec[0] == b"setFeePerKb")
+            .and_then(|spec| rlp_decode_list(&spec[1]))
+            .and_then(|args| args.first().cloned())
+            .map(|coin| rlp_decode_u64(&coin));
+        let voters = rlp_decode_list(&items[i + 1])
+            .map(|vs| {
+                vs.into_iter()
+                    .filter(|v| v.len() == 20)
+                    .map(|v| alloy_primitives::Address::from_slice(&v))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(fee) = fee {
+            election.push((fee, voters));
+        }
+        i += 2;
+    }
+    election
 }
 
 // ---------------------------------------------------------------------------

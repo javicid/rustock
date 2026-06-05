@@ -77,6 +77,11 @@ pub struct BridgeConstants {
     /// Lock-whitelist change authorizer keys (rskj WhitelistConstants,
     /// AddressBasedAuthorizer with minimum ONE).
     pub whitelist_authorizer_keys: &'static [&'static str],
+    /// Fee-per-KB change authorizer keys (rskj FeePerKbConstants,
+    /// AddressBasedAuthorizer with minimum MAJORITY).
+    pub fee_per_kb_authorizer_keys: &'static [&'static str],
+    /// Maximum votable fee per KB (rskj FeePerKbConstants.maxFeePerKb).
+    pub max_fee_per_kb: u64,
 
     /// BTC height from which headers cannot be processed until RSKIP434
     /// (bitcoinj 12-byte chainwork overflow; rskj
@@ -154,6 +159,13 @@ impl BridgeConstants {
             whitelist_authorizer_keys: &[
                 "041a2449e9d63409c5a8ea3a21c4109b1a6634ee88fd57176d45ea46a59713d5e0b688313cf252128a3e49a0b2effb4b413e5a2525a6fa5894d059f815c9d9efa6",
             ],
+            // FeePerKbMainNetConstants authorizer keys (majority = 2 of 3)
+            fee_per_kb_authorizer_keys: &[
+                "0448f51638348b034995b1fd934fe14c92afde783e69f120a46ee16eb6bdc2e4f6b5e37772094c68c0dea2b1be3d96ea9651a9eebda7304914c8047f4e3e251378",
+                "0484c66f75548baf93e322574adac4e4579b6a53f8d11fab640e14c90118e6983ef24b0de349a3e88f72e81e771ae1c897cef446fd7f4da71778c532aee3b6c41b",
+                "04bb6435dc1ea12da843ebe213893d136c1624acd681fff82551498ae00bf28e9323164b00daf925fa75177463b8254a2aae8a1713e4d851a84ea369c193e9ce51",
+            ],
+            max_fee_per_kb: 5_000_000,
             block_with_too_much_chain_work_height: 849_138,
             // bitcoinj checkpoint at BTC mainnet #499,968 (2017-12-18), hash
             // 000000000000000000296e10eb4987c4eb9b7ba0841102dec4480e5d6b89acb5
@@ -208,6 +220,13 @@ impl BridgeConstants {
             whitelist_authorizer_keys: &[
                 "04bf7e3bca7f7c58326382ed9c2516a8773c21f1b806984bb1c5c33bd18046502d97b28c0ea5b16433fbb2b23f14e95b36209f304841e814017f1ede1ecbdcfce3",
             ],
+            // FeePerKbTestNetConstants authorizer keys (majority = 2 of 3)
+            fee_per_kb_authorizer_keys: &[
+                "04701d1d27f8c2ae97912d96fb1f82f10c2395fd320e7a869049268c6b53d2060dfb2e22e3248955332d88cd2ae29a398f8f3858e48dd6d8ffbc37dfd6d1aa4934",
+                "045ef89e4a5645dc68895dbc33b4c966c3a0a52bb837ecdd2ba448604c4f47266456d1191420e1d32bbe8741f8315fde4d1440908d400e5998dbed6549d499559b",
+                "0455db9b3867c14e84a6f58bd2165f13bfdba0703cb84ea85788373a6a109f3717e40483aa1f8ef947f435ccdf10e530dd8b3025aa2d4a7014f12180ee3a301d27",
+            ],
+            max_fee_per_kb: 5_000_000,
             block_with_too_much_chain_work_height: u32::MAX,
             // bitcoinj checkpoint at BTC testnet #1,413,216 (2018-09-13), hash
             // 000000000000001aa547c01c17edae35e21dd63fd7e6627daedf997bd3a54627
@@ -245,6 +264,11 @@ impl BridgeConstants {
             whitelist_authorizer_keys: &[
                 "04641fb250d7ca7a1cb4f530588e978013038ec4294d084d248869dd54d98873e45c61d00ceeaeeb9e35eab19fa5fbd8f07cb8a5f0ddba26b4d4b18349c09199ad",
             ],
+            // FeePerKbRegTestConstants single authorizer key
+            fee_per_kb_authorizer_keys: &[
+                "0430c7d0146029db553d60cf11e8d39df1c63979ee2e4cd1e4d4289a5d88cfcbf3a09b06b5cbc88b5bfeb4b87a94cefab81c8d44655e7e813fc3e18f51cfe7e8a0",
+            ],
+            max_fee_per_kb: 5_000_000,
             block_with_too_much_chain_work_height: u32::MAX,
             btc_checkpoint: None,
         }

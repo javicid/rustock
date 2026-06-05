@@ -377,7 +377,7 @@ fn execute_method<CTX: ContextTr>(
         "rollbackFederation" => governance::rollback_federation(ctx, gas_cost),
         "addFederatorPublicKey" => governance::add_federator_public_key(ctx, args, gas_cost),
         "addFederatorPublicKeyMultikey" => governance::add_federator_public_key_multikey(ctx, args, gas_cost),
-        "voteFeePerKbChange" => governance::vote_fee_per_kb_change(ctx, args, gas_cost),
+        "voteFeePerKbChange" => governance::vote_fee_per_kb_change(ctx, args, gas_cost, config, tx_ctx),
         "increaseLockingCap" => governance::increase_locking_cap(ctx, args, gas_cost),
         "addLockWhitelistAddress" => governance::add_lock_whitelist_address(ctx, args, gas_cost, config, tx_ctx),
         "addOneOffLockWhitelistAddress" => governance::add_one_off_lock_whitelist_address(ctx, args, gas_cost, config, tx_ctx),
