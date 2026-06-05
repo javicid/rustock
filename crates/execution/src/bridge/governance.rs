@@ -94,7 +94,6 @@ fn abi_decode_int256_as_u64(args: &[u8], slot: usize) -> Option<u64> {
 // Use the shared constant from storage.rs
 use super::storage::FEE_PER_KB_KEY;
 const LOCKING_CAP_KEY: &str = "lockingCap";
-const LOCK_WHITELIST_DISABLE_BLOCK_DELAY_KEY: &str = "lockWhitelistDisDelay";
 
 // ---------------------------------------------------------------------------
 // Federation change methods
@@ -315,8 +314,24 @@ pub fn add_lock_whitelist_address<CTX: ContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     gas_cost: u64,
+    config: &super::constants::BridgeConstants,
+    tx_ctx: &crate::precompiles::BridgeTxContext,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    add_one_off_lock_whitelist_address(ctx, args, gas_cost)
+    add_one_off_lock_whitelist_address(ctx, args, gas_cost, config, tx_ctx)
+}
+
+/// rskj AddressBasedAuthorizer (minimum ONE): the tx sender must be the RSK
+/// address of one of the whitelist-change authorizer keys.
+fn is_whitelist_change_authorized(
+    config: &super::constants::BridgeConstants,
+    sender: alloy_primitives::Address,
+) -> bool {
+    config.whitelist_authorizer_keys.iter().any(|hex| {
+        alloy_primitives::hex::decode(hex)
+            .ok()
+            .and_then(|k| super::federation::rsk_address_from_public_key(&k))
+            .is_some_and(|a| a == sender)
+    })
 }
 
 /// `addOneOffLockWhitelistAddress(string address, int256 maxTransferValue)` → int256
@@ -332,6 +347,8 @@ pub fn add_one_off_lock_whitelist_address<CTX: ContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     gas_cost: u64,
+    config: &super::constants::BridgeConstants,
+    tx_ctx: &crate::precompiles::BridgeTxContext,
 ) -> Result<PrecompileOutput, PrecompileError> {
     let addr_str = match abi_decode_string_arg(args, 0) {
         Ok(s) => s,
@@ -348,10 +365,16 @@ pub fn add_one_off_lock_whitelist_address<CTX: ContextTr>(
         None => return Ok(encode_int_result(gas_cost, -2)),
     };
 
+    if !is_whitelist_change_authorized(config, tx_ctx.rsk_sender) {
+        return Ok(encode_int_result(gas_cost, -10));
+    }
+
     let (mut entries, disable_h) = load_one_off_whitelist(ctx);
 
-    // Check for duplicate
-    if entries.iter().any(|(h, _)| h == &hash160) {
+    // Duplicates across BOTH whitelists (rskj LockWhitelist.isWhitelisted)
+    if entries.iter().any(|(h, _)| h == &hash160)
+        || load_unlimited_whitelist(ctx).contains(&hash160)
+    {
         return Ok(encode_int_result(gas_cost, -1));
     }
 
@@ -374,6 +397,8 @@ pub fn add_unlimited_lock_whitelist_address<CTX: ContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     gas_cost: u64,
+    config: &super::constants::BridgeConstants,
+    tx_ctx: &crate::precompiles::BridgeTxContext,
 ) -> Result<PrecompileOutput, PrecompileError> {
     let addr_str = match abi_decode_string_arg(args, 0) {
         Ok(s) => s,
@@ -385,10 +410,16 @@ pub fn add_unlimited_lock_whitelist_address<CTX: ContextTr>(
         Err(_) => return Ok(encode_int_result(gas_cost, -2)),
     };
 
+    if !is_whitelist_change_authorized(config, tx_ctx.rsk_sender) {
+        return Ok(encode_int_result(gas_cost, -10));
+    }
+
     let mut entries = load_unlimited_whitelist(ctx);
 
-    // Check for duplicate
-    if entries.iter().any(|h| h == &hash160) {
+    // Duplicates across BOTH whitelists (rskj LockWhitelist.isWhitelisted)
+    if entries.iter().any(|h| h == &hash160)
+        || load_one_off_whitelist(ctx).0.iter().any(|(h, _)| h == &hash160)
+    {
         return Ok(encode_int_result(gas_cost, -1));
     }
 
@@ -410,7 +441,13 @@ pub fn remove_lock_whitelist_address<CTX: ContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     gas_cost: u64,
+    config: &super::constants::BridgeConstants,
+    tx_ctx: &crate::precompiles::BridgeTxContext,
 ) -> Result<PrecompileOutput, PrecompileError> {
+    if !is_whitelist_change_authorized(config, tx_ctx.rsk_sender) {
+        return Ok(encode_int_result(gas_cost, -10));
+    }
+
     let addr_str = match abi_decode_string_arg(args, 0) {
         Ok(s) => s,
         Err(_) => return Ok(encode_int_result(gas_cost, -2)),
@@ -443,10 +480,17 @@ pub fn remove_lock_whitelist_address<CTX: ContextTr>(
 }
 
 /// `setLockWhitelistDisableBlockDelay(int256 delay)` → int256
+///
+/// rskj WhitelistSupportImpl: sets the whitelist disable height to the BTC
+/// best-chain height plus the delay, inside the one-off whitelist blob.
+/// Returns 1 success, -1 delay already set, -2 invalid delay,
+/// -10 unauthorized.
 pub fn set_lock_whitelist_disable_block_delay<CTX: ContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     gas_cost: u64,
+    config: &super::constants::BridgeConstants,
+    tx_ctx: &crate::precompiles::BridgeTxContext,
 ) -> Result<PrecompileOutput, PrecompileError> {
     if args.len() < 32 {
         return Err(PrecompileError::other(
@@ -454,9 +498,24 @@ pub fn set_lock_whitelist_disable_block_delay<CTX: ContextTr>(
         ));
     }
 
-    let delay = U256::from_be_slice(&args[..32]);
-    let key = bridge_storage_key(LOCK_WHITELIST_DISABLE_BLOCK_DELAY_KEY);
-    bridge_sstore(ctx, key, delay);
+    if !is_whitelist_change_authorized(config, tx_ctx.rsk_sender) {
+        return Ok(encode_int_result(gas_cost, -10));
+    }
+
+    let (entries, disable_h) = load_one_off_whitelist(ctx);
+    if disable_h < i32::MAX {
+        return Ok(encode_int_result(gas_cost, -1)); // delay already set
+    }
+
+    let delay = U256::from_be_slice(&args[..32]).to::<u64>() as i64;
+    let best_height = super::btc_store::load_chain_head(ctx)
+        .map(|h| h.height as i64)
+        .unwrap_or(0);
+    if delay + best_height <= best_height {
+        return Ok(encode_int_result(gas_cost, -2)); // invalid delay
+    }
+
+    store_one_off_whitelist(ctx, &entries, (best_height + delay) as i32);
 
     Ok(encode_int_result(gas_cost, 1))
 }

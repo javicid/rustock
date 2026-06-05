@@ -379,11 +379,11 @@ fn execute_method<CTX: ContextTr>(
         "addFederatorPublicKeyMultikey" => governance::add_federator_public_key_multikey(ctx, args, gas_cost),
         "voteFeePerKbChange" => governance::vote_fee_per_kb_change(ctx, args, gas_cost),
         "increaseLockingCap" => governance::increase_locking_cap(ctx, args, gas_cost),
-        "addLockWhitelistAddress" => governance::add_lock_whitelist_address(ctx, args, gas_cost),
-        "addOneOffLockWhitelistAddress" => governance::add_one_off_lock_whitelist_address(ctx, args, gas_cost),
-        "addUnlimitedLockWhitelistAddress" => governance::add_unlimited_lock_whitelist_address(ctx, args, gas_cost),
-        "removeLockWhitelistAddress" => governance::remove_lock_whitelist_address(ctx, args, gas_cost),
-        "setLockWhitelistDisableBlockDelay" => governance::set_lock_whitelist_disable_block_delay(ctx, args, gas_cost),
+        "addLockWhitelistAddress" => governance::add_lock_whitelist_address(ctx, args, gas_cost, config, tx_ctx),
+        "addOneOffLockWhitelistAddress" => governance::add_one_off_lock_whitelist_address(ctx, args, gas_cost, config, tx_ctx),
+        "addUnlimitedLockWhitelistAddress" => governance::add_unlimited_lock_whitelist_address(ctx, args, gas_cost, config, tx_ctx),
+        "removeLockWhitelistAddress" => governance::remove_lock_whitelist_address(ctx, args, gas_cost, config, tx_ctx),
+        "setLockWhitelistDisableBlockDelay" => governance::set_lock_whitelist_disable_block_delay(ctx, args, gas_cost, config, tx_ctx),
 
         // Transaction-callable read-only
         "getActivePowpegRedeemScript" => governance::get_active_powpeg_redeem_script(ctx, gas_cost),

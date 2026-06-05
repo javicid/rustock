@@ -390,7 +390,9 @@ pub fn deserialize_unlimited_whitelist(data: &[u8]) -> Vec<[u8; 20]> {
 /// Load the one-off lock whitelist from Bridge storage.
 pub fn load_one_off_whitelist<CTX: ContextTr>(ctx: &mut CTX) -> (Vec<([u8; 20], u64)>, i32) {
     let data = bridge_load_bytes_named(ctx, LOCK_WHITELIST_KEY);
-    deserialize_one_off_whitelist(&data).unwrap_or((Vec::new(), i32::MIN))
+    // rskj LockWhitelist defaults disableBlockHeight to Integer.MAX_VALUE:
+    // an empty whitelist is ACTIVE (every legacy peg-in is rejected).
+    deserialize_one_off_whitelist(&data).unwrap_or((Vec::new(), i32::MAX))
 }
 
 /// Store the one-off lock whitelist into Bridge storage.

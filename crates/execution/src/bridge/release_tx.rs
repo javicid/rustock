@@ -253,6 +253,75 @@ pub fn complete_pegout_tx(
     }
 }
 
+/// Replica of `Wallet.completeTx` with `SendRequest.emptyWallet = true`, as
+/// used by rskj's `ReleaseTransactionBuilder.buildEmptyWalletTo` for peg-in
+/// rejection refunds: spend ALL the given UTXOs (in provider order — the
+/// MAX_MONEY selection skips sorting) into a single output to `refund_script`
+/// worth the gathered total minus the size-based fee.
+pub fn build_empty_wallet_to(
+    utxos: &[BridgeUtxo],
+    refund_script: &ScriptBuf,
+    redeem_script: &[u8],
+    fee_per_kb: u64,
+    version: i32,
+) -> Option<BuiltPegout> {
+    if utxos.is_empty() {
+        return None;
+    }
+    let threshold = redeem_script_threshold(redeem_script);
+    if threshold == 0 {
+        return None;
+    }
+
+    let gathered: u64 = utxos.iter().map(|u| u.value_satoshis).sum();
+
+    let inputs: Vec<TxIn> = utxos
+        .iter()
+        .map(|u| TxIn {
+            previous_output: OutPoint {
+                txid: txid_from_stored_hash(&u.tx_hash),
+                vout: u.vout,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        })
+        .collect();
+    let mut tx = BtcTransaction {
+        version: Version(version),
+        lock_time: LockTime::ZERO,
+        input: inputs,
+        output: vec![TxOut {
+            value: Amount::from_sat(gathered),
+            script_pubkey: refund_script.clone(),
+        }],
+    };
+
+    // adjustOutputDownwardsForFee: single pass, fee from the empty-scriptSig
+    // size plus the signing estimate; the output must stay above dust.
+    let base_size = bitcoin::consensus::serialize(&tx).len();
+    let size = base_size + utxos.len() * (threshold * SIG_SIZE + redeem_script.len());
+    let fee_rate = fee_per_kb.max(REFERENCE_DEFAULT_MIN_TX_FEE);
+    let fee = fee_rate * size as u64 / 1000;
+    if fee >= gathered {
+        return None;
+    }
+    let value = gathered - fee;
+    if value < min_non_dust_value(refund_script) {
+        return None;
+    }
+    tx.output[0].value = Amount::from_sat(value);
+
+    let scriptsig = placeholder_scriptsig(redeem_script, threshold);
+    for input in &mut tx.input {
+        input.script_sig = ScriptBuf::from_bytes(scriptsig.clone());
+    }
+    if bitcoin::consensus::serialize(&tx).len() > MAX_STANDARD_TX_SIZE {
+        return None;
+    }
+    Some(BuiltPegout { tx, used_utxos: utxos.to_vec() })
+}
+
 /// Convert a stored UTXO hash (bitcoinj display/stored byte order) into a
 /// rust-bitcoin `Txid` (internal byte order).
 fn txid_from_stored_hash(stored: &[u8; 32]) -> Txid {
@@ -721,6 +790,90 @@ mod tests {
 
         // Fully signed: no placeholder left to consume.
         assert!(update_script_with_signature(&updated2, &[0x30], 0).is_none());
+    }
+
+    /// Mainnet groundtruth: the whitelist-rejected peg-in
+    /// f8cf5d4eb235cdd88afe502047f7cf96212805f1beea18d4328a5668d9a85383
+    /// (registered in RSK tx 0x292b8f49... at block #268,846, 0.35 BTC to the
+    /// genesis federation) produced the rejection release whose txid appears
+    /// in block #272,850's add_signature events.
+    #[test]
+    fn mainnet_268846_rejection_release_txid() {
+        let pegin_hex = "010000000198d97366c38c8013adaaa2929c84f0e7d8fc2e93702a242329134f6880bdd092000000006a47304402206a38b5af9c244904e11afde7995e2ce32a7d7a7a107802aa3619c3ee1f71cad002204a2f112536f5dba011e8527dd344e5aa06e7909a0ff453a3d514c3ac1aec11e4012103e4388dd4e2b53498d8dca313d42453d226828f7da181bf7761029faf06391ceffeffffff02c00e16020000000017a91451f103320b435b5fe417b3f3e0f18972ccc710a087684d7804000000001976a914736b40a8092e2a941ce5b51676df108b380bc33788ac8bd90700";
+        let pegin: BtcTransaction =
+            bitcoin::consensus::deserialize(&alloy_primitives::hex::decode(pegin_hex).unwrap())
+                .unwrap();
+
+        // Genesis federation redeem script (8-of-15) and P2SH script.
+        let config = super::super::constants::BridgeConstants::mainnet();
+        let keys: Vec<[u8; 33]> = config
+            .genesis_federation_public_keys
+            .iter()
+            .map(|h| alloy_primitives::hex::decode(h).unwrap().try_into().unwrap())
+            .collect();
+        let redeem = super::super::peg::build_federation_redeem_script(&keys, 8);
+        let mut fed_script = vec![0xa9, 0x14];
+        use bitcoin::hashes::Hash as _;
+        let h160 = bitcoin::hashes::hash160::Hash::hash(&redeem);
+        fed_script.extend_from_slice(h160.as_byte_array());
+        fed_script.push(0x87);
+        assert_eq!(
+            h160.as_byte_array().to_vec(),
+            alloy_primitives::hex::decode("51f103320b435b5fe417b3f3e0f18972ccc710a0").unwrap(),
+            "genesis federation P2SH hash"
+        );
+
+        // The peg-in's federation UTXOs (output 0, 0.35 BTC).
+        let mut txid = *pegin.compute_txid().to_raw_hash().as_byte_array();
+        txid.reverse(); // stored/display order
+        let utxos: Vec<BridgeUtxo> = pegin
+            .output
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| o.script_pubkey.as_bytes() == fed_script.as_slice())
+            .map(|(i, o)| BridgeUtxo {
+                tx_hash: txid,
+                vout: i as u32,
+                value_satoshis: o.value.to_sat(),
+                height: 0,
+                script: o.script_pubkey.to_bytes(),
+                coinbase: false,
+            })
+            .collect();
+        assert_eq!(utxos.len(), 1);
+        assert_eq!(utxos[0].value_satoshis, 35_000_000);
+
+        // Refund to the sender's P2PKH (pubkey from the first input).
+        let sender_pubkey = alloy_primitives::hex::decode(
+            "03e4388dd4e2b53498d8dca313d42453d226828f7da181bf7761029faf06391cef",
+        )
+        .unwrap();
+        let sender_h160 = bitcoin::hashes::hash160::Hash::hash(&sender_pubkey);
+        let mut refund = vec![0x76, 0xa9, 0x14];
+        refund.extend_from_slice(sender_h160.as_byte_array());
+        refund.extend_from_slice(&[0x88, 0xac]);
+
+        let built = build_empty_wallet_to(
+            &utxos,
+            &ScriptBuf::from_bytes(refund),
+            &redeem,
+            500_000, // mainnet genesis feePerKb
+            1,       // pre-RSKIP201
+        )
+        .expect("rejection release builds");
+
+        // Fee: 500000 sat/kB over 1198 bytes (598 serialized + 8*75+598
+        // signing estimate) = 599,000.
+        assert_eq!(built.tx.output.len(), 1);
+        assert_eq!(built.tx.output[0].value.to_sat(), 35_000_000 - 599_000);
+
+        let mut rid = *built.tx.compute_txid().to_raw_hash().as_byte_array();
+        rid.reverse();
+        assert_eq!(
+            alloy_primitives::hex::encode(rid),
+            "5b42e517f17c47b036bee6311a87d3679490f721d99e2811ef9fd2a5b7f5ca11",
+            "rejection release txid must match the mainnet add_signature event"
+        );
     }
 
     #[test]

@@ -244,11 +244,72 @@ pub fn register_btc_transaction<CTX: ContextTr>(
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     }
 
-    // Enforce minimum peg-in value (rskj handleNonRefundablePegin).
-    if total_value < config.minimum_pegin_tx_value {
+    // Enforce minimum peg-in value (legacy minimum until RSKIP219,
+    // strictly-below comparison per PegUtilsLegacy.isValidPegInTx).
+    let min_pegin = if hardfork_cfg.has_rskip219(rsk_height) {
+        config.minimum_pegin_tx_value
+    } else {
+        config.legacy_minimum_pegin_tx_value
+    };
+    if total_value < min_pegin {
         if should_mark_rejected_pegin_as_processed(hardfork_cfg, rsk_height) {
             set_btc_tx_processed(ctx, &btc_tx_hash, rsk_height);
         }
+        return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
+    }
+
+    // Legacy (protocol v0) peg-ins require a P2PKH sender; without one the
+    // sender is undetermined and rskj aborts without marking as processed.
+    let Some(sender_pubkey) = btc_sender_pubkey(&btc_tx) else {
+        return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
+    };
+    let sender_hash160 = pubkey_hash160(&sender_pubkey);
+
+    // Lock whitelist gate (rskj verifyLockSenderIsWhitelisted): the matching
+    // one-off entry is consumed on success; rejection generates a refund
+    // peg-out back to the sender (generateRejectionRelease).
+    if !whitelist_allows_and_consume(ctx, &sender_hash160, total_value, btc_block_height) {
+        let pegin_utxos: Vec<BridgeUtxo> = btc_tx
+            .output
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| o.script_pubkey == fed_script)
+            .map(|(index, o)| BridgeUtxo {
+                tx_hash: btc_txid_event_bytes(&btc_tx),
+                vout: index as u32,
+                value_satoshis: o.value.to_sat(),
+                height: 0,
+                script: o.script_pubkey.to_bytes(),
+                coinbase: btc_tx.is_coinbase(),
+            })
+            .collect();
+        let fee_per_kb = get_effective_fee_per_kb(ctx, config);
+        let tx_version = if hardfork_cfg.has_rskip201(rsk_height) { 2 } else { 1 };
+        let refund_script = p2pkh_output_script(&sender_hash160);
+        if let Some(built) = super::release_tx::build_empty_wallet_to(
+            &pegin_utxos,
+            &refund_script,
+            &fed_redeem,
+            fee_per_kb,
+            tx_version,
+        ) {
+            let use_tx_hash = hardfork_cfg.has_rskip146(rsk_height);
+            let waiting_key = bridge_storage_key(PEGOUTS_WAITING_FOR_CONFIRMATIONS_KEY);
+            let existing = bridge_load_bytes(ctx, waiting_key);
+            let mut waiting = deserialize_pegouts_waiting_for_confirmations(&existing, use_tx_hash);
+            waiting.push(PegoutWaitingForConfirmations {
+                btc_tx_raw: btc_serialize(&built.tx),
+                rsk_block_height: rsk_height,
+                // TODO(rustock): post-RSKIP146 the rejection is keyed by the
+                // registerBtcTransaction RSK tx hash and logs
+                // release_requested; wire the tx context when sync nears
+                // papyrus200 rejections.
+                rsk_tx_hash: None,
+            });
+            let updated = serialize_pegouts_waiting_for_confirmations(&waiting, use_tx_hash);
+            bridge_store_bytes(ctx, waiting_key, &updated);
+        }
+        set_btc_tx_processed(ctx, &btc_tx_hash, rsk_height);
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     }
 
@@ -279,6 +340,48 @@ pub fn register_btc_transaction<CTX: ContextTr>(
     set_btc_tx_processed(ctx, &btc_tx_hash, rsk_height);
 
     Ok(PrecompileOutput::new(gas_cost, Bytes::new()))
+}
+
+/// The peg-in sender's public key from the first input's P2PKH scriptSig
+/// (`<sig> <pubkey>`, compressed or uncompressed) — rskj BtcLockSender.
+fn btc_sender_pubkey(tx: &BtcTransaction) -> Option<Vec<u8>> {
+    let script = tx.input.first()?.script_sig.as_bytes();
+    let chunks = super::release_tx::parse_chunks(script)?;
+    match chunks.as_slice() {
+        [super::release_tx::Chunk::Data(_sig), super::release_tx::Chunk::Data(pubkey)]
+            if pubkey.len() == 33 || pubkey.len() == 65 =>
+        {
+            Some(pubkey.clone())
+        }
+        _ => None,
+    }
+}
+
+/// rskj `LockWhitelist.isWhitelistedFor` + `consume`: returns whether the
+/// sender may peg in `amount` at BTC height `height`, consuming the matching
+/// one-off entry. A height past the disable height turns the whitelist off
+/// (but a matching one-off entry is still consumed).
+fn whitelist_allows_and_consume<CTX: ContextTr>(
+    ctx: &mut CTX,
+    sender_hash160: &[u8; 20],
+    amount: u64,
+    height: u64,
+) -> bool {
+    let (mut one_off, disable_h) = load_one_off_whitelist(ctx);
+    let disabled = (height as i64) > (disable_h as i64);
+
+    if let Some(pos) = one_off.iter().position(|(h, _)| h == sender_hash160) {
+        let allowed = disabled || amount <= one_off[pos].1;
+        if allowed {
+            one_off.remove(pos);
+            store_one_off_whitelist(ctx, &one_off, disable_h);
+        }
+        return allowed;
+    }
+    if disabled {
+        return true;
+    }
+    load_unlimited_whitelist(ctx).contains(sender_hash160)
 }
 
 /// rskj `BridgeSupport.registerNewUtxos`: register every output paying the
@@ -475,14 +578,15 @@ pub fn release_btc<CTX: ContextTr>(
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     }
 
-    // Determine minimum pegout value based on RSKIP219 activation
-    let min_satoshis = if hardfork_cfg.has_rskip219(block_number) {
-        config.minimum_pegout_tx_value
+    // rskj requestRelease: post-RSKIP219 the minimum is inclusive (and also
+    // bounded by a fee-based estimate — TODO before iris300); the legacy rule
+    // is EXCLUSIVE: value must be strictly greater than the legacy minimum.
+    let rejected = if hardfork_cfg.has_rskip219(block_number) {
+        amount_satoshis_u256 < U256::from(config.minimum_pegout_tx_value)
     } else {
-        config.legacy_minimum_pegout_tx_value
+        amount_satoshis_u256 <= U256::from(config.legacy_minimum_pegout_tx_value)
     };
-
-    if amount_satoshis_u256 < U256::from(min_satoshis) {
+    if rejected {
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     }
 
@@ -860,7 +964,29 @@ pub fn add_signature<CTX: ContextTr>(
     // Find the BTC tx by RSK tx hash
     let btc_tx_raw = match wfs.get(&rsk_tx_hash) {
         Some(r) => r.clone(),
-        None => return Ok(PrecompileOutput::new(gas_cost, Bytes::new())),
+        None => {
+            // Temporary diagnostics for the #272,850 pipeline debug: show how
+            // far the peg-out pipeline progressed when the lookup misses.
+            let queue_len = {
+                let key = bridge_storage_key(RELEASE_REQUEST_QUEUE_KEY);
+                deserialize_release_queue_legacy(&bridge_load_bytes(ctx, key)).len()
+            };
+            let wfc_len = {
+                let key = bridge_storage_key(PEGOUTS_WAITING_FOR_CONFIRMATIONS_KEY);
+                deserialize_pegouts_waiting_for_confirmations(&bridge_load_bytes(ctx, key), false)
+                    .len()
+            };
+            let utxo_count = load_federation_utxos(ctx).len();
+            tracing::debug!(
+                "addSignature: WFS miss for {} (wfs keys: {:?}; queue {} entries, wfc {} entries, {} federation utxos)",
+                to_hex(&rsk_tx_hash),
+                wfs.keys().map(|k| to_hex(&k[..4])).collect::<Vec<_>>(),
+                queue_len,
+                wfc_len,
+                utxo_count
+            );
+            return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
+        }
     };
 
     let mut btc_tx: BtcTransaction = match deserialize(&btc_tx_raw) {
