@@ -554,6 +554,139 @@ mod tests {
         assert_eq!(ist.gas_params.sstore_reset_without_cold_load_cost(), 4_200);
     }
 
+    /// Multi-tx version of the #382,134 regression: a later transaction in
+    /// the SAME block re-reads (and possibly same-value re-writes) the bridge
+    /// slots written by an earlier one — the slots must still reach the trie.
+    /// Mirrors #378,129: registerBtcTransaction writes the rejection release,
+    /// the block's own updateCollections reads it, REMASC closes the block.
+    #[test]
+    fn test_paid_bridge_storage_survives_same_block_reread() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+
+        let sender = Address::repeat_byte(0xAA);
+        let caller2 = Address::repeat_byte(0xCD);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc * U256::from(2));
+        let root = put_account(&root, store.as_ref(), &caller2, 0, one_rbtc);
+
+        let block_store =
+            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let header = dummy_header(8_000_000);
+
+        // tx1: releaseBtc (writes the release request queue blob)
+        let tx1 = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
+            value: one_rbtc,
+            input: Bytes::new(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        // tx2: updateCollections (reads the queue; building fails without
+        // UTXOs so the queue is re-stored byte-identical)
+        let tx2 = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::from_static(&[0x0c, 0x5a, 0x99, 0x90]),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        let result = executor
+            .execute_block(
+                &header,
+                &[(tx1, sender), (tx2, caller2)],
+                &root,
+                store.clone(),
+            )
+            .expect("block executes");
+        assert!(result.tx_results[0].success, "releaseBtc succeeds");
+        assert!(result.tx_results[1].success, "updateCollections succeeds");
+
+        // Apply to the trie and read the queue back through a fresh root,
+        // exactly like the next block would.
+        let new_root =
+            crate::state::apply_state_changes(&root, store.as_ref(), &result.state_changes);
+        let queue_key = {
+            use sha3::{Digest, Keccak256};
+            let mut padded = [0u8; 32];
+            let name = b"releaseRequestQueueWithTxHash";
+            padded[32 - name.len()..].copy_from_slice(name);
+            let _ = Keccak256::digest(name); // (key is ascii-padded, not hashed)
+            padded
+        };
+        let slot_b256 = B256::from(queue_key);
+        let key_bytes = rustock_trie::storage_key(&crate::precompiles::BRIDGE_ADDR, &slot_b256);
+        let key = rustock_trie::TrieKeySlice::from_key(&key_bytes);
+        let stored = new_root.get(&key, store.as_ref());
+        assert!(
+            stored.is_some(),
+            "queue length cell must survive into the trie after a same-block re-read"
+        );
+    }
+
+    /// Regression for mainnet #382,134: bridge storage written by a PAID
+    /// bridge transaction (post-RSKIP88, revm path) must survive into the
+    /// block's state changes. A paid releaseBtc enqueues a release request
+    /// (a multi-slot blob under the Bridge account).
+    #[test]
+    fn test_paid_bridge_tx_persists_bridge_storage() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc * U256::from(2));
+
+        let block_store =
+            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let header = dummy_header(8_000_000); // paid bridge era
+
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
+            value: one_rbtc, // 1 RBTC -> well above the pegout minimum
+            input: Bytes::new(), // empty input = releaseBtc
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        let result = executor
+            .execute_block(&header, &[(tx, sender)], &root, store)
+            .expect("block executes");
+        assert!(result.tx_results[0].success, "releaseBtc succeeds");
+
+        let bridge_state = result
+            .state_changes
+            .get(&crate::precompiles::BRIDGE_ADDR)
+            .expect("bridge account in state changes");
+        let written_slots = bridge_state
+            .storage
+            .iter()
+            .filter(|(_, slot)| slot.present_value != slot.original_value())
+            .count();
+        assert!(
+            written_slots >= 2,
+            "releaseBtc must persist the release request queue blob, got {written_slots} changed slots"
+        );
+    }
+
     #[test]
     fn test_simple_value_transfer() {
         let store = Arc::new(MemoryTrieStore::new());

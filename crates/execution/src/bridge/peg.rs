@@ -294,13 +294,20 @@ pub fn register_btc_transaction<CTX: ContextTr>(
         let fee_per_kb = get_effective_fee_per_kb(ctx, config);
         let tx_version = if hardfork_cfg.has_rskip201(rsk_height) { 2 } else { 1 };
         let refund_script = p2pkh_output_script(&sender_hash160);
-        if let Some(built) = super::release_tx::build_empty_wallet_to(
+        let built = super::release_tx::build_empty_wallet_to(
             &pegin_utxos,
             &refund_script,
             &fed_redeem,
             fee_per_kb,
             tx_version,
-        ) {
+        );
+        tracing::debug!(
+            "pegin rejection release: utxos {} fee_per_kb {} built {:?}",
+            pegin_utxos.len(),
+            fee_per_kb,
+            built.as_ref().map(|b| b.tx.compute_txid().to_string())
+        );
+        if let Some(built) = built {
             let use_tx_hash = hardfork_cfg.has_rskip146(rsk_height);
             let waiting_key = bridge_storage_key(PEGOUTS_WAITING_FOR_CONFIRMATIONS_KEY);
             let existing = bridge_load_bytes(ctx, waiting_key);
@@ -849,7 +856,6 @@ pub fn update_collections<CTX: ContextTr>(
         let waiting_key = bridge_storage_key(PEGOUTS_WAITING_FOR_CONFIRMATIONS_KEY);
         let waiting_data = bridge_load_bytes(ctx, waiting_key);
         let mut waiting = deserialize_pegouts_waiting_for_confirmations(&waiting_data, use_tx_hash);
-
         let min_confirmations = config.rsk2btc_minimum_acceptable_confirmations as u64;
         let confirmed_pos = waiting.iter().position(|e| {
             block_number
@@ -859,6 +865,11 @@ pub fn update_collections<CTX: ContextTr>(
 
         if let Some(pos) = confirmed_pos {
             let entry = waiting.remove(pos);
+            tracing::debug!(
+                "promoting confirmed pegout created at #{} ({} bytes) into WFS",
+                entry.rsk_block_height,
+                entry.btc_tx_raw.len()
+            );
             let updated = serialize_pegouts_waiting_for_confirmations(&waiting, use_tx_hash);
             bridge_store_bytes(ctx, waiting_key, &updated);
 
@@ -985,6 +996,20 @@ pub fn add_signature<CTX: ContextTr>(
                     .len()
             };
             let utxo_count = load_federation_utxos(ctx).len();
+            let wfc_raw_len = {
+                let key = bridge_storage_key(PEGOUTS_WAITING_FOR_CONFIRMATIONS_KEY);
+                bridge_load_bytes(ctx, key).len()
+            };
+            let wfs_raw_len = bridge_load_bytes(ctx, wfs_key).len();
+            let fee_per_kb = get_effective_fee_per_kb(ctx, config);
+            let stored_fed = load_federation_member_keys(ctx).len();
+            tracing::debug!(
+                "WFS raw {} bytes, WFC raw {} bytes, fee_per_kb {}, stored fed keys {}",
+                wfs_raw_len,
+                wfc_raw_len,
+                fee_per_kb,
+                stored_fed
+            );
             let (one_off, disable_h) = load_one_off_whitelist(ctx);
             tracing::debug!(
                 "addSignature: WFS miss for {} (wfs keys: {:?}; queue {} entries, wfc {} entries, {} federation utxos; whitelist {:?} disable={} unlimited={})",

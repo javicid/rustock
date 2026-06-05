@@ -44,9 +44,14 @@ pub fn apply_state_changes(
         }
 
         for (slot, storage_slot) in &account.storage {
-            if !storage_slot.is_changed() {
-                continue;
-            }
+            // No is_changed() filter: revm's per-transaction journal fold
+            // resets a slot's original_value when a LATER transaction in the
+            // same block re-reads it, making a genuine first-tx write look
+            // unchanged (mainnet #378,129: the rejection release written by
+            // registerBtcTransaction vanished because the block's own
+            // updateCollections re-read the cells). Writing the present
+            // value unconditionally is always correct — a read-only slot
+            // holds the same value the trie already has.
             new_root = put_storage_value(&new_root, store, addr, *slot, storage_slot.present_value);
         }
     }

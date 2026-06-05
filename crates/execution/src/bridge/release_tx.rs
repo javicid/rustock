@@ -792,6 +792,72 @@ mod tests {
         assert!(update_script_with_signature(&updated2, &[0x30], 0).is_none());
     }
 
+    /// Second mainnet groundtruth: the whitelist-rejected peg-in at RSK
+    /// #378,129 (post-RSKIP88) must produce the rejection release whose txid
+    /// appears in block #382,134's add_signature events.
+    #[test]
+    fn mainnet_378129_rejection_release_txid() {
+        let pegin_hex = open_pegin_378129();
+        let pegin: BtcTransaction =
+            bitcoin::consensus::deserialize(&alloy_primitives::hex::decode(pegin_hex).unwrap())
+                .unwrap();
+        let config = super::super::constants::BridgeConstants::mainnet();
+        let keys: Vec<[u8; 33]> = config
+            .genesis_federation_public_keys
+            .iter()
+            .map(|h| alloy_primitives::hex::decode(h).unwrap().try_into().unwrap())
+            .collect();
+        let redeem = super::super::peg::build_federation_redeem_script(&keys, 8);
+        use bitcoin::hashes::Hash as _;
+        let h160 = bitcoin::hashes::hash160::Hash::hash(&redeem);
+        let mut fed_script = vec![0xa9, 0x14];
+        fed_script.extend_from_slice(h160.as_byte_array());
+        fed_script.push(0x87);
+
+        let mut txid = *pegin.compute_txid().to_raw_hash().as_byte_array();
+        txid.reverse();
+        let utxos: Vec<BridgeUtxo> = pegin
+            .output
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| o.script_pubkey.as_bytes() == fed_script.as_slice())
+            .map(|(i, o)| BridgeUtxo {
+                tx_hash: txid,
+                vout: i as u32,
+                value_satoshis: o.value.to_sat(),
+                height: 0,
+                script: o.script_pubkey.to_bytes(),
+                coinbase: false,
+            })
+            .collect();
+        assert_eq!(utxos.len(), 1, "one 0.3 BTC federation output");
+
+        let sender_h160 =
+            alloy_primitives::hex::decode("6105e0718165a715a644033fea05d12451747ec9").unwrap();
+        let mut refund = vec![0x76, 0xa9, 0x14];
+        refund.extend_from_slice(&sender_h160);
+        refund.extend_from_slice(&[0x88, 0xac]);
+
+        let built = build_empty_wallet_to(
+            &utxos,
+            &ScriptBuf::from_bytes(refund),
+            &redeem,
+            500_000,
+            1,
+        )
+        .expect("rejection release builds");
+        let mut rid = *built.tx.compute_txid().to_raw_hash().as_byte_array();
+        rid.reverse();
+        assert_eq!(
+            alloy_primitives::hex::encode(rid),
+            "3061f2cde3abd19957784734f42ae0744bf4cac1fb82f104920af994f2847a42"
+        );
+    }
+
+    fn open_pegin_378129() -> &'static str {
+        "01000000016d2ddc655238b6f109ecf9c1e7aa6cdd45a4a68f638e8540111194620a24e2ae010000006a473044022078a581ac84297ea831d6a04bab9d7f809c67c88eb385ab924447485f34288b3002200eb6257d2c4618bc3c353463f82b488e39df84f25718cebcdff2e80d0743b0440121027c2a8e9aa95990b704dd104496bcec52c68ec3bc8199ced4ce3885224aded6b5feffffff027cf73001000000001976a9147274e670ad82b15ee0a34b81560d19f1fd9fa6d488ac80c3c9010000000017a91451f103320b435b5fe417b3f3e0f18972ccc710a08711f40700"
+    }
+
     /// Mainnet groundtruth: the whitelist-rejected peg-in
     /// f8cf5d4eb235cdd88afe502047f7cf96212805f1beea18d4328a5668d9a85383
     /// (registered in RSK tx 0x292b8f49... at block #268,846, 0.35 BTC to the
