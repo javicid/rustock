@@ -47,6 +47,25 @@ pub struct Header {
     pub cached_hash_for_merged_mining: Option<B256>,
 }
 
+/// `BigInteger.toByteArray()` for a non-negative value: zero is the single
+/// byte 0x00, and values whose top bit is set get a 0x00 sign prefix. rskj
+/// encodes difficulty (`RLP.encodeBlockDifficulty`), gasLimit (raw bytes it
+/// produced the same way) and minimumGasPrice
+/// (`RLP.encodeSignedCoinNonNullZero`) with these semantics.
+fn java_signed_bytes(value: &U256) -> Vec<u8> {
+    if value.is_zero() {
+        return vec![0];
+    }
+    let be = value.to_be_bytes::<32>();
+    let start = be.iter().position(|b| *b != 0).unwrap();
+    let mut out = Vec::with_capacity(33 - start);
+    if be[start] & 0x80 != 0 {
+        out.push(0);
+    }
+    out.extend_from_slice(&be[start..]);
+    out
+}
+
 impl Encodable for Header {
     fn encode(&self, out: &mut dyn alloy_rlp::BufMut) {
         let mut list = Vec::new();
@@ -57,47 +76,42 @@ impl Encodable for Header {
         self.transactions_root.encode(&mut list);
         self.receipts_root.encode(&mut list);
         self.logs_bloom.encode(&mut list);
-        self.difficulty.encode(&mut list);
+        java_signed_bytes(&self.difficulty).as_slice().encode(&mut list);
         self.number.encode(&mut list);
-        self.gas_limit.encode(&mut list);
+        java_signed_bytes(&self.gas_limit).as_slice().encode(&mut list);
         self.gas_used.encode(&mut list);
         self.timestamp.encode(&mut list);
         self.extra_data.encode(&mut list);
         self.paid_fees.encode(&mut list);
-        self.minimum_gas_price.encode(&mut list);
+        java_signed_bytes(&self.minimum_gas_price).as_slice().encode(&mut list);
         self.uncle_count.encode(&mut list);
-        
+
         if let Some(umm) = &self.umm_root {
             umm.encode(&mut list);
         }
+        // rskj emits the merkle proof and coinbase tx whenever the mining
+        // header is present — as empty elements if need be — rather than
+        // omitting them (BlockHeader.getEncoded with merged mining fields).
         if let Some(btc) = &self.bitcoin_merged_mining_header {
             btc.encode(&mut list);
+            match &self.bitcoin_merged_mining_merkle_proof {
+                Some(proof) => proof.encode(&mut list),
+                None => list.push(0x80),
+            }
+            match &self.bitcoin_merged_mining_coinbase_transaction {
+                Some(tx) => tx.encode(&mut list),
+                None => list.push(0x80),
+            }
         }
-        if let Some(proof) = &self.bitcoin_merged_mining_merkle_proof {
-            proof.encode(&mut list);
-        }
-        if let Some(tx) = &self.bitcoin_merged_mining_coinbase_transaction {
-            tx.encode(&mut list);
-        }
-        
+
         alloy_rlp::Header { list: true, payload_length: list.len() }.encode(out);
         out.put_slice(&list);
     }
 
     fn length(&self) -> usize {
-        let mut len = self.parent_hash.length() + self.ommers_hash.length() + self.beneficiary.length() +
-                      self.state_root.length() + self.transactions_root.length() + self.receipts_root.length() +
-                      self.logs_bloom.length() + self.difficulty.length() + self.number.length() +
-                      self.gas_limit.length() + self.gas_used.length() + self.timestamp.length() +
-                      self.extra_data.length() + self.paid_fees.length() + self.minimum_gas_price.length() +
-                      self.uncle_count.length();
-        
-        if let Some(umm) = &self.umm_root { len += umm.length(); }
-        if let Some(btc) = &self.bitcoin_merged_mining_header { len += btc.length(); }
-        if let Some(proof) = &self.bitcoin_merged_mining_merkle_proof { len += proof.length(); }
-        if let Some(tx) = &self.bitcoin_merged_mining_coinbase_transaction { len += tx.length(); }
-        
-        alloy_rlp::Header { list: true, payload_length: len }.length() + len
+        let mut buf = Vec::new();
+        self.encode(&mut buf);
+        buf.len()
     }
 }
 
@@ -448,5 +462,55 @@ mod tests {
         let decoded = Header::decode_with_hash(&mut slice).expect("decode failed");
 
         assert_eq!(decoded.cached_hash.unwrap(), keccak256(&bytes));
+    }
+
+    /// Groundtruth: the uncle of RSK MAINNET BLOCK #3397 (header #3395,
+    /// hash 0xc1a82a82..., from public-node.rsk.co). Its zero
+    /// minimumGasPrice encodes as a raw 0x00 byte (encodeSignedCoinNonNullZero)
+    /// and its empty merged-mining proof/coinbase encode as 0x80 placeholders.
+    /// Both the uncle's own hash and the block's sha3Uncles must match.
+    #[test]
+    fn test_mainnet_block_3397_uncle_encoding() {
+        let header = Header {
+            parent_hash: "0x6e2c4fc25852c65f06d2be44b702029f142d9ab89d5f5f21c24bb00ea890a4c6".parse().unwrap(),
+            ommers_hash: "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347".parse().unwrap(),
+            beneficiary: "0x14d3065c8eb89895f4df12450ec6b130049f8034".parse().unwrap(),
+            state_root: "0x42536b117ad09ae74da25b5bc25dc1fc98fc1d995a2cba419673807966421624".parse().unwrap(),
+            transactions_root: "0x1def8d2ff49af73e1abbb2c973a1af6f496b5e44bd7a93fbd1c0156090a50a9b".parse().unwrap(),
+            receipts_root: "0x10494928db1d75522b131648096f37c5982db7ac4da9f0ab0d9820efafa3ecec".parse().unwrap(),
+            logs_bloom: Bloom::ZERO,
+            extension_data: None,
+            difficulty: U256::from(0x1ef082d0eba72au64),
+            number: 0xd43,
+            gas_limit: U256::from(0x4c4b40),
+            gas_used: 0x4be3d0,
+            timestamp: 0x5a4e720b,
+            extra_data: Bytes::from_static(&[0x2a]),
+            paid_fees: U256::ZERO,
+            minimum_gas_price: U256::ZERO,
+            uncle_count: 0,
+            umm_root: None,
+            bitcoin_merged_mining_header: Some(Bytes::from(
+                alloy_primitives::hex::decode("f8441ba100c98acd36a060dd25c8c8d46f42ededd98f7c2c7e5d460c3557a6ba0e693d4d50a053c04cb6bedfa59173811b3b1c2783f4328a7745f136abe58fcd1bac16de76e6").unwrap()
+            )),
+            bitcoin_merged_mining_merkle_proof: Some(Bytes::new()),
+            bitcoin_merged_mining_coinbase_transaction: Some(Bytes::new()),
+            cached_hash: None,
+            cached_hash_for_merged_mining: None,
+        };
+
+        let mut encoded = Vec::new();
+        header.encode(&mut encoded);
+        let expected_hash: B256 =
+            "0xc1a82a82e999490d8570ae9b80a3dcd29d143a65241d02db30e3d174988353d4".parse().unwrap();
+        assert_eq!(keccak256(&encoded), expected_hash, "uncle header hash");
+
+        // sha3Uncles of block #3397 = keccak(RLP([uncle_full_encoding]))
+        let mut uncles_list = Vec::new();
+        alloy_rlp::Header { list: true, payload_length: encoded.len() }.encode(&mut uncles_list);
+        uncles_list.extend_from_slice(&encoded);
+        let expected_sha3_uncles: B256 =
+            "0xed488b69222610bae4c438b50d2472019e3efed77c654771025775d19d2ec648".parse().unwrap();
+        assert_eq!(keccak256(&uncles_list), expected_sha3_uncles, "block #3397 sha3Uncles");
     }
 }
