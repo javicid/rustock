@@ -217,24 +217,16 @@ impl PartialMerkleTree {
 
 /// Combine two 32-byte hashes for the Bitcoin merkle tree.
 ///
-/// Matches rskj's `MerkleTreeUtils.combineLeftRight`: hashes are stored in
-/// "display" (big-endian) order, so they must be reversed to "internal"
-/// (little-endian/wire) order before concatenation and double-SHA256, then
-/// the result is reversed back to display order.
+/// Our hashes stay in wire ("internal", little-endian) order from parse
+/// through extraction, so the combination is a plain double-SHA256 of the
+/// concatenation — equivalent to rskj's `MerkleTreeUtils.combineLeftRight`,
+/// which operates on display-order `Sha256Hash` values and therefore
+/// reverses on the way in and out.
 fn combine_hashes(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
-    let mut rev_left = *left;
-    rev_left.reverse();
-    let mut rev_right = *right;
-    rev_right.reverse();
-
     let mut combined = [0u8; 64];
-    combined[..32].copy_from_slice(&rev_left);
-    combined[32..].copy_from_slice(&rev_right);
-
-    let hash = sha256d::Hash::hash(&combined);
-    let mut result = *hash.as_byte_array();
-    result.reverse();
-    result
+    combined[..32].copy_from_slice(left);
+    combined[32..].copy_from_slice(right);
+    *sha256d::Hash::hash(&combined).as_byte_array()
 }
 
 /// Compute tree height from transaction count.
@@ -352,6 +344,18 @@ impl MerkleBranch {
             hashes.push(h);
         }
 
+        // ABI callers supply display-order hashes (rskj Sha256Hash.wrap of
+        // the bytes32 args); our merkle arithmetic uses wire (internal)
+        // order throughout.
+        let mut tx_hash = tx_hash;
+        tx_hash.reverse();
+        let hashes = hashes
+            .into_iter()
+            .map(|mut h| {
+                h.reverse();
+                h
+            })
+            .collect();
         let branch = MerkleBranch { hashes, path };
         Some((branch, tx_hash, block_hash))
     }
@@ -476,10 +480,10 @@ mod tests {
         let tx_hash = [0x42; 32];
         let sibling = [0x43; 32];
         let branch = MerkleBranch {
-            hashes: vec![sibling],
+            hashes: vec![rev(sibling)],
             path: 0, // tx is on the left
         };
-        let root = branch.reduce_from(&tx_hash);
+        let root = branch.reduce_from(&rev(tx_hash));
         assert_eq!(root, combine_hashes(&tx_hash, &sibling));
     }
 
@@ -488,10 +492,10 @@ mod tests {
         let tx_hash = [0x42; 32];
         let sibling = [0x43; 32];
         let branch = MerkleBranch {
-            hashes: vec![sibling],
+            hashes: vec![rev(sibling)],
             path: 1, // tx is on the right
         };
-        let root = branch.reduce_from(&tx_hash);
+        let root = branch.reduce_from(&rev(tx_hash));
         assert_eq!(root, combine_hashes(&sibling, &tx_hash));
     }
 
@@ -530,6 +534,13 @@ mod tests {
         assert!(!PartialMerkleTree::has_expected_size(&data));
     }
 
+    /// rskj branch vectors are display-order hashes; reverse for our wire
+    /// order convention.
+    fn rev(mut h: [u8; 32]) -> [u8; 32] {
+        h.reverse();
+        h
+    }
+
     /// Ported from rskj MerkleBranchTest.oneHashBranch
     /// assertBranchCorrectlyProves(hashes, path, txHash, expectedMerkleRoot)
     #[test]
@@ -539,11 +550,11 @@ mod tests {
         let expected_root = hex_to_32("71306e0f38f1f606d7a4eadf22814432321b2a6d6f40c94fdc8e7dd2bbcef47f");
 
         let branch = MerkleBranch {
-            hashes: vec![h1],
+            hashes: vec![rev(h1)],
             path: 1,
         };
-        let root = branch.reduce_from(&tx_hash);
-        assert_eq!(root, expected_root, "rskj oneHashBranch root mismatch");
+        let root = branch.reduce_from(&rev(tx_hash));
+        assert_eq!(rev(root), expected_root, "rskj oneHashBranch root mismatch");
     }
 
     /// Ported from rskj MerkleBranchTest.twoHashesBranch
@@ -555,11 +566,11 @@ mod tests {
         let expected_root = hex_to_32("14fd0a443ebba0fe62e323b5250fb13042e7840701058fb025032f1527f8f6f5");
 
         let branch = MerkleBranch {
-            hashes: vec![h1, h2],
+            hashes: vec![rev(h1), rev(h2)],
             path: 3,
         };
-        let root = branch.reduce_from(&tx_hash);
-        assert_eq!(root, expected_root, "rskj twoHashesBranch root mismatch");
+        let root = branch.reduce_from(&rev(tx_hash));
+        assert_eq!(rev(root), expected_root, "rskj twoHashesBranch root mismatch");
     }
 
     /// Ported from rskj MerkleBranchTest.threeHashesBranch
@@ -572,11 +583,11 @@ mod tests {
         let expected_root = hex_to_32("f7f0eb7ba33dd6f37ad11153d1bc803cd6f932051d72fa73343bff59d270e9ef");
 
         let branch = MerkleBranch {
-            hashes: vec![h1, h2, h3],
+            hashes: vec![rev(h1), rev(h2), rev(h3)],
             path: 5,
         };
-        let root = branch.reduce_from(&tx_hash);
-        assert_eq!(root, expected_root, "rskj threeHashesBranch root mismatch");
+        let root = branch.reduce_from(&rev(tx_hash));
+        assert_eq!(rev(root), expected_root, "rskj threeHashesBranch root mismatch");
     }
 
     /// Ported from rskj MerkleBranchTest.threeHashesBranchBis (alternate leaf)
@@ -589,11 +600,11 @@ mod tests {
         let expected_root = hex_to_32("f7f0eb7ba33dd6f37ad11153d1bc803cd6f932051d72fa73343bff59d270e9ef");
 
         let branch = MerkleBranch {
-            hashes: vec![h1, h2, h3],
+            hashes: vec![rev(h1), rev(h2), rev(h3)],
             path: 4,
         };
-        let root = branch.reduce_from(&tx_hash);
-        assert_eq!(root, expected_root, "rskj threeHashesBranchBis root mismatch");
+        let root = branch.reduce_from(&rev(tx_hash));
+        assert_eq!(rev(root), expected_root, "rskj threeHashesBranchBis root mismatch");
     }
 
     /// Ported from rskj MerkleBranchTest.threeHashesBranchFailsIfPathIsWrong
@@ -606,37 +617,43 @@ mod tests {
         let expected_root = hex_to_32("f7f0eb7ba33dd6f37ad11153d1bc803cd6f932051d72fa73343bff59d270e9ef");
 
         let branch = MerkleBranch {
-            hashes: vec![h1, h2, h3],
+            hashes: vec![rev(h1), rev(h2), rev(h3)],
             path: 3, // wrong path
         };
-        let root = branch.reduce_from(&tx_hash);
+        let root = branch.reduce_from(&rev(tx_hash));
         assert_ne!(root, expected_root, "Wrong path should produce different root");
+    }
+
+    /// rskj vectors are display-order `Sha256Hash` values; our convention is
+    /// wire (internal) order, so they are reversed on the way in and out.
+    fn combine_display(left: &str, right: &str) -> [u8; 32] {
+        let mut l = hex_to_32(left);
+        l.reverse();
+        let mut r = hex_to_32(right);
+        r.reverse();
+        let mut out = combine_hashes(&l, &r);
+        out.reverse();
+        out
     }
 
     /// Ported from rskj MerkleTreeUtilsTest.combineLeftRight — 3 vectors from
     /// bitcoind regtest (two-transaction blocks).
     #[test]
     fn rskj_combine_left_right_vector_1() {
-        let left  = hex_to_32("b945b008fbc3f357db745909958b570773fc14575a36af8bbc195b484e21f366");
-        let right = hex_to_32("9880f57b6735152a8c6d4c7e1b3bc6434ee75e459511a642bbb8cb71d3a6b6d8");
         let expected = hex_to_32("ceea4835dd23fae1978a3f6f3f0aa0171e018360272dd5b98d37550fbc978d01");
-        assert_eq!(combine_hashes(&left, &right), expected, "rskj combineLeftRight vector 1");
+        assert_eq!(combine_display("b945b008fbc3f357db745909958b570773fc14575a36af8bbc195b484e21f366", "9880f57b6735152a8c6d4c7e1b3bc6434ee75e459511a642bbb8cb71d3a6b6d8"), expected, "rskj combineLeftRight vector 1");
     }
 
     #[test]
     fn rskj_combine_left_right_vector_2() {
-        let left  = hex_to_32("083eafdf670bb1bbc83b63262887e3cf519c3e252fac29adfb92c1e857b37f91");
-        let right = hex_to_32("5740915e973a211c71655d10e4c672301c27c287843dcfa97b7aafc04992ec5e");
         let expected = hex_to_32("107857d7233c41d4c37ecaa9ad9d9ab15371f643074866cd23d657e6e99676be");
-        assert_eq!(combine_hashes(&left, &right), expected, "rskj combineLeftRight vector 2");
+        assert_eq!(combine_display("083eafdf670bb1bbc83b63262887e3cf519c3e252fac29adfb92c1e857b37f91", "5740915e973a211c71655d10e4c672301c27c287843dcfa97b7aafc04992ec5e"), expected, "rskj combineLeftRight vector 2");
     }
 
     #[test]
     fn rskj_combine_left_right_vector_3() {
-        let left  = hex_to_32("c960ed36a67318cd562d384bfbf41499db1312835e2bfe86805d9465afe9736f");
-        let right = hex_to_32("120196be3b0ca6ba07d3cfee53f8dc883781e82afdfba11181184f41a67b9898");
         let expected = hex_to_32("71a12c9bd54735864dd6e12640e6d00d60a42a2e92e4cd0bde3f9f268b7d4345");
-        assert_eq!(combine_hashes(&left, &right), expected, "rskj combineLeftRight vector 3");
+        assert_eq!(combine_display("c960ed36a67318cd562d384bfbf41499db1312835e2bfe86805d9465afe9736f", "120196be3b0ca6ba07d3cfee53f8dc883781e82afdfba11181184f41a67b9898"), expected, "rskj combineLeftRight vector 3");
     }
 
     /// Ported from rskj PartialMerkleTreeFormatUtilsTest.overflowSize
@@ -667,5 +684,34 @@ mod tests {
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&bytes);
         arr
+    }
+
+    /// Groundtruth: the PMT from the first mainnet peg-in (RSK #6916,
+    /// registerBtcTransaction at BTC block #502,572). The extracted root must
+    /// equal the real block merkle root
+    /// 794bc781118b3bbe2c6a3a6ae21128bb50756e2dabe36e8225aacc133375835d
+    /// (display order) and the matches must include the peg-in txid
+    /// b4b31c7c486d1e2594f8fb96962d023a7b1eadf322862eed098deee0464394b5.
+    #[test]
+    fn mainnet_6916_pegin_pmt_extracts_real_root() {
+        let pmt_bytes = alloy_primitives::hex::decode("630800000d14e6e59463afbfd4155db84d7592b5af577ef5dc0e9d906676e9ec81f37401d472706346992d8220d9138dc144077bdbf5522de323024c2cf3d74e239fc11fb2afc6543956e6fb6f0cc43c5dd4c66fd271eff5f9309768dd7c267d767725f4538a093bb1fa025a85c0cd4967119bc286d9a951a828a7c413e4a8994ded5b9077b5944346e0ee8d09ed2e8622f3ad1e7b3a022d9696fbf894251e6d487c1cb3b4522650fec9201f035d965ce42cfcc157b388470b6f6ff15dd72fd5651a57586cab8bac3b5531b3f490a97b2363a2ef18121a43873753a08e35991732fb789265cd9dd43584dbe701bb953f21af68029a30d8b6327cd57d2dd242327c1b135d4c8f5e36b8bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e351963062f66fa39895750a0f0c651f2fc736d69b746ed77319d5c0ecab6539d3655f163f3eccf325846b1c1244e17b6464d5b85c3cd06587cf992067f37c086d17ab6dd35ee7aef6de22ac59ed37468ee5eb15948db42c438fdfb4c5b08d6316a203bcecd9713b9a2b150614ee116dcff986c29c2246745704bbdb0100").unwrap();
+        assert!(PartialMerkleTree::has_expected_size(&pmt_bytes));
+        let pmt = PartialMerkleTree::parse(&pmt_bytes).expect("parse");
+        let result = pmt.extract_matches().expect("extract");
+
+        // Internal (little-endian) byte order, as stored in BTC headers.
+        let mut expected_root = alloy_primitives::hex::decode(
+            "794bc781118b3bbe2c6a3a6ae21128bb50756e2dabe36e8225aacc133375835d").unwrap();
+        expected_root.reverse();
+        assert_eq!(result.merkle_root.to_vec(), expected_root, "merkle root");
+
+        let mut expected_txid = alloy_primitives::hex::decode(
+            "b4b31c7c486d1e2594f8fb96962d023a7b1eadf322862eed098deee0464394b5").unwrap();
+        expected_txid.reverse();
+        let contains = result
+            .matched_hashes
+            .iter()
+            .any(|h| h.to_vec() == expected_txid);
+        assert!(contains, "matched hashes must include the peg-in txid");
     }
 }
