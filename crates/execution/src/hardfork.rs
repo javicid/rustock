@@ -193,6 +193,17 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Hop400
     }
 
+    /// RSKIP170: pegin_btc event replaces lock_btc (Iris300).
+    pub fn has_rskip170(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Iris300
+    }
+
+    /// RSKIP326: add_signature is only logged when a signature is actually
+    /// applied (Fingerroot500).
+    pub fn has_rskip326(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Fingerroot500
+    }
+
     /// RSKIP459: mark rejected non-refundable peg-ins as processed (Lovell700).
     /// Disabled again by RSKIP551 at Vetiver900.
     pub fn has_rskip459(&self, block_number: u64) -> bool {

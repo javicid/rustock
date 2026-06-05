@@ -34,7 +34,6 @@ use revm::context_interface::{ContextTr, JournalTr};
 use revm::precompile::{PrecompileError, PrecompileOutput};
 use std::collections::BTreeMap;
 
-use sha3::Digest;
 use sha2;
 use ripemd;
 
@@ -231,6 +230,16 @@ pub fn register_btc_transaction<CTX: ContextTr>(
     if let Some(dest) = rsk_destination {
         if !rbtc_amount.is_zero() {
             let _ = ctx.journal_mut().transfer(BRIDGE_ADDR, dest, rbtc_amount);
+        }
+
+        // Peg-in events: lock_btc from RSKIP146, pegin_btc from RSKIP170.
+        let txid_bytes = btc_txid_event_bytes(&btc_tx);
+        if hardfork_cfg.has_rskip170(rsk_height) {
+            let protocol_version = if has_op_return_destination(&btc_tx) { 1 } else { 0 };
+            super::events::log_pegin_btc(ctx, dest, &txid_bytes, total_value, protocol_version);
+        } else if hardfork_cfg.has_rskip146(rsk_height) {
+            let sender = btc_sender_base58(&btc_tx, config).unwrap_or_default();
+            super::events::log_lock_btc(ctx, dest, &txid_bytes, &sender, total_value);
         }
     }
 
@@ -485,8 +494,11 @@ pub fn update_collections<CTX: ContextTr>(
     let use_rskip271 = hardfork_cfg.has_rskip271(block_number);
 
     // rskj BridgeSupport.updateCollections logs an update_collections event;
-    // the legacy single-topic format applies before RSKIP146.
-    if !use_tx_hash {
+    // the single-topic legacy format applies before RSKIP146, the Solidity
+    // format afterwards.
+    if use_tx_hash {
+        super::events::log_solidity_update_collections(ctx, tx_ctx.rsk_sender);
+    } else {
         super::events::log_legacy_update_collections(ctx, tx_ctx.rsk_sender);
     }
 
@@ -552,6 +564,19 @@ pub fn update_collections<CTX: ContextTr>(
 
                 let updated = serialize_pegouts_waiting_for_confirmations(&waiting, use_tx_hash);
                 bridge_store_bytes(ctx, waiting_key, &updated);
+
+                // rskj logReleaseBtcRequested (RSKIP146): fired when the
+                // peg-out BTC transaction is created.
+                if use_tx_hash {
+                    let total: u64 = pending.iter().map(|r| r.amount_satoshis).sum();
+                    let rsk_hash = update_collections_rsk_hash.unwrap_or([0u8; 32]);
+                    super::events::log_release_requested(
+                        ctx,
+                        &rsk_hash,
+                        &btc_txid_event_bytes(&btc_tx),
+                        total,
+                    );
+                }
 
                 // Clear the queue
                 bridge_store_bytes(ctx, queue_key, &[]);
@@ -694,30 +719,45 @@ pub fn add_signature<CTX: ContextTr>(
     let redeem_script = build_federation_redeem_script(&federation_keys, threshold);
 
     // rskj logs an add_signature event when the federator key belongs to the
-    // federation, BEFORE applying the new signatures — the logged BTC tx
-    // hash covers only previously-applied ones (BridgeSupport.addReleaseSignatures).
+    // federation: before RSKIP326 it fires BEFORE applying the signatures;
+    // afterwards only when a signature was actually applied. The format is
+    // legacy single-topic before RSKIP146 and Solidity afterwards.
     let legacy_events = !hardfork_cfg.has_rskip146(block_number);
+    let log_only_when_applied = hardfork_cfg.has_rskip326(block_number);
     let is_member = compress_pubkey(&fed_key)
         .map(|k| federation_keys.contains(&k))
         .unwrap_or(false);
-    if legacy_events && is_member {
-        let txid = btc_tx.compute_txid().to_string();
-        super::events::log_legacy_add_signature(
-            ctx,
-            &txid,
-            &pubkey_hash160(&fed_key),
-            &rsk_tx_hash,
-        );
+    let emit_add_signature = |ctx: &mut CTX, btc_tx: &BtcTransaction| {
+        if legacy_events {
+            let txid = btc_tx.compute_txid().to_string();
+            super::events::log_legacy_add_signature(
+                ctx,
+                &txid,
+                &pubkey_hash160(&fed_key),
+                &rsk_tx_hash,
+            );
+        } else {
+            // Pre-RSKIP415 the federator's RSK address derives from its BTC key.
+            if let Some(addr) = super::federation::rsk_address_from_public_key(&fed_key) {
+                super::events::log_solidity_add_signature(ctx, &rsk_tx_hash, addr, &fed_key);
+            }
+        }
+    };
+    if is_member && !log_only_when_applied {
+        emit_add_signature(ctx, &btc_tx);
     }
 
     // Apply DER signatures to each input
-    let _ = apply_signatures_to_tx(
+    let applied = apply_signatures_to_tx(
         &mut btc_tx,
         &sigs,
         &fed_key,
         &federation_keys,
         &redeem_script,
     );
+    if is_member && log_only_when_applied && applied {
+        emit_add_signature(ctx, &btc_tx);
+    }
 
     // Count distinct sigs on the first input to determine if threshold is reached
     let sig_count = count_signatures_in_tx(&btc_tx, threshold);
@@ -727,6 +767,8 @@ pub fn add_signature<CTX: ContextTr>(
         if legacy_events {
             let txid = btc_tx.compute_txid().to_string();
             super::events::log_legacy_release_btc(ctx, &txid, &btc_serialize(&btc_tx));
+        } else {
+            super::events::log_solidity_release_btc(ctx, &rsk_tx_hash, &btc_serialize(&btc_tx));
         }
         // Fully signed — remove from waiting map
         // (The BTC tx is broadcast off-chain by federation nodes)
@@ -747,6 +789,40 @@ pub fn add_signature<CTX: ContextTr>(
     }
 
     Ok(PrecompileOutput::new(gas_cost, Bytes::new()))
+}
+
+/// BTC txid in rskj event byte order: bitcoinj `Sha256Hash.getBytes()` keeps
+/// the display (big-endian) order, the reverse of rust-bitcoin's internal one.
+fn btc_txid_event_bytes(tx: &BtcTransaction) -> [u8; 32] {
+    let mut bytes = *tx.compute_txid().to_raw_hash().as_byte_array();
+    bytes.reverse();
+    bytes
+}
+
+/// Whether the peg-in carries an OP_RETURN destination (protocol v1).
+fn has_op_return_destination(tx: &BtcTransaction) -> bool {
+    tx.output.iter().any(|o| o.script_pubkey.is_op_return())
+}
+
+/// Base58Check P2PKH address of the peg-in sender (first input's public key).
+fn btc_sender_base58(tx: &BtcTransaction, config: &BridgeConstants) -> Option<String> {
+    let first_input = tx.input.first()?;
+    let script_bytes = first_input.script_sig.as_bytes();
+    if script_bytes.len() < 34 {
+        return None;
+    }
+    let pubkey_len = script_bytes[script_bytes.len() - 34] as usize;
+    if pubkey_len != 33 {
+        return None;
+    }
+    let pubkey = &script_bytes[script_bytes.len() - 33..];
+    let network = match config.btc_network {
+        super::constants::BtcNetwork::Mainnet => bitcoin::Network::Bitcoin,
+        super::constants::BtcNetwork::Testnet => bitcoin::Network::Testnet,
+        super::constants::BtcNetwork::Regtest => bitcoin::Network::Regtest,
+    };
+    let key = bitcoin::PublicKey::from_slice(pubkey).ok()?;
+    Some(bitcoin::Address::p2pkh(key.pubkey_hash(), network).to_string())
 }
 
 /// Compress a SEC1 public key (33- or 65-byte) to its 33-byte form.
@@ -1455,8 +1531,10 @@ fn extract_rsk_destination(btc_tx: &BtcTransaction) -> Option<RskAddress> {
             let pubkey_len = script_bytes[script_bytes.len() - 34] as usize;
             if pubkey_len == 33 && script_bytes.len() >= 34 {
                 let pubkey = &script_bytes[script_bytes.len() - 33..];
-                let hash = sha3::Keccak256::digest(pubkey);
-                return Some(RskAddress::from_slice(&hash[12..]));
+                // rskj derives the address from the UNCOMPRESSED point
+                // (ECKey.getAddress); hashing the compressed bytes would
+                // credit the wrong account.
+                return super::federation::rsk_address_from_public_key(pubkey);
             }
         }
     }
