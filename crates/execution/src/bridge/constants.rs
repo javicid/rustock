@@ -74,6 +74,13 @@ pub struct BridgeConstants {
     /// federation-change, lock-whitelist and feePerKb authorizer keys
     /// (rskj BridgeUtils.isFromAuthorizedSender).
     pub authorized_free_tx_keys: &'static [&'static str],
+
+    /// Initial BTC chain checkpoint: (80-byte header hex, height, chain work
+    /// hex). rskj seeds a fresh bridge BTC block store from the bitcoinj
+    /// checkpoints file at the federation creation time minus one week
+    /// (BridgeSupport.ensureBtcBlockStore); the pick is deterministic, so the
+    /// chosen StoredBlock is inlined here. None = seed from the BTC genesis.
+    pub btc_checkpoint: Option<(&'static str, u32, &'static str)>,
 }
 
 /// BTC network selection.
@@ -135,6 +142,13 @@ impl BridgeConstants {
                 "0484c66f75548baf93e322574adac4e4579b6a53f8d11fab640e14c90118e6983ef24b0de349a3e88f72e81e771ae1c897cef446fd7f4da71778c532aee3b6c41b",
                 "04bb6435dc1ea12da843ebe213893d136c1624acd681fff82551498ae00bf28e9323164b00daf925fa75177463b8254a2aae8a1713e4d851a84ea369c193e9ce51",
             ],
+            // bitcoinj checkpoint at BTC mainnet #499,968 (2017-12-18), hash
+            // 000000000000000000296e10eb4987c4eb9b7ba0841102dec4480e5d6b89acb5
+            btc_checkpoint: Some((
+                "00000020e37c80a7a8b850e3e89add09090b6b89b874496513ef89000000000000000000285ddc7985e7c34eb205d2c3129727f7bc10873e11e054b48d1a92786a42d7d2c8c8375a459600189b3aa792",
+                499_968,
+                "00cd6eae36c0cee5640896d3",
+            )),
         }
     }
 
@@ -177,6 +191,13 @@ impl BridgeConstants {
                 "045ef89e4a5645dc68895dbc33b4c966c3a0a52bb837ecdd2ba448604c4f47266456d1191420e1d32bbe8741f8315fde4d1440908d400e5998dbed6549d499559b",
                 "0455db9b3867c14e84a6f58bd2165f13bfdba0703cb84ea85788373a6a109f3717e40483aa1f8ef947f435ccdf10e530dd8b3025aa2d4a7014f12180ee3a301d27",
             ],
+            // bitcoinj checkpoint at BTC testnet #1,413,216 (2018-09-13), hash
+            // 000000000000001aa547c01c17edae35e21dd63fd7e6627daedf997bd3a54627
+            btc_checkpoint: Some((
+                "00000020c4891929bff550199ebac0f3c8691f19d84633de53da8af346000000000000000c109cfe5b24faa1e0174b788c7e3e8f2fb340bcee07a544914b167ad4c27b82b9a9995bf05f4c1908698a4b",
+                1_413_216,
+                "000000c1a1942223f6072a8d",
+            )),
         }
     }
 
@@ -202,6 +223,7 @@ impl BridgeConstants {
             // Regtest has areBridgeTxsPaid from genesis; no free senders needed.
             genesis_federation_public_keys: &[],
             authorized_free_tx_keys: &[],
+            btc_checkpoint: None,
         }
     }
 }

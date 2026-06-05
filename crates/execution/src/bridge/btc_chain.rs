@@ -44,6 +44,8 @@ pub fn receive_header<CTX: ContextTr>(
 ) -> Result<PrecompileOutput, PrecompileError> {
     let gas_cost = 10_600u64;
 
+    ensure_btc_chain_seeded(ctx, config, use_v2);
+
     // Decode ABI-encoded `bytes` argument
     let header_bytes = decode_abi_bytes(args).ok_or_else(|| {
         PrecompileError::other("receiveHeader: invalid ABI encoding")
@@ -123,6 +125,49 @@ pub fn receive_header<CTX: ContextTr>(
 ///
 /// Applies each header sequentially. Returns ABI-encoded int256 with the
 /// number of successfully processed headers.
+/// Seed the bridge BTC chain on first use, mirroring rskj's
+/// `BridgeSupport.ensureBtcBlockStore`: a fresh store starts at the
+/// checkpoint preceding the federation creation time (see
+/// `BridgeConstants::btc_checkpoint`), or the BTC genesis block without one.
+pub fn ensure_btc_chain_seeded<CTX: ContextTr>(
+    ctx: &mut CTX,
+    config: &BridgeConstants,
+    use_v2: bool,
+) {
+    if load_chain_head(ctx).is_some() {
+        return;
+    }
+
+    let stored = match config.btc_checkpoint {
+        Some((header_hex, height, chain_work_hex)) => {
+            let bytes = match alloy_primitives::hex::decode(header_hex) {
+                Ok(b) => b,
+                Err(_) => return,
+            };
+            let header: BtcHeader = match deserialize(&bytes) {
+                Ok(h) => h,
+                Err(_) => return,
+            };
+            let work = U256::from_be_slice(&alloy_primitives::hex::decode(chain_work_hex).unwrap_or_default());
+            StoredBlock::new(header, height, work)
+        }
+        None => {
+            let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
+            let work = compute_work(genesis.header.bits);
+            StoredBlock::new(genesis.header, 0, work)
+        }
+    };
+
+    let hash = stored.header.block_hash();
+    put_stored_block(ctx, &stored, use_v2);
+    store_chain_head(ctx, &stored, use_v2);
+    super::storage::bridge_store_btc_block_hash_by_height(
+        ctx,
+        stored.height,
+        bitcoin_hash_to_b256(&hash),
+    );
+}
+
 pub fn receive_headers<CTX: ContextTr>(
     ctx: &mut CTX,
     args: &[u8],
@@ -132,6 +177,8 @@ pub fn receive_headers<CTX: ContextTr>(
     let headers = decode_abi_bytes_array(args).ok_or_else(|| {
         PrecompileError::other("receiveHeaders: invalid ABI encoding")
     })?;
+
+    ensure_btc_chain_seeded(ctx, config, use_v2);
 
     // Rate limiting
     let timestamp_key = bridge_storage_key(super::storage::RECEIVE_HEADERS_TIMESTAMP_KEY);
@@ -431,6 +478,24 @@ pub fn b256_to_bitcoin_hash(b: &alloy_primitives::B256) -> BlockHash {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The inlined mainnet checkpoint must decode to the bitcoinj checkpoint
+    /// rskj seeds from: BTC #499,968,
+    /// 000000000000000000296e10eb4987c4eb9b7ba0841102dec4480e5d6b89acb5.
+    #[test]
+    fn mainnet_btc_checkpoint_decodes_to_expected_block() {
+        let (header_hex, height, work_hex) =
+            BridgeConstants::mainnet().btc_checkpoint.unwrap();
+        assert_eq!(height, 499_968);
+        let bytes = alloy_primitives::hex::decode(header_hex).unwrap();
+        let header: BtcHeader = deserialize(&bytes).unwrap();
+        assert_eq!(
+            header.block_hash().to_string(),
+            "000000000000000000296e10eb4987c4eb9b7ba0841102dec4480e5d6b89acb5"
+        );
+        let work = U256::from_be_slice(&alloy_primitives::hex::decode(work_hex).unwrap());
+        assert!(!work.is_zero());
+    }
 
     #[test]
     fn encode_int_positive() {

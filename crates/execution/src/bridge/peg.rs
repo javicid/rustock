@@ -108,6 +108,14 @@ pub fn register_btc_transaction<CTX: ContextTr>(
     // Compute BTC tx hash
     let btc_tx_hash = calculate_btc_tx_hash(&btc_tx_data);
 
+    // A fresh bridge BTC store must be seeded with the rskj checkpoint
+    // before any chain lookups.
+    {
+        let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+        let use_v2 = hardfork_cfg.has_stored_block_v2(block_number);
+        super::btc_chain::ensure_btc_chain_seeded(ctx, config, use_v2);
+    }
+
     // Check if already processed
     if is_btc_tx_processed(ctx, &btc_tx_hash) {
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
