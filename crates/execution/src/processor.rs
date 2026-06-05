@@ -123,6 +123,14 @@ impl BlockProcessor {
         let mut new_state_root = apply_state_changes(state_root, trie_store.as_ref(), &exec_result.state_changes);
         let state_root_hash = new_state_root.compute_hash(trie_store.as_ref());
         new_state_root.save(trie_store.as_ref(), true);
+        // Reload the root lazily: children become hash references resolved on
+        // demand, so subsequent blocks only walk their dirty paths instead of
+        // re-serializing the whole accumulated trie on every state-root
+        // computation (~160ms/block once REMASC pays 17 accounts per block).
+        let new_state_root = trie_store
+            .get(state_root_hash.as_slice())
+            .map(|data| rustock_trie::TrieNode::from_message(&data, trie_store.as_ref()))
+            .unwrap_or(new_state_root);
         let receipts_root =
             ordered_trie_root(&receipts, self.hardfork_cfg.has_unitrie_state_root(header.number));
 
