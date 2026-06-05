@@ -235,25 +235,44 @@ pub fn execute_bridge<CTX: ContextTr>(
         .ok_or_else(|| PrecompileError::other("Bridge: unknown method selector"))?;
 
     let args = &input[4..];
-    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
-
-    let function_cost = match method.gas_cost {
-        BridgeGasCost::Fixed(c) => c,
-        BridgeGasCost::InputDependent => {
-            receive_headers_cost(args, hardfork_cfg, block_number)
-        }
-        BridgeGasCost::Dynamic => {
-            btc_tx_confirmations_cost(ctx, args, config)
-        }
-    };
-    // rskj Bridge.getGasForData: totalCost = functionCost + data.length * 2
-    let gas_cost = function_cost.saturating_add(2 * input.len() as u64);
+    let gas_cost = bridge_call_gas_cost(ctx, input, config, hardfork_cfg)?;
 
     if gas_limit < gas_cost {
         return Err(PrecompileError::OutOfGas);
     }
 
     execute_method(ctx, method.name, args, gas_cost, config, block_store, use_v2, hardfork_cfg, tx_ctx)
+}
+
+/// rskj `Bridge.getGasForData` for a parsed call: functionCost plus
+/// `data.length * 2` (23_000 flat for the empty-input releaseBtc form).
+/// Free bridge transactions cost 0 — callers handle that case.
+pub fn bridge_call_gas_cost<CTX: ContextTr>(
+    ctx: &mut CTX,
+    input: &[u8],
+    config: &BridgeConstants,
+    hardfork_cfg: &RskHardforkConfig,
+) -> Result<u64, PrecompileError> {
+    if input.is_empty() {
+        return Ok(23_000);
+    }
+    if input.len() < 4 {
+        return Err(PrecompileError::other("Bridge: input too short for selector"));
+    }
+    let selector = [input[0], input[1], input[2], input[3]];
+    let method = find_bridge_method(&selector)
+        .ok_or_else(|| PrecompileError::other("Bridge: unknown method selector"))?;
+
+    let args = &input[4..];
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+
+    let function_cost = match method.gas_cost {
+        BridgeGasCost::Fixed(c) => c,
+        BridgeGasCost::InputDependent => receive_headers_cost(args, hardfork_cfg, block_number),
+        BridgeGasCost::Dynamic => btc_tx_confirmations_cost(ctx, args, config),
+    };
+    // rskj Bridge.getGasForData: totalCost = functionCost + data.length * 2
+    Ok(function_cost.saturating_add(2 * input.len() as u64))
 }
 
 /// rskj `Bridge.receiveHeadersGetCost`: 22_000 before RSKIP124; afterwards a

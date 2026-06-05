@@ -199,6 +199,18 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Lovell700
     }
 
+    /// RSKIP136 (bahamas — mainnet 3_397, testnet/regtest genesis): correct
+    /// gas accounting for direct precompile calls. Before it, rskj checked
+    /// the tx gas limit against the precompile cost alone and recorded
+    /// gasUsed = precompileCost + intrinsicCost, which can EXCEED the limit.
+    pub fn has_rskip136(&self, block_number: u64) -> bool {
+        let height = match self.chain_id {
+            RSK_MAINNET_CHAIN_ID => 3_397,
+            _ => 0,
+        };
+        block_number >= height
+    }
+
     /// RSKIP124: public receiveHeaders with header-count-based cost (Wasabi100).
     pub fn has_rskip124(&self, block_number: u64) -> bool {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Wasabi100
