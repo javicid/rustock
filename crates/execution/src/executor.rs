@@ -655,6 +655,88 @@ mod tests {
         );
     }
 
+    /// Regression for mainnet #892,228: rskj has no EIP-161 — contracts
+    /// created during execution start with nonce 0, and addresses they later
+    /// derive via CREATE shift by one if the nonce is seeded to 1 (revm's
+    /// SPURIOUS_DRAGON default from the per-era CfgEnv spec). The dividend
+    /// contract at 0xcf0e5881… created payout wallets at
+    /// keccak(rlp([contract, nonce])) and every recipient came out one nonce
+    /// ahead of rskj's (real first wallet d82ac9f5… = nonce 0).
+    #[test]
+    fn test_created_contract_starts_with_nonce_zero() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+        let block_store =
+            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+
+        // Runtime code: CREATE(0,0,0); SSTORE(0, created); STOP.
+        let runtime: Vec<u8> = vec![
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0xf0, 0x60, 0x00, 0x55, 0x00,
+        ];
+        // Init code: CODECOPY the runtime and RETURN it.
+        let mut init = vec![
+            0x60, 0x0b, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, 0x0b, 0x60, 0x00, 0xf3,
+        ];
+        init.extend_from_slice(&runtime);
+
+        let deploy = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(1_000_000),
+            to: Bytes::new(),
+            value: U256::ZERO,
+            input: Bytes::from(init),
+            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+        };
+        let header1 = dummy_header(892_000);
+        let r1 = executor
+            .execute_block(&header1, &[(deploy, sender)], &root, store.clone())
+            .expect("deploy block");
+        assert!(r1.tx_results[0].success);
+        let deployed = sender.create(0); // deploy tx from sender nonce 0
+        let d_acct = r1.state_changes.get(&deployed).expect("deployed account");
+        assert_eq!(
+            d_acct.info.nonce, 0,
+            "created contract must start at nonce 0 (no EIP-161 in rskj)"
+        );
+        let root2 =
+            crate::state::apply_state_changes(&root, store.as_ref(), &r1.state_changes);
+
+        let call = rustock_core::Transaction {
+            nonce: 1,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(1_000_000),
+            to: Bytes::copy_from_slice(deployed.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::new(),
+            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+        };
+        let header2 = dummy_header(892_001);
+        let r2 = executor
+            .execute_block(&header2, &[(call, sender)], &root2, store.clone())
+            .expect("create block");
+        assert!(r2.tx_results[0].success);
+
+        // The child must derive from nonce 0: keccak(rlp([deployed, 0])).
+        let expected_child = deployed.create(0);
+        let slot0 = r2
+            .state_changes
+            .get(&deployed)
+            .expect("contract state")
+            .storage
+            .get(&U256::ZERO)
+            .expect("slot 0 written");
+        assert_eq!(
+            Address::from_slice(&slot0.present_value.to_be_bytes::<32>()[12..]),
+            expected_child,
+            "CREATE inside a freshly deployed contract must use nonce 0"
+        );
+    }
+
     /// Regression for mainnet #764,123: addLockWhitelistAddress is disabled
     /// post-RSKIP87 (orchid), so rskj's parseData returns null. The gas is
     /// the flat releaseBtc cost (23,000, no data cost) and — although
