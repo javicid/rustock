@@ -111,6 +111,23 @@ impl DatabaseRef for RskDatabase {
         let slot = B256::from(index);
         let key = storage_key(&address, &slot);
 
+        // Divergence-hunt diagnostic (env-gated): compare every storage read
+        // against public-node groundtruth to find receipts-invisible state
+        // divergences (mainnet #892,228).
+        static TRACE_SLOAD: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("RUSTOCK_TRACE_SLOAD").is_some());
+        if *TRACE_SLOAD {
+            tracing::debug!(
+                "SLOAD {} {:x} = 0x{}",
+                address,
+                index,
+                self.trie_get(&key)
+                    .as_deref()
+                    .map(alloy_primitives::hex::encode)
+                    .unwrap_or_default()
+            );
+        }
+
         match self.trie_get(&key) {
             Some(data) => {
                 if data.len() > 32 {
