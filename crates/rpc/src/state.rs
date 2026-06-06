@@ -184,7 +184,7 @@ fn resolve_header(block_param: &str, store: &BlockStore) -> Option<Header> {
     }
 }
 
-fn trie_get_account(root: &TrieNode, key: &[u8], state: &RpcState) -> Option<AccountState> {
+pub(crate) fn trie_get_account(root: &TrieNode, key: &[u8], state: &RpcState) -> Option<AccountState> {
     let trie_store = state.trie_store.as_ref()?;
     let expanded = TrieKeySlice::from_key(key);
     let data = root.get(&expanded, &**trie_store)?;

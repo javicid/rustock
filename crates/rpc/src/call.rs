@@ -23,8 +23,8 @@ pub fn eth_call(id: Value, params: &Value, state: &RpcState) -> JsonRpcResponse 
         return JsonRpcResponse::error(id, INTERNAL_ERROR, "Cannot resolve block");
     };
 
-    let tx = build_call_tx(&call_req, &header);
     let sender = call_req.from.unwrap_or(Address::ZERO);
+    let tx = build_call_tx(&call_req, &header, &root, sender, state);
     let executor = RskExecutor::new(hardfork_cfg, state.store.clone());
 
     match executor.execute_tx(&header, &tx, sender, &root, trie_store) {
@@ -63,7 +63,7 @@ pub fn eth_estimate_gas(id: Value, params: &Value, state: &RpcState) -> JsonRpcR
     let mut hi = gas_cap;
 
     // First check if the transaction even succeeds at the gas cap
-    let mut tx = build_call_tx(&call_req, &header);
+    let mut tx = build_call_tx(&call_req, &header, &root, sender, state);
     tx.gas_limit = U256::from(hi);
     match executor.execute_tx(&header, &tx, sender, &root, trie_store.clone()) {
         Ok(result) if result.success => {}
@@ -77,7 +77,7 @@ pub fn eth_estimate_gas(id: Value, params: &Value, state: &RpcState) -> JsonRpcR
 
     while lo + 1 < hi {
         let mid = lo + (hi - lo) / 2;
-        let mut probe_tx = build_call_tx(&call_req, &header);
+        let mut probe_tx = build_call_tx(&call_req, &header, &root, sender, state);
         probe_tx.gas_limit = U256::from(mid);
 
         match executor.execute_tx(&header, &probe_tx, sender, &root, trie_store.clone()) {
@@ -89,10 +89,27 @@ pub fn eth_estimate_gas(id: Value, params: &Value, state: &RpcState) -> JsonRpcR
     JsonRpcResponse::success(id, json!(crate::helpers::to_hex_u64(hi)))
 }
 
-fn build_call_tx(req: &CallRequest, header: &rustock_core::Header) -> Transaction {
+/// eth_call/eth_estimateGas are simulations: default the nonce to the
+/// sender's current one and the gas price to the block minimum so the
+/// executor's transaction validation passes (rskj skips those checks for
+/// local calls).
+fn build_call_tx(
+    req: &CallRequest,
+    header: &rustock_core::Header,
+    root: &rustock_trie::TrieNode,
+    sender: Address,
+    state: &RpcState,
+) -> Transaction {
+    let sender_nonce = crate::state::trie_get_account(
+        root,
+        &rustock_trie::account_key(&sender),
+        state,
+    )
+    .map(|a| a.nonce.to::<u64>())
+    .unwrap_or(0);
     Transaction {
-        nonce: 0,
-        gas_price: req.gas_price.unwrap_or(U256::ZERO),
+        nonce: sender_nonce,
+        gas_price: req.gas_price.unwrap_or(header.minimum_gas_price),
         gas_limit: req.gas.map(U256::from).unwrap_or(header.gas_limit),
         to: req.to.map(|a| Bytes::copy_from_slice(a.as_slice())).unwrap_or_default(),
         value: req.value.unwrap_or(U256::ZERO),
