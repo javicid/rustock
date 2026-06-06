@@ -285,6 +285,16 @@ pub fn find_bridge_method(selector: &[u8; 4]) -> Option<&'static BridgeMethodInf
 // Bridge execution entry point
 // ---------------------------------------------------------------------------
 
+/// Marker for rskj's "invisible exception" on direct precompile calls:
+/// the receipt is SUCCESS with the flat parse-failure gas, but the sender
+/// is charged the full gas limit and the endowment is not transferred.
+pub const INVISIBLE_EXCEPTION_MARKER: &str = "rskj invisible exception";
+
+/// Whether a Bridge error is the direct-call invisible-exception marker.
+pub fn is_invisible_exception(e: &PrecompileError) -> bool {
+    matches!(e, PrecompileError::Other(msg) if msg == INVISIBLE_EXCEPTION_MARKER)
+}
+
 /// Main entry point for the Bridge precompile.
 ///
 /// Called from `RskPrecompileProvider::run_bridge` with the full EVM context.
@@ -330,14 +340,20 @@ pub fn execute_bridge<CTX: ContextTr>(
             return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
         }
         // Post-RSKIP88 rskj throws — but for a direct transaction the
-        // exception is invisible: TransactionExecutor.call() spends only
-        // requiredGas + basicTxCost and go() (vm == null) commits, so the
-        // receipt is SUCCESS with empty output and no logs (mainnet
-        // #764,123 calls the post-RSKIP87-disabled addLockWhitelistAddress).
-        // Only internal calls observe the failure.
+        // exception is invisible in the RECEIPT: TransactionExecutor.call()
+        // spends only requiredGas + basicTxCost and go() (vm == null)
+        // commits, so the receipt is SUCCESS with empty output and no logs
+        // (mainnet #764,123 calls the post-RSKIP87-disabled
+        // addLockWhitelistAddress). The FEE accounting still sees it: the
+        // execution summary is marked failed, so the sender is charged the
+        // FULL gas limit (no leftover refund) and REMASC receives
+        // gasLimit * gasPrice, and the endowment is not transferred
+        // (TransactionExecutionSummary.getFee / TransactionExecutor.call).
+        // Callers translate this marker into those semantics. Only internal
+        // calls observe the failure as a plain CALL failure.
         use revm::context_interface::JournalTr;
         if ctx.journal().depth() == 1 {
-            return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
+            return Err(PrecompileError::other(INVISIBLE_EXCEPTION_MARKER));
         }
         return Err(PrecompileError::other("Bridge: invalid calldata"));
     };

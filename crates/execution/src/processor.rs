@@ -21,6 +21,8 @@ pub enum ProcessError {
     Execution(#[from] crate::executor::ExecutionError),
     #[error("gas used mismatch: header={header}, computed={computed}")]
     GasUsedMismatch { header: u64, computed: u64 },
+    #[error("paid fees mismatch: header={header}, computed={computed}")]
+    PaidFeesMismatch { header: alloy_primitives::U256, computed: alloy_primitives::U256 },
     #[error("state root mismatch: header={header}, computed={computed}")]
     StateRootMismatch { header: B256, computed: B256 },
     #[error("receipts root mismatch: header={header}, computed={computed}")]
@@ -40,6 +42,9 @@ pub enum ProcessError {
 pub struct ProcessedBlock {
     pub receipts: Vec<Receipt>,
     pub gas_used: u64,
+    /// Total fees credited to REMASC, validated against `header.paid_fees`
+    /// like rskj's BlockExecutor.
+    pub paid_fees: alloy_primitives::U256,
     pub new_state_root: TrieNode,
     pub state_root_hash: B256,
     pub receipts_root: B256,
@@ -137,6 +142,7 @@ impl BlockProcessor {
         Ok(ProcessedBlock {
             receipts,
             gas_used: exec_result.gas_used,
+            paid_fees: exec_result.paid_fees,
             new_state_root,
             state_root_hash,
             receipts_root,
@@ -184,6 +190,18 @@ impl BlockProcessor {
             return Err(ProcessError::GasUsedMismatch {
                 header: header.gas_used,
                 computed: result.gas_used,
+            });
+        }
+
+        // rskj BlockExecutor validates the header's paidFees against the
+        // fees actually credited to REMASC. A mismatch here is a silent
+        // REMASC/sender balance divergence that would only surface at the
+        // next state-root check (the #1,591,000 wasabi halt took ~830k
+        // blocks to expose three mis-charged txs at #764,123-#765,073).
+        if result.paid_fees != header.paid_fees {
+            return Err(ProcessError::PaidFeesMismatch {
+                header: header.paid_fees,
+                computed: result.paid_fees,
             });
         }
 

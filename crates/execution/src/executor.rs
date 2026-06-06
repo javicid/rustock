@@ -35,6 +35,9 @@ pub struct TxExecutionResult {
 pub struct BlockExecutionResult {
     pub tx_results: Vec<TxExecutionResult>,
     pub gas_used: u64,
+    /// Total fees credited to REMASC (rskj validates this against
+    /// `header.paid_fees` after execution).
+    pub paid_fees: U256,
     pub state_changes: revm::state::EvmState,
 }
 
@@ -71,6 +74,20 @@ impl RskExecutor {
         self
     }
 
+    pub fn with_bridge_constants(
+        mut self,
+        constants: crate::bridge::constants::BridgeConstants,
+    ) -> Self {
+        self.free_bridge_senders = constants
+            .genesis_federation_public_keys
+            .iter()
+            .chain(constants.authorized_free_tx_keys.iter())
+            .filter_map(|hex| rsk_address_from_pubkey_hex(hex))
+            .collect();
+        self.bridge_constants = constants;
+        self
+    }
+
     /// Execute a single transaction against the given state root.
     pub fn execute_tx(
         &self,
@@ -97,7 +114,9 @@ impl RskExecutor {
             &self.hardfork_cfg,
             Some(self.block_store.clone()),
             self.remasc_config.clone(),
-        );
+        )
+        .with_bridge_config(self.bridge_constants.clone());
+        let invisible_flag = precompile_provider.invisible_exception_flag();
         let mut evm = ctx.build_mainnet().with_precompiles(precompile_provider);
         crate::rsk_instructions::install(&mut evm.instruction);
 
@@ -107,6 +126,7 @@ impl RskExecutor {
             evm.ctx.set_tx(tx_env);
             let mut handler = crate::rsk_handler::RskHandler::new(
                 !self.hardfork_cfg.has_rskip453(header.number),
+                invisible_flag,
             );
             let out = handler
                 .run(&mut evm)
@@ -161,15 +181,18 @@ impl RskExecutor {
             &self.hardfork_cfg,
             Some(self.block_store.clone()),
             self.remasc_config.clone(),
-        );
+        )
+        .with_bridge_config(self.bridge_constants.clone());
         // Shared slot for per-transaction Bridge context (tx hash + BTC destination).
         // We clone the Arc before moving the provider into the EVM so we can update
         // it between transactions.
         let bridge_ctx_slot = precompile_provider.bridge_tx_context_slot();
+        let invisible_flag = precompile_provider.invisible_exception_flag();
         let mut evm = ctx.build_mainnet().with_precompiles(precompile_provider);
         crate::rsk_instructions::install(&mut evm.instruction);
 
         let mut total_gas = 0u64;
+        let mut total_fees = U256::ZERO;
         let mut tx_results = Vec::with_capacity(transactions.len());
 
         for (i, (tx, sender)) in transactions.iter().enumerate() {
@@ -279,6 +302,7 @@ impl RskExecutor {
                     }
                 };
 
+                let mut invisible_exception = false;
                 let (success, output, logs) = if enough_gas {
                     let tx_ctx = bridge_ctx_slot.lock().map(|g| g.clone()).unwrap_or_default();
                     let use_v2 = self.hardfork_cfg.has_stored_block_v2(header.number);
@@ -296,10 +320,27 @@ impl RskExecutor {
                     match outcome {
                         Ok(out) => {
                             evm.ctx.journal_mut().checkpoint_commit();
+                            // rskj transfers the endowment after execute()
+                            // returns without throwing.
+                            if !tx.value.is_zero() {
+                                let _ = evm.ctx.journal_mut().transfer(
+                                    *sender,
+                                    crate::precompiles::BRIDGE_ADDR,
+                                    tx.value,
+                                );
+                            }
                             // Drain bridge events into the receipt like revm
                             // does for normal transactions.
                             let logs = evm.ctx.journal_mut().take_logs();
                             (true, out.bytes.to_vec(), logs)
+                        }
+                        Err(e) if crate::bridge::is_invisible_exception(&e) => {
+                            // rskj invisible exception: receipt SUCCESS with
+                            // the spent gas, no logs, no endowment — but the
+                            // sender is charged the FULL gas limit.
+                            evm.ctx.journal_mut().checkpoint_revert(checkpoint);
+                            invisible_exception = true;
+                            (true, Vec::new(), Vec::new())
                         }
                         Err(e) => {
                             evm.ctx.journal_mut().checkpoint_revert(checkpoint);
@@ -312,7 +353,14 @@ impl RskExecutor {
                 };
 
                 // Fees go to REMASC like the revm path (block beneficiary).
-                let fee = U256::from(gas_used) * tx.gas_price;
+                // An invisible exception charges the full gas limit
+                // (rskj TransactionExecutionSummary.getFee when failed).
+                let fee_gas = if invisible_exception {
+                    tx.gas_limit.to::<u64>()
+                } else {
+                    gas_used
+                };
+                let fee = U256::from(fee_gas) * tx.gas_price;
                 if !fee.is_zero() {
                     let _ = evm.ctx.journal_mut().transfer(
                         *sender,
@@ -320,6 +368,7 @@ impl RskExecutor {
                         fee,
                     );
                 }
+                total_fees += fee;
 
                 total_gas += gas_used;
                 tx_results.push(TxExecutionResult {
@@ -340,6 +389,7 @@ impl RskExecutor {
                 evm.ctx.set_tx(tx_env);
                 let mut handler = crate::rsk_handler::RskHandler::new(
                 !self.hardfork_cfg.has_rskip453(header.number),
+                invisible_flag.clone(),
             );
                 handler
                     .run(&mut evm)
@@ -353,6 +403,15 @@ impl RskExecutor {
             let output = result.output().map(|o| o.to_vec()).unwrap_or_default();
             let logs = result.into_logs();
             let created_address = Self::extract_created_address(tx, &success);
+
+            // Mirror what RskHandler paid REMASC: the full gas limit on an
+            // invisible exception, the spent gas otherwise.
+            let fee_gas = if invisible_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                tx.gas_limit.to::<u64>()
+            } else {
+                gas_used
+            };
+            total_fees += U256::from(fee_gas) * tx.gas_price;
 
             total_gas += gas_used;
             tx_results.push(TxExecutionResult {
@@ -371,6 +430,7 @@ impl RskExecutor {
         Ok(BlockExecutionResult {
             tx_results,
             gas_used: total_gas,
+            paid_fees: total_fees,
             state_changes: state,
         })
     }
@@ -872,7 +932,7 @@ mod tests {
         .unwrap();
         let tx = rustock_core::Transaction {
             nonce: 0,
-            gas_price: U256::from(0),
+            gas_price: U256::from(183_000_000u64), // mainnet tx gas price
             gas_limit: U256::from(1_000_000),
             to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
             value: U256::ZERO,
@@ -903,6 +963,154 @@ mod tests {
                 "disabled method must not touch bridge storage"
             );
         }
+        // The FEE side sees the failure: the sender is charged the FULL gas
+        // limit and REMASC receives it (rskj summary.getFee when failed).
+        // Remote groundtruth: sender 0x6ba9...75b balance drops by exactly
+        // 1,000,000 * 183,000,000 = 183e12 wei across #764,122 -> #764,123.
+        let full_fee = U256::from(1_000_000u64) * U256::from(183_000_000u64);
+        assert_eq!(
+            result.state_changes.get(&sender).unwrap().info.balance,
+            one_rbtc - full_fee,
+            "sender pays for the full gas limit, no leftover refund"
+        );
+        assert_eq!(
+            result
+                .state_changes
+                .get(&crate::precompiles::REMASC_ADDR)
+                .unwrap()
+                .info
+                .balance,
+            full_fee,
+            "REMASC receives gasLimit * gasPrice"
+        );
+        assert_eq!(result.paid_fees, full_fee, "paid_fees tracks the full fee");
+    }
+
+    /// The same disabled-method profile routed through revm (post-RSKIP136,
+    /// mainnet #765,073 used gasPrice 60M wei): receipt SUCCESS with only
+    /// the spent 47,408 gas, but the sender pays for the full 1,000,000
+    /// limit, REMASC receives it, and the endowment is NOT transferred
+    /// (rskj TransactionExecutor.call skips it when execute() throws).
+    #[test]
+    fn test_disabled_bridge_method_charges_full_gas_limit_post_rskip136() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+
+        // addLockWhitelistAddress selector + garbage args: disabled forever
+        // post-RSKIP87, parse failure at every later era.
+        let mut input = vec![0x50, 0x2b, 0xbb, 0xce];
+        input.extend_from_slice(&[0u8; 32]);
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(60_000_000u64),
+            gas_limit: U256::from(1_000_000),
+            to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
+            value: U256::from(7), // endowment must stay with the sender
+            input: Bytes::from(input),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+
+        let block_store =
+            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+
+        let header = dummy_header(2_392_700); // papyrus200: RSKIP136 active
+        let result = executor
+            .execute_block(&header, &[(tx, sender)], &root, store.clone())
+            .expect("block executes");
+        assert!(result.tx_results[0].success, "receipt records SUCCESS");
+        // 21,000 + 4 nonzero * 68 + 32 zero * 4 + 23,000 = 44,400
+        assert_eq!(
+            result.tx_results[0].gas_used,
+            21_000 + 4 * 68 + 32 * 4 + 23_000,
+            "receipt shows only the spent gas"
+        );
+        let full_fee = U256::from(1_000_000u64) * U256::from(60_000_000u64);
+        assert_eq!(
+            result.state_changes.get(&sender).unwrap().info.balance,
+            one_rbtc - full_fee,
+            "sender pays the full limit and keeps the endowment"
+        );
+        assert_eq!(
+            result
+                .state_changes
+                .get(&crate::precompiles::REMASC_ADDR)
+                .unwrap()
+                .info
+                .balance,
+            full_fee,
+            "REMASC receives gasLimit * gasPrice"
+        );
+        let bridge_balance = result
+            .state_changes
+            .get(&crate::precompiles::BRIDGE_ADDR)
+            .map(|a| a.info.balance)
+            .unwrap_or_default();
+        assert_eq!(bridge_balance, U256::ZERO, "no endowment on invisible exception");
+        assert_eq!(result.paid_fees, full_fee);
+    }
+
+    /// rskj TransactionExecutor.call transfers the endowment after a
+    /// non-throwing precompile execute(); the pre-RSKIP136 direct path must
+    /// do the same for successful Bridge calls.
+    #[test]
+    fn test_pre_rskip136_direct_bridge_success_transfers_endowment() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+
+        // voteFeePerKbChange(int256) — enabled at every era; an unauthorized
+        // sender gets an error CODE in the output but the call succeeds.
+        let mut input = vec![0x04, 0x61, 0x31, 0x3e];
+        let mut arg = [0u8; 32];
+        arg[30..].copy_from_slice(&30_000u16.to_be_bytes());
+        input.extend_from_slice(&arg);
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::ZERO,
+            gas_limit: U256::from(100_000),
+            to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
+            value: U256::from(5),
+            input: Bytes::from(input),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+
+        let block_store =
+            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+
+        let header = dummy_header(764_123); // pre-RSKIP136 direct path
+        let result = executor
+            .execute_block(&header, &[(tx, sender)], &root, store.clone())
+            .expect("block executes");
+        assert!(result.tx_results[0].success);
+        assert_eq!(
+            result
+                .state_changes
+                .get(&crate::precompiles::BRIDGE_ADDR)
+                .unwrap()
+                .info
+                .balance,
+            U256::from(5),
+            "successful direct bridge call transfers the endowment"
+        );
+        assert_eq!(
+            result.state_changes.get(&sender).unwrap().info.balance,
+            one_rbtc - U256::from(5),
+        );
     }
 
     /// Regression for mainnet #466,503: rskj charges NEW_ACCT_CALL (25,000)
@@ -2012,9 +2220,11 @@ mod tests {
     // End-to-end precompile execution tests
     // -----------------------------------------------------------------------
 
-    /// Direct tx to REMASC precompile (0x01000008).
-    /// REMASC costs 0 gas — total should be only intrinsic gas (21000).
-    /// Uses a low block number (below maturity) so process_miners_fees is a no-op.
+    /// A USER tx to the REMASC precompile (0x01000008) is rskj's
+    /// RemascInvalidInvocationException ("Invoked Remasc outside last tx of
+    /// the block") — invisible for a direct tx: receipt SUCCESS with only
+    /// intrinsic gas (getGasForData is 0), no fee distribution, but the
+    /// sender is charged the FULL gas limit and REMASC receives it.
     #[test]
     fn test_remasc_precompile_direct_call() {
         let store = Arc::new(MemoryTrieStore::new());
@@ -2028,14 +2238,13 @@ mod tests {
             BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap(),
         );
 
-        // Block 100 is below mainnet maturity (4000), so REMASC is a no-op
         let header = dummy_header(100);
 
         let remasc_addr = crate::precompiles::REMASC_ADDR;
 
         let tx = rustock_core::Transaction {
             nonce: 0,
-            gas_price: U256::from(0),
+            gas_price: U256::from(1_000),
             gas_limit: U256::from(100_000),
             to: Bytes::copy_from_slice(remasc_addr.as_slice()),
             value: U256::ZERO,
@@ -2052,11 +2261,25 @@ mod tests {
         );
 
         let result = executor
-            .execute_tx(&header, &tx, sender, &root, store)
+            .execute_block(&header, &[(tx, sender)], &root, store)
             .unwrap();
 
-        assert!(result.success, "REMASC direct call should succeed");
-        assert_eq!(result.gas_used, 21_000, "REMASC costs 0 gas, total = intrinsic only");
+        assert!(result.tx_results[0].success, "receipt records SUCCESS");
+        assert_eq!(
+            result.tx_results[0].gas_used, 21_000,
+            "REMASC costs 0 gas, receipt shows intrinsic only"
+        );
+        // No fee distribution may run for a user tx.
+        let remasc_state = result.state_changes.get(&remasc_addr).unwrap();
+        assert!(remasc_state.storage.is_empty(), "no REMASC storage writes");
+        let full_fee = U256::from(100_000u64) * U256::from(1_000u64);
+        assert_eq!(
+            result.state_changes.get(&sender).unwrap().info.balance,
+            one_rbtc - full_fee,
+            "sender pays for the full gas limit"
+        );
+        assert_eq!(remasc_state.info.balance, full_fee);
+        assert_eq!(result.paid_fees, full_fee);
     }
 
     /// Direct tx to Bridge precompile (0x01000006).
@@ -3966,10 +4189,11 @@ mod tests {
         let mut header = dummy_header(block_number);
         header.beneficiary = Address::repeat_byte(0x99); // actual miner (not used for fee routing)
 
+        // The REMASC system tx: unsigned, zero gas (rskj RemascTransaction).
         let remasc_tx = rustock_core::Transaction {
             nonce: 0,
             gas_price: U256::from(0),
-            gas_limit: U256::from(100_000),
+            gas_limit: U256::ZERO,
             to: Bytes::copy_from_slice(remasc_addr.as_slice()),
             value: U256::ZERO,
             input: Bytes::new(),
@@ -3979,10 +4203,16 @@ mod tests {
             cached_rlp: None,
         };
 
+        // The rskj remasc tests run regtest with a NON-EMPTY genesis
+        // federation (injected at construction); our regtest constants have
+        // no canonical key list, so model it with the mainnet federation —
+        // the assertions are federation-count independent.
         let executor = RskExecutor::new(
             RskHardforkConfig::all_active(33),
             block_store.clone(),
-        ).with_remasc_config(remasc_config);
+        )
+        .with_remasc_config(remasc_config)
+        .with_bridge_constants(crate::bridge::constants::BridgeConstants::mainnet());
 
         executor
             .execute_block(&header, &[(remasc_tx, sender)], &root, trie_store)
@@ -4175,10 +4405,11 @@ mod tests {
         let mut header = dummy_header(15);
         header.beneficiary = Address::repeat_byte(0x99);
 
+        // The REMASC system tx: unsigned, zero gas (rskj RemascTransaction).
         let remasc_tx = rustock_core::Transaction {
             nonce: 0,
             gas_price: U256::from(0),
-            gas_limit: U256::from(100_000),
+            gas_limit: U256::ZERO,
             to: Bytes::copy_from_slice(remasc_addr.as_slice()),
             value: U256::ZERO,
             input: Bytes::new(),
@@ -4510,10 +4741,11 @@ mod tests {
         let mut header = dummy_header(15);
         header.beneficiary = Address::repeat_byte(0x99);
 
+        // The REMASC system tx: unsigned, zero gas (rskj RemascTransaction).
         let remasc_tx = rustock_core::Transaction {
             nonce: 0,
             gas_price: U256::from(0),
-            gas_limit: U256::from(100_000),
+            gas_limit: U256::ZERO,
             to: Bytes::copy_from_slice(remasc_addr.as_slice()),
             value: U256::ZERO,
             input: Bytes::new(),

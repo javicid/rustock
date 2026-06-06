@@ -43,8 +43,10 @@ use revm::interpreter::interpreter::EthInterpreter;
 use revm::interpreter::interpreter_action::FrameInit;
 use revm::interpreter::{CallOutcome, CreateOutcome, InstructionResult, InterpreterAction};
 use revm::primitives::hardfork::SpecId;
-use revm::primitives::{Address, Bytes};
+use revm::primitives::{Address, Bytes, U256};
 use revm::state::EvmState;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// `MainnetHandler` with rskj's eternal-frontier account semantics
 /// (see module docs).
@@ -53,13 +55,24 @@ pub struct RskHandler<CTX, ERROR, FRAME> {
     /// Pre-RSKIP453 (lovell700): internal creates with an unpayable code
     /// deposit deploy with empty code instead of failing.
     empty_create_on_unpayable_deposit: bool,
+    /// Shared with `RskPrecompileProvider`: set when a direct Bridge call
+    /// hits rskj's invisible-exception path (parse failure post-RSKIP88).
+    /// rskj marks the execution summary failed, so the sender gets NO
+    /// leftover refund and REMASC receives gasLimit * gasPrice — while the
+    /// receipt stays SUCCESS with only the spent gas (mainnet #764,123:
+    /// receipt 47,408 gas, fee charged for the full 1,000,000 limit).
+    invisible_exception: Arc<AtomicBool>,
     _phantom: core::marker::PhantomData<(CTX, ERROR, FRAME)>,
 }
 
 impl<CTX, ERROR, FRAME> RskHandler<CTX, ERROR, FRAME> {
-    pub fn new(empty_create_on_unpayable_deposit: bool) -> Self {
+    pub fn new(
+        empty_create_on_unpayable_deposit: bool,
+        invisible_exception: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             empty_create_on_unpayable_deposit,
+            invisible_exception,
             _phantom: core::marker::PhantomData,
         }
     }
@@ -67,7 +80,7 @@ impl<CTX, ERROR, FRAME> RskHandler<CTX, ERROR, FRAME> {
 
 impl<CTX, ERROR, FRAME> Default for RskHandler<CTX, ERROR, FRAME> {
     fn default() -> Self {
-        Self::new(false)
+        Self::new(false, Arc::default())
     }
 }
 
@@ -89,10 +102,60 @@ where
     type HaltReason = HaltReason;
 
     fn load_accounts(&self, evm: &mut Self::Evm) -> Result<(), Self::Error> {
+        // Clear any stale invisible-exception flag from a previous tx.
+        self.invisible_exception.store(false, Ordering::Relaxed);
         revm::handler::pre_execution::load_accounts::<EVM, ERROR>(evm)?;
         // The default sets the journal spec from CfgEnv; pin it back to
         // rskj's eternal frontier account semantics.
         evm.ctx().journal_mut().set_spec_id(SpecId::HOMESTEAD);
+        Ok(())
+    }
+
+    /// rskj invisible exception: the sender gets NO leftover/refund back —
+    /// the full upfront gasLimit * gasPrice deduction stands
+    /// (TransactionExecutionSummary leftover/refund are zero when failed).
+    fn reimburse_caller(
+        &self,
+        evm: &mut Self::Evm,
+        exec_result: &mut FrameResult,
+    ) -> Result<(), Self::Error> {
+        if self.invisible_exception.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        revm::handler::post_execution::reimburse_caller(
+            evm.ctx(),
+            exec_result.gas(),
+            U256::ZERO,
+        )
+        .map_err(From::from)
+    }
+
+    /// rskj invisible exception: REMASC (the block beneficiary) receives
+    /// the FULL gasLimit * gasPrice (TransactionExecutionSummary.getFee
+    /// returns calcCost(gasLimit) when failed).
+    fn reward_beneficiary(
+        &self,
+        evm: &mut Self::Evm,
+        exec_result: &mut FrameResult,
+    ) -> Result<(), Self::Error> {
+        if !self.invisible_exception.load(Ordering::Relaxed) {
+            return revm::handler::post_execution::reward_beneficiary(
+                evm.ctx(),
+                exec_result.gas(),
+            )
+            .map_err(From::from);
+        }
+        use revm::context_interface::journaled_state::account::JournaledAccountTr;
+        use revm::context_interface::{Block, Transaction};
+        let ctx = evm.ctx();
+        let basefee = ctx.block().basefee() as u128;
+        let gas_limit = ctx.tx().gas_limit();
+        let fee = ctx.tx().effective_gas_price(basefee) * gas_limit as u128;
+        let beneficiary = ctx.block().beneficiary();
+        ctx.journal_mut()
+            .load_account_mut(beneficiary)
+            .map_err(|e| ERROR::from(e))?
+            .incr_balance(U256::from(fee));
         Ok(())
     }
 

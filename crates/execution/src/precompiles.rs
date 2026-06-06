@@ -848,6 +848,11 @@ pub struct RskPrecompileProvider {
     /// Shared slot for per-transaction context used by Bridge precompile.
     /// Updated by the executor before each `transact_one`.
     bridge_tx_context: std::sync::Arc<std::sync::Mutex<BridgeTxContext>>,
+    /// Set when a direct Bridge call hits rskj's invisible-exception path
+    /// (parse failure post-RSKIP88). `RskHandler` reads it during fee
+    /// finalization: no leftover refund, REMASC gets gasLimit * gasPrice.
+    /// Cleared by `RskHandler::load_accounts` before each transaction.
+    invisible_exception: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl std::fmt::Debug for RskPrecompileProvider {
@@ -865,6 +870,11 @@ impl RskPrecompileProvider {
     /// per-transaction context before each `transact_one` call.
     pub fn bridge_tx_context_slot(&self) -> std::sync::Arc<std::sync::Mutex<BridgeTxContext>> {
         std::sync::Arc::clone(&self.bridge_tx_context)
+    }
+
+    /// Returns the shared invisible-exception flag for `RskHandler`.
+    pub fn invisible_exception_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::clone(&self.invisible_exception)
     }
 }
 
@@ -895,6 +905,7 @@ impl RskPrecompileProvider {
             remasc_config,
             bridge_config: BridgeConstants::mainnet(),
             bridge_tx_context: std::sync::Arc::new(std::sync::Mutex::new(BridgeTxContext::default())),
+            invisible_exception: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -959,6 +970,30 @@ impl RskPrecompileProvider {
             gas: Gas::new(inputs.gas_limit),
             output: Bytes::new(),
         };
+
+        // rskj invisible exception (direct Bridge call, parse failure
+        // post-RSKIP88): the CALL succeeds with the flat parse-failure gas,
+        // empty output and no endowment; `RskHandler` reads the flag during
+        // fee finalization to charge the sender the full gas limit.
+        if let Err(e) = &exec_result {
+            if crate::bridge::is_invisible_exception(e) {
+                self.invisible_exception
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                // The CALL frame already transferred the endowment; rskj
+                // skips it when execute() throws (TransactionExecutor.call).
+                if let Some(value) = inputs.transfer_value().filter(|v| !v.is_zero()) {
+                    let _ = context
+                        .journal_mut()
+                        .transfer(inputs.target_address, inputs.caller, value);
+                }
+                // rskj getGasForData: 23,000 flat for a Bridge parse
+                // failure, 0 for REMASC.
+                let spent = if *addr == BRIDGE_ADDR { 23_000 } else { 0 };
+                let underflow = result.gas.record_cost(spent);
+                assert!(underflow, "gas pre-checked against the flat cost");
+                return Ok(Some(result));
+            }
+        }
 
         match exec_result {
             Ok(output) => {
@@ -1201,22 +1236,36 @@ impl RskPrecompileProvider {
         )
     }
 
-    /// REMASC precompile (0x01000008).
-    /// Distributes miner fees with delayed maturity. Gas: 0.
+    /// REMASC precompile (0x01000008). Gas: 0 (rskj getGasForData).
+    ///
+    /// Fee distribution itself runs only for the block's REMASC system tx,
+    /// which the executor dispatches directly — every invocation arriving
+    /// here is a user tx or an internal CALL. rskj (Remasc.processMinersFees)
+    /// throws RemascInvalidInvocationException for those, EXCEPT
+    /// getStateForDebugging() which has no caller guard and succeeds
+    /// (no state changes, so only its return data is modelled loosely).
     fn run_remasc<CTX: ContextTr>(
         &self,
         context: &mut CTX,
-        _input: &[u8],
+        input: &[u8],
         _gas_limit: u64,
     ) -> Result<PrecompileOutput, PrecompileError> {
-        crate::remasc::process_miners_fees(
-            context,
-            &self.remasc_config,
-            &self.bridge_config,
-            &self.hardfork_cfg,
-            self.block_store.as_ref(),
-        )?;
-        Ok(PrecompileOutput::new(0, Vec::new().into()))
+        const GET_STATE_FOR_DEBUGGING: [u8; 4] = [0x0d, 0x0c, 0xee, 0x93];
+        if input.len() == 4 && input[..4] == GET_STATE_FOR_DEBUGGING {
+            return Ok(PrecompileOutput::new(0, Bytes::new()));
+        }
+        // Everything else throws in rskj: invisible for a direct tx
+        // (receipt SUCCESS, intrinsic gas, sender charged the full limit),
+        // a plain CALL failure for internal calls.
+        use revm::context_interface::JournalTr;
+        if context.journal().depth() == 1 {
+            return Err(PrecompileError::other(
+                crate::bridge::INVISIBLE_EXCEPTION_MARKER,
+            ));
+        }
+        Err(PrecompileError::other(
+            "Remasc: invoked outside the block's REMASC system tx",
+        ))
     }
 }
 
@@ -1230,6 +1279,7 @@ impl Clone for RskPrecompileProvider {
             remasc_config: self.remasc_config.clone(),
             bridge_config: self.bridge_config.clone(),
             bridge_tx_context: std::sync::Arc::clone(&self.bridge_tx_context),
+            invisible_exception: std::sync::Arc::clone(&self.invisible_exception),
         }
     }
 }
