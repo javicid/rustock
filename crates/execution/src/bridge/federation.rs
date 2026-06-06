@@ -244,3 +244,54 @@ mod tests {
         assert!(fed.get_public_key(1, FederationKeyType::BTC).is_none());
     }
 }
+
+/// A federation stored under newFederation/oldFederation in the legacy
+/// only-BTC-keys format (pre-RSKIP123):
+/// `RLP[ creationTime(millis), creationBlockNumber, RLP[key...] ]`.
+#[derive(Debug, Clone)]
+pub struct StoredFederation {
+    pub keys: Vec<[u8; 33]>,
+    pub creation_time_millis: u64,
+    pub creation_block: u64,
+}
+
+pub fn serialize_federation_only_btc_keys(
+    keys: &[[u8; 33]],
+    creation_time_millis: u64,
+    creation_block: u64,
+) -> Vec<u8> {
+    use super::serialization::{rlp_encode_element, rlp_encode_list, rlp_encode_u64};
+    let mut sorted = keys.to_vec();
+    sorted.sort();
+    let key_items: Vec<Vec<u8>> = sorted.iter().map(|k| rlp_encode_element(k)).collect();
+    rlp_encode_list(&[
+        rlp_encode_u64(creation_time_millis),
+        rlp_encode_u64(creation_block),
+        rlp_encode_list(&key_items),
+    ])
+}
+
+pub fn load_stored_federation<CTX: revm::context_interface::ContextTr>(
+    ctx: &mut CTX,
+    storage_key: &str,
+) -> Option<StoredFederation> {
+    use super::serialization::{rlp_decode_list, rlp_decode_u64};
+    use super::storage::bridge_load_bytes_named;
+    let data = bridge_load_bytes_named(ctx, storage_key);
+    if data.is_empty() {
+        return None;
+    }
+    let outer = rlp_decode_list(&data)?;
+    if outer.len() != 3 {
+        return None;
+    }
+    let keys = rlp_decode_list(&outer[2])?
+        .into_iter()
+        .filter_map(|k| k.try_into().ok())
+        .collect();
+    Some(StoredFederation {
+        keys,
+        creation_time_millis: rlp_decode_u64(&outer[0]),
+        creation_block: rlp_decode_u64(&outer[1]),
+    })
+}

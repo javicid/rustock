@@ -565,6 +565,18 @@ pub fn load_federation_utxos<CTX: ContextTr>(ctx: &mut CTX) -> Vec<BridgeUtxo> {
     deserialize_utxo_list(&data)
 }
 
+/// Store the OLD (retiring) federation's BTC UTXOs into Bridge storage.
+pub fn store_old_federation_utxos<CTX: ContextTr>(ctx: &mut CTX, utxos: &[BridgeUtxo]) {
+    let data = serialize_utxo_list(utxos);
+    bridge_store_bytes_named(ctx, OLD_FEDERATION_BTC_UTXOS_KEY, &data);
+}
+
+/// Load the OLD (retiring) federation's BTC UTXOs.
+pub fn load_old_federation_utxos<CTX: ContextTr>(ctx: &mut CTX) -> Vec<BridgeUtxo> {
+    let data = bridge_load_bytes_named(ctx, OLD_FEDERATION_BTC_UTXOS_KEY);
+    deserialize_utxo_list(&data)
+}
+
 /// Store the active federation's BTC UTXOs into Bridge storage.
 pub fn store_federation_utxos<CTX: ContextTr>(ctx: &mut CTX, utxos: &[BridgeUtxo]) {
     let data = serialize_utxo_list(utxos);

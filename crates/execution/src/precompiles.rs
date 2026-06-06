@@ -1212,6 +1212,8 @@ impl RskPrecompileProvider {
         crate::remasc::process_miners_fees(
             context,
             &self.remasc_config,
+            &self.bridge_config,
+            &self.hardfork_cfg,
             self.block_store.as_ref(),
         )?;
         Ok(PrecompileOutput::new(0, Vec::new().into()))

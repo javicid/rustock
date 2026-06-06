@@ -69,6 +69,32 @@ pub fn log_legacy_release_btc<CTX: ContextTr>(
 }
 
 
+/// Legacy `commit_federation_topic` event
+/// (rskj BrigeEventLoggerLegacyImpl.logCommitFederation):
+/// data = RLP[ RLP[oldFedAddressHash160, RLP[oldKeys...]],
+///             RLP[newFedAddressHash160, RLP[newKeys...]],
+///             activationBlockNumber as a DECIMAL ASCII string ].
+pub fn log_legacy_commit_federation<CTX: ContextTr>(
+    ctx: &mut CTX,
+    old_fed_hash160: &[u8; 20],
+    old_keys: &[[u8; 33]],
+    new_fed_hash160: &[u8; 20],
+    new_keys: &[[u8; 33]],
+    activation_block: u64,
+) {
+    use super::serialization::{rlp_encode_element, rlp_encode_list};
+    let fed_data = |hash160: &[u8; 20], keys: &[[u8; 33]]| {
+        let key_items: Vec<Vec<u8>> = keys.iter().map(|k| rlp_encode_element(k)).collect();
+        rlp_encode_list(&[rlp_encode_element(hash160), rlp_encode_list(&key_items)])
+    };
+    let data = rlp_encode_list(&[
+        fed_data(old_fed_hash160, old_keys),
+        fed_data(new_fed_hash160, new_keys),
+        rlp_encode_element(activation_block.to_string().as_bytes()),
+    ]);
+    emit(ctx, legacy_topic("commit_federation_topic"), data);
+}
+
 // ---------------------------------------------------------------------------
 // RSKIP146 (Solidity-format) events — rskj BridgeEventLoggerImpl
 // ---------------------------------------------------------------------------

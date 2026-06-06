@@ -182,6 +182,8 @@ impl RskExecutor {
                 crate::remasc::process_miners_fees(
                     &mut evm.ctx,
                     &self.remasc_config,
+                    &self.bridge_constants,
+                    &self.hardfork_cfg,
                     Some(&self.block_store),
                 )
                 .map_err(|e| ExecutionError::Evm(format!("REMASC: {e:?}")))?;
@@ -3760,12 +3762,15 @@ mod tests {
             "rewardBalance = 21000 - 4200 = 16800"
         );
 
-        // REMASC storage: federationBalance = 33
+        // Pre-RSKIP85 the federation cut (3360/100 = 33) is paid out to the
+        // 15 genesis federators every block, never accrued: the
+        // federationBalance cell stays untouched. (The accrual-below-minimum
+        // path is groundtruthed by the mainnet #4010 test.)
         let fed_key = crate::remasc::remasc_storage_key(crate::remasc::FEDERATION_BALANCE_KEY);
-        assert_eq!(
-            remasc_state.storage.get(&fed_key).unwrap().present_value,
-            U256::from(33),
-            "federationBalance = 3360 / 100 = 33"
+        let fed_slot = remasc_state.storage.get(&fed_key);
+        assert!(
+            fed_slot.is_none() || fed_slot.unwrap().present_value.is_zero(),
+            "federation cut paid out pre-RSKIP85, not accrued"
         );
 
         // REMASC storage: burnedBalance = 0
@@ -4022,12 +4027,10 @@ mod tests {
             "burned = minersSurplus = 2995 % 2 = 1"
         );
 
-        // federationBalance = 33
+        // Pre-RSKIP85: the federation cut is paid out, not accrued.
         let fed_key = crate::remasc::remasc_storage_key(crate::remasc::FEDERATION_BALANCE_KEY);
-        assert_eq!(
-            remasc_state.storage.get(&fed_key).unwrap().present_value,
-            U256::from(33),
-        );
+        let fed_slot = remasc_state.storage.get(&fed_key);
+        assert!(fed_slot.is_none() || fed_slot.unwrap().present_value.is_zero());
     }
 
     /// Test late uncle inclusion penalty.

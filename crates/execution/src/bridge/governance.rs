@@ -99,133 +99,329 @@ const LOCKING_CAP_KEY: &str = "lockingCap";
 // Federation change methods
 // ---------------------------------------------------------------------------
 
+/// Federation-change governance (rskj FederationSupportImpl
+/// .voteFederationChange): createFederation / addFederatorPublicKey /
+/// commitFederation / rollbackFederation are VOTES in an ABICallElection
+/// keyed by (function, args); only a MAJORITY of the federation-change
+/// authorizer keys executes the action. Mainnet block #648,926 carried the
+/// first winning commit.
+
+const FEDERATION_ELECTION_KEY: &str = "federationElection";
+
+fn federation_change_authorizers(
+    config: &super::constants::BridgeConstants,
+) -> Vec<alloy_primitives::Address> {
+    config
+        .federation_change_authorizer_keys
+        .iter()
+        .filter_map(|hex| {
+            alloy_primitives::hex::decode(hex)
+                .ok()
+                .and_then(|k| super::federation::rsk_address_from_public_key(&k))
+        })
+        .collect()
+}
+
 /// `createFederation()` → int256
-///
-/// Creates a new pending federation. Returns:
-///   1  = success
-///  -1  = pending federation already exists
-///  -10 = unauthorized
 pub fn create_federation<CTX: ContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
+    config: &super::constants::BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
+    tx_ctx: &crate::precompiles::BridgeTxContext,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    let existing = bridge_load_bytes_named(ctx, PENDING_FEDERATION_KEY);
-    if !existing.is_empty() {
-        return Ok(encode_int_result(gas_cost, -1));
-    }
-
-    // Create empty pending federation: RLP list with empty members list
-    let empty_federation = serialize_pending_federation(&[]);
-    bridge_store_bytes_named(ctx, PENDING_FEDERATION_KEY, &empty_federation);
-
-    Ok(encode_int_result(gas_cost, 1))
+    let code = vote_federation_change(ctx, "create", vec![], config, hardfork_cfg, tx_ctx);
+    Ok(encode_int_result(gas_cost, code))
 }
 
-/// `addFederatorPublicKey(bytes key)` → int256
-///
-/// Adds a public key to the pending federation. Returns:
-///   1  = success
-///  -1  = key already exists
-///  -2  = no pending federation
+/// `addFederatorPublicKey(bytes key)` → int256 (pre-RSKIP123 only)
 pub fn add_federator_public_key<CTX: ContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     gas_cost: u64,
+    config: &super::constants::BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
+    tx_ctx: &crate::precompiles::BridgeTxContext,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    let existing = bridge_load_bytes_named(ctx, PENDING_FEDERATION_KEY);
-    if existing.is_empty() {
-        return Ok(encode_int_result(gas_cost, -2));
-    }
-
-    let pubkey = decode_bytes_arg(args)?;
-    let mut members = deserialize_pending_federation(&existing);
-    members.push(pubkey);
-    let updated = serialize_pending_federation(&members);
-    bridge_store_bytes_named(ctx, PENDING_FEDERATION_KEY, &updated);
-
-    Ok(encode_int_result(gas_cost, 1))
+    let Ok(pubkey) = decode_bytes_arg(args) else {
+        return Ok(encode_int_result(gas_cost, -10));
+    };
+    let code = vote_federation_change(ctx, "add", vec![pubkey], config, hardfork_cfg, tx_ctx);
+    Ok(encode_int_result(gas_cost, code))
 }
 
-/// `addFederatorPublicKeyMultikey(bytes btcKey, bytes rskKey, bytes mstKey)` → int256
-///
-/// Same as addFederatorPublicKey but with separate keys for BTC/RSK/MST.
-/// For storage purposes, we store the BTC key as the representative key.
+/// `addFederatorPublicKeyMultikey(bytes btcKey, bytes rskKey, bytes mstKey)`
+/// → int256 (post-RSKIP123)
 pub fn add_federator_public_key_multikey<CTX: ContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     gas_cost: u64,
+    config: &super::constants::BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
+    tx_ctx: &crate::precompiles::BridgeTxContext,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    let existing = bridge_load_bytes_named(ctx, PENDING_FEDERATION_KEY);
-    if existing.is_empty() {
-        return Ok(encode_int_result(gas_cost, -2));
-    }
-
-    let btc_key = decode_bytes_arg(args)?;
-    let mut members = deserialize_pending_federation(&existing);
-    members.push(btc_key);
-    let updated = serialize_pending_federation(&members);
-    bridge_store_bytes_named(ctx, PENDING_FEDERATION_KEY, &updated);
-
-    Ok(encode_int_result(gas_cost, 1))
+    // TODO(rustock): multikey members (RSKIP123, wasabi100) store three keys
+    // per member; the vote piping is in place but the pending-federation and
+    // federation serialization formats must move to the member format before
+    // the first post-wasabi federation change.
+    let Ok(btc_key) = decode_bytes_arg(args) else {
+        return Ok(encode_int_result(gas_cost, -10));
+    };
+    let code =
+        vote_federation_change(ctx, "add-multi", vec![btc_key], config, hardfork_cfg, tx_ctx);
+    Ok(encode_int_result(gas_cost, code))
 }
 
 /// `commitFederation(bytes pendingHash)` → int256
-///
-/// Commits the pending federation as the new active federation.
-/// Returns:
-///   1  = success
-///  -1  = no pending federation
-///  -2  = pending hash mismatch
 pub fn commit_federation<CTX: ContextTr>(
     ctx: &mut CTX,
-    _args: &[u8],
+    args: &[u8],
     gas_cost: u64,
+    config: &super::constants::BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
+    tx_ctx: &crate::precompiles::BridgeTxContext,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    let pending_data = bridge_load_bytes_named(ctx, PENDING_FEDERATION_KEY);
-    if pending_data.is_empty() {
-        return Ok(encode_int_result(gas_cost, -1));
-    }
-
-    // Promote pending → active. Move current active → old (retiring).
-    let current_active = bridge_load_bytes_named(ctx, NEW_FEDERATION_KEY);
-    if !current_active.is_empty() {
-        bridge_store_bytes_named(ctx, OLD_FEDERATION_KEY, &current_active);
-    }
-
-    // Build federation RLP: [[member_keys...], creation_time, creation_block]
-    // Use current block number and timestamp from the context.
-    let members = deserialize_pending_federation(&pending_data);
-    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
-    let federation_rlp = serialize_federation(&members, 0, block_number);
-    bridge_store_bytes_named(ctx, NEW_FEDERATION_KEY, &federation_rlp);
-
-    // Store creation block height
-    bridge_store_u256(ctx, ACTIVE_FEDERATION_CREATION_BLOCK_HEIGHT_KEY, U256::from(block_number));
-
-    // Clear pending
-    bridge_store_bytes_named(ctx, PENDING_FEDERATION_KEY, &[]);
-
-    Ok(encode_int_result(gas_cost, 1))
+    let Ok(hash) = decode_bytes_arg(args) else {
+        return Ok(encode_int_result(gas_cost, -10));
+    };
+    let code = vote_federation_change(ctx, "commit", vec![hash], config, hardfork_cfg, tx_ctx);
+    Ok(encode_int_result(gas_cost, code))
 }
 
 /// `rollbackFederation()` → int256
-///
-/// Discards the pending federation.
-/// Returns:
-///   1  = success
-///  -1  = no pending federation
 pub fn rollback_federation<CTX: ContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
+    config: &super::constants::BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
+    tx_ctx: &crate::precompiles::BridgeTxContext,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    let existing = bridge_load_bytes_named(ctx, PENDING_FEDERATION_KEY);
-    if existing.is_empty() {
-        return Ok(encode_int_result(gas_cost, -1));
+    let code = vote_federation_change(ctx, "rollback", vec![], config, hardfork_cfg, tx_ctx);
+    Ok(encode_int_result(gas_cost, code))
+}
+
+fn vote_federation_change<CTX: ContextTr>(
+    ctx: &mut CTX,
+    function: &str,
+    args: Vec<Vec<u8>>,
+    config: &super::constants::BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
+    tx_ctx: &crate::precompiles::BridgeTxContext,
+) -> i64 {
+    let authorizers = federation_change_authorizers(config);
+    if !authorizers.contains(&tx_ctx.rsk_sender) {
+        return -10; // UNAUTHORIZED_CALLER
     }
 
+    // Dry-run first; only register the vote when the call would succeed.
+    let dry = execute_federation_change(ctx, function, &args, true, config, hardfork_cfg);
+    if dry != 1 {
+        return dry;
+    }
+
+    let spec = super::vote::AbiCallSpec::new(function, args.clone());
+    let mut election = super::vote::Election::load(ctx, FEDERATION_ELECTION_KEY);
+    if !election.vote(&spec, tx_ctx.rsk_sender) {
+        return -10; // GENERIC_ERROR (duplicate vote)
+    }
+
+    let required = authorizers.len() / 2 + 1;
+    let mut code = 1i64;
+    if let Some(winner) = election.winner(required) {
+        code = execute_federation_change(ctx, function, &args, false, config, hardfork_cfg);
+        // create/commit clear the whole election inside the action;
+        // clearWinners then removes the winning entry.
+        if matches!(function, "create" | "commit") && code == 1 {
+            election.clear();
+        } else {
+            election.remove(winner);
+        }
+    }
+    election.store(ctx, FEDERATION_ELECTION_KEY);
+    code
+}
+
+/// rskj FederationSupportImpl.executeVoteFederationChangeFunction.
+fn execute_federation_change<CTX: ContextTr>(
+    ctx: &mut CTX,
+    function: &str,
+    args: &[Vec<u8>],
+    dry_run: bool,
+    config: &super::constants::BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
+) -> i64 {
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    match function {
+        "create" => {
+            if !bridge_load_bytes_named(ctx, PENDING_FEDERATION_KEY).is_empty() {
+                return -1; // PENDING_FEDERATION_ALREADY_EXISTS
+            }
+            let new_fed = super::federation::load_stored_federation(ctx, NEW_FEDERATION_KEY);
+            let old_fed = super::federation::load_stored_federation(ctx, OLD_FEDERATION_KEY);
+            let age = federation_activation_age(config, hardfork_cfg, block_number);
+            if let (Some(new), Some(_)) = (&new_fed, &old_fed) {
+                if block_number < new.creation_block + age {
+                    return -2; // EXISTING_FEDERATION_AWAITING_ACTIVATION
+                }
+                return -3; // RETIRING_FEDERATION_ALREADY_EXISTS
+            }
+            if dry_run {
+                return 1;
+            }
+            bridge_store_bytes_named(
+                ctx,
+                PENDING_FEDERATION_KEY,
+                &serialize_pending_federation(&[]),
+            );
+            1
+        }
+        "add" | "add-multi" => {
+            if function == "add" && hardfork_cfg.has_rskip123(block_number) {
+                return -10; // "add" disabled post-RSKIP123
+            }
+            let pending_data = bridge_load_bytes_named(ctx, PENDING_FEDERATION_KEY);
+            if pending_data.is_empty() {
+                return -1; // FEDERATION_NON_EXISTENT
+            }
+            let key_bytes = &args[0];
+            // BtcECKey.fromPublicOnly failure -> BridgeIllegalArgumentException
+            if k256::PublicKey::from_sec1_bytes(key_bytes).is_err() {
+                return -10;
+            }
+            let mut members = deserialize_pending_federation(&pending_data);
+            if members.iter().any(|k| k == key_bytes) {
+                return -2; // FEDERATOR_ALREADY_PRESENT
+            }
+            if dry_run {
+                return 1;
+            }
+            members.push(key_bytes.clone());
+            bridge_store_bytes_named(
+                ctx,
+                PENDING_FEDERATION_KEY,
+                &serialize_pending_federation(&members),
+            );
+            1
+        }
+        "commit" => {
+            let pending_data = bridge_load_bytes_named(ctx, PENDING_FEDERATION_KEY);
+            if pending_data.is_empty() {
+                return -1; // FEDERATION_NON_EXISTENT
+            }
+            let members = deserialize_pending_federation(&pending_data);
+            if members.len() < 2 {
+                return -2; // INSUFFICIENT_MEMBERS
+            }
+            // PendingFederation.getHash: keccak over the sorted-keys RLP.
+            let pending_hash = {
+                use sha3::{Digest, Keccak256};
+                Keccak256::digest(serialize_pending_federation(&members))
+            };
+            if args[0] != pending_hash[..] {
+                return -3; // PENDING_FEDERATION_MISMATCHED_HASH
+            }
+            if dry_run {
+                return 1;
+            }
+            commit_pending_federation(ctx, &members, config, hardfork_cfg);
+            1
+        }
+        "rollback" => {
+            if bridge_load_bytes_named(ctx, PENDING_FEDERATION_KEY).is_empty() {
+                return -1; // FEDERATION_NON_EXISTENT
+            }
+            if dry_run {
+                return 1;
+            }
+            bridge_store_bytes_named(ctx, PENDING_FEDERATION_KEY, &[]);
+            1
+        }
+        _ => -10, // NON_EXISTING_FUNCTION_CALLED
+    }
+}
+
+pub(crate) fn federation_activation_age(
+    config: &super::constants::BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
+    block_number: u64,
+) -> u64 {
+    if hardfork_cfg.has_rskip383(block_number) {
+        config.federation_activation_age
+    } else {
+        config.federation_activation_age_legacy
+    }
+}
+
+/// rskj legacyCommitPendingFederation: build the federation from the pending
+/// keys, move the active federation's UTXOs to the old-federation set, store
+/// active as old / built as new, wipe the pending federation, and log the
+/// legacy commit_federation event.
+fn commit_pending_federation<CTX: ContextTr>(
+    ctx: &mut CTX,
+    pending_keys: &[Vec<u8>],
+    config: &super::constants::BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
+) {
+    use revm::context_interface::Block as _;
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let timestamp = ctx.block().timestamp().to::<u64>();
+
+    // Built federation: compressed sorted keys, creation time = block
+    // timestamp (raw seconds value stored through Instant.ofEpochMilli
+    // pre-RSKIP419), creation block = this block.
+    let mut new_keys: Vec<[u8; 33]> = pending_keys
+        .iter()
+        .filter_map(|k| {
+            use k256::elliptic_curve::sec1::ToEncodedPoint;
+            let parsed = k256::PublicKey::from_sec1_bytes(k).ok()?;
+            parsed.to_encoded_point(true).as_bytes().try_into().ok()
+        })
+        .collect();
+    new_keys.sort();
+
+    // Move active-federation UTXOs to the old set.
+    let active_utxos = load_federation_utxos(ctx);
+    store_federation_utxos(ctx, &[]);
+    super::storage::store_old_federation_utxos(ctx, &active_utxos);
+
+    // Current ACTIVE federation becomes the old one (genesis when none).
+    let active = super::federation::load_stored_federation(ctx, NEW_FEDERATION_KEY);
+    let (old_keys, old_time, old_block) = match &active {
+        Some(fed) => (fed.keys.clone(), fed.creation_time_millis, fed.creation_block),
+        None => (
+            super::peg::genesis_federation_keys(config),
+            config.genesis_federation_creation_time_millis,
+            1,
+        ),
+    };
+
+    bridge_store_bytes_named(
+        ctx,
+        OLD_FEDERATION_KEY,
+        &super::federation::serialize_federation_only_btc_keys(&old_keys, old_time, old_block),
+    );
+    bridge_store_bytes_named(
+        ctx,
+        NEW_FEDERATION_KEY,
+        &super::federation::serialize_federation_only_btc_keys(&new_keys, timestamp, block_number),
+    );
     bridge_store_bytes_named(ctx, PENDING_FEDERATION_KEY, &[]);
 
-    Ok(encode_int_result(gas_cost, 1))
+    // Legacy commit_federation event (pre-RSKIP146).
+    let old_redeem =
+        super::peg::build_federation_redeem_script(&old_keys, old_keys.len() / 2 + 1);
+    let new_redeem =
+        super::peg::build_federation_redeem_script(&new_keys, new_keys.len() / 2 + 1);
+    let activation =
+        block_number + federation_activation_age(config, hardfork_cfg, block_number);
+    super::events::log_legacy_commit_federation(
+        ctx,
+        &super::peg::redeem_script_hash160_pub(&old_redeem),
+        &old_keys,
+        &super::peg::redeem_script_hash160_pub(&new_redeem),
+        &new_keys,
+        activation,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -689,17 +885,6 @@ fn deserialize_pending_federation(data: &[u8]) -> Vec<Vec<u8>> {
     serialization::rlp_decode_list(data).unwrap_or_default()
 }
 
-/// Serialize a committed federation as `[[member_keys...], creation_time, creation_block]`.
-fn serialize_federation(member_keys: &[Vec<u8>], creation_time: u64, creation_block: u64) -> Vec<u8> {
-    let keys_rlp: Vec<Vec<u8>> = member_keys
-        .iter()
-        .map(|k| serialization::rlp_encode_element(k))
-        .collect();
-    let keys_list = serialization::rlp_encode_list(&keys_rlp);
-    let time_rlp = serialization::rlp_encode_u64(creation_time);
-    let block_rlp = serialization::rlp_encode_u64(creation_block);
-    serialization::rlp_encode_list(&[keys_list, time_rlp, block_rlp])
-}
 
 /// Decode a single `bytes` ABI argument from calldata.
 fn decode_bytes_arg(args: &[u8]) -> Result<Vec<u8>, PrecompileError> {
@@ -783,44 +968,22 @@ mod tests {
 
     /// Ported from rskj: committed federation roundtrip with known values.
     /// Matches BridgeSerializationUtilsTest pattern: 6 keys, creation_time=5000,
-    /// creation_block=42.
+/// rskj serializeFederationOnlyBtcKeys layout:
+    /// RLP[creationTime(millis), creationBlockNumber, RLP[keys...]] with
+    /// keys sorted lexicographically.
     #[test]
-    fn rskj_committed_federation_roundtrip() {
-        let keys: Vec<Vec<u8>> = (100u8..106)
-            .map(|i| vec![i; 33])
-            .collect();
+    fn rskj_federation_only_btc_keys_roundtrip() {
+        let mut keys: Vec<[u8; 33]> = (100u8..106).map(|i| [i; 33]).collect();
+        keys.reverse(); // serializer must sort
 
-        let creation_time = 5000u64;
-        let creation_block = 42u64;
-
-        let encoded = serialize_federation(&keys, creation_time, creation_block);
+        let encoded =
+            super::super::federation::serialize_federation_only_btc_keys(&keys, 5000, 42);
         let decoded = serialization::rlp_decode_list(&encoded).unwrap();
-        assert_eq!(decoded.len(), 3, "federation RLP should have 3 items");
-
-        let decoded_keys = serialization::rlp_decode_list(&decoded[0]).unwrap();
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(serialization::rlp_decode_u64(&decoded[0]), 5000);
+        assert_eq!(serialization::rlp_decode_u64(&decoded[1]), 42);
+        let decoded_keys = serialization::rlp_decode_list(&decoded[2]).unwrap();
         assert_eq!(decoded_keys.len(), 6);
-        for (i, key) in decoded_keys.iter().enumerate() {
-            assert_eq!(key, &keys[i], "key {i} mismatch");
-        }
-
-        let decoded_time = serialization::rlp_decode_u64(&decoded[1]);
-        assert_eq!(decoded_time, creation_time);
-
-        let decoded_block = serialization::rlp_decode_u64(&decoded[2]);
-        assert_eq!(decoded_block, creation_block);
-    }
-
-    /// Verify single-member federation serialization.
-    #[test]
-    fn rskj_committed_federation_single_member() {
-        let keys = vec![vec![0x02; 33]];
-        let encoded = serialize_federation(&keys, 0, 1);
-
-        let decoded = serialization::rlp_decode_list(&encoded).unwrap();
-        let decoded_keys = serialization::rlp_decode_list(&decoded[0]).unwrap();
-        assert_eq!(decoded_keys.len(), 1);
-        assert_eq!(decoded_keys[0], vec![0x02; 33]);
-        assert_eq!(serialization::rlp_decode_u64(&decoded[1]), 0);
-        assert_eq!(serialization::rlp_decode_u64(&decoded[2]), 1);
+        assert_eq!(decoded_keys[0], vec![100u8; 33], "keys sorted");
     }
 }

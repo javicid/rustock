@@ -401,25 +401,26 @@ fn pay_mining_fees<CTX: ContextTr>(
 /// or the genesis federation while none is stored. Members are ordered by
 /// compressed BTC public key (rskj Federation constructor), groundtruthed by
 /// the mainnet #4010 payout order.
-fn federation_rsk_addresses<CTX: ContextTr>(ctx: &mut CTX, config: &RemascConfig) -> Vec<Address> {
+fn federation_rsk_addresses<CTX: ContextTr>(
+    ctx: &mut CTX,
+    config: &RemascConfig,
+    bridge_config: &crate::bridge::constants::BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
+) -> Vec<Address> {
     // The Bridge account may be cold outside revm's transact flow; journal
     // storage reads require the account to be loaded.
     use revm::context_interface::JournalTr;
     let _ = ctx.journal_mut().load_account(crate::precompiles::BRIDGE_ADDR);
-    let stored = crate::bridge::peg::load_federation_member_keys(ctx);
-    if !stored.is_empty() {
-        return stored
-            .iter()
-            .filter_map(|k| crate::bridge::federation::rsk_address_from_public_key(k))
-            .collect();
-    }
-    let mut keys: Vec<Vec<u8>> = config
-        .genesis_federation_public_keys
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let stored = crate::bridge::peg::federation_keys_or_genesis(
+        ctx,
+        bridge_config,
+        hardfork_cfg,
+        block_number,
+    );
+    let _ = config;
+    stored
         .iter()
-        .filter_map(|h| alloy_primitives::hex::decode(h).ok())
-        .collect();
-    keys.sort();
-    keys.iter()
         .filter_map(|k| crate::bridge::federation::rsk_address_from_public_key(k))
         .collect()
 }
@@ -431,6 +432,8 @@ fn federation_rsk_addresses<CTX: ContextTr>(ctx: &mut CTX, config: &RemascConfig
 fn pay_to_federation<CTX: ContextTr>(
     ctx: &mut CTX,
     config: &RemascConfig,
+    bridge_config: &crate::bridge::constants::BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
     processing_block_hash: alloy_primitives::B256,
     current_number: u64,
     synthetic_reward: U256,
@@ -439,7 +442,7 @@ fn pay_to_federation<CTX: ContextTr>(
     let fed_key = remasc_storage_key(FEDERATION_BALANCE_KEY);
     let pay_total = remasc_sload(ctx, fed_key) + federation_reward;
 
-    let federators = federation_rsk_addresses(ctx, config);
+    let federators = federation_rsk_addresses(ctx, config, bridge_config, hardfork_cfg);
     if federators.is_empty() {
         remasc_sstore(ctx, fed_key, pay_total);
         return federation_reward;
@@ -475,6 +478,8 @@ fn pay_to_federation<CTX: ContextTr>(
 pub fn process_miners_fees<CTX: ContextTr>(
     ctx: &mut CTX,
     config: &RemascConfig,
+    bridge_config: &crate::bridge::constants::BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
     block_store: Option<&Arc<BlockStore>>,
 ) -> Result<(), PrecompileError> {
     let current_number = ctx.block().number().to::<u64>();
@@ -543,7 +548,15 @@ pub fn process_miners_fees<CTX: ContextTr>(
 
     // Pay the federation its cut (rskj Remasc.payToFederation)
     let federation_reward =
-        pay_to_federation(ctx, config, processing_hash, current_number, remaining);
+        pay_to_federation(
+            ctx,
+            config,
+            bridge_config,
+            hardfork_cfg,
+            processing_hash,
+            current_number,
+            remaining,
+        );
     remaining -= federation_reward;
 
     if !siblings.is_empty() {

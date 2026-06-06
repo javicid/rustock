@@ -174,6 +174,17 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Orchid
     }
 
+    /// RSKIP123: multikey federation members; disables the single-key "add"
+    /// federation-change function (Wasabi100).
+    pub fn has_rskip123(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Wasabi100
+    }
+
+    /// RSKIP383: longer federation activation age (Fingerroot500).
+    pub fn has_rskip383(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Fingerroot500
+    }
+
     /// RSKIP146: release request queue stores RSK tx hash (Papyrus200, mainnet 2_392_700).
     pub fn has_rskip146(&self, block_number: u64) -> bool {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Papyrus200

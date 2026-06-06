@@ -23,6 +23,7 @@ pub mod release_tx;
 pub mod serialization;
 pub mod storage;
 pub mod tx;
+pub mod vote;
 
 use alloy_primitives::{Bytes, U256};
 use revm::context_interface::ContextTr;
@@ -388,11 +389,11 @@ fn execute_method<CTX: ContextTr>(
         "addSignature" => peg::add_signature(ctx, args, gas_cost, config, hardfork_cfg),
 
         // Phase 6: Governance
-        "createFederation" => governance::create_federation(ctx, gas_cost),
-        "commitFederation" => governance::commit_federation(ctx, args, gas_cost),
-        "rollbackFederation" => governance::rollback_federation(ctx, gas_cost),
-        "addFederatorPublicKey" => governance::add_federator_public_key(ctx, args, gas_cost),
-        "addFederatorPublicKeyMultikey" => governance::add_federator_public_key_multikey(ctx, args, gas_cost),
+        "createFederation" => governance::create_federation(ctx, gas_cost, config, hardfork_cfg, tx_ctx),
+        "commitFederation" => governance::commit_federation(ctx, args, gas_cost, config, hardfork_cfg, tx_ctx),
+        "rollbackFederation" => governance::rollback_federation(ctx, gas_cost, config, hardfork_cfg, tx_ctx),
+        "addFederatorPublicKey" => governance::add_federator_public_key(ctx, args, gas_cost, config, hardfork_cfg, tx_ctx),
+        "addFederatorPublicKeyMultikey" => governance::add_federator_public_key_multikey(ctx, args, gas_cost, config, hardfork_cfg, tx_ctx),
         "voteFeePerKbChange" => governance::vote_fee_per_kb_change(ctx, args, gas_cost, config, tx_ctx),
         "increaseLockingCap" => governance::increase_locking_cap(ctx, args, gas_cost),
         "addLockWhitelistAddress" => governance::add_lock_whitelist_address(ctx, args, gas_cost, config, tx_ctx),

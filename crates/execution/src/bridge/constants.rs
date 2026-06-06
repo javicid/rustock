@@ -82,6 +82,18 @@ pub struct BridgeConstants {
     pub fee_per_kb_authorizer_keys: &'static [&'static str],
     /// Maximum votable fee per KB (rskj FeePerKbConstants.maxFeePerKb).
     pub max_fee_per_kb: u64,
+    /// Federation-change authorizer keys (rskj FederationConstants,
+    /// AddressBasedAuthorizer with minimum MAJORITY).
+    pub federation_change_authorizer_keys: &'static [&'static str],
+    /// Blocks after commitment before the new federation activates
+    /// (rskj federationActivationAgeLegacy, pre-RSKIP383).
+    pub federation_activation_age_legacy: u64,
+    /// Post-RSKIP383 activation age.
+    pub federation_activation_age: u64,
+    /// Genesis federation creation time as stored (epoch-seconds value kept
+    /// in a millis field: Instant.ofEpochMilli semantics, rskj
+    /// genesisFederationCreationTime).
+    pub genesis_federation_creation_time_millis: u64,
 
     /// BTC height from which headers cannot be processed until RSKIP434
     /// (bitcoinj 12-byte chainwork overflow; rskj
@@ -166,6 +178,15 @@ impl BridgeConstants {
                 "04bb6435dc1ea12da843ebe213893d136c1624acd681fff82551498ae00bf28e9323164b00daf925fa75177463b8254a2aae8a1713e4d851a84ea369c193e9ce51",
             ],
             max_fee_per_kb: 5_000_000,
+            // FederationMainNetConstants authorizer keys (majority = 2 of 3)
+            federation_change_authorizer_keys: &[
+                "04e593d4cde25137b13f19462bc4c02e97ba2ed5a3860813497abf9b4eeb9259e37e0384d12cfd2d9a7a0ba606b31ee34317a9d7f4a8591c6bcf5dfd5563248b2f",
+                "045e7f2563e73d44d149c19cffca36e1898597dc759d76166b8104103c0d3f351a8a48e3a224544e9a649ad8ebcfdbd6c39744ddb85925f19c7e3fd48f07fc1c06",
+                "0441945e4e272936106f6200b36162f3510e8083535c15e175ac82deaf828da955b85fd72b7534f2a34cedfb45fa63b728cc696a2bd3c5d39ec799ec2618e9aa9f",
+            ],
+            federation_activation_age_legacy: 18_500,
+            federation_activation_age: 40_320,
+            genesis_federation_creation_time_millis: 1_514_948_400,
             block_with_too_much_chain_work_height: 849_138,
             // bitcoinj checkpoint at BTC mainnet #499,968 (2017-12-18), hash
             // 000000000000000000296e10eb4987c4eb9b7ba0841102dec4480e5d6b89acb5
@@ -227,6 +248,15 @@ impl BridgeConstants {
                 "0455db9b3867c14e84a6f58bd2165f13bfdba0703cb84ea85788373a6a109f3717e40483aa1f8ef947f435ccdf10e530dd8b3025aa2d4a7014f12180ee3a301d27",
             ],
             max_fee_per_kb: 5_000_000,
+            // FederationTestNetConstants authorizer keys (majority = 2 of 3)
+            federation_change_authorizer_keys: &[
+                "04d9052c2022f6f35da53f04f02856ff5e59f9836eec03daad0328d12c5c66140205da540498e46cd05bf63c1201382dd84c100f0d52a10654159965aea452c3f2",
+                "04bf889f2035c8c441d7d1054b6a449742edd04d202f44a29348b4140b34e2a81ce66e388f40046636fd012bd7e3cecd9b951ffe28422334722d20a1cf6c7926fb",
+                "047e707e4f67655c40c539363fb435d89574b8fe400971ba0290de9c2adbb2bd4e1e5b35a2188b9409ff2cc102292616efc113623483056bb8d8a02bf7695670ea",
+            ],
+            federation_activation_age_legacy: 60,
+            federation_activation_age: 2_400,
+            genesis_federation_creation_time_millis: 1_538_967_600,
             block_with_too_much_chain_work_height: u32::MAX,
             // bitcoinj checkpoint at BTC testnet #1,413,216 (2018-09-13), hash
             // 000000000000001aa547c01c17edae35e21dd63fd7e6627daedf997bd3a54627
@@ -269,6 +299,17 @@ impl BridgeConstants {
                 "0430c7d0146029db553d60cf11e8d39df1c63979ee2e4cd1e4d4289a5d88cfcbf3a09b06b5cbc88b5bfeb4b87a94cefab81c8d44655e7e813fc3e18f51cfe7e8a0",
             ],
             max_fee_per_kb: 5_000_000,
+            // FederationRegTestConstants authorizer keys (majority = 3 of 5)
+            federation_change_authorizer_keys: &[
+                "04dde17c5fab31ffc53c91c2390136c325bb8690dc135b0840075dd7b86910d8ab9e88baad0c32f3eea8833446a6bc5ff1cd2efa99ecb17801bcb65fc16fc7d991",
+                "04af886c67231476807e2a8eee9193878b9d94e30aa2ee469a9611d20e1e1c1b438e5044148f65e6e61bf03e9d72e597cb9cdea96d6fc044001b22099f9ec403e2",
+                "045d4dedf9c69ab3ea139d0f0da0ad00160b7663d01ce7a6155cd44a3567d360112b0480ab6f31cac7345b5f64862205ea7ccf555fcf218f87fa0d801008fecb61",
+                "04709f002ac4642b6a87ea0a9dc76eeaa93f71b3185985817ec1827eae34b46b5d869320efb5c5cbe2a5c13f96463fe0210710b53352a4314188daffe07bd54154",
+                "04aff62315e9c18004392a5d9e39496ff5794b2d9f43ab4e8ade64740d7fdfe896969be859b43f26ef5aa4b5a0d11808277b4abfa1a07cc39f2839b89cc2bc6b4c",
+            ],
+            federation_activation_age_legacy: 10,
+            federation_activation_age: 150,
+            genesis_federation_creation_time_millis: 1_451_606_400_000,
             block_with_too_much_chain_work_height: u32::MAX,
             btc_checkpoint: None,
         }

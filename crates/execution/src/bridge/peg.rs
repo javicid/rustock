@@ -202,7 +202,8 @@ pub fn register_btc_transaction<CTX: ContextTr>(
 
     // The active federation's P2SH script identifies which outputs are
     // peg-ins and which inputs make the tx a peg-out.
-    let federation_keys = federation_keys_or_genesis(ctx, config);
+    let block_number_now = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let federation_keys = federation_keys_or_genesis(ctx, config, hardfork_cfg, block_number_now);
     let threshold = (federation_keys.len() / 2) + 1;
     let fed_redeem = build_federation_redeem_script(&federation_keys, threshold);
     let fed_script = p2sh_output_script(&redeem_script_hash160(&fed_redeem));
@@ -712,7 +713,8 @@ pub fn update_collections<CTX: ContextTr>(
         };
 
         if !pending.is_empty() {
-            let federation_keys = federation_keys_or_genesis(ctx, config);
+            let federation_keys =
+                federation_keys_or_genesis(ctx, config, hardfork_cfg, block_number);
             if !federation_keys.is_empty() {
                 let threshold = (federation_keys.len() / 2) + 1;
                 let redeem_script = build_federation_redeem_script(&federation_keys, threshold);
@@ -902,25 +904,45 @@ pub fn update_collections<CTX: ContextTr>(
     Ok(PrecompileOutput::new(gas_cost, Bytes::new()))
 }
 
-/// Active federation member keys: the committed federation from storage, or
-/// the genesis federation from the network constants when none was ever
-/// stored (rskj `FederationSupport.getActiveFederation` fallback).
+/// Active federation member keys (rskj FederationSupport.getActiveFederation):
+/// the committed (new) federation once it reaches the activation age, the old
+/// federation while the new one awaits activation, or the genesis federation
+/// when none was ever stored.
 pub(crate) fn federation_keys_or_genesis<CTX: ContextTr>(
     ctx: &mut CTX,
     config: &BridgeConstants,
+    hardfork_cfg: &RskHardforkConfig,
+    block_number: u64,
 ) -> Vec<[u8; 33]> {
-    let stored = load_federation_member_keys(ctx);
-    if !stored.is_empty() {
-        return stored;
+    let new = super::federation::load_stored_federation(ctx, NEW_FEDERATION_KEY);
+    let old = super::federation::load_stored_federation(ctx, OLD_FEDERATION_KEY);
+    let age =
+        super::governance::federation_activation_age(config, hardfork_cfg, block_number);
+    match (new, old) {
+        (Some(n), Some(o)) => {
+            if block_number >= n.creation_block + age {
+                n.keys
+            } else {
+                o.keys
+            }
+        }
+        (Some(n), None) => n.keys,
+        (None, _) => genesis_federation_keys(config),
     }
-    config
+}
+
+pub(crate) fn genesis_federation_keys(config: &BridgeConstants) -> Vec<[u8; 33]> {
+    // rskj Federation sorts members by compressed BTC public key.
+    let mut keys: Vec<[u8; 33]> = config
         .genesis_federation_public_keys
         .iter()
         .filter_map(|hex| {
             let bytes = alloy_primitives::hex::decode(hex).ok()?;
             bytes.try_into().ok()
         })
-        .collect()
+        .collect();
+    keys.sort();
+    keys
 }
 
 // ---------------------------------------------------------------------------
@@ -1046,7 +1068,8 @@ pub fn add_signature<CTX: ContextTr>(
 
     // Membership check against the active federation (genesis fallback).
     // TODO(rustock): rskj also accepts retiring-federation members.
-    let federation_keys = federation_keys_or_genesis(ctx, config);
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let federation_keys = federation_keys_or_genesis(ctx, config, hardfork_cfg, block_number);
     if federation_keys.is_empty() {
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     }
@@ -1432,6 +1455,11 @@ pub fn build_federation_redeem_script(keys: &[[u8; 33]], threshold: usize) -> Ve
     script.push(0x50 + sorted_keys.len() as u8); // OP_n
     script.push(0xAE); // OP_CHECKMULTISIG
     script
+}
+
+/// Public wrapper for governance (commit_federation event addresses).
+pub fn redeem_script_hash160_pub(redeem_script: &[u8]) -> [u8; 20] {
+    redeem_script_hash160(redeem_script)
 }
 
 /// Compute RIPEMD160(SHA256(redeem_script)) = P2SH address hash160.
