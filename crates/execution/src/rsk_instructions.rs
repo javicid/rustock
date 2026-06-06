@@ -56,7 +56,57 @@ where
         opcode::STATICCALL,
         Instruction::new(rsk_static_call::<WIRE, HOST>, CALL_STATIC_GAS),
     );
+
+    // Divergence-hunt diagnostics (env-gated): log the inputs of opcodes
+    // whose gas charge can dwarf the remaining gas, to locate the exact
+    // OOG-with-gas-remaining halt site.
+    if std::env::var_os("RUSTOCK_TRACE_OPS").is_some() {
+        instructions.insert_instruction(
+            opcode::KECCAK256,
+            Instruction::new(traced_keccak::<WIRE, HOST>, 30),
+        );
+        instructions.insert_instruction(
+            opcode::CODECOPY,
+            Instruction::new(traced_codecopy::<WIRE, HOST>, 3),
+        );
+        instructions.insert_instruction(
+            opcode::RETURN,
+            Instruction::new(traced_return::<WIRE, HOST>, 0),
+        );
+        instructions.insert_instruction(
+            opcode::EXP,
+            Instruction::new(traced_exp::<WIRE, HOST>, 10),
+        );
+    }
 }
+
+macro_rules! traced_op {
+    ($name:ident, $label:literal, $peek:literal, $delegate:path) => {
+        fn $name<WIRE: InterpreterTypes, H: Host + ?Sized>(
+            context: InstructionContext<'_, H, WIRE>,
+        ) {
+            let data = context.interpreter.stack.data();
+            let vals: Vec<String> = data
+                .iter()
+                .rev()
+                .take($peek)
+                .map(|v| format!("{:x}", v))
+                .collect();
+            tracing::debug!(
+                "OP {} stack_top={:?} gas_remaining={}",
+                $label,
+                vals,
+                context.interpreter.gas.remaining()
+            );
+            $delegate(context)
+        }
+    };
+}
+
+traced_op!(traced_keccak, "KECCAK256", 2, revm::interpreter::instructions::system::keccak256);
+traced_op!(traced_codecopy, "CODECOPY", 3, revm::interpreter::instructions::system::codecopy);
+traced_op!(traced_return, "RETURN", 2, revm::interpreter::instructions::control::ret);
+traced_op!(traced_exp, "EXP", 2, revm::interpreter::instructions::arithmetic::exp);
 
 /// rskj `VM.getMessageCall` gas math, shared by the four call opcodes.
 ///
