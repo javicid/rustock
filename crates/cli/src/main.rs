@@ -129,6 +129,9 @@ async fn main() -> Result<()> {
         _ => ChainConfig::regtest(),
     };
     let config = Arc::new(config);
+    // Block-hash computation (RSKIP92) needs the activation heights before
+    // any header is decoded.
+    config.activation_heights.clone().install();
 
     let store = Arc::new(BlockStore::open(&args.data_dir)?);
 

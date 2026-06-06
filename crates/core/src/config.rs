@@ -30,7 +30,23 @@ pub struct ActivationHeights {
     pub papyrus200: u64,
 }
 
+/// Process-wide activation heights, consulted by block-hash computation
+/// (RSKIP92 changes which header fields are hashed). Mirrors rskj's injected
+/// ActivationConfig singleton. Defaults to mainnet if never installed.
+static ACTIVATIONS: std::sync::OnceLock<ActivationHeights> = std::sync::OnceLock::new();
+
 impl ActivationHeights {
+    /// Install the process-wide activation heights. Call once at startup
+    /// before any header decoding; later calls are ignored.
+    pub fn install(self) {
+        let _ = ACTIVATIONS.set(self);
+    }
+
+    /// The installed activation heights (mainnet if none installed).
+    pub fn current() -> &'static ActivationHeights {
+        ACTIVATIONS.get_or_init(Self::mainnet)
+    }
+
     pub fn mainnet() -> Self {
         Self {
             orchid: 729_000,

@@ -66,8 +66,11 @@ fn java_signed_bytes(value: &U256) -> Vec<u8> {
     out
 }
 
-impl Encodable for Header {
-    fn encode(&self, out: &mut dyn alloy_rlp::BufMut) {
+impl Header {
+    /// rskj BlockHeader.getEncoded(true, with_merkle_proof_and_coinbase):
+    /// list payload of all header fields; the merkle proof and coinbase tx
+    /// are excluded from RSKIP92 block hashes but kept on the wire.
+    fn encode_payload(&self, with_merkle_proof_and_coinbase: bool) -> Vec<u8> {
         let mut list = Vec::new();
         self.parent_hash.encode(&mut list);
         self.ommers_hash.encode(&mut list);
@@ -94,16 +97,24 @@ impl Encodable for Header {
         // omitting them (BlockHeader.getEncoded with merged mining fields).
         if let Some(btc) = &self.bitcoin_merged_mining_header {
             btc.encode(&mut list);
-            match &self.bitcoin_merged_mining_merkle_proof {
-                Some(proof) => proof.encode(&mut list),
-                None => list.push(0x80),
-            }
-            match &self.bitcoin_merged_mining_coinbase_transaction {
-                Some(tx) => tx.encode(&mut list),
-                None => list.push(0x80),
+            if with_merkle_proof_and_coinbase {
+                match &self.bitcoin_merged_mining_merkle_proof {
+                    Some(proof) => proof.encode(&mut list),
+                    None => list.push(0x80),
+                }
+                match &self.bitcoin_merged_mining_coinbase_transaction {
+                    Some(tx) => tx.encode(&mut list),
+                    None => list.push(0x80),
+                }
             }
         }
+        list
+    }
+}
 
+impl Encodable for Header {
+    fn encode(&self, out: &mut dyn alloy_rlp::BufMut) {
+        let list = self.encode_payload(true);
         alloy_rlp::Header { list: true, payload_length: list.len() }.encode(out);
         out.put_slice(&list);
     }
@@ -212,13 +223,49 @@ impl alloy_rlp::Decodable for Header {
 }
 
 impl Header {
+    /// RSKIP92 (orchid): the block hash is computed over the header encoding
+    /// WITHOUT the merged-mining merkle proof and coinbase transaction
+    /// (rskj BlockHeader.getHash → getEncodedForHash, useRskip92Encoding).
+    fn rskip92_active(&self) -> bool {
+        self.number >= crate::config::ActivationHeights::current().orchid
+    }
+
     pub fn hash(&self) -> B256 {
         if let Some(h) = self.cached_hash {
             return h;
         }
-        let mut buffer = Vec::new();
-        self.encode(&mut buffer);
+        let payload = self.encode_payload(!self.rskip92_active());
+        let mut buffer = Vec::with_capacity(payload.len() + 4);
+        alloy_rlp::Header { list: true, payload_length: payload.len() }.encode(&mut buffer);
+        buffer.extend_from_slice(&payload);
         alloy_primitives::keccak256(&buffer)
+    }
+
+    /// Compute the RSKIP92 block hash from original encoded bytes: re-wrap the
+    /// list payload with the last two items (merkle proof, coinbase) dropped.
+    fn rskip92_hash_from_encoded(encoded: &[u8]) -> Option<B256> {
+        let mut parse = encoded;
+        let list_h = alloy_rlp::Header::decode(&mut parse).ok()?;
+        let body = parse.get(..list_h.payload_length)?;
+        let mut ends = Vec::new();
+        let mut cursor = body;
+        while !cursor.is_empty() {
+            let mut temp = cursor;
+            let item_h = alloy_rlp::Header::decode(&mut temp).ok()?;
+            if item_h.payload_length > temp.len() {
+                return None;
+            }
+            cursor = &temp[item_h.payload_length..];
+            ends.push(body.len() - cursor.len());
+        }
+        if ends.len() < 3 {
+            return None;
+        }
+        let payload = &body[..ends[ends.len() - 3]];
+        let mut buf = Vec::with_capacity(payload.len() + 4);
+        alloy_rlp::Header { list: true, payload_length: payload.len() }.encode(&mut buf);
+        buf.extend_from_slice(payload);
+        Some(alloy_primitives::keccak256(&buf))
     }
 
     /// Decode a header from RLP bytes and compute the hash from those original
@@ -228,7 +275,14 @@ impl Header {
         let original = *buf;
         let mut header = <Self as Decodable>::decode(buf)?;
         let consumed = original.len() - buf.len();
-        header.cached_hash = Some(alloy_primitives::keccak256(&original[..consumed]));
+        let has_proof_and_coinbase = header.bitcoin_merged_mining_merkle_proof.is_some()
+            || header.bitcoin_merged_mining_coinbase_transaction.is_some();
+        header.cached_hash = if header.rskip92_active() && has_proof_and_coinbase {
+            Self::rskip92_hash_from_encoded(&original[..consumed])
+        } else {
+            None
+        }
+        .or_else(|| Some(alloy_primitives::keccak256(&original[..consumed])));
 
         // Compute merged mining hash from original RLP bytes.
         // Three cases depending on ummRoot presence:
@@ -367,7 +421,7 @@ impl Header {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{Address, B256, U256, Bytes, keccak256};
+    use alloy_primitives::{Address, B256, U256, Bytes, keccak256, b256, address, hex};
     use alloy_rlp::{Decodable, Encodable};
 
     fn standard_test_header() -> Header {
@@ -430,6 +484,55 @@ mod tests {
         assert_eq!(decoded.hash(), decoded.cached_hash.unwrap());
         // For canonical encoding, cached hash equals keccak256(original bytes)
         assert_eq!(decoded.cached_hash.unwrap(), keccak256(&bytes));
+    }
+
+    /// RSK mainnet block #729,024 (first skeleton anchor after orchid):
+    /// post-RSKIP92 the block hash excludes the merged-mining merkle proof
+    /// and coinbase tx. Groundtruth hash from public-node.rsk.co.
+    #[test]
+    fn test_rskip92_block_hash_excludes_proof_and_coinbase() {
+        let header = Header {
+            parent_hash: b256!("bc878751e68379e4bed22a803dd9b262939b857cd6bc1d665a767911ecc59697"),
+            ommers_hash: b256!("1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347"),
+            beneficiary: address!("07c5446adb392be116f4859a722589f3fa8223e4"),
+            state_root: b256!("9353e92a109be8ea409972a9dc0b16eb8e6b03db731e26f84f5c007843dbb182"),
+            transactions_root: b256!("59dcb4081ee7ca8a7d53532fbcdcba82b631f3e1489efde55c82a93b06c1aaac"),
+            receipts_root: b256!("a70fc9a7d692ac80a46b23dcf81d5928dbdebc8ac097cfdbce2c03301d9e9406"),
+            logs_bloom: Bloom::ZERO,
+            extension_data: None,
+            difficulty: U256::from(0xa406a0050938ca1a7_u128),
+            number: 729_024,
+            gas_limit: U256::from(0x67c280),
+            gas_used: 0,
+            timestamp: 0x5b932ec1,
+            extra_data: Bytes::new(),
+            paid_fees: U256::ZERO,
+            minimum_gas_price: U256::from(0x387ee40),
+            uncle_count: 0,
+            umm_root: None,
+            bitcoin_merged_mining_header: Some(Bytes::from(hex::decode("00000020acdd4738e831d35ebe6645a87753b8b3f039e5f9c65c0400000000000000000085751e2e92e415c18a729c97da426024245e96dd2d79854549874cada2d2b50cc32e935ba11928170c066040").unwrap())),
+            bitcoin_merged_mining_merkle_proof: Some(Bytes::from(hex::decode("933662067ae81cd741330a5c016522ba48fb86623f060554ceaf7e22373cc12496524f3581c075e4b7515ef02c5618df17bf23b714f4f009de2ea39609e3b8f16ae54151c8e73358be6b287d1129df13fd32b128d3fc9b9f872d5a44f8a5ef2bb1254f0ff89566420ab6357c7e11c8607d6f4383b338b9c84191c50fc5e81475a643ee5a693f0116de61f1ff8823c25844416b1f1080d6017ac2a91b66b87bf3b777aa583044084d50a3b5b0902fba0e80b413a039037f353fe301c7c9862056fe78a6f14d21c663b2e556a8eb9c7b3e4b01eaa94e51fe55846d6e7151a72606ba69fa024ae827376734e89eb4e0f7a3f6e08f7cfef5ac21b9ae5fea70fe021d").unwrap())),
+            bitcoin_merged_mining_coinbase_transaction: Some(Bytes::from(hex::decode("00000000000000c08c2bae9460a30c6a03f7a557813a68cebdc1d38c70ffd6363ac537fb20c15d4cbd3de0fd7404d31200000000000000002952534b424c4f434b3aa40e3d3aad7ee477a2f38bd83c6e22413b231f48e0b831214589ecde9fb7e24e00000000").unwrap())),
+            cached_hash: None,
+            cached_hash_for_merged_mining: None,
+        };
+        let expected = b256!("d444f85747420e624055e16285d2fd5a14a38fb1932a378a336d1e39e66e3db1");
+
+        // Re-encode path (programmatically built header).
+        assert_eq!(header.hash(), expected);
+
+        // Wire-decode path: full encoding (with proof + coinbase, as rskj
+        // transmits) must still hash without them.
+        let mut bytes = Vec::new();
+        header.encode(&mut bytes);
+        let mut slice = bytes.as_slice();
+        let decoded = Header::decode_with_hash(&mut slice).expect("decode failed");
+        assert_eq!(decoded.cached_hash, Some(expected));
+        // The wrong (pre-fix) value was keccak over the full encoding.
+        assert_eq!(
+            keccak256(&bytes),
+            b256!("241f1473b749f420fc1dc1d9d398e478fba883c8b2b615ca4591cd3b2b352a8d")
+        );
     }
 
     #[test]
