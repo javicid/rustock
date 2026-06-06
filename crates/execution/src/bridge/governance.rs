@@ -873,7 +873,12 @@ pub fn get_active_federation_creation_block_height<CTX: ContextTr>(
 
 /// Serialize a pending federation as an RLP list of member public keys.
 fn serialize_pending_federation(member_keys: &[Vec<u8>]) -> Vec<u8> {
-    let encoded_keys: Vec<Vec<u8>> = member_keys
+    // rskj PendingFederation.serializeOnlyBtcKeys sorts by the key bytes
+    // (BtcECKey.PUBKEY_COMPARATOR); the keccak of this serialization is the
+    // hash the commit vote must match.
+    let mut sorted = member_keys.to_vec();
+    sorted.sort();
+    let encoded_keys: Vec<Vec<u8>> = sorted
         .iter()
         .map(|k| serialization::rlp_encode_element(k))
         .collect();
