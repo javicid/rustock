@@ -10,7 +10,7 @@
 //! was charged the 25,000 new-account cost, while rskj charges it only until
 //! the first call creates the 0x…01 account node.
 //!
-//! `RskHandler` is `MainnetHandler` with two changes:
+//! `RskHandler` is `MainnetHandler` with three changes:
 //! - after the default `load_accounts` synchronizes the journal spec from the
 //!   config, it pins the JOURNAL spec back to HOMESTEAD. The journal spec only
 //!   governs account semantics (existence-based emptiness, no state clearing);
@@ -21,31 +21,53 @@
 //!   mainnet #892,228 paid dividends to wallets created at
 //!   keccak(rlp([contract, nonce])) and every recipient came out one nonce
 //!   ahead of rskj's.
+//! - before RSKIP453 (lovell700), an INTERNAL create whose constructor ran
+//!   successfully always succeeds (rskj Program.finalizeContractCreation):
+//!   if the code deposit is unpayable or the code exceeds the 0x6000 max
+//!   size, the contract is left with EMPTY code, the constructor's state
+//!   stays committed and the address is pushed — instead of EIP-2's
+//!   out-of-gas. Mainnet #1,071,481 deploys an RNS Deed whose 944,800 gas
+//!   deposit can't fit in the 600,000 tx limit; rskj deploys it codeless
+//!   and the auction proceeds. Top-level deploy transactions are NOT
+//!   affected (rskj TransactionExecutor.createContract throws, like EIP-2).
 
 use revm::context::result::HaltReason;
 use revm::context_interface::journaled_state::account::JournaledAccountTr;
-use revm::context_interface::{ContextTr, JournalTr};
+use revm::context_interface::{Cfg, ContextTr, JournalTr};
+use revm::handler::instructions::InstructionProvider;
 use revm::handler::{
-    CreateFrame, EthFrame, EvmTr, EvmTrError, FrameData, FrameResult, Handler, ItemOrResult,
-    PrecompileProvider,
+    ContextTrDbError, CreateFrame, EthFrame, EvmTr, EvmTrError, FrameData, FrameInitOrResult,
+    FrameResult, Handler, ItemOrResult, PrecompileProvider,
 };
 use revm::interpreter::interpreter::EthInterpreter;
 use revm::interpreter::interpreter_action::FrameInit;
+use revm::interpreter::{CallOutcome, CreateOutcome, InstructionResult, InterpreterAction};
 use revm::primitives::hardfork::SpecId;
+use revm::primitives::{Address, Bytes};
 use revm::state::EvmState;
 
 /// `MainnetHandler` with rskj's eternal-frontier account semantics
 /// (see module docs).
 #[derive(Debug, Clone)]
 pub struct RskHandler<CTX, ERROR, FRAME> {
+    /// Pre-RSKIP453 (lovell700): internal creates with an unpayable code
+    /// deposit deploy with empty code instead of failing.
+    empty_create_on_unpayable_deposit: bool,
     _phantom: core::marker::PhantomData<(CTX, ERROR, FRAME)>,
+}
+
+impl<CTX, ERROR, FRAME> RskHandler<CTX, ERROR, FRAME> {
+    pub fn new(empty_create_on_unpayable_deposit: bool) -> Self {
+        Self {
+            empty_create_on_unpayable_deposit,
+            _phantom: core::marker::PhantomData,
+        }
+    }
 }
 
 impl<CTX, ERROR, FRAME> Default for RskHandler<CTX, ERROR, FRAME> {
     fn default() -> Self {
-        Self {
-            _phantom: core::marker::PhantomData,
-        }
+        Self::new(false)
     }
 }
 
@@ -54,6 +76,10 @@ where
     EVM: EvmTr<
         Context: ContextTr<Journal: JournalTr<State = EvmState>>,
         Frame = EthFrame<EthInterpreter>,
+        Instructions: InstructionProvider<
+            Context = <EVM as EvmTr>::Context,
+            InterpreterTypes = EthInterpreter,
+        >,
         Precompiles: PrecompileProvider<<EVM as EvmTr>::Context>,
     >,
     ERROR: EvmTrError<EVM>,
@@ -70,11 +96,13 @@ where
         Ok(())
     }
 
-    /// The mainnet exec loop with one addition: immediately after a CREATE
-    /// frame is initialized, reset the created account's nonce to 0 (rskj has
-    /// no EIP-161; revm seeds it to 1 from the per-era CfgEnv spec). Must
-    /// happen before the constructor runs — addresses the new contract
-    /// derives via CREATE depend on its current nonce.
+    /// The mainnet exec loop with two additions:
+    /// - immediately after a CREATE frame is initialized, reset the created
+    ///   account's nonce to 0 (rskj has no EIP-161; revm seeds it to 1 from
+    ///   the per-era CfgEnv spec). Must happen before the constructor runs —
+    ///   addresses the new contract derives via CREATE depend on its nonce.
+    /// - frames run through `rsk_frame_run`, which applies the pre-RSKIP453
+    ///   empty-deploy quirk to internal creates.
     fn run_exec_loop(
         &mut self,
         evm: &mut Self::Evm,
@@ -87,24 +115,176 @@ where
         zero_created_contract_nonce(evm);
 
         loop {
-            let call_or_result = evm.frame_run()?;
+            let call_or_result = rsk_frame_run(evm, self.empty_create_on_unpayable_deposit)?;
 
             let result = match call_or_result {
-                ItemOrResult::Item(init) => match evm.frame_init(init)? {
-                    ItemOrResult::Item(_) => {
-                        zero_created_contract_nonce(evm);
-                        continue;
+                ItemOrResult::Item(init) => {
+                    if *TRACE_FRAMES {
+                        trace_frame_init(&init);
                     }
-                    // Do not pop the frame since no new frame was created
-                    ItemOrResult::Result(result) => result,
-                },
+                    match evm.frame_init(init)? {
+                        ItemOrResult::Item(_) => {
+                            zero_created_contract_nonce(evm);
+                            continue;
+                        }
+                        // Do not pop the frame since no new frame was created
+                        ItemOrResult::Result(result) => result,
+                    }
+                }
                 ItemOrResult::Result(result) => result,
             };
+            if *TRACE_FRAMES {
+                tracing::debug!(
+                    "FRAME RESULT {:?} gas_remaining={} gas_spent={}",
+                    result.instruction_result(),
+                    result.gas().remaining(),
+                    result.gas().spent(),
+                );
+            }
 
             if let Some(result) = evm.frame_return_result(result)? {
                 return Ok(result);
             }
         }
+    }
+}
+
+/// `EvmTr::frame_run` with the create-return path replaced by
+/// `rsk_return_create` (same shape as revm's default implementation).
+fn rsk_frame_run<EVM>(
+    evm: &mut EVM,
+    empty_create_on_unpayable_deposit: bool,
+) -> Result<FrameInitOrResult<EthFrame<EthInterpreter>>, ContextTrDbError<EVM::Context>>
+where
+    EVM: EvmTr<
+        Context: ContextTr<Journal: JournalTr<State = EvmState>>,
+        Frame = EthFrame<EthInterpreter>,
+        Instructions: InstructionProvider<
+            Context = <EVM as EvmTr>::Context,
+            InterpreterTypes = EthInterpreter,
+        >,
+    >,
+{
+    let (ctx, instructions, _precompiles, frame_stack) = evm.all_mut();
+    let frame = frame_stack.get();
+
+    let action = frame
+        .interpreter
+        .run_plain(instructions.instruction_table(), ctx);
+
+    let mut interpreter_result = match action {
+        InterpreterAction::NewFrame(frame_input) => {
+            return Ok(ItemOrResult::Item(FrameInit {
+                frame_input,
+                depth: frame.depth + 1,
+                memory: frame.interpreter.memory.new_child_context(),
+            }));
+        }
+        InterpreterAction::Return(result) => result,
+    };
+
+    let result = match &frame.data {
+        FrameData::Call(call) => {
+            if interpreter_result.result.is_ok() {
+                ctx.journal_mut().checkpoint_commit();
+            } else {
+                ctx.journal_mut().checkpoint_revert(frame.checkpoint);
+            }
+            ItemOrResult::Result(FrameResult::Call(CallOutcome::new(
+                interpreter_result,
+                call.return_memory_range.clone(),
+            )))
+        }
+        FrameData::Create(create) => {
+            // The empty-deploy quirk applies only to INTERNAL creates
+            // (depth > 0); top-level deploy transactions fail like EIP-2
+            // in rskj too.
+            if empty_create_on_unpayable_deposit && frame.depth > 0 {
+                rsk_return_create(
+                    ctx,
+                    frame.checkpoint,
+                    &mut interpreter_result,
+                    create.created_address,
+                );
+            } else {
+                let (cfg, journal) = ctx.cfg_journal_mut();
+                revm::handler::return_create(
+                    journal,
+                    cfg,
+                    frame.checkpoint,
+                    &mut interpreter_result,
+                    create.created_address,
+                );
+            }
+            ItemOrResult::Result(FrameResult::Create(CreateOutcome::new(
+                interpreter_result,
+                Some(create.created_address),
+            )))
+        }
+    };
+    frame.set_finished(true);
+    Ok(result)
+}
+
+/// rskj `Program.finalizeContractCreation` before RSKIP453: a constructor
+/// that ran successfully always deploys. An unpayable code deposit or
+/// over-max-size code (0x6000, rskj Constants.MAX_CONTRACT_SIZE) leaves the
+/// contract with EMPTY code — without charging the deposit — while the
+/// constructor's state changes stay committed and the address is returned.
+fn rsk_return_create<CTX: ContextTr>(
+    ctx: &mut CTX,
+    checkpoint: revm::context_interface::journaled_state::JournalCheckpoint,
+    interpreter_result: &mut revm::interpreter::InterpreterResult,
+    address: Address,
+) {
+    let (cfg, journal) = ctx.cfg_journal_mut();
+    if !interpreter_result.result.is_ok() {
+        journal.checkpoint_revert(checkpoint);
+        return;
+    }
+
+    let code_len = interpreter_result.output.len();
+    let oversize = code_len > cfg.max_code_size();
+    let deposit = cfg.gas_params().code_deposit_cost(code_len);
+    // Short-circuit keeps the deposit uncharged in the oversize case, like
+    // rskj (the exception set by either check skips spendGas + saveCode).
+    if oversize || !interpreter_result.gas.record_cost(deposit) {
+        interpreter_result.output = Bytes::new();
+    }
+
+    journal.checkpoint_commit();
+    journal.set_code(
+        address,
+        revm::state::Bytecode::new_legacy(interpreter_result.output.clone()),
+    );
+    interpreter_result.result = InstructionResult::Return;
+}
+
+/// Divergence-hunt diagnostic (env-gated): log every sub-frame's input and
+/// result during execution.
+static TRACE_FRAMES: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("RUSTOCK_TRACE_FRAMES").is_some());
+
+fn trace_frame_init(init: &FrameInit) {
+    use revm::interpreter::interpreter_action::FrameInput;
+    match &init.frame_input {
+        FrameInput::Call(c) => tracing::debug!(
+            "FRAME CALL depth={} target={} caller={} scheme={:?} gas_limit={} input_len={}",
+            init.depth,
+            c.target_address,
+            c.caller,
+            c.scheme,
+            c.gas_limit,
+            c.input.len(),
+        ),
+        FrameInput::Create(c) => tracing::debug!(
+            "FRAME CREATE depth={} caller={} scheme={:?} gas_limit={}",
+            init.depth,
+            c.caller(),
+            c.scheme(),
+            c.gas_limit(),
+        ),
+        FrameInput::Empty => {}
     }
 }
 

@@ -221,6 +221,13 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Fingerroot500
     }
 
+    /// RSKIP453: internal creates with an unpayable code deposit (or
+    /// over-max-size code) FAIL instead of deploying with empty code
+    /// (Lovell700).
+    pub fn has_rskip453(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Lovell700
+    }
+
     /// RSKIP434: lifts the BTC chainwork-overflow header block (Arrowhead631).
     pub fn has_rskip434(&self, block_number: u64) -> bool {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Arrowhead631

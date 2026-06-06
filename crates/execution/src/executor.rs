@@ -105,7 +105,9 @@ impl RskExecutor {
             use revm::context::ContextSetters;
             use revm::handler::Handler;
             evm.ctx.set_tx(tx_env);
-            let mut handler = crate::rsk_handler::RskHandler::default();
+            let mut handler = crate::rsk_handler::RskHandler::new(
+                !self.hardfork_cfg.has_rskip453(header.number),
+            );
             let out = handler
                 .run(&mut evm)
                 .map_err(|e: revm::context::result::EVMError<_>| {
@@ -336,7 +338,9 @@ impl RskExecutor {
                 use revm::context::ContextSetters;
                 use revm::handler::Handler;
                 evm.ctx.set_tx(tx_env);
-                let mut handler = crate::rsk_handler::RskHandler::default();
+                let mut handler = crate::rsk_handler::RskHandler::new(
+                !self.hardfork_cfg.has_rskip453(header.number),
+            );
                 handler
                     .run(&mut evm)
                     .map_err(|e: revm::context::result::EVMError<_>| {
@@ -734,6 +738,108 @@ mod tests {
             Address::from_slice(&slot0.present_value.to_be_bytes::<32>()[12..]),
             expected_child,
             "CREATE inside a freshly deployed contract must use nonce 0"
+        );
+    }
+
+    /// Regression for mainnet #1,071,481: before RSKIP453 (lovell700) an
+    /// INTERNAL create whose constructor succeeds always deploys — an
+    /// unpayable code deposit leaves the contract with EMPTY code, the
+    /// constructor state committed and the address pushed (rskj
+    /// Program.finalizeContractCreation), instead of EIP-2's out-of-gas.
+    /// The RNS registrar deploys a Deed whose 944,800-gas deposit cannot
+    /// fit in the 600,000 tx limit; rskj deploys it codeless and the
+    /// auction proceeds (tx gas 259,460, status success).
+    #[test]
+    fn test_pre_rskip453_internal_create_with_unpayable_deposit_deploys_empty() {
+        // Child initcode: RETURN(0, 0x10000) — 65,536 zero bytes of "code",
+        // deposit 13.1M gas, unpayable within the 1M tx limit.
+        // Caller runtime: MSTORE initcode; CREATE; SSTORE(0, address).
+        let runtime: Vec<u8> = vec![
+            0x66, 0x62, 0x01, 0x00, 0x00, 0x60, 0x00, 0xf3, // PUSH7 initcode
+            0x60, 0x00, 0x52, // MSTORE at word 0
+            0x60, 0x07, 0x60, 0x19, 0x60, 0x00, 0xf0, // CREATE(0, 25, 7)
+            0x60, 0x00, 0x55, // SSTORE(0, created)
+            0x00,
+        ];
+        let mut init = vec![
+            0x60, 0x15, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, 0x15, 0x60, 0x00, 0xf3,
+        ];
+        init.extend_from_slice(&runtime);
+
+        let run_at = |block: u64, init: Vec<u8>| {
+            let store = Arc::new(MemoryTrieStore::new());
+            let root = TrieNode::empty();
+            let sender = Address::repeat_byte(0xAA);
+            let one_rbtc = U256::from(10u64).pow(U256::from(18));
+            let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+
+            let deploy = rustock_core::Transaction {
+                nonce: 0,
+                gas_price: U256::from(0),
+                gas_limit: U256::from(1_000_000),
+                to: Bytes::new(),
+                value: U256::ZERO,
+                input: Bytes::from(init),
+                v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+            };
+            let header1 = dummy_header(block);
+            let r1 = executor
+                .execute_block(&header1, &[(deploy, sender)], &root, store.clone())
+                .expect("deploy block");
+            assert!(r1.tx_results[0].success);
+            let root2 =
+                crate::state::apply_state_changes(&root, store.as_ref(), &r1.state_changes);
+
+            let caller = sender.create(0);
+            let call = rustock_core::Transaction {
+                nonce: 1,
+                gas_price: U256::from(0),
+                gas_limit: U256::from(1_000_000),
+                to: Bytes::copy_from_slice(caller.as_slice()),
+                value: U256::ZERO,
+                input: Bytes::new(),
+                v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+            };
+            let header2 = dummy_header(block + 1);
+            let r2 = executor
+                .execute_block(&header2, &[(call, sender)], &root2, store.clone())
+                .expect("create block");
+            let slot0 = r2.state_changes.get(&caller).and_then(|a| {
+                a.storage.get(&U256::ZERO).map(|s| s.present_value)
+            });
+            (caller, slot0, r2)
+        };
+
+        // Pre-RSKIP453: the create "succeeds" — address pushed, empty code.
+        let (caller, slot0, r2) = run_at(1_071_481, init.clone());
+        assert!(r2.tx_results[0].success);
+        let child = caller.create(0);
+        assert_eq!(
+            Address::from_slice(&slot0.expect("slot 0 written").to_be_bytes::<32>()[12..]),
+            child,
+            "unpayable deposit must still deploy (empty code) pre-RSKIP453"
+        );
+        let child_acct = r2.state_changes.get(&child).expect("child account exists");
+        assert!(
+            child_acct
+                .info
+                .code
+                .as_ref()
+                .map(|c| c.is_empty())
+                .unwrap_or(true),
+            "child must have empty code"
+        );
+
+        // Post-RSKIP453 (lovell700): EIP-2/EIP-170 semantics — the failed
+        // create consumes the forwarded gas (no 63/64 in RSK) and the
+        // caller goes out of gas with it.
+        let (_, _, r2) = run_at(7_338_024, init);
+        assert!(
+            !r2.tx_results[0].success,
+            "unpayable/oversize deposit must fail post-RSKIP453"
         );
     }
 
