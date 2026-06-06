@@ -121,8 +121,32 @@ pub fn resolve_state_root(block_param: &str, state: &RpcState) -> Option<(TrieNo
     let trie_store = state.trie_store.as_ref()?;
     let store = &state.store;
 
-    let header = resolve_header(block_param, store)?;
-    let root_hash = header.state_root;
+    // State queries against "latest" must use the EXECUTED head — the
+    // download head can be far ahead and its state doesn't exist yet.
+    // Fall back to the chain head when no exec head is tracked.
+    let header = match block_param {
+        "latest" | "pending" => store
+            .exec_head()
+            .ok()
+            .flatten()
+            .and_then(|(exec_hash, _)| store.header(exec_hash).ok().flatten())
+            .or_else(|| resolve_header(block_param, store))?,
+        _ => resolve_header(block_param, store)?,
+    };
+
+    // Pre-RSKIP126 (wasabi100) headers carry the legacy Ethereum-style state
+    // root, which doesn't exist in the Unitrie store. For the executed head
+    // the Unitrie root is tracked alongside it; older pre-wasabi blocks
+    // cannot be resolved.
+    let root_hash = if trie_store.get(header.state_root.as_slice()).is_some() {
+        header.state_root
+    } else {
+        let (exec_hash, exec_root) = store.exec_head().ok().flatten()?;
+        if exec_hash != header.hash() {
+            return None;
+        }
+        exec_root
+    };
 
     let root_data = trie_store.get(root_hash.as_slice())?;
     let root_node = TrieNode::from_message(&root_data, &**trie_store);
