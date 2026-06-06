@@ -406,17 +406,17 @@ fn federation_rsk_addresses<CTX: ContextTr>(
     config: &RemascConfig,
     bridge_config: &crate::bridge::constants::BridgeConstants,
     hardfork_cfg: &crate::hardfork::RskHardforkConfig,
+    processing_block_number: u64,
 ) -> Vec<Address> {
     // The Bridge account may be cold outside revm's transact flow; journal
     // storage reads require the account to be loaded.
     use revm::context_interface::JournalTr;
     let _ = ctx.journal_mut().load_account(crate::precompiles::BRIDGE_ADDR);
-    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
     let stored = crate::bridge::peg::federation_keys_or_genesis(
         ctx,
         bridge_config,
         hardfork_cfg,
-        block_number,
+        processing_block_number,
     );
     let _ = config;
     stored
@@ -435,6 +435,7 @@ fn pay_to_federation<CTX: ContextTr>(
     bridge_config: &crate::bridge::constants::BridgeConstants,
     hardfork_cfg: &crate::hardfork::RskHardforkConfig,
     processing_block_hash: alloy_primitives::B256,
+    processing_block_number: u64,
     current_number: u64,
     synthetic_reward: U256,
 ) -> U256 {
@@ -442,7 +443,18 @@ fn pay_to_federation<CTX: ContextTr>(
     let fed_key = remasc_storage_key(FEDERATION_BALANCE_KEY);
     let pay_total = remasc_sload(ctx, fed_key) + federation_reward;
 
-    let federators = federation_rsk_addresses(ctx, config, bridge_config, hardfork_cfg);
+    // rskj builds the REMASC FederationSupport with the PROCESSING block
+    // (the matured one): the federation is resolved at that height, so a
+    // newly committed federation is paid only once the processing block
+    // itself passes the activation age (mainnet #667,426 still paid the
+    // genesis federation).
+    let federators = federation_rsk_addresses(
+        ctx,
+        config,
+        bridge_config,
+        hardfork_cfg,
+        processing_block_number,
+    );
     if federators.is_empty() {
         remasc_sstore(ctx, fed_key, pay_total);
         return federation_reward;
@@ -554,6 +566,7 @@ pub fn process_miners_fees<CTX: ContextTr>(
             bridge_config,
             hardfork_cfg,
             processing_hash,
+            candidate_block_number,
             current_number,
             remaining,
         );
