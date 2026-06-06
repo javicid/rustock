@@ -655,6 +655,68 @@ mod tests {
         );
     }
 
+    /// Regression for mainnet #764,123: addLockWhitelistAddress is disabled
+    /// post-RSKIP87 (orchid), so rskj's parseData returns null. The gas is
+    /// the flat releaseBtc cost (23,000, no data cost) and — although
+    /// RSKIP88 makes execute() throw — a direct transaction records SUCCESS
+    /// with empty output because TransactionExecutor spends only
+    /// requiredGas + basicTxCost and go() (vm == null) just commits.
+    /// Real receipt: status 0x1, gasUsed 47,408 (21,000 + 3,408 + 23,000).
+    #[test]
+    fn test_disabled_bridge_method_post_rskip87_charges_flat_cost() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+
+        let sender = Address::from_slice(
+            &alloy_primitives::hex::decode("6ba9d41b07da470fe340cbd439a42538795eb75b").unwrap(),
+        );
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+
+        // addLockWhitelistAddress("1HqQJ9PxdG51NmFij43bBUrmQRDULbnSzW", 1 gwei)
+        let input = alloy_primitives::hex::decode(
+            "502bbbce0000000000000000000000000000000000000000000000000000000000000040\
+             000000000000000000000000000000000000000000000000000000003b9aca00\
+             0000000000000000000000000000000000000000000000000000000000000022\
+             314871514a395078644735314e6d46696a3433624255726d515244554c626e53\
+             7a57000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap();
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(1_000_000),
+            to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::from(input),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+
+        let block_store =
+            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+
+        let header = dummy_header(764_123);
+        let result = executor
+            .execute_block(&header, &[(tx, sender)], &root, store.clone())
+            .expect("block executes");
+        assert!(result.tx_results[0].success, "receipt records SUCCESS");
+        assert_eq!(
+            result.tx_results[0].gas_used, 47_408,
+            "flat releaseBtc cost, no data cost, no method cost"
+        );
+        // The disabled method must NOT execute: no bridge storage writes.
+        if let Some(bridge) = result.state_changes.get(&crate::precompiles::BRIDGE_ADDR) {
+            assert!(
+                bridge.storage.is_empty(),
+                "disabled method must not touch bridge storage"
+            );
+        }
+    }
+
     /// Regression for mainnet #466,503: rskj charges NEW_ACCT_CALL (25,000)
     /// on trie EXISTENCE — the first-ever internal call to a precompile
     /// creates its account node (zero-value transfer), so the charge applies
@@ -2644,12 +2706,26 @@ mod tests {
     }
 
     /// Ported from rskj BridgeTest.getEstimatedFeesForPegOutAmount_preRSKIP540__shouldThrowVMException.
+    /// The VMException is invisible in a DIRECT transaction's receipt:
+    /// TransactionExecutor spends only requiredGas (flat 23,000 for the
+    /// disabled-method parse failure) + basicTxCost and records SUCCESS
+    /// (see mainnet #764,123 for the same pattern with RSKIP87).
     #[test]
     fn test_rskip540_estimated_fees_for_pegout_amount_disabled_before_vetiver900() {
         // 0.004 BTC (mainnet minimum) in wei — valid amount, but method not enabled yet.
         let amount = U256::from(400_000u64) * U256::from(10_000_000_000u64);
         let result = call_estimated_fees_for_pegout_amount(8_804_199, amount);
-        assert!(!result.success, "method must not exist before vetiver900");
+        assert!(result.success, "rskj throws, but a direct tx records SUCCESS");
+
+        // Flat parse-failure cost, no method execution: intrinsic (RSKIP400
+        // calldata prices at this height) + 23,000.
+        let mut input = vec![0u8; 36];
+        input[..4].copy_from_slice(&block_header_selector(
+            "getEstimatedFeesForPegOutAmount(uint256)",
+        ));
+        input[4..36].copy_from_slice(&amount.to_be_bytes::<32>());
+        let data_gas: u64 = input.iter().map(|b| if *b == 0 { 4 } else { 16 }).sum();
+        assert_eq!(result.gas_used, 21_000 + data_gas + 23_000);
     }
 
     /// Ported from rskj BridgeTest.getEstimatedFeesForPegOutAmount_afterRSKIP540_shouldExecute.
@@ -2670,7 +2746,8 @@ mod tests {
 
     /// Regression for mainnet block #2646 (gas used mismatch 31280 vs 31272):
     /// rskj Bridge.getGasForData charges functionCost + data.length * 2.
-    /// getNextPegoutCreationBlockNumber: 21000 + 4*68 + 3000 + 4*2 = 24280.
+    /// voteFeePerKbChange (enabled at every era):
+    /// 21000 + 4*68 + 30*4 + 2*68 + 10000 + 36*2 = 31600.
     #[test]
     fn test_bridge_call_charges_rskj_data_cost() {
         let store = Arc::new(MemoryTrieStore::new());
@@ -2681,20 +2758,24 @@ mod tests {
         let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
         let header = dummy_header(2_646);
 
+        let mut input = vec![0x04, 0x61, 0x31, 0x3e]; // voteFeePerKbChange(int256)
+        let mut value = [0u8; 32];
+        value[30..].copy_from_slice(&30_000u16.to_be_bytes());
+        input.extend_from_slice(&value);
         let tx = rustock_core::Transaction {
             nonce: 0,
             gas_price: U256::from(0),
             gas_limit: U256::from(100_000),
             to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
             value: U256::ZERO,
-            input: Bytes::from(block_header_selector("getNextPegoutCreationBlockNumber()").to_vec()),
+            input: Bytes::from(input),
             v: 28, r: U256::from(1), s: U256::from(1), cached_rlp: None,
         };
 
         let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
         let result = executor.execute_tx(&header, &tx, sender, &root, store).unwrap();
         assert!(result.success);
-        assert_eq!(result.gas_used, 24_280, "functionCost 3000 + data cost 4*2");
+        assert_eq!(result.gas_used, 31_600, "functionCost 10000 + data cost 36*2");
     }
 
     // -----------------------------------------------------------------------
@@ -2829,9 +2910,9 @@ mod tests {
 
     /// Regression for mainnet block #3307: before RSKIP136 (bahamas, 3_397)
     /// rskj checks the limit against the precompile cost alone and records
-    /// gasUsed = precompileCost + intrinsicCost — above the 30_000 limit.
-    /// getNextPegoutCreationBlockNumber: 21272 + 3000 + 8 = 24280 with a
-    /// 23_000 limit (>= required 3008, < total).
+    /// gasUsed = precompileCost + intrinsicCost — above the tx gas limit.
+    /// voteFeePerKbChange: 21528 + 10000 + 72 = 31600 with a 25_000 limit
+    /// (>= required 10_072, < total).
     #[test]
     fn test_pre_rskip136_bridge_gas_exceeds_limit() {
         let store = Arc::new(MemoryTrieStore::new());
@@ -2841,20 +2922,24 @@ mod tests {
         let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
         let header = dummy_header(3_307);
 
+        let mut input = vec![0x04, 0x61, 0x31, 0x3e]; // voteFeePerKbChange(int256)
+        let mut value = [0u8; 32];
+        value[30..].copy_from_slice(&30_000u16.to_be_bytes());
+        input.extend_from_slice(&value);
         let tx = rustock_core::Transaction {
             nonce: 0,
             gas_price: U256::from(0),
-            gas_limit: U256::from(23_000), // below total 24_280, above required 3_008
+            gas_limit: U256::from(25_000), // below total 31_600, above required 10_072
             to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
             value: U256::ZERO,
-            input: Bytes::from(block_header_selector("getNextPegoutCreationBlockNumber()").to_vec()),
+            input: Bytes::from(input),
             v: 28, r: U256::from(1), s: U256::from(1), cached_rlp: None,
         };
 
         let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
         let result = executor.execute_block(&header, &[(tx, sender)], &root, store).unwrap();
         assert!(result.tx_results[0].success);
-        assert_eq!(result.tx_results[0].gas_used, 24_280, "gasUsed exceeds the tx gas limit pre-RSKIP136");
+        assert_eq!(result.tx_results[0].gas_used, 31_600, "gasUsed exceeds the tx gas limit pre-RSKIP136");
     }
 
     /// getCoinbaseAddress at depth 1 returns the grandparent's coinbase.

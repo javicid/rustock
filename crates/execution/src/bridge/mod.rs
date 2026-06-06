@@ -68,6 +68,86 @@ pub struct BridgeMethodInfo {
     pub selector: [u8; 4],
     pub gas_cost: BridgeGasCost,
     pub permission: BridgePermission,
+    pub enabled: BridgeMethodEnabled,
+}
+
+/// rskj `BridgeMethods` isEnabled: methods appear/disappear at hardforks.
+/// A disabled method's selector is a parse failure (rskj parseData → null).
+#[derive(Debug, Clone, Copy)]
+pub enum BridgeMethodEnabled {
+    Always,
+    /// Enabled from the given network upgrade onwards.
+    Since(crate::hardfork::RskNetworkUpgrade),
+    /// Enabled only BEFORE the given network upgrade (legacy methods).
+    Until(crate::hardfork::RskNetworkUpgrade),
+}
+
+impl BridgeMethodEnabled {
+    pub fn is_enabled(&self, hardfork_cfg: &RskHardforkConfig, block_number: u64) -> bool {
+        match self {
+            Self::Always => true,
+            Self::Since(u) => hardfork_cfg.active_upgrade(block_number) >= *u,
+            Self::Until(u) => hardfork_cfg.active_upgrade(block_number) < *u,
+        }
+    }
+}
+
+/// rskj BridgeMethods activation lambdas, mapped through reference.conf
+/// (rskip87/89=orchid, rskip122/123=wasabi100, rskip134/143=papyrus200,
+/// rskip176/186/200/220=iris300, rskip271/293=hop400, rskip419=lovell700,
+/// rskip540=vetiver900).
+fn method_enabled(name: &str) -> BridgeMethodEnabled {
+    use crate::hardfork::RskNetworkUpgrade::*;
+    use BridgeMethodEnabled::*;
+    match name {
+        // !RSKIP87 / !RSKIP89
+        "addLockWhitelistAddress" | "getBtcBlockchainBlockLocator" => Until(Orchid),
+        // RSKIP87 / RSKIP89
+        "addOneOffLockWhitelistAddress"
+        | "addUnlimitedLockWhitelistAddress"
+        | "getLockWhitelistEntryByAddress"
+        | "getBtcBlockchainInitialBlockHeight"
+        | "getBtcBlockchainBlockHashAtDepth" => Since(Orchid),
+        // !RSKIP123
+        "addFederatorPublicKey"
+        | "getFederatorPublicKey"
+        | "getPendingFederatorPublicKey"
+        | "getRetiringFederatorPublicKey" => Until(Wasabi100),
+        // RSKIP122 / RSKIP123
+        "addFederatorPublicKeyMultikey"
+        | "getFederatorPublicKeyOfType"
+        | "getPendingFederatorPublicKeyOfType"
+        | "getRetiringFederatorPublicKeyOfType"
+        | "getBtcTransactionConfirmations" => Since(Wasabi100),
+        // RSKIP134 / RSKIP143
+        "getLockingCap"
+        | "increaseLockingCap"
+        | "registerBtcCoinbaseTransaction"
+        | "hasBtcBlockCoinbaseTransactionInformation" => Since(Papyrus200),
+        // RSKIP176 / RSKIP186 / RSKIP200 / RSKIP220
+        "registerFastBridgeBtcTransaction"
+        | "getActiveFederationCreationBlockHeight"
+        | "receiveHeader"
+        | "getBtcBlockchainBestBlockHeader"
+        | "getBtcBlockchainBlockHeaderByHash"
+        | "getBtcBlockchainBlockHeaderByHeight"
+        | "getBtcBlockchainParentBlockHeaderByHash" => Since(Iris300),
+        // RSKIP271 / RSKIP293
+        "getNextPegoutCreationBlockNumber"
+        | "getQueuedPegoutsCount"
+        | "getEstimatedFeesForNextPegOutEvent"
+        | "getActivePowpegRedeemScript" => Since(Hop400),
+        // RSKIP419
+        "getProposedFederationAddress"
+        | "getProposedFederationSize"
+        | "getProposedFederationCreationTime"
+        | "getProposedFederationCreationBlockNumber"
+        | "getProposedFederatorPublicKeyOfType"
+        | "getStateForSvpClient" => Since(Lovell700),
+        // RSKIP540
+        "getEstimatedFeesForPegOutAmount" => Since(Vetiver900),
+        _ => Always,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -178,6 +258,7 @@ fn build_method_table() -> Vec<BridgeMethodInfo> {
             selector: compute_selector(sig),
             gas_cost: gas,
             permission: perm,
+            enabled: method_enabled(name),
         })
         .collect()
 }
@@ -228,22 +309,34 @@ pub fn execute_bridge<CTX: ContextTr>(
         return execute_method(ctx, "releaseBtc", &[], gas_cost, config, block_store, use_v2, hardfork_cfg, tx_ctx);
     }
 
-    // rskj Bridge.parseData: 1-3 byte data or an unknown selector is a parse
-    // failure. Before RSKIP88 (orchid) execute() returns null — the tx
-    // SUCCEEDS, charged the flat releaseBtc cost without executing anything
-    // (mainnet #648,914 sent ASCII text as calldata). Afterwards it throws.
+    // rskj Bridge.parseData: 1-3 byte data, an unknown selector, or a method
+    // not enabled at this block is a parse failure. Before RSKIP88 (orchid)
+    // execute() returns null — the tx SUCCEEDS, charged the flat releaseBtc
+    // cost without executing anything (mainnet #648,914 sent ASCII text as
+    // calldata). Afterwards it throws BridgeIllegalArgumentException.
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
     let parsed = if input.len() < 4 {
         None
     } else {
         find_bridge_method(&[input[0], input[1], input[2], input[3]])
+            .filter(|m| m.enabled.is_enabled(hardfork_cfg, block_number))
     };
     let Some(method) = parsed else {
-        let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+        let gas_cost = 23_000u64; // BridgeMethods.RELEASE_BTC cost, no data cost
+        if gas_limit < gas_cost {
+            return Err(PrecompileError::OutOfGas);
+        }
         if !hardfork_cfg.has_rskip88(block_number) {
-            let gas_cost = 23_000u64; // BridgeMethods.RELEASE_BTC cost, no data cost
-            if gas_limit < gas_cost {
-                return Err(PrecompileError::OutOfGas);
-            }
+            return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
+        }
+        // Post-RSKIP88 rskj throws — but for a direct transaction the
+        // exception is invisible: TransactionExecutor.call() spends only
+        // requiredGas + basicTxCost and go() (vm == null) commits, so the
+        // receipt is SUCCESS with empty output and no logs (mainnet
+        // #764,123 calls the post-RSKIP87-disabled addLockWhitelistAddress).
+        // Only internal calls observe the failure.
+        use revm::context_interface::JournalTr;
+        if ctx.journal().depth() == 1 {
             return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
         }
         return Err(PrecompileError::other("Bridge: invalid calldata"));
@@ -276,13 +369,15 @@ pub fn bridge_call_gas_cost<CTX: ContextTr>(
     if input.len() < 4 {
         return Ok(23_000);
     }
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
     let selector = [input[0], input[1], input[2], input[3]];
-    let Some(method) = find_bridge_method(&selector) else {
+    let Some(method) = find_bridge_method(&selector)
+        .filter(|m| m.enabled.is_enabled(hardfork_cfg, block_number))
+    else {
         return Ok(23_000);
     };
 
     let args = &input[4..];
-    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
 
     let function_cost = match method.gas_cost {
         BridgeGasCost::Fixed(c) => c,
