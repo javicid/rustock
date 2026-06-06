@@ -227,9 +227,15 @@ pub fn register_btc_transaction<CTX: ContextTr>(
         })
     });
     if is_pegout {
-        register_new_utxos(ctx, &btc_tx, &fed_script);
+        let active_utxo_key = active_federation_utxo_key(ctx, config, hardfork_cfg, rsk_height);
+        register_federation_outputs(ctx, &btc_tx, &fed_script, active_utxo_key);
         if let Some((_, retiring_script)) = &retiring {
-            register_old_federation_utxos(ctx, &btc_tx, retiring_script);
+            register_federation_outputs(
+                ctx,
+                &btc_tx,
+                retiring_script,
+                super::storage::OLD_FEDERATION_BTC_UTXOS_KEY,
+            );
         }
         set_btc_tx_processed(ctx, &btc_tx_hash, rsk_height);
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
@@ -379,10 +385,17 @@ pub fn register_btc_transaction<CTX: ContextTr>(
     }
 
     // rskj registerNewUtxos: outputs paying the active federation feed the
-    // NEW UTXO set; outputs paying the retiring federation feed the OLD set.
-    register_new_utxos(ctx, &btc_tx, &fed_script);
+    // set that backs it (the OLD set while a committed federation awaits
+    // activation); outputs paying the retiring federation feed the OLD set.
+    let active_utxo_key = active_federation_utxo_key(ctx, config, hardfork_cfg, rsk_height);
+    register_federation_outputs(ctx, &btc_tx, &fed_script, active_utxo_key);
     if let Some((_, retiring_script)) = &retiring {
-        register_old_federation_utxos(ctx, &btc_tx, retiring_script);
+        register_federation_outputs(
+            ctx,
+            &btc_tx,
+            retiring_script,
+            super::storage::OLD_FEDERATION_BTC_UTXOS_KEY,
+        );
     }
 
     // Mark as processed
@@ -433,40 +446,13 @@ fn whitelist_allows_and_consume<CTX: ContextTr>(
     load_unlimited_whitelist(ctx).contains(sender_hash160)
 }
 
-/// Outputs paying the RETIRING federation register into the OLD UTXO set.
-fn register_old_federation_utxos<CTX: ContextTr>(
-    ctx: &mut CTX,
-    btc_tx: &BtcTransaction,
-    retiring_script: &bitcoin::ScriptBuf,
-) {
-    let new_utxos: Vec<BridgeUtxo> = btc_tx
-        .output
-        .iter()
-        .enumerate()
-        .filter(|(_, o)| o.script_pubkey == *retiring_script)
-        .map(|(index, o)| BridgeUtxo {
-            tx_hash: btc_txid_event_bytes(btc_tx),
-            vout: index as u32,
-            value_satoshis: o.value.to_sat(),
-            height: 0,
-            script: o.script_pubkey.to_bytes(),
-            coinbase: btc_tx.is_coinbase(),
-        })
-        .collect();
-    if new_utxos.is_empty() {
-        return;
-    }
-    let mut utxos = super::storage::load_old_federation_utxos(ctx);
-    utxos.extend(new_utxos);
-    super::storage::store_old_federation_utxos(ctx, &utxos);
-}
-
 /// rskj `BridgeSupport.registerNewUtxos`: register every output paying the
-/// active federation as a federation UTXO (height 0, original scriptPubKey).
-fn register_new_utxos<CTX: ContextTr>(
+/// given federation script into the given UTXO storage set.
+fn register_federation_outputs<CTX: ContextTr>(
     ctx: &mut CTX,
     btc_tx: &BtcTransaction,
     fed_script: &bitcoin::ScriptBuf,
+    utxo_key: &str,
 ) {
     let new_utxos: Vec<BridgeUtxo> = btc_tx
         .output
@@ -485,9 +471,9 @@ fn register_new_utxos<CTX: ContextTr>(
     if new_utxos.is_empty() {
         return;
     }
-    let mut utxos = load_federation_utxos(ctx);
+    let mut utxos = load_utxos_at(ctx, utxo_key);
     utxos.extend(new_utxos);
-    store_federation_utxos(ctx, &utxos);
+    store_utxos_at(ctx, utxo_key, &utxos);
 }
 
 // ---------------------------------------------------------------------------
@@ -786,7 +772,9 @@ pub fn update_collections<CTX: ContextTr>(
                 let fee_per_kb = get_effective_fee_per_kb(ctx, config);
                 let tx_version = if hardfork_cfg.has_rskip201(block_number) { 2 } else { 1 };
 
-                let mut available = load_federation_utxos(ctx);
+                let active_utxo_key =
+                    active_federation_utxo_key(ctx, config, hardfork_cfg, block_number);
+                let mut available = load_utxos_at(ctx, active_utxo_key);
                 let waiting_key = bridge_storage_key(PEGOUTS_WAITING_FOR_CONFIRMATIONS_KEY);
                 let existing_data = bridge_load_bytes(ctx, waiting_key);
                 let mut waiting =
@@ -912,7 +900,7 @@ pub fn update_collections<CTX: ContextTr>(
                     let updated =
                         serialize_pegouts_waiting_for_confirmations(&waiting, use_tx_hash);
                     bridge_store_bytes(ctx, waiting_key, &updated);
-                    store_federation_utxos(ctx, &available);
+                    store_utxos_at(ctx, active_utxo_key, &available);
                 }
             }
         }
@@ -1097,6 +1085,34 @@ pub(crate) fn federation_keys_or_genesis<CTX: ContextTr>(
         (Some(n), None) => n.keys,
         (None, _) => genesis_federation_keys(config),
     }
+}
+
+/// Which UTXO storage set backs the ACTIVE federation: after a commit and
+/// until activation the active federation IS the old one, whose UTXOs were
+/// moved to oldFederationBtcUTXOs (rskj getActiveFederationBtcUTXOs).
+pub(crate) fn active_federation_utxo_key<CTX: ContextTr>(
+    ctx: &mut CTX,
+    config: &BridgeConstants,
+    hardfork_cfg: &RskHardforkConfig,
+    block_number: u64,
+) -> &'static str {
+    let new = super::federation::load_stored_federation(ctx, NEW_FEDERATION_KEY);
+    let old = super::federation::load_stored_federation(ctx, OLD_FEDERATION_KEY);
+    if let (Some(n), Some(_)) = (new, old) {
+        let age = super::governance::federation_activation_age(config, hardfork_cfg, block_number);
+        if block_number < n.creation_block + age {
+            return super::storage::OLD_FEDERATION_BTC_UTXOS_KEY;
+        }
+    }
+    super::storage::NEW_FEDERATION_BTC_UTXOS_KEY
+}
+
+fn load_utxos_at<CTX: ContextTr>(ctx: &mut CTX, key: &str) -> Vec<BridgeUtxo> {
+    super::storage::deserialize_utxo_list(&bridge_load_bytes_named(ctx, key))
+}
+
+fn store_utxos_at<CTX: ContextTr>(ctx: &mut CTX, key: &str, utxos: &[BridgeUtxo]) {
+    bridge_store_bytes_named(ctx, key, &super::storage::serialize_utxo_list(utxos));
 }
 
 /// Retiring federation keys (rskj getRetiringFederation): the old federation
