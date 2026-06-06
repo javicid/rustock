@@ -168,6 +168,12 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Orchid
     }
 
+    /// RSKIP88: invalid Bridge calldata throws instead of silently returning
+    /// null (Orchid, mainnet 729_000).
+    pub fn has_rskip88(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Orchid
+    }
+
     /// RSKIP146: release request queue stores RSK tx hash (Papyrus200, mainnet 2_392_700).
     pub fn has_rskip146(&self, block_number: u64) -> bool {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Papyrus200

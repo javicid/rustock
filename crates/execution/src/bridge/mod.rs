@@ -227,13 +227,26 @@ pub fn execute_bridge<CTX: ContextTr>(
         return execute_method(ctx, "releaseBtc", &[], gas_cost, config, block_store, use_v2, hardfork_cfg, tx_ctx);
     }
 
-    if input.len() < 4 {
-        return Err(PrecompileError::other("Bridge: input too short for selector"));
-    }
-
-    let selector = [input[0], input[1], input[2], input[3]];
-    let method = find_bridge_method(&selector)
-        .ok_or_else(|| PrecompileError::other("Bridge: unknown method selector"))?;
+    // rskj Bridge.parseData: 1-3 byte data or an unknown selector is a parse
+    // failure. Before RSKIP88 (orchid) execute() returns null — the tx
+    // SUCCEEDS, charged the flat releaseBtc cost without executing anything
+    // (mainnet #648,914 sent ASCII text as calldata). Afterwards it throws.
+    let parsed = if input.len() < 4 {
+        None
+    } else {
+        find_bridge_method(&[input[0], input[1], input[2], input[3]])
+    };
+    let Some(method) = parsed else {
+        let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+        if !hardfork_cfg.has_rskip88(block_number) {
+            let gas_cost = 23_000u64; // BridgeMethods.RELEASE_BTC cost, no data cost
+            if gas_limit < gas_cost {
+                return Err(PrecompileError::OutOfGas);
+            }
+            return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
+        }
+        return Err(PrecompileError::other("Bridge: invalid calldata"));
+    };
 
     let args = &input[4..];
     let gas_cost = bridge_call_gas_cost(ctx, input, config, hardfork_cfg)?;
@@ -257,12 +270,15 @@ pub fn bridge_call_gas_cost<CTX: ContextTr>(
     if input.is_empty() {
         return Ok(23_000);
     }
+    // rskj getGasForData: a parse failure costs the flat releaseBtc amount
+    // (no data cost), at every era.
     if input.len() < 4 {
-        return Err(PrecompileError::other("Bridge: input too short for selector"));
+        return Ok(23_000);
     }
     let selector = [input[0], input[1], input[2], input[3]];
-    let method = find_bridge_method(&selector)
-        .ok_or_else(|| PrecompileError::other("Bridge: unknown method selector"))?;
+    let Some(method) = find_bridge_method(&selector) else {
+        return Ok(23_000);
+    };
 
     let args = &input[4..];
     let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
