@@ -90,6 +90,10 @@ pub struct BridgeConstants {
     pub federation_activation_age_legacy: u64,
     /// Post-RSKIP383 activation age.
     pub federation_activation_age: u64,
+    /// rskj fundsMigrationAgeSinceActivationBegin.
+    pub funds_migration_age_begin: u64,
+    /// rskj fundsMigrationAgeSinceActivationEnd (non-special-case).
+    pub funds_migration_age_end: u64,
     /// Genesis federation creation time as stored (epoch-seconds value kept
     /// in a millis field: Instant.ofEpochMilli semantics, rskj
     /// genesisFederationCreationTime).
@@ -186,6 +190,8 @@ impl BridgeConstants {
             ],
             federation_activation_age_legacy: 18_500,
             federation_activation_age: 40_320,
+            funds_migration_age_begin: 0,
+            funds_migration_age_end: 10_585,
             genesis_federation_creation_time_millis: 1_514_948_400,
             block_with_too_much_chain_work_height: 849_138,
             // bitcoinj checkpoint at BTC mainnet #499,968 (2017-12-18), hash
@@ -256,6 +262,8 @@ impl BridgeConstants {
             ],
             federation_activation_age_legacy: 60,
             federation_activation_age: 2_400,
+            funds_migration_age_begin: 60,
+            funds_migration_age_end: 900,
             genesis_federation_creation_time_millis: 1_538_967_600,
             block_with_too_much_chain_work_height: u32::MAX,
             // bitcoinj checkpoint at BTC testnet #1,413,216 (2018-09-13), hash
@@ -309,6 +317,8 @@ impl BridgeConstants {
             ],
             federation_activation_age_legacy: 10,
             federation_activation_age: 150,
+            funds_migration_age_begin: 15,
+            funds_migration_age_end: 150,
             genesis_federation_creation_time_millis: 1_451_606_400_000,
             block_with_too_much_chain_work_height: u32::MAX,
             btc_checkpoint: None,

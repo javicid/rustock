@@ -200,13 +200,19 @@ pub fn register_btc_transaction<CTX: ContextTr>(
         PrecompileError::other("registerBtcTransaction: invalid BTC transaction")
     })?;
 
-    // The active federation's P2SH script identifies which outputs are
-    // peg-ins and which inputs make the tx a peg-out.
+    // Live federations (active + retiring during migration): their P2SH
+    // scripts identify which outputs are peg-ins and which inputs make the
+    // tx a peg-out (rskj getNoSpendWalletForLiveFederations).
     let block_number_now = revm::context_interface::Block::number(ctx.block()).to::<u64>();
     let federation_keys = federation_keys_or_genesis(ctx, config, hardfork_cfg, block_number_now);
     let threshold = (federation_keys.len() / 2) + 1;
     let fed_redeem = build_federation_redeem_script(&federation_keys, threshold);
     let fed_script = p2sh_output_script(&redeem_script_hash160(&fed_redeem));
+    let retiring = retiring_federation_keys(ctx, config, hardfork_cfg, block_number_now).map(|keys| {
+        let redeem = build_federation_redeem_script(&keys, keys.len() / 2 + 1);
+        let script = p2sh_output_script(&redeem_script_hash160(&redeem));
+        (redeem, script)
+    });
 
     // rskj marks processed txs with the RSK execution block number
     // (BridgeSupport.markTxAsProcessed), not the BTC block height.
@@ -216,21 +222,28 @@ pub fn register_btc_transaction<CTX: ContextTr>(
     // (its scriptSig carries the federation redeem script). Peg-outs are
     // registered to reclaim the change UTXOs; nothing is credited.
     let is_pegout = btc_tx.input.iter().any(|i| {
-        super::release_tx::extract_redeem_script(i.script_sig.as_bytes())
-            .is_some_and(|r| r == fed_redeem)
+        super::release_tx::extract_redeem_script(i.script_sig.as_bytes()).is_some_and(|r| {
+            r == fed_redeem || retiring.as_ref().is_some_and(|(rr, _)| r == *rr)
+        })
     });
     if is_pegout {
         register_new_utxos(ctx, &btc_tx, &fed_script);
+        if let Some((_, retiring_script)) = &retiring {
+            register_old_federation_utxos(ctx, &btc_tx, retiring_script);
+        }
         set_btc_tx_processed(ctx, &btc_tx_hash, rsk_height);
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     }
 
-    // Peg-in value: only the outputs paying the federation
-    // (rskj computeTotalAmountSent over the federation wallet).
+    // Peg-in value: the outputs paying any live federation
+    // (rskj computeTotalAmountSent over the live-federations wallet).
+    let pays_live_federation = |script: &bitcoin::ScriptBuf| {
+        *script == fed_script || retiring.as_ref().is_some_and(|(_, rs)| *script == *rs)
+    };
     let total_value: u64 = btc_tx
         .output
         .iter()
-        .filter(|o| o.script_pubkey == fed_script)
+        .filter(|o| pays_live_federation(&o.script_pubkey))
         .map(|o| o.value.to_sat())
         .sum();
     if total_value == 0 {
@@ -272,11 +285,15 @@ pub fn register_btc_transaction<CTX: ContextTr>(
         wl_allowed
     );
     if !wl_allowed {
+        // TODO(rustock): a rejected peg-in paying BOTH live federations would
+        // need per-input redeem scripts in the refund; none exists on
+        // mainnet pre-wasabi. Inputs paying the retiring federation use its
+        // redeem via the same builder when the active outputs are absent.
         let pegin_utxos: Vec<BridgeUtxo> = btc_tx
             .output
             .iter()
             .enumerate()
-            .filter(|(_, o)| o.script_pubkey == fed_script)
+            .filter(|(_, o)| pays_live_federation(&o.script_pubkey))
             .map(|(index, o)| BridgeUtxo {
                 tx_hash: btc_txid_event_bytes(&btc_tx),
                 vout: index as u32,
@@ -286,13 +303,21 @@ pub fn register_btc_transaction<CTX: ContextTr>(
                 coinbase: btc_tx.is_coinbase(),
             })
             .collect();
+        let refund_redeem = if pegin_utxos
+            .iter()
+            .all(|u| retiring.as_ref().is_some_and(|(_, rs)| u.script == rs.to_bytes()))
+        {
+            &retiring.as_ref().expect("checked above").0
+        } else {
+            &fed_redeem
+        };
         let fee_per_kb = get_effective_fee_per_kb(ctx, config);
         let tx_version = if hardfork_cfg.has_rskip201(rsk_height) { 2 } else { 1 };
         let refund_script = p2pkh_output_script(&sender_hash160);
         let built = super::release_tx::build_empty_wallet_to(
             &pegin_utxos,
             &refund_script,
-            &fed_redeem,
+            refund_redeem,
             fee_per_kb,
             tx_version,
         );
@@ -353,9 +378,12 @@ pub fn register_btc_transaction<CTX: ContextTr>(
         }
     }
 
-    // rskj registerNewUtxos: the outputs paying the federation become
-    // spendable federation UTXOs for future peg-outs.
+    // rskj registerNewUtxos: outputs paying the active federation feed the
+    // NEW UTXO set; outputs paying the retiring federation feed the OLD set.
     register_new_utxos(ctx, &btc_tx, &fed_script);
+    if let Some((_, retiring_script)) = &retiring {
+        register_old_federation_utxos(ctx, &btc_tx, retiring_script);
+    }
 
     // Mark as processed
     set_btc_tx_processed(ctx, &btc_tx_hash, rsk_height);
@@ -403,6 +431,34 @@ fn whitelist_allows_and_consume<CTX: ContextTr>(
         return true;
     }
     load_unlimited_whitelist(ctx).contains(sender_hash160)
+}
+
+/// Outputs paying the RETIRING federation register into the OLD UTXO set.
+fn register_old_federation_utxos<CTX: ContextTr>(
+    ctx: &mut CTX,
+    btc_tx: &BtcTransaction,
+    retiring_script: &bitcoin::ScriptBuf,
+) {
+    let new_utxos: Vec<BridgeUtxo> = btc_tx
+        .output
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| o.script_pubkey == *retiring_script)
+        .map(|(index, o)| BridgeUtxo {
+            tx_hash: btc_txid_event_bytes(btc_tx),
+            vout: index as u32,
+            value_satoshis: o.value.to_sat(),
+            height: 0,
+            script: o.script_pubkey.to_bytes(),
+            coinbase: btc_tx.is_coinbase(),
+        })
+        .collect();
+    if new_utxos.is_empty() {
+        return;
+    }
+    let mut utxos = super::storage::load_old_federation_utxos(ctx);
+    utxos.extend(new_utxos);
+    super::storage::store_old_federation_utxos(ctx, &utxos);
 }
 
 /// rskj `BridgeSupport.registerNewUtxos`: register every output paying the
@@ -689,6 +745,14 @@ pub fn update_collections<CTX: ContextTr>(
     }
 
     // -----------------------------------------------------------------------
+    // Step 0: Funds migration (rskj processFundsMigration) — while the new
+    // federation is in its migration window, each updateCollections call
+    // moves the retiring federation's balance into the active federation
+    // with a migration transaction queued like a peg-out.
+    // -----------------------------------------------------------------------
+    process_funds_migration(ctx, config, hardfork_cfg, block_number);
+
+    // -----------------------------------------------------------------------
     // Step 1: Process peg-out requests (rskj processPegoutRequests)
     // -----------------------------------------------------------------------
     let should_process_requests = if use_rskip271 {
@@ -904,6 +968,110 @@ pub fn update_collections<CTX: ContextTr>(
     Ok(PrecompileOutput::new(gas_cost, Bytes::new()))
 }
 
+/// rskj `BridgeSupport.processFundsMigration` (pre-RSKIP294/376 era).
+fn process_funds_migration<CTX: ContextTr>(
+    ctx: &mut CTX,
+    config: &BridgeConstants,
+    hardfork_cfg: &RskHardforkConfig,
+    block_number: u64,
+) {
+    let Some(retiring_keys) =
+        retiring_federation_keys(ctx, config, hardfork_cfg, block_number)
+    else {
+        return;
+    };
+    let Some(new_fed) = super::federation::load_stored_federation(ctx, NEW_FEDERATION_KEY)
+    else {
+        return;
+    };
+
+    let age = block_number.saturating_sub(new_fed.creation_block);
+    let activation_age =
+        super::governance::federation_activation_age(config, hardfork_cfg, block_number);
+    // TODO(rustock): RSKIP357/374 special-case migration end (172,800) for
+    // the fingerroot-era change; mainnet here is far pre-357.
+    let migration_start = activation_age + config.funds_migration_age_begin;
+    let migration_end = activation_age + config.funds_migration_age_end;
+    let in_migration_age = age > migration_start && age < migration_end;
+    let past_migration_age = age >= migration_end;
+    if !in_migration_age && !past_migration_age {
+        return;
+    }
+
+    let mut old_utxos = super::storage::load_old_federation_utxos(ctx);
+    let balance: u64 = old_utxos.iter().map(|u| u.value_satoshis).sum();
+    let fee_per_kb = get_effective_fee_per_kb(ctx, config);
+
+    let should_migrate = (in_migration_age && balance > fee_per_kb / 2)
+        || (past_migration_age && balance > 0);
+    if should_migrate {
+        let threshold = retiring_keys.len() / 2 + 1;
+        let retiring_redeem = build_federation_redeem_script(&retiring_keys, threshold);
+        let new_threshold = new_fed.keys.len() / 2 + 1;
+        let new_redeem = build_federation_redeem_script(&new_fed.keys, new_threshold);
+        let active_script = p2sh_output_script(&redeem_script_hash160(&new_redeem));
+
+        // createMigrationTransaction: target the full balance, halving on
+        // size overflow (pre-RSKIP376 migrations are version 1).
+        let mut target = balance;
+        let built = loop {
+            let outputs = [super::release_tx::PegoutOutput {
+                script: active_script.clone(),
+                amount_satoshis: target,
+            }];
+            match super::release_tx::complete_pegout_tx(
+                &old_utxos,
+                &outputs,
+                &active_script,
+                &retiring_redeem,
+                fee_per_kb,
+                1,
+            ) {
+                Some(b) => break Some(b),
+                None => {
+                    target /= 2;
+                    if target < 10_000 {
+                        break None;
+                    }
+                }
+            }
+        };
+
+        if let Some(built) = built {
+            let use_tx_hash = hardfork_cfg.has_rskip146(block_number);
+            let waiting_key = bridge_storage_key(PEGOUTS_WAITING_FOR_CONFIRMATIONS_KEY);
+            let existing = bridge_load_bytes(ctx, waiting_key);
+            let mut waiting =
+                deserialize_pegouts_waiting_for_confirmations(&existing, use_tx_hash);
+            waiting.push(PegoutWaitingForConfirmations {
+                btc_tx_raw: btc_serialize(&built.tx),
+                rsk_block_height: block_number,
+                rsk_tx_hash: None,
+            });
+            let updated = serialize_pegouts_waiting_for_confirmations(&waiting, use_tx_hash);
+            bridge_store_bytes(ctx, waiting_key, &updated);
+
+            old_utxos.retain(|u| {
+                !built
+                    .used_utxos
+                    .iter()
+                    .any(|s| s.tx_hash == u.tx_hash && s.vout == u.vout)
+            });
+            super::storage::store_old_federation_utxos(ctx, &old_utxos);
+            tracing::debug!(
+                "funds migration: queued {} ({} utxos) at #{block_number}",
+                built.tx.compute_txid(),
+                built.used_utxos.len()
+            );
+        }
+    }
+
+    if past_migration_age {
+        // clearRetiredFederation: the old federation is gone for good.
+        bridge_store_bytes_named(ctx, OLD_FEDERATION_KEY, &[]);
+    }
+}
+
 /// Active federation member keys (rskj FederationSupport.getActiveFederation):
 /// the committed (new) federation once it reaches the activation age, the old
 /// federation while the new one awaits activation, or the genesis federation
@@ -928,6 +1096,24 @@ pub(crate) fn federation_keys_or_genesis<CTX: ContextTr>(
         }
         (Some(n), None) => n.keys,
         (None, _) => genesis_federation_keys(config),
+    }
+}
+
+/// Retiring federation keys (rskj getRetiringFederation): the old federation
+/// while both old+new exist and the new one has reached activation age.
+pub(crate) fn retiring_federation_keys<CTX: ContextTr>(
+    ctx: &mut CTX,
+    config: &BridgeConstants,
+    hardfork_cfg: &RskHardforkConfig,
+    block_number: u64,
+) -> Option<Vec<[u8; 33]>> {
+    let new = super::federation::load_stored_federation(ctx, NEW_FEDERATION_KEY)?;
+    let old = super::federation::load_stored_federation(ctx, OLD_FEDERATION_KEY)?;
+    let age = super::governance::federation_activation_age(config, hardfork_cfg, block_number);
+    if block_number >= new.creation_block + age {
+        Some(old.keys)
+    } else {
+        None
     }
 }
 
@@ -1076,7 +1262,11 @@ pub fn add_signature<CTX: ContextTr>(
     let Some(compressed_key) = compress_pubkey(&fed_key) else {
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     };
-    if !federation_keys.contains(&compressed_key) {
+    // rskj getFederationFromPublicKey: active first, then retiring.
+    let is_member = federation_keys.contains(&compressed_key)
+        || retiring_federation_keys(ctx, config, hardfork_cfg, block_number)
+            .is_some_and(|keys| keys.contains(&compressed_key));
+    if !is_member {
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     }
 
