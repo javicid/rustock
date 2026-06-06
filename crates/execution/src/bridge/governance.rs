@@ -476,16 +476,19 @@ pub fn vote_fee_per_kb_change<CTX: ContextTr>(
     }
     let fee_satoshis = fee_value.to::<u64>();
 
-    // MAJORITY of the authorizer set must vote the same value.
+    // MAJORITY of the authorizer set must vote the same value. Entries are
+    // keyed by the RLP-ENCODED coin (serializeCoin) bytes, like rskj's
+    // ABICallSpec arguments.
     let required = authorizers.len() / 2 + 1;
+    let coin_encoded = serialization::rlp_encode_u64(fee_satoshis);
     let mut election = load_fee_per_kb_election(ctx);
     let entry = election
         .iter_mut()
-        .find(|(value, _)| *value == fee_satoshis);
+        .find(|(value, _)| *value == coin_encoded);
     let voters = match entry {
         Some((_, voters)) => voters,
         None => {
-            election.push((fee_satoshis, Vec::new()));
+            election.push((coin_encoded, Vec::new()));
             &mut election.last_mut().expect("just pushed").1
         }
     };
@@ -512,21 +515,20 @@ const FEE_PER_KB_ELECTION_KEY: &str = "feePerKbElection";
 /// serialized spec bytes. The spec is
 /// `RLP[ "setFeePerKb", RLP[ rlp(serializeCoin(fee)) ] ]` and the voters a
 /// sorted RLP list of 20-byte addresses.
-fn serialize_fee_per_kb_spec(fee_satoshis: u64) -> Vec<u8> {
-    use super::serialization::{rlp_encode_element, rlp_encode_list, rlp_encode_u64};
-    let coin = rlp_encode_u64(fee_satoshis); // serializeCoin
-    let args = rlp_encode_list(&[rlp_encode_element(&coin)]);
+fn serialize_fee_per_kb_spec(coin_encoded: &[u8]) -> Vec<u8> {
+    use super::serialization::{rlp_encode_element, rlp_encode_list};
+    let args = rlp_encode_list(&[rlp_encode_element(coin_encoded)]);
     rlp_encode_list(&[rlp_encode_element(b"setFeePerKb"), args])
 }
 
 fn store_fee_per_kb_election<CTX: ContextTr>(
     ctx: &mut CTX,
-    election: &[(u64, Vec<alloy_primitives::Address>)],
+    election: &[(Vec<u8>, Vec<alloy_primitives::Address>)],
 ) {
     use super::serialization::{rlp_encode_element, rlp_encode_list};
     let mut entries: Vec<(Vec<u8>, &Vec<alloy_primitives::Address>)> = election
         .iter()
-        .map(|(fee, voters)| (serialize_fee_per_kb_spec(*fee), voters))
+        .map(|(coin, voters)| (serialize_fee_per_kb_spec(coin), voters))
         .collect();
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -547,8 +549,8 @@ fn store_fee_per_kb_election<CTX: ContextTr>(
 
 fn load_fee_per_kb_election<CTX: ContextTr>(
     ctx: &mut CTX,
-) -> Vec<(u64, Vec<alloy_primitives::Address>)> {
-    use super::serialization::{rlp_decode_list, rlp_decode_u64};
+) -> Vec<(Vec<u8>, Vec<alloy_primitives::Address>)> {
+    use super::serialization::rlp_decode_list;
     let data = bridge_load_bytes_named(ctx, FEE_PER_KB_ELECTION_KEY);
     if data.is_empty() {
         return Vec::new();
@@ -559,12 +561,12 @@ fn load_fee_per_kb_election<CTX: ContextTr>(
     let mut election = Vec::new();
     let mut i = 0;
     while i + 1 < items.len() {
-        // spec: RLP[function, RLP[args]]
-        let fee = rlp_decode_list(&items[i])
+        // spec: RLP[function, RLP[args]]; the argument is kept as the
+        // RLP-encoded coin bytes (rskj compares raw spec arguments).
+        let coin = rlp_decode_list(&items[i])
             .filter(|spec| spec.len() == 2 && spec[0] == b"setFeePerKb")
             .and_then(|spec| rlp_decode_list(&spec[1]))
-            .and_then(|args| args.first().cloned())
-            .map(|coin| rlp_decode_u64(&coin));
+            .and_then(|args| args.first().cloned());
         let voters = rlp_decode_list(&items[i + 1])
             .map(|vs| {
                 vs.into_iter()
@@ -573,8 +575,8 @@ fn load_fee_per_kb_election<CTX: ContextTr>(
                     .collect()
             })
             .unwrap_or_default();
-        if let Some(fee) = fee {
-            election.push((fee, voters));
+        if let Some(coin) = coin {
+            election.push((coin, voters));
         }
         i += 2;
     }

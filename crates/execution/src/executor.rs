@@ -578,6 +578,83 @@ mod tests {
         assert_eq!(ist.gas_params.sstore_reset_without_cold_load_cost(), 4_200);
     }
 
+    /// Regression for mainnet #671,450: the feePerKb election must apply the
+    /// voted value once a MAJORITY of authorizers votes it (the migration tx
+    /// fee at #667,434 depends on the 30,000 sat/kB vote applied at
+    /// #632,051). The election storage round-trip previously decoded the
+    /// RLP-encoded coin as raw bytes, so votes never matched across blocks.
+    #[test]
+    fn test_fee_per_kb_vote_applies_at_majority() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+
+        // Mainnet feePerKb authorizer RSK addresses.
+        let voter1 = Address::from_slice(
+            &alloy_primitives::hex::decode("a02db0ed94a5894bc6f9079bb9a2d93ada1917f3").unwrap(),
+        );
+        let voter2 = Address::from_slice(
+            &alloy_primitives::hex::decode("180a7edda4e640ea5a3e495e17a1efad260c39e9").unwrap(),
+        );
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &voter1, 0, one_rbtc);
+        let root = put_account(&root, store.as_ref(), &voter2, 0, one_rbtc);
+
+        let block_store =
+            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+
+        let vote_tx = |nonce: u64| {
+            let mut input = vec![0x04, 0x61, 0x31, 0x3e]; // voteFeePerKbChange(int256)
+            let mut value = [0u8; 32];
+            value[30..].copy_from_slice(&30_000u16.to_be_bytes());
+            input.extend_from_slice(&value);
+            rustock_core::Transaction {
+                nonce,
+                gas_price: U256::from(0),
+                gas_limit: U256::from(100_000),
+                to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
+                value: U256::ZERO,
+                input: Bytes::from(input),
+                v: 0,
+                r: U256::ZERO,
+                s: U256::ZERO,
+                cached_rlp: None,
+            }
+        };
+
+        // Vote 1 in one block, vote 2 in the NEXT block: the election must
+        // round-trip through the trie between them.
+        let header1 = dummy_header(632_000);
+        let r1 = executor
+            .execute_block(&header1, &[(vote_tx(0), voter1)], &root, store.clone())
+            .expect("block 1");
+        assert!(r1.tx_results[0].success);
+        let root2 = crate::state::apply_state_changes(&root, store.as_ref(), &r1.state_changes);
+
+        let header2 = dummy_header(632_051);
+        let r2 = executor
+            .execute_block(&header2, &[(vote_tx(0), voter2)], &root2, store.clone())
+            .expect("block 2");
+        assert!(r2.tx_results[0].success);
+
+        let bridge_state = r2
+            .state_changes
+            .get(&crate::precompiles::BRIDGE_ADDR)
+            .expect("bridge in state");
+        let fee_key = crate::bridge::storage::bridge_storage_key(
+            crate::bridge::storage::FEE_PER_KB_KEY,
+        );
+        let fee_slot = bridge_state
+            .storage
+            .get(&fee_key)
+            .expect("feePerKb cell written");
+        assert_eq!(
+            fee_slot.present_value,
+            U256::from(30_000),
+            "majority vote applies the new feePerKb"
+        );
+    }
+
     /// Regression for mainnet #466,503: rskj charges NEW_ACCT_CALL (25,000)
     /// on trie EXISTENCE — the first-ever internal call to a precompile
     /// creates its account node (zero-value transfer), so the charge applies
