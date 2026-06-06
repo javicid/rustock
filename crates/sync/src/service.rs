@@ -929,17 +929,20 @@ impl SyncService {
                 }
                 let (req_id, msg) = create_body_request(*hash);
                 let peer = &peers[*next_request % peers.len()];
-                let ok = self.peer_store.send_to_peer(peer, msg).await;
-                if ok {
-                    in_flight.insert(req_id, *next_request);
+                if self.peer_store.send_to_peer(peer, msg).await {
                     sent += 1;
                 } else {
                     debug!(
                         target: "rustock::sync",
-                        "Failed to send body request to peer {:?}, skipping",
+                        "Failed to send body request to peer {:?}, leaving for retry",
                         &peer.0[..4]
                     );
                 }
+                // Track the request even if the send failed (peer may have just
+                // disconnected): the stalled-request retry re-sends everything
+                // in flight. Dropping it here would orphan the block — nothing
+                // would ever request it again and the batch could never finish.
+                in_flight.insert(req_id, *next_request);
                 *next_request += 1;
             }
             if sent > 0 {
@@ -970,12 +973,18 @@ impl SyncService {
             let stalled: Vec<(u64, usize)> = in_flight.drain().collect();
             let count = stalled.len();
             for (i, (_old_id, idx)) in stalled.into_iter().enumerate() {
-                let (hash, _header) = &pending_headers[idx];
+                let (hash, header) = &pending_headers[idx];
+                debug!(
+                    target: "rustock::sync",
+                    "Stalled body request: block #{} hash {:?}",
+                    header.number, hash
+                );
                 let (req_id, msg) = create_body_request(*hash);
                 let peer = &peers[i % peers.len()];
-                if self.peer_store.send_to_peer(peer, msg).await {
-                    in_flight.insert(req_id, idx);
-                }
+                // Keep the request tracked even on send failure so the next
+                // retry round re-attempts it (see send_body_requests).
+                let _ = self.peer_store.send_to_peer(peer, msg).await;
+                in_flight.insert(req_id, idx);
             }
             info!(
                 target: "rustock::sync",

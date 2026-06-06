@@ -626,6 +626,57 @@ async fn test_skeleton_round_transitions_to_next_skeleton() {
     drop(event_tx);
 }
 
+#[tokio::test]
+async fn test_failed_body_send_stays_tracked_for_retry() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let b1 = dummy_header(1, genesis.hash(), U256::from(1));
+    let b2 = dummy_header(2, b1.hash(), U256::from(1));
+    store.put_header(&b1).unwrap();
+    store.put_header(&b2).unwrap();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store.clone(), event_rx);
+
+    // Peer whose session channel is closed: every send to it fails.
+    let peer = B512::repeat_byte(0x01);
+    let (tx, rx) = mpsc::unbounded_channel();
+    peer_store.add_peer(peer, tx).await;
+    drop(rx);
+
+    let mut in_flight = std::collections::HashMap::new();
+    in_flight.insert(7u64, 0usize); // b1's body request in flight
+    service.state = SyncState::DownloadingBodies {
+        peer_best: 10,
+        pending_headers: vec![(b1.hash(), b1.clone()), (b2.hash(), b2.clone())],
+        next_request: 1,
+        in_flight,
+    };
+
+    // b1's body arrives; the service tops up with a request for b2, whose
+    // send fails (dead peer). The request must stay tracked so the stalled
+    // retry re-attempts it — dropping it would orphan b2 forever and the
+    // batch could never complete.
+    service.on_body_response(7, vec![], vec![]).await;
+
+    match &service.state {
+        SyncState::DownloadingBodies { in_flight, .. } => {
+            assert_eq!(
+                in_flight.len(),
+                1,
+                "request with failed send must remain in flight for retry"
+            );
+        }
+        other => panic!("Expected DownloadingBodies, got {:?}", other),
+    }
+}
+
 // -- PeerChunkTracker tests -----------------------------------------------
 
 #[test]
