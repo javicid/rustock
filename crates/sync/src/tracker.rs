@@ -1,6 +1,7 @@
 use alloy_primitives::B512;
 use rustock_core::types::header::Header;
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::time::{Duration, Instant};
 
 /// Number of chunk requests to keep in flight per peer.
 pub(crate) const PIPELINE_DEPTH: usize = 4;
@@ -18,6 +19,9 @@ pub struct PeerChunkTracker {
     pub(crate) buffered: BTreeMap<usize, Vec<Header>>,
     /// Total number of chunks in this skeleton.
     pub(crate) total_chunks: usize,
+    /// Per-peer instant since which we have been waiting for a response
+    /// (set on first outstanding request, refreshed on each response).
+    pub(crate) waiting_since: HashMap<B512, Instant>,
 }
 
 impl PeerChunkTracker {
@@ -30,6 +34,7 @@ impl PeerChunkTracker {
             next_to_process: 1,
             buffered: BTreeMap::new(),
             total_chunks: skeleton_len,
+            waiting_since: HashMap::new(),
         }
     }
 
@@ -50,12 +55,20 @@ impl PeerChunkTracker {
             .entry(peer)
             .or_default()
             .push_back(chunk_idx);
+        self.waiting_since.entry(peer).or_insert_with(Instant::now);
     }
 
     /// Identifies which chunk a response from `peer` corresponds to
     /// by popping the front of that peer's in-flight queue.
     pub fn identify_response(&mut self, peer: &B512) -> Option<usize> {
-        self.in_flight.get_mut(peer)?.pop_front()
+        let queue = self.in_flight.get_mut(peer)?;
+        let idx = queue.pop_front();
+        if queue.is_empty() {
+            self.waiting_since.remove(peer);
+        } else {
+            self.waiting_since.insert(*peer, Instant::now());
+        }
+        idx
     }
 
     /// Buffers a response for the given chunk index.
@@ -86,9 +99,22 @@ impl PeerChunkTracker {
         PIPELINE_DEPTH.saturating_sub(current)
     }
 
+    /// Peers that have chunks in flight but haven't responded within `timeout`.
+    pub fn stalled_peers(&self, timeout: Duration) -> Vec<B512> {
+        self.waiting_since
+            .iter()
+            .filter(|(peer, since)| {
+                since.elapsed() > timeout
+                    && self.in_flight.get(*peer).is_some_and(|q| !q.is_empty())
+            })
+            .map(|(peer, _)| *peer)
+            .collect()
+    }
+
     /// Reassigns all in-flight chunks from a disconnected peer back to the
     /// assignment pool by resetting `next_to_assign` to the minimum.
     pub fn handle_peer_disconnect(&mut self, peer: &B512) {
+        self.waiting_since.remove(peer);
         if let Some(queue) = self.in_flight.remove(peer) {
             for idx in queue {
                 if idx >= self.next_to_process && !self.buffered.contains_key(&idx) && idx < self.next_to_assign {

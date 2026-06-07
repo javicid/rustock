@@ -22,6 +22,16 @@ use tracing::{info, debug, trace, warn, error};
 /// Timeout for pending requests before resetting to Idle.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Per-peer stall timeout during header download: a peer holding chunks
+/// that hasn't responded within this window gets its chunks reassigned
+/// and is sidelined (rskj punishes TIMEOUT_MESSAGE peers via peer scoring;
+/// without this a single dead-but-connected peer wedges every round, since
+/// chunks are processed in order).
+const PEER_STALL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a stalled peer is excluded from header-chunk assignment.
+const PEER_SIDELINE_DURATION: Duration = Duration::from_secs(300);
+
 /// Interval between sync tick checks.
 const TICK_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -74,6 +84,12 @@ pub struct SyncService {
     pending_follow_bodies: HashMap<u64, (B256, Header)>,
     tx_pool: Option<Arc<crate::TransactionPool>>,
     blocks_since_flush: u64,
+    /// Peers excluded from header-chunk assignment (stalled mid-round),
+    /// mapped to the instant their sideline expires.
+    pub(crate) sidelined: HashMap<B512, Instant>,
+    /// Start height of the last skeleton pre-fetch request, so the request
+    /// is sent once per round instead of on every incoming event.
+    last_prefetch_start: Option<u64>,
 }
 
 impl SyncService {
@@ -97,6 +113,8 @@ impl SyncService {
             pending_follow_bodies: HashMap::new(),
             tx_pool: None,
             blocks_since_flush: 0,
+            sidelined: HashMap::new(),
+            last_prefetch_start: None,
         }
     }
 
@@ -189,8 +207,9 @@ impl SyncService {
         }
     }
 
-    /// Detect peers that disconnected while holding in-flight chunks and
-    /// reassign those chunks so the round can make progress.
+    /// Detect peers that disconnected or stalled while holding in-flight
+    /// chunks and reassign those chunks so the round can make progress.
+    /// Stalled peers are additionally sidelined from future assignment.
     async fn check_disconnected_peers(&mut self) {
         if let SyncState::DownloadingHeaders { tracker, .. } = &mut self.state {
             let tracked_peers: Vec<B512> = tracker.in_flight.keys().cloned().collect();
@@ -208,6 +227,16 @@ impl SyncService {
                         any_removed = true;
                     }
                 }
+            }
+            for peer in tracker.stalled_peers(PEER_STALL_TIMEOUT) {
+                warn!(
+                    target: "rustock::sync",
+                    "Peer {:?} stalled with in-flight header chunks, sidelining and reassigning",
+                    &peer.0[..4]
+                );
+                tracker.handle_peer_disconnect(&peer);
+                self.sidelined.insert(peer, Instant::now() + PEER_SIDELINE_DURATION);
+                any_removed = true;
             }
             if any_removed {
                 self.last_progress = Instant::now();
@@ -377,9 +406,19 @@ impl SyncService {
             ..
         } = &mut self.state
         {
-            let peers = self.peer_store.peers().await;
+            let mut peers = self.peer_store.peers().await;
             if peers.is_empty() {
                 return;
+            }
+
+            // Exclude sidelined (stalled) peers; if every peer is sidelined,
+            // forgive them all rather than stalling the round.
+            let now = Instant::now();
+            self.sidelined.retain(|_, until| *until > now);
+            if peers.iter().any(|p| !self.sidelined.contains_key(p)) {
+                peers.retain(|p| !self.sidelined.contains_key(p));
+            } else {
+                self.sidelined.clear();
             }
 
             // Collect assignments first, then send (to avoid borrow issues)
@@ -407,7 +446,7 @@ impl SyncService {
     }
 
     /// Try to pre-fetch the next skeleton when we've sent the last chunk.
-    async fn maybe_prefetch_skeleton(&self) {
+    async fn maybe_prefetch_skeleton(&mut self) {
         if let SyncState::DownloadingHeaders {
             tracker,
             skeleton,
@@ -422,7 +461,15 @@ impl SyncService {
                 && pending_next_skeleton.is_none()
             {
                 let last_height = skeleton.last().map(|b| b.number).unwrap_or(0);
-                if let Some(peer) = self.peer_store.peers().await.first() {
+                if self.last_prefetch_start == Some(last_height) {
+                    return; // already requested; re-sending on every event spams peers
+                }
+                let peers = self.peer_store.peers().await;
+                let peer = peers
+                    .iter()
+                    .find(|p| !self.sidelined.contains_key(*p))
+                    .or_else(|| peers.first());
+                if let Some(peer) = peer {
                     debug!(
                         target: "rustock::sync",
                         "Pre-fetching next skeleton from #{}",
@@ -430,6 +477,7 @@ impl SyncService {
                     );
                     let msg = create_skeleton_request(last_height);
                     self.peer_store.send_to_peer(peer, msg).await;
+                    self.last_prefetch_start = Some(last_height);
                 }
             }
         }

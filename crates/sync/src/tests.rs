@@ -851,6 +851,107 @@ fn test_tracker_disconnect_with_buffered_chunk() {
 }
 
 #[test]
+fn test_tracker_stalled_peers() {
+    let mut tracker = PeerChunkTracker::new(10);
+    let peer_a = B512::repeat_byte(0x0A);
+    let peer_b = B512::repeat_byte(0x0B);
+
+    tracker.record_sent(peer_a, 1);
+    tracker.record_sent(peer_b, 2);
+    tracker.record_sent(peer_b, 3);
+
+    // With a zero timeout, both peers count as stalled.
+    let mut stalled = tracker.stalled_peers(std::time::Duration::ZERO);
+    stalled.sort();
+    assert_eq!(stalled, vec![peer_a, peer_b]);
+
+    // A response drains peer_a's queue — it is no longer waiting.
+    assert_eq!(tracker.identify_response(&peer_a), Some(1));
+    assert_eq!(tracker.stalled_peers(std::time::Duration::ZERO), vec![peer_b]);
+
+    // A response from peer_b refreshes its clock but it still has chunk 3
+    // outstanding, so it remains subject to the stall timeout.
+    assert_eq!(tracker.identify_response(&peer_b), Some(2));
+    assert_eq!(tracker.stalled_peers(std::time::Duration::ZERO), vec![peer_b]);
+    assert!(tracker.stalled_peers(std::time::Duration::from_secs(60)).is_empty());
+}
+
+#[test]
+fn test_tracker_disconnect_clears_stall_tracking() {
+    let mut tracker = PeerChunkTracker::new(10);
+    let peer = B512::repeat_byte(0x0A);
+
+    tracker.record_sent(peer, 1);
+    assert_eq!(tracker.stalled_peers(std::time::Duration::ZERO), vec![peer]);
+
+    tracker.handle_peer_disconnect(&peer);
+    assert!(tracker.stalled_peers(std::time::Duration::ZERO).is_empty());
+}
+
+#[tokio::test]
+async fn test_stalled_peer_sidelined_and_chunks_reassigned() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store, verifier, peer_store.clone()));
+
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store.clone(), event_rx);
+
+    let peer_a = B512::repeat_byte(0x0A);
+    let peer_b = B512::repeat_byte(0x0B);
+    let (tx_a, _rx_a) = mpsc::unbounded_channel();
+    let (tx_b, mut rx_b) = mpsc::unbounded_channel();
+    peer_store.add_peer(peer_a, tx_a).await;
+    peer_store.add_peer(peer_b, tx_b).await;
+
+    // Round in flight: peer_a holds chunk 1 (stalled 11s), peer_b holds chunk 2.
+    let mut tracker = PeerChunkTracker::new(3);
+    tracker.record_sent(peer_a, 1);
+    tracker.record_sent(peer_b, 2);
+    tracker.next_to_assign = 3;
+    tracker.waiting_since.insert(
+        peer_a,
+        std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(11))
+            .expect("system uptime > 11s"),
+    );
+
+    service.state = SyncState::DownloadingHeaders {
+        peer_best: 384,
+        skeleton: vec![
+            BlockIdentifier { hash: B256::repeat_byte(0x01), number: 0 },
+            BlockIdentifier { hash: B256::repeat_byte(0x02), number: 192 },
+            BlockIdentifier { hash: B256::repeat_byte(0x03), number: 384 },
+        ],
+        connection_point: 0,
+        tracker,
+        pending_next_skeleton: None,
+    };
+    service.last_progress = std::time::Instant::now();
+
+    service.on_tick().await;
+
+    // peer_a is sidelined and its chunk handed to peer_b.
+    assert!(service.sidelined.contains_key(&peer_a));
+    match &service.state {
+        SyncState::DownloadingHeaders { tracker, .. } => {
+            assert!(!tracker.in_flight.contains_key(&peer_a));
+            assert!(tracker.in_flight.get(&peer_b).unwrap().contains(&1));
+        }
+        other => panic!("Expected DownloadingHeaders, got {:?}", other),
+    }
+    assert!(rx_b.try_recv().is_ok(), "reassigned chunk request sent to peer_b");
+
+    drop(event_tx);
+}
+
+#[test]
 fn test_tracker_is_complete() {
     let mut tracker = PeerChunkTracker::new(3); // chunks 1, 2
     assert!(!tracker.is_complete());
