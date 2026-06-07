@@ -240,9 +240,14 @@ impl RskExecutor {
                 debug!(tx_index = i, "executing REMASC system call");
                 // Warm the REMASC account: outside revm's transact flow the
                 // journal rejects storage ops on accounts it has not loaded.
+                // Touch it too: rskj transfers the (zero) endowment to the
+                // callee and under frontier semantics that creates the REMASC
+                // contract account record from block #1 (mainnet header #1's
+                // state root contains it with nonce 0 / balance 0).
                 {
                     use revm::context_interface::{ContextTr, JournalTr};
                     let _ = evm.ctx.journal_mut().load_account(REMASC_ADDR);
+                    evm.ctx.journal_mut().touch_account(REMASC_ADDR);
                 }
                 crate::remasc::process_miners_fees(
                     &mut evm.ctx,
