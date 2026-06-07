@@ -236,12 +236,11 @@ impl BlockProcessor {
             // Diagnostic (RUSTOCK_ORCHID_CHECK_INTERVAL=K): pre-RSKIP126
             // headers carry the Orchid-format state root; converting the
             // unitrie and comparing pinpoints content divergence long before
-            // the wasabi state-root check would. Conversion is only defined
-            // for post-orchid (RSKIP85) blocks — rskj 1.x: "we shouldn't be
-            // converting blocks before orchid in stable networks".
-            let past_orchid = self.hardfork_cfg.active_upgrade(header.number)
-                >= crate::hardfork::RskNetworkUpgrade::Orchid;
-            if past_orchid && header.number % interval == 0 {
+            // the wasabi state-root check would. The Orchid trie format is
+            // unchanged from the 2018 genesis client through wasabi (the
+            // conversion reproduces the genesis header's stateRoot), so the
+            // check is valid for every pre-RSKIP126 block.
+            if header.number % interval == 0 {
                 let computed = rustock_trie::orchid_state_root(
                     &result.new_state_root,
                     trie_store.as_ref(),

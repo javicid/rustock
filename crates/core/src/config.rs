@@ -362,6 +362,27 @@ mod tests {
         assert!(genesis.bitcoin_merged_mining_header.is_some());
     }
 
+    /// The mainnet genesis header's stateRoot (0x9fa70f12...) was produced by
+    /// the original 2018 client's account trie; converting our genesis unitrie
+    /// must reproduce it (the pre-RSKIP126 root format is the same from
+    /// genesis through wasabi).
+    #[test]
+    fn test_mainnet_genesis_orchid_state_root_matches_header() {
+        use rustock_trie::{
+            account_key, orchid_state_root, AccountState, MemoryTrieStore, TrieKeySlice, TrieNode,
+        };
+
+        let config = ChainConfig::mainnet();
+        let store = MemoryTrieStore::new();
+        let mut root = TrieNode::empty();
+        for entry in config.genesis_alloc() {
+            let key = TrieKeySlice::from_key(&account_key(&entry.address));
+            let acct = AccountState::new(entry.nonce, entry.balance);
+            root = root.put(&key, &acct.encode(), &store);
+        }
+        assert_eq!(orchid_state_root(&root, &store), config.genesis_header().state_root);
+    }
+
     #[test]
     fn test_testnet_genesis_header() {
         let config = ChainConfig::testnet();
