@@ -41,6 +41,16 @@ pub fn account_key_from_bytes(addr_bytes: &[u8]) -> Vec<u8> {
     key
 }
 
+/// Computes the trie key of an account's storage-prefix node.
+/// Result: `account_key || 0x00`. rskj `setupContract` stores `[0x01]` here
+/// for every contract; the node is consensus-relevant (part of the unitrie
+/// state root) even though no RPC exposes it.
+pub fn storage_prefix_key(addr: &Address) -> Vec<u8> {
+    let mut key = account_key(addr);
+    key.push(STORAGE_PREFIX);
+    key
+}
+
 /// Computes the trie key for an account's code.
 /// Result: `account_key || 0x80`.
 pub fn code_key(addr: &Address) -> Vec<u8> {

@@ -7,15 +7,37 @@ use alloy_primitives::{Address, B256, U256};
 use revm::state::{AccountStatus, EvmState};
 use rustock_trie::{
     AccountState, TrieKeySlice, TrieNode, TrieStore,
-    account_key, code_key, storage_key,
+    account_key, code_key, storage_key, storage_prefix_key,
 };
 use tracing::debug;
+
+/// Contract storage-prefix marker nodes to write alongside the EVM state
+/// (rskj `MutableRepository.setupContract`: `[0x01]` at `account_key || 0x00`).
+#[derive(Debug, Default)]
+pub struct ContractMarkers {
+    /// Created accounts that must NOT get a marker: a top-level CREATE
+    /// transaction with empty data creates the account "without code nor
+    /// storage. It doesn't even call setupContract()" (rskj
+    /// TransactionExecutor.create).
+    pub skip_created: Vec<Address>,
+    /// Precompiles successfully called during the block; rskj writes their
+    /// marker on the first successful call (TransactionExecutor.call /
+    /// Program.callToPrecompiledAddress).
+    pub precompiles: Vec<Address>,
+    /// The REMASC system tx executed: rskj `TransactionExecutor.execute`
+    /// increments the sender nonce, and the REMASC tx sender is the special
+    /// 1-byte `[0x00]` address (12-byte unitrie key), so its nonce equals the
+    /// block height. revm cannot represent the 1-byte address, so the bump is
+    /// applied directly to the trie.
+    pub bump_remasc_sender: bool,
+}
 
 /// Apply all state changes from EVM execution to the trie, returning the new root.
 pub fn apply_state_changes(
     root: &TrieNode,
     store: &dyn TrieStore,
     state: &EvmState,
+    markers: &ContractMarkers,
 ) -> TrieNode {
     let mut new_root = root.clone();
 
@@ -25,14 +47,21 @@ pub fn apply_state_changes(
         }
 
         if account.status.contains(AccountStatus::SelfDestructed) {
-            new_root = delete_account(&new_root, store, addr, account);
-            debug!(%addr, "self-destructed account removed from trie");
+            // rskj `MutableRepository.delete`: the whole account subtree
+            // (storage, code, marker) goes away in one recursive delete.
+            let key = TrieKeySlice::from_key(&account_key(addr));
+            new_root = new_root.delete_recursive(&key, store);
+            debug!(%addr, "self-destructed account subtree removed from trie");
             continue;
         }
 
         new_root = put_account_info(&new_root, store, addr, account);
 
         if account.status.contains(AccountStatus::Created) {
+            if !markers.skip_created.contains(addr) {
+                let key = TrieKeySlice::from_key(&storage_prefix_key(addr));
+                new_root = new_root.put(&key, &[1], store);
+            }
             if let Some(ref code) = account.info.code {
                 let code_bytes = code.original_bytes();
                 if !code_bytes.is_empty() {
@@ -54,6 +83,21 @@ pub fn apply_state_changes(
             // holds the same value the trie already has.
             new_root = put_storage_value(&new_root, store, addr, *slot, storage_slot.present_value);
         }
+    }
+
+    for addr in &markers.precompiles {
+        let key = TrieKeySlice::from_key(&storage_prefix_key(addr));
+        new_root = new_root.put(&key, &[1], store);
+    }
+
+    if markers.bump_remasc_sender {
+        let key = TrieKeySlice::from_key(&rustock_trie::account_key_from_bytes(&[0x00]));
+        let mut acct = new_root
+            .get(&key, store)
+            .and_then(|data| AccountState::decode(&data).ok())
+            .unwrap_or_default();
+        acct.nonce += U256::from(1);
+        new_root = new_root.put(&key, &acct.encode(), store);
     }
 
     new_root
@@ -89,30 +133,6 @@ fn put_storage_value(
         let start = be.iter().position(|&b| b != 0).unwrap_or(32);
         root.put(&key, &be[start..], store)
     }
-}
-
-fn delete_account(
-    root: &TrieNode,
-    store: &dyn TrieStore,
-    addr: &Address,
-    account: &revm::state::Account,
-) -> TrieNode {
-    let mut new_root = root.clone();
-
-    for slot in account.storage.keys() {
-        let slot_b256 = B256::from(*slot);
-        let key_bytes = storage_key(addr, &slot_b256);
-        let key = TrieKeySlice::from_key(&key_bytes);
-        new_root = new_root.delete(&key, store);
-    }
-
-    let code_key_bytes = code_key(addr);
-    let code_trie_key = TrieKeySlice::from_key(&code_key_bytes);
-    new_root = new_root.delete(&code_trie_key, store);
-
-    let acct_key_bytes = account_key(addr);
-    let acct_trie_key = TrieKeySlice::from_key(&acct_key_bytes);
-    new_root.delete(&acct_trie_key, store)
 }
 
 #[cfg(test)]
@@ -181,7 +201,7 @@ mod tests {
         state.insert(sender, make_touched_account(1, U256::from(979_000)));
         state.insert(recipient, make_touched_account(0, U256::from(1_000)));
 
-        let new_root = apply_state_changes(&root, &store, &state);
+        let new_root = apply_state_changes(&root, &store, &state, &ContractMarkers::default());
 
         let sender_acct = read_account(&new_root, &store, &sender).unwrap();
         assert_eq!(sender_acct.nonce, U256::from(1));
@@ -214,7 +234,7 @@ mod tests {
         let mut state = EvmState::default();
         state.insert(addr, account);
 
-        let new_root = apply_state_changes(&root, &store, &state);
+        let new_root = apply_state_changes(&root, &store, &state, &ContractMarkers::default());
 
         assert_eq!(read_storage(&new_root, &store, &addr, U256::from(0)), U256::from(42));
         assert_eq!(read_storage(&new_root, &store, &addr, U256::from(1)), U256::from(100));
@@ -245,7 +265,7 @@ mod tests {
         let mut state = EvmState::default();
         state.insert(addr, account);
 
-        let new_root = apply_state_changes(&root, &store, &state);
+        let new_root = apply_state_changes(&root, &store, &state, &ContractMarkers::default());
 
         assert_eq!(read_storage(&new_root, &store, &addr, U256::from(5)), U256::ZERO);
     }
@@ -278,7 +298,7 @@ mod tests {
         let mut state = EvmState::default();
         state.insert(addr, account);
 
-        let new_root = apply_state_changes(&root, &store, &state);
+        let new_root = apply_state_changes(&root, &store, &state, &ContractMarkers::default());
 
         let acct = read_account(&new_root, &store, &addr).unwrap();
         assert_eq!(acct.nonce, U256::from(1));
@@ -289,6 +309,44 @@ mod tests {
         assert_eq!(stored_code, code);
 
         assert_eq!(read_storage(&new_root, &store, &addr, U256::from(0)), U256::from(99));
+    }
+
+    #[test]
+    fn test_created_contract_gets_storage_prefix_marker() {
+        let (store, root) = empty_trie();
+        let addr = Address::repeat_byte(0xEE);
+
+        let info = make_account_info(1, U256::ZERO);
+        let account = Account {
+            info: info.clone(),
+            original_info: Box::new(info),
+            transaction_id: 0,
+            storage: Default::default(),
+            status: AccountStatus::Created | AccountStatus::Touched,
+        };
+        let mut state = EvmState::default();
+        state.insert(addr, account);
+
+        let new_root = apply_state_changes(&root, &store, &state, &ContractMarkers::default());
+        let marker_key = TrieKeySlice::from_key(&storage_prefix_key(&addr));
+        assert_eq!(new_root.get(&marker_key, &store), Some(vec![1]), "rskj setupContract marker");
+
+        // Same account in skip_created (empty-data CREATE tx): no marker.
+        let markers = ContractMarkers { skip_created: vec![addr], ..Default::default() };
+        let skipped_root = apply_state_changes(&root, &store, &state, &markers);
+        assert_eq!(skipped_root.get(&marker_key, &store), None, "empty-data CREATE skips the marker");
+    }
+
+    #[test]
+    fn test_precompile_markers_written() {
+        let (store, root) = empty_trie();
+        let ecrecover = Address::with_last_byte(0x01);
+
+        let markers = ContractMarkers { precompiles: vec![ecrecover], ..Default::default() };
+        let new_root = apply_state_changes(&root, &store, &EvmState::default(), &markers);
+
+        let marker_key = TrieKeySlice::from_key(&storage_prefix_key(&ecrecover));
+        assert_eq!(new_root.get(&marker_key, &store), Some(vec![1]));
     }
 
     #[test]
@@ -308,6 +366,15 @@ mod tests {
         let slot_key = TrieKeySlice::from_key(&storage_key(&addr, &slot_b256));
         let root = root.put(&slot_key, &[7u8], &store);
 
+        // Marker + a storage slot written in an "earlier block" that revm's
+        // per-tx state map does not mention; the recursive delete must remove
+        // them anyway (rskj MutableRepository.delete → deleteRecursive).
+        let marker_key = TrieKeySlice::from_key(&storage_prefix_key(&addr));
+        let root = root.put(&marker_key, &[1u8], &store);
+        let old_slot = B256::from(U256::from(77));
+        let old_slot_key = TrieKeySlice::from_key(&storage_key(&addr, &old_slot));
+        let root = root.put(&old_slot_key, &[0xAAu8], &store);
+
         assert!(read_account(&root, &store, &addr).is_some());
 
         let info = make_account_info(5, U256::ZERO);
@@ -325,11 +392,19 @@ mod tests {
         let mut state = EvmState::default();
         state.insert(addr, account);
 
-        let new_root = apply_state_changes(&root, &store, &state);
+        let new_root = apply_state_changes(&root, &store, &state, &ContractMarkers::default());
 
         assert!(read_account(&new_root, &store, &addr).is_none());
         assert!(new_root.get(&code_trie_key, &store).is_none());
         assert_eq!(read_storage(&new_root, &store, &addr, U256::from(0)), U256::ZERO);
+        let marker_key = TrieKeySlice::from_key(&storage_prefix_key(&addr));
+        assert!(new_root.get(&marker_key, &store).is_none(), "marker removed");
+        assert_eq!(
+            read_storage(&new_root, &store, &addr, U256::from(77)),
+            U256::ZERO,
+            "storage from earlier blocks removed by the recursive delete"
+        );
+        assert!(new_root.is_empty_trie(), "nothing else was in the trie");
     }
 
     #[test]
@@ -353,7 +428,7 @@ mod tests {
         let mut state = EvmState::default();
         state.insert(addr, account);
 
-        let new_root = apply_state_changes(&root, &store, &state);
+        let new_root = apply_state_changes(&root, &store, &state, &ContractMarkers::default());
 
         let acct_after = read_account(&new_root, &store, &addr).unwrap();
         assert_eq!(acct_after.balance, U256::from(500), "untouched account should be unchanged");
@@ -369,8 +444,8 @@ mod tests {
         state.insert(addr1, make_touched_account(0, U256::from(100)));
         state.insert(addr2, make_touched_account(0, U256::from(200)));
 
-        let root1 = apply_state_changes(&root, &store, &state);
-        let root2 = apply_state_changes(&root, &store, &state);
+        let root1 = apply_state_changes(&root, &store, &state, &ContractMarkers::default());
+        let root2 = apply_state_changes(&root, &store, &state, &ContractMarkers::default());
 
         assert_eq!(
             root1.compute_hash(&store),

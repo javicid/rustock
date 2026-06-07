@@ -25,6 +25,8 @@ pub enum ProcessError {
     PaidFeesMismatch { header: alloy_primitives::U256, computed: alloy_primitives::U256 },
     #[error("state root mismatch: header={header}, computed={computed}")]
     StateRootMismatch { header: B256, computed: B256 },
+    #[error("orchid state root mismatch: header={header}, computed={computed}")]
+    OrchidStateRootMismatch { header: B256, computed: B256 },
     #[error("receipts root mismatch: header={header}, computed={computed}")]
     ReceiptsRootMismatch { header: B256, computed: B256 },
     #[error("transactions root mismatch: header={header}, computed={computed}")]
@@ -35,6 +37,19 @@ pub enum ProcessError {
     LogsBloomMismatch,
     #[error("storage error: {0}")]
     Storage(#[from] anyhow::Error),
+}
+
+/// Diagnostic knob: validate the Orchid-converted state root against
+/// pre-RSKIP126 headers every K blocks (`RUSTOCK_ORCHID_CHECK_INTERVAL=K`).
+/// Disabled when unset/0/unparsable.
+fn orchid_check_interval() -> Option<u64> {
+    static INTERVAL: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *INTERVAL.get_or_init(|| {
+        std::env::var("RUSTOCK_ORCHID_CHECK_INTERVAL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|k| *k > 0)
+    })
 }
 
 /// Result of processing a block.
@@ -125,7 +140,12 @@ impl BlockProcessor {
             ));
         }
 
-        let mut new_state_root = apply_state_changes(state_root, trie_store.as_ref(), &exec_result.state_changes);
+        let mut new_state_root = apply_state_changes(
+            state_root,
+            trie_store.as_ref(),
+            &exec_result.state_changes,
+            &exec_result.markers,
+        );
         let state_root_hash = new_state_root.compute_hash(trie_store.as_ref());
         new_state_root.save(trie_store.as_ref(), true);
         // Reload the root lazily: children become hash references resolved on
@@ -181,7 +201,7 @@ impl BlockProcessor {
             });
         }
 
-        let result = self.execute_block(block, state_root, trie_store)?;
+        let result = self.execute_block(block, state_root, trie_store.clone())?;
 
         if result.gas_used != header.gas_used {
             for (i, r) in result.receipts.iter().enumerate() {
@@ -211,6 +231,28 @@ impl BlockProcessor {
                     header: header.state_root,
                     computed: result.state_root_hash,
                 });
+            }
+        } else if let Some(interval) = orchid_check_interval() {
+            // Diagnostic (RUSTOCK_ORCHID_CHECK_INTERVAL=K): pre-RSKIP126
+            // headers carry the Orchid-format state root; converting the
+            // unitrie and comparing pinpoints content divergence long before
+            // the wasabi state-root check would. Conversion is only defined
+            // for post-orchid (RSKIP85) blocks — rskj 1.x: "we shouldn't be
+            // converting blocks before orchid in stable networks".
+            let past_orchid = self.hardfork_cfg.active_upgrade(header.number)
+                >= crate::hardfork::RskNetworkUpgrade::Orchid;
+            if past_orchid && header.number % interval == 0 {
+                let computed = rustock_trie::orchid_state_root(
+                    &result.new_state_root,
+                    trie_store.as_ref(),
+                );
+                if computed != header.state_root {
+                    return Err(ProcessError::OrchidStateRootMismatch {
+                        header: header.state_root,
+                        computed,
+                    });
+                }
+                debug!(number = header.number, "orchid state root validated");
             }
         }
 

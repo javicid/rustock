@@ -118,6 +118,17 @@ impl RskHardforkConfig {
         }
     }
 
+    /// First block at which `upgrade` activates, if it activates on this network.
+    pub fn activation_height(&self, upgrade: RskNetworkUpgrade) -> Option<u64> {
+        self.activations.iter().find(|(_, u)| *u == upgrade).map(|(h, _)| *h)
+    }
+
+    /// rskj `ActivationConfig.ForBlock.isActivating`: the upgrade activates
+    /// exactly at this block.
+    pub fn is_activating(&self, upgrade: RskNetworkUpgrade, block_number: u64) -> bool {
+        self.activation_height(upgrade) == Some(block_number)
+    }
+
     /// Returns the active RSK network upgrade at the given block height.
     pub fn active_upgrade(&self, block_number: u64) -> RskNetworkUpgrade {
         let mut active = RskNetworkUpgrade::Genesis;

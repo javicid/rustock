@@ -15,7 +15,7 @@ use crate::varint;
 
 const MAX_EMBEDDED_NODE_SIZE: usize = 44;
 
-fn keccak(data: &[u8]) -> B256 {
+pub(crate) fn keccak(data: &[u8]) -> B256 {
     B256::from_slice(&Keccak256::digest(data))
 }
 
@@ -144,6 +144,18 @@ impl TrieNode {
         }
     }
 
+    /// Builds an in-memory node from explicit parts (orchid conversion only —
+    /// these nodes are hashed, never saved).
+    pub(crate) fn from_parts(
+        shared_path: TrieKeySlice,
+        value: Option<Vec<u8>>,
+        value_hash: Option<B256>,
+        left: NodeRef,
+        right: NodeRef,
+    ) -> Self {
+        Self { shared_path, value, value_hash, left, right, children_size: 0, saved: false }
+    }
+
     pub fn new_leaf(shared_path: TrieKeySlice, value: Vec<u8>) -> Self {
         let value_hash = Some(keccak(&value));
         Self {
@@ -173,7 +185,7 @@ impl TrieNode {
         self.value_length() > 32
     }
 
-    fn get_value_hash(&self) -> B256 {
+    pub(crate) fn get_value_hash(&self) -> B256 {
         self.value_hash.unwrap_or_else(|| {
             self.value.as_ref().map_or(B256::ZERO, |v| keccak(v))
         })
@@ -449,6 +461,17 @@ impl TrieNode {
         }
     }
 
+    /// Deletes the node at the given key together with its whole subtree
+    /// (rskj `Trie.deleteRecursive`). Used to remove an account and all its
+    /// storage/code/marker descendants in one operation.
+    pub fn delete_recursive(&self, key: &TrieKeySlice, store: &dyn TrieStore) -> TrieNode {
+        let key_slice = key.clone();
+        match self.put_impl(&key_slice, None, true, store) {
+            Some(node) => node,
+            None => TrieNode::empty(),
+        }
+    }
+
     fn put_impl(
         &self,
         key: &TrieKeySlice,
@@ -526,13 +549,16 @@ impl TrieNode {
             }
 
             if is_recursive_delete {
+                // rskj `new Trie(store, sharedPath, null)`: the whole subtree
+                // (children included) is dropped; put_impl collapses the
+                // now-empty node to None so the parent unlinks it.
                 return Some(TrieNode {
                     shared_path: self.shared_path.clone(),
                     value: None,
                     value_hash: None,
-                    left: self.left.clone(),
-                    right: self.right.clone(),
-                    children_size: self.children_size,
+                    left: NodeRef::Empty,
+                    right: NodeRef::Empty,
+                    children_size: 0,
                     saved: false,
                 });
             }

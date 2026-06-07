@@ -955,3 +955,121 @@ mod unit {
         assert_eq!(TrieNode::empty().compute_hash_orchid(false, &store), empty_trie_hash());
     }
 }
+
+#[cfg(test)]
+mod delete_recursive_tests {
+    use crate::{MemoryTrieStore, TrieKeySlice, TrieNode};
+
+    #[test]
+    fn delete_recursive_removes_whole_subtree() {
+        let store = MemoryTrieStore::new();
+        // Account-style layout: a prefix key with value plus descendants.
+        let acct = [0xAB, 0xCD];
+        let mut child_a = acct.to_vec();
+        child_a.push(0x00); // "storage prefix"
+        let mut child_b = acct.to_vec();
+        child_b.extend_from_slice(&[0x00, 0x55]); // "storage cell"
+        let mut child_c = acct.to_vec();
+        child_c.push(0x80); // "code"
+        let other = [0xAB, 0x00]; // sibling outside the subtree
+
+        let root = TrieNode::empty()
+            .put(&TrieKeySlice::from_key(&acct), &[1, 2, 3], &store)
+            .put(&TrieKeySlice::from_key(&child_a), &[1], &store)
+            .put(&TrieKeySlice::from_key(&child_b), &[9, 9], &store)
+            .put(&TrieKeySlice::from_key(&child_c), &[0x60, 0x00], &store)
+            .put(&TrieKeySlice::from_key(&other), &[7], &store);
+
+        let new_root = root.delete_recursive(&TrieKeySlice::from_key(&acct), &store);
+
+        assert!(new_root.get(&TrieKeySlice::from_key(&acct), &store).is_none());
+        assert!(new_root.get(&TrieKeySlice::from_key(&child_a), &store).is_none());
+        assert!(new_root.get(&TrieKeySlice::from_key(&child_b), &store).is_none());
+        assert!(new_root.get(&TrieKeySlice::from_key(&child_c), &store).is_none());
+        assert_eq!(new_root.get(&TrieKeySlice::from_key(&other), &store), Some(vec![7]));
+
+        // Root hash equals a trie that never contained the subtree.
+        let clean = TrieNode::empty().put(&TrieKeySlice::from_key(&other), &[7], &store);
+        assert_eq!(new_root.compute_hash(&store), clean.compute_hash(&store));
+    }
+
+    #[test]
+    fn delete_recursive_on_missing_key_is_noop() {
+        let store = MemoryTrieStore::new();
+        let root = TrieNode::empty().put(&TrieKeySlice::from_key(&[0x11]), &[1], &store);
+        let new_root = root.delete_recursive(&TrieKeySlice::from_key(&[0x22]), &store);
+        assert_eq!(new_root.compute_hash(&store), root.compute_hash(&store));
+    }
+}
+
+#[cfg(test)]
+mod orchid_converter_tests {
+    use crate::account::AccountState;
+    use crate::key_mapper::{account_key, account_key_from_bytes, code_key, storage_key, storage_prefix_key};
+    use crate::{empty_trie_hash, orchid_state_root, MemoryTrieStore, TrieKeySlice, TrieNode};
+    use alloy_primitives::{Address, B256, U256};
+
+    fn put(root: TrieNode, store: &MemoryTrieStore, key: &[u8], value: &[u8]) -> TrieNode {
+        root.put(&TrieKeySlice::from_key(key), value, store)
+    }
+
+    #[test]
+    fn orchid_conversion_smoke() {
+        let store = MemoryTrieStore::new();
+        let mut root = TrieNode::empty();
+
+        // EOA
+        let eoa = Address::repeat_byte(0x11);
+        root = put(root, &store, &account_key(&eoa),
+            &AccountState::new(U256::from(1), U256::from(1000)).encode());
+
+        // Contract: account + marker + code + 2 storage cells (incl. a
+        // leading-zeroes slot, stored stripped in the unitrie).
+        let c = Address::repeat_byte(0x22);
+        root = put(root, &store, &account_key(&c),
+            &AccountState::new(U256::ZERO, U256::from(5)).encode());
+        root = put(root, &store, &storage_prefix_key(&c), &[1]);
+        root = put(root, &store, &code_key(&c), &[0x60, 0x00, 0x60, 0x00, 0xF3]);
+        root = put(root, &store, &storage_key(&c, &B256::from(U256::from(1))), &[42]);
+        root = put(root, &store, &storage_key(&c, &B256::repeat_byte(0xCD)), &[1, 2, 3]);
+
+        // REMASC sender account (1-byte address, 12-byte unitrie key).
+        root = put(root, &store, &account_key_from_bytes(&[0x00]),
+            &AccountState::new(U256::ZERO, U256::from(7)).encode());
+
+        let r1 = orchid_state_root(&root, &store);
+        let r2 = orchid_state_root(&root, &store);
+        assert_eq!(r1, r2, "deterministic");
+        assert_ne!(r1, empty_trie_hash());
+    }
+
+    #[test]
+    fn orchid_root_ignores_contract_marker() {
+        // The storage-prefix marker node exists only in the unitrie; the
+        // Orchid storage trie root must be identical with or without it
+        // (rskj TrieConverter strips the first storage node's value).
+        let store = MemoryTrieStore::new();
+        let c = Address::repeat_byte(0x33);
+        let base = TrieNode::empty().put(
+            &TrieKeySlice::from_key(&account_key(&c)),
+            &AccountState::new(U256::ZERO, U256::from(9)).encode(),
+            &store,
+        );
+
+        let without_marker = orchid_state_root(&base, &store);
+        let with_marker = base.put(
+            &TrieKeySlice::from_key(&storage_prefix_key(&c)),
+            &[1],
+            &store,
+        );
+        let with_marker_root = orchid_state_root(&with_marker, &store);
+        assert_eq!(without_marker, with_marker_root);
+
+        // But the unitrie roots DO differ — the marker is consensus-relevant
+        // for the wasabi (RSKIP126) state root.
+        assert_ne!(
+            base.compute_hash(&store),
+            with_marker.compute_hash(&store)
+        );
+    }
+}

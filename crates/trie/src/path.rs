@@ -122,6 +122,14 @@ impl TrieKeySlice {
     pub fn expand(&self) -> &[u8] {
         &self.expanded[self.offset..self.limit]
     }
+
+    /// Returns a new slice with `n` zero bits prepended (rskj `TrieKeySlice.leftPad`).
+    pub fn left_pad(&self, n: usize) -> Self {
+        let new_len = n + self.length();
+        let mut expanded = vec![0u8; n];
+        expanded.extend_from_slice(self.expand());
+        Self { expanded, offset: 0, limit: new_len }
+    }
 }
 
 impl PartialEq for TrieKeySlice {
@@ -210,5 +218,14 @@ mod tests {
         let empty = TrieKeySlice::empty();
         assert_eq!(empty.length(), 0);
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn test_left_pad() {
+        let key = TrieKeySlice::from_key(&[0xFF]).slice(4, 8); // 1111
+        let padded = key.left_pad(3);
+        assert_eq!(padded.length(), 7);
+        assert_eq!(padded.expand(), &[0, 0, 0, 1, 1, 1, 1]);
+        assert_eq!(key.left_pad(0).expand(), key.expand());
     }
 }

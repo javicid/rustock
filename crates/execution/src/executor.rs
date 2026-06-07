@@ -39,6 +39,9 @@ pub struct BlockExecutionResult {
     /// `header.paid_fees` after execution).
     pub paid_fees: U256,
     pub state_changes: revm::state::EvmState,
+    /// Contract storage-prefix marker writes accumulated during execution
+    /// (rskj `setupContract`), applied to the trie with the state changes.
+    pub markers: crate::state::ContractMarkers,
 }
 
 /// Executes RSK blocks and transactions using revm.
@@ -188,12 +191,49 @@ impl RskExecutor {
         // it between transactions.
         let bridge_ctx_slot = precompile_provider.bridge_tx_context_slot();
         let invisible_flag = precompile_provider.invisible_exception_flag();
+        let called_precompiles = precompile_provider.called_precompiles_slot();
         let mut evm = ctx.build_mainnet().with_precompiles(precompile_provider);
         crate::rsk_instructions::install(&mut evm.instruction);
 
         let mut total_gas = 0u64;
         let mut total_fees = U256::ZERO;
         let mut tx_results = Vec::with_capacity(transactions.len());
+        let mut markers = crate::state::ContractMarkers::default();
+
+        // rskj BlockExecutor.maintainPrecompiledContractStorageRoots, run
+        // before the block's transactions: at the RSKIP126 activation block
+        // every genesis precompile is created (if absent) and marked; each
+        // consensus-enabled precompile gets a fresh account (nonce/balance
+        // reset) plus the marker exactly at its activation block.
+        {
+            use crate::hardfork::RskNetworkUpgrade;
+            use revm::context_interface::{ContextTr, JournalTr};
+            let mut ops: Vec<(Address, bool)> = Vec::new(); // (addr, reset_account)
+            if self.hardfork_cfg.is_activating(RskNetworkUpgrade::Wasabi100, header.number) {
+                ops.extend(crate::precompiles::GENESIS_PRECOMPILES.map(|a| (a, false)));
+            }
+            for (addr, upgrade) in crate::precompiles::CONSENSUS_ENABLED_PRECOMPILES {
+                if self.hardfork_cfg.is_activating(upgrade, header.number) {
+                    ops.push((addr, true));
+                }
+            }
+            for (addr, reset) in ops {
+                {
+                    use revm::context_interface::journaled_state::account::JournaledAccountTr;
+                    let mut acc = evm.ctx.journal_mut().load_account_mut(addr)
+                        .map_err(|e| ExecutionError::Evm(format!("{e:?}")))?;
+                    if reset {
+                        // rskj track.createAccount: a fresh AccountState.
+                        acc.data.set_balance(U256::ZERO);
+                        acc.data.set_nonce(0);
+                    }
+                }
+                evm.ctx.journal_mut().touch_account(addr);
+                if !markers.precompiles.contains(&addr) {
+                    markers.precompiles.push(addr);
+                }
+            }
+        }
 
         for (i, (tx, sender)) in transactions.iter().enumerate() {
             if Self::is_remasc_tx(tx) {
@@ -218,6 +258,15 @@ impl RskExecutor {
                     use revm::context_interface::{ContextTr, JournalTr};
                     evm.ctx.journal_mut().take_logs()
                 };
+
+                // rskj: the REMASC system tx is a successful direct precompile
+                // call every block, so the contract marker is (re)written and
+                // the special 1-byte REMASC sender account's nonce increments
+                // (TransactionExecutor.execute → track.increaseNonce(sender)).
+                if !markers.precompiles.contains(&REMASC_ADDR) {
+                    markers.precompiles.push(REMASC_ADDR);
+                }
+                markers.bump_remasc_sender = true;
 
                 tx_results.push(TxExecutionResult {
                     gas_used: 0,
@@ -329,6 +378,11 @@ impl RskExecutor {
                                     tx.value,
                                 );
                             }
+                            // rskj setupContract after a successful direct
+                            // precompile call (TransactionExecutor.call).
+                            if !markers.precompiles.contains(&crate::precompiles::BRIDGE_ADDR) {
+                                markers.precompiles.push(crate::precompiles::BRIDGE_ADDR);
+                            }
                             // Drain bridge events into the receipt like revm
                             // does for normal transactions.
                             let logs = evm.ctx.journal_mut().take_logs();
@@ -383,6 +437,12 @@ impl RskExecutor {
 
             let tx_env = tx_env_from_rsk_tx(tx, *sender, &self.hardfork_cfg);
 
+            // Per-tx precompile marker tracking: drained below only if the
+            // transaction commits (rskj cacheTrack rollback drops markers).
+            if let Ok(mut called) = called_precompiles.lock() {
+                called.clear();
+            }
+
             let result = {
                 use revm::context::ContextSetters;
                 use revm::handler::Handler;
@@ -403,6 +463,24 @@ impl RskExecutor {
             let output = result.output().map(|o| o.to_vec()).unwrap_or_default();
             let logs = result.into_logs();
             let created_address = Self::extract_created_address(tx, &success);
+
+            if success {
+                if let Ok(mut called) = called_precompiles.lock() {
+                    for addr in called.drain(..) {
+                        if !markers.precompiles.contains(&addr) {
+                            markers.precompiles.push(addr);
+                        }
+                    }
+                }
+                // rskj TransactionExecutor.create: a CREATE tx with empty data
+                // makes the account "without code nor storage. It doesn't even
+                // call setupContract()".
+                if tx.to.is_empty() && tx.input.is_empty() {
+                    if let Some(addr) = created_address {
+                        markers.skip_created.push(addr);
+                    }
+                }
+            }
 
             // Mirror what RskHandler paid REMASC: the full gas limit on an
             // invisible exception, the spent gas otherwise.
@@ -432,6 +510,7 @@ impl RskExecutor {
             gas_used: total_gas,
             paid_fees: total_fees,
             state_changes: state,
+            markers,
         })
     }
 
@@ -693,7 +772,7 @@ mod tests {
             .execute_block(&header1, &[(vote_tx(0), voter1)], &root, store.clone())
             .expect("block 1");
         assert!(r1.tx_results[0].success);
-        let root2 = crate::state::apply_state_changes(&root, store.as_ref(), &r1.state_changes);
+        let root2 = crate::state::apply_state_changes(&root, store.as_ref(), &r1.state_changes, &r1.markers);
 
         let header2 = dummy_header(632_051);
         let r2 = executor
@@ -768,7 +847,7 @@ mod tests {
             "created contract must start at nonce 0 (no EIP-161 in rskj)"
         );
         let root2 =
-            crate::state::apply_state_changes(&root, store.as_ref(), &r1.state_changes);
+            crate::state::apply_state_changes(&root, store.as_ref(), &r1.state_changes, &r1.markers);
 
         let call = rustock_core::Transaction {
             nonce: 1,
@@ -851,7 +930,7 @@ mod tests {
                 .expect("deploy block");
             assert!(r1.tx_results[0].success);
             let root2 =
-                crate::state::apply_state_changes(&root, store.as_ref(), &r1.state_changes);
+                crate::state::apply_state_changes(&root, store.as_ref(), &r1.state_changes, &r1.markers);
 
             let caller = sender.create(0);
             let call = rustock_core::Transaction {
@@ -1167,7 +1246,7 @@ mod tests {
 
         // Apply to the trie: the ecrecover account node must now exist.
         let root2 =
-            crate::state::apply_state_changes(&root, store.as_ref(), &r1.state_changes);
+            crate::state::apply_state_changes(&root, store.as_ref(), &r1.state_changes, &r1.markers);
 
         let header2 = dummy_header(466_504);
         let r2 = executor
@@ -1247,7 +1326,7 @@ mod tests {
         // Apply to the trie and read the queue back through a fresh root,
         // exactly like the next block would.
         let new_root =
-            crate::state::apply_state_changes(&root, store.as_ref(), &result.state_changes);
+            crate::state::apply_state_changes(&root, store.as_ref(), &result.state_changes, &result.markers);
         let queue_key = {
             use sha3::{Digest, Keccak256};
             let mut padded = [0u8; 32];

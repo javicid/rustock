@@ -58,6 +58,35 @@ pub const SECP256K1_ADD_ADDR: Address =
 pub const SECP256K1_MUL_ADDR: Address =
     Address::new(hex_addr("0000000000000000000000000000000001000017"));
 
+/// rskj `PrecompiledContracts.GENESIS_ADDRESSES`: precompiles that exist from
+/// genesis. At the RSKIP126 activation block all of them are created (if
+/// absent) and get the contract storage-prefix marker
+/// (`BlockExecutor.maintainPrecompiledContractStorageRoots`).
+pub const GENESIS_PRECOMPILES: [Address; 7] = [
+    Address::new(hex_addr("0000000000000000000000000000000000000001")), // ecrecover
+    Address::new(hex_addr("0000000000000000000000000000000000000002")), // sha256
+    Address::new(hex_addr("0000000000000000000000000000000000000003")), // ripemd160
+    Address::new(hex_addr("0000000000000000000000000000000000000004")), // identity
+    Address::new(hex_addr("0000000000000000000000000000000000000005")), // modexp
+    BRIDGE_ADDR,
+    REMASC_ADDR,
+];
+
+/// rskj `PrecompiledContracts.CONSENSUS_ENABLED_ADDRESSES`: precompiles
+/// enabled by a network upgrade. At each one's activation block rskj
+/// re-creates the account (resetting nonce/balance) and writes the marker.
+pub const CONSENSUS_ENABLED_PRECOMPILES: [(Address, crate::hardfork::RskNetworkUpgrade); 9] = [
+    (HD_WALLET_UTILS_ADDR, crate::hardfork::RskNetworkUpgrade::Wasabi100), // RSKIP106
+    (BLOCK_HEADER_ADDR, crate::hardfork::RskNetworkUpgrade::Wasabi100),    // RSKIP119
+    (Address::new(hex_addr("0000000000000000000000000000000000000006")), crate::hardfork::RskNetworkUpgrade::Papyrus200), // altBN128 add, RSKIP137
+    (Address::new(hex_addr("0000000000000000000000000000000000000007")), crate::hardfork::RskNetworkUpgrade::Papyrus200), // altBN128 mul, RSKIP137
+    (Address::new(hex_addr("0000000000000000000000000000000000000008")), crate::hardfork::RskNetworkUpgrade::Papyrus200), // altBN128 pairing, RSKIP137
+    (Address::new(hex_addr("0000000000000000000000000000000000000009")), crate::hardfork::RskNetworkUpgrade::Iris300), // blake2f, RSKIP153
+    (ENVIRONMENT_ADDR, crate::hardfork::RskNetworkUpgrade::Arrowhead600), // RSKIP203
+    (SECP256K1_ADD_ADDR, crate::hardfork::RskNetworkUpgrade::Reed800),    // RSKIP516
+    (SECP256K1_MUL_ADDR, crate::hardfork::RskNetworkUpgrade::Reed800),    // RSKIP516
+];
+
 /// Returns all RSK precompile addresses (including standard Ethereum ones).
 pub fn all_rsk_precompile_addresses() -> Vec<Address> {
     vec![
@@ -853,6 +882,11 @@ pub struct RskPrecompileProvider {
     /// finalization: no leftover refund, REMASC gets gasLimit * gasPrice.
     /// Cleared by `RskHandler::load_accounts` before each transaction.
     invisible_exception: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Precompiles successfully called during the current transaction. rskj
+    /// writes the contract storage-prefix marker (`setupContract`) on every
+    /// successful precompile call; the executor drains this after each tx and
+    /// applies the markers to the trie if the tx committed.
+    called_precompiles: std::sync::Arc<std::sync::Mutex<Vec<Address>>>,
 }
 
 impl std::fmt::Debug for RskPrecompileProvider {
@@ -875,6 +909,19 @@ impl RskPrecompileProvider {
     /// Returns the shared invisible-exception flag for `RskHandler`.
     pub fn invisible_exception_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
         std::sync::Arc::clone(&self.invisible_exception)
+    }
+
+    /// Returns the shared list of successfully-called precompiles.
+    pub fn called_precompiles_slot(&self) -> std::sync::Arc<std::sync::Mutex<Vec<Address>>> {
+        std::sync::Arc::clone(&self.called_precompiles)
+    }
+
+    fn record_called(&self, addr: Address) {
+        if let Ok(mut called) = self.called_precompiles.lock() {
+            if !called.contains(&addr) {
+                called.push(addr);
+            }
+        }
     }
 }
 
@@ -906,6 +953,7 @@ impl RskPrecompileProvider {
             bridge_config: BridgeConstants::mainnet(),
             bridge_tx_context: std::sync::Arc::new(std::sync::Mutex::new(BridgeTxContext::default())),
             invisible_exception: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            called_precompiles: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -1003,6 +1051,8 @@ impl RskPrecompileProvider {
                 result.result = if output.reverted {
                     InstructionResult::Revert
                 } else {
+                    // rskj setupContract on successful precompile calls.
+                    self.record_called(*addr);
                     InstructionResult::Return
                 };
                 result.output = output.bytes;
@@ -1280,6 +1330,7 @@ impl Clone for RskPrecompileProvider {
             bridge_config: self.bridge_config.clone(),
             bridge_tx_context: std::sync::Arc::clone(&self.bridge_tx_context),
             invisible_exception: std::sync::Arc::clone(&self.invisible_exception),
+            called_precompiles: std::sync::Arc::clone(&self.called_precompiles),
         }
     }
 }
@@ -1349,6 +1400,8 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for RskPrecompileProvider {
                 result.result = if output.reverted {
                     InstructionResult::Revert
                 } else {
+                    // rskj setupContract on successful precompile calls.
+                    self.record_called(inputs.bytecode_address);
                     InstructionResult::Return
                 };
                 result.output = output.bytes;
