@@ -103,14 +103,17 @@ impl RskExecutor {
         let spec_id = self.hardfork_cfg.spec_id(header.number);
         let block_env = block_env_from_header(header, &self.hardfork_cfg);
         let tx_env = tx_env_from_rsk_tx(tx, sender, &self.hardfork_cfg);
-        let db = RskDatabase::new(state_root.clone(), trie_store, self.block_store.clone());
+        let db = RskDatabase::new(state_root.clone(), trie_store.clone(), self.block_store.clone());
 
         let cfg = make_cfg_env(spec_id, self.hardfork_cfg.chain_id, self.hardfork_cfg.has_rskip544(header.number));
 
+        let mut chain_ext = crate::raw_storage::RskChainExt::default();
+        chain_ext.raw_storage.set_reader(trie_store, state_root.clone());
         let ctx = revm::Context::mainnet()
             .with_db(WrapDatabaseRef(db))
             .with_block(block_env)
-            .with_cfg(cfg);
+            .with_cfg(cfg)
+            .with_chain(chain_ext);
 
         let precompile_provider = RskPrecompileProvider::new(
             rsk_precompiles(&self.hardfork_cfg, header.number),
@@ -171,13 +174,16 @@ impl RskExecutor {
     ) -> Result<BlockExecutionResult, ExecutionError> {
         let spec_id = self.hardfork_cfg.spec_id(header.number);
         let block_env = block_env_from_header(header, &self.hardfork_cfg);
-        let db = RskDatabase::new(state_root.clone(), trie_store, self.block_store.clone());
+        let db = RskDatabase::new(state_root.clone(), trie_store.clone(), self.block_store.clone());
         let cfg = make_cfg_env(spec_id, self.hardfork_cfg.chain_id, self.hardfork_cfg.has_rskip544(header.number));
 
+        let mut chain_ext = crate::raw_storage::RskChainExt::default();
+        chain_ext.raw_storage.set_reader(trie_store, state_root.clone());
         let ctx = revm::Context::mainnet()
             .with_db(WrapDatabaseRef(db))
             .with_block(block_env)
-            .with_cfg(cfg);
+            .with_cfg(cfg)
+            .with_chain(chain_ext);
 
         let precompile_provider = RskPrecompileProvider::new(
             rsk_precompiles(&self.hardfork_cfg, header.number),
@@ -236,6 +242,10 @@ impl RskExecutor {
         }
 
         for (i, (tx, sender)) in transactions.iter().enumerate() {
+            {
+                use revm::context_interface::ContextTr;
+                evm.ctx.chain_mut().raw_storage.begin_tx();
+            }
             if Self::is_remasc_tx(tx) {
                 debug!(tx_index = i, "executing REMASC system call");
                 // Warm the REMASC account: outside revm's transact flow the
@@ -257,6 +267,10 @@ impl RskExecutor {
                     Some(&self.block_store),
                 )
                 .map_err(|e| ExecutionError::Evm(format!("REMASC: {e:?}")))?;
+                {
+                    use revm::context_interface::ContextTr;
+                    evm.ctx.chain_mut().raw_storage.commit_call();
+                }
 
                 // Drain the mining_fee_topic logs into the receipt.
                 let logs = {
@@ -373,6 +387,7 @@ impl RskExecutor {
                     );
                     match outcome {
                         Ok(out) => {
+                            evm.ctx.chain_mut().raw_storage.commit_call();
                             evm.ctx.journal_mut().checkpoint_commit();
                             // rskj transfers the endowment after execute()
                             // returns without throwing.
@@ -397,11 +412,13 @@ impl RskExecutor {
                             // rskj invisible exception: receipt SUCCESS with
                             // the spent gas, no logs, no endowment — but the
                             // sender is charged the FULL gas limit.
+                            evm.ctx.chain_mut().raw_storage.discard_call();
                             evm.ctx.journal_mut().checkpoint_revert(checkpoint);
                             invisible_exception = true;
                             (true, Vec::new(), Vec::new())
                         }
                         Err(e) => {
+                            evm.ctx.chain_mut().raw_storage.discard_call();
                             evm.ctx.journal_mut().checkpoint_revert(checkpoint);
                             debug!(tx_index = i, error = %e, "direct bridge call failed");
                             (false, Vec::new(), Vec::new())
@@ -469,6 +486,13 @@ impl RskExecutor {
             let logs = result.into_logs();
             let created_address = Self::extract_created_address(tx, &success);
 
+            if !success {
+                // rskj cacheTrack rollback: a failed tx drops its bridge
+                // raw-storage writes along with the rest of its state.
+                use revm::context_interface::ContextTr;
+                evm.ctx.chain_mut().raw_storage.discard_tx();
+            }
+
             if success {
                 if let Ok(mut called) = called_precompiles.lock() {
                     for addr in called.drain(..) {
@@ -508,6 +532,10 @@ impl RskExecutor {
             debug!(tx_index = i, gas_used, success, "executed transaction");
         }
 
+        {
+            use revm::context_interface::ContextTr;
+            markers.raw_storage = evm.ctx.chain_mut().raw_storage.drain();
+        }
         let state = evm.finalize();
 
         Ok(BlockExecutionResult {
@@ -785,21 +813,20 @@ mod tests {
             .expect("block 2");
         assert!(r2.tx_results[0].success);
 
-        let bridge_state = r2
-            .state_changes
-            .get(&crate::precompiles::BRIDGE_ADDR)
-            .expect("bridge in state");
         let fee_key = crate::bridge::storage::bridge_storage_key(
             crate::bridge::storage::FEE_PER_KB_KEY,
         );
-        let fee_slot = bridge_state
-            .storage
-            .get(&fee_key)
-            .expect("feePerKb cell written");
+        let fee_write = r2
+            .markers
+            .raw_storage
+            .iter()
+            .rev()
+            .find(|(addr, key, _)| *addr == crate::precompiles::BRIDGE_ADDR && *key == fee_key)
+            .expect("feePerKb entry written");
         assert_eq!(
-            fee_slot.present_value,
-            U256::from(30_000),
-            "majority vote applies the new feePerKb"
+            fee_write.2.as_deref(),
+            Some(crate::bridge::storage::rlp_encode_uint(U256::from(30_000)).as_slice()),
+            "majority vote stores the new feePerKb as rskj serializeCoin RLP"
         );
     }
 
@@ -1386,18 +1413,15 @@ mod tests {
             .expect("block executes");
         assert!(result.tx_results[0].success, "releaseBtc succeeds");
 
-        let bridge_state = result
-            .state_changes
-            .get(&crate::precompiles::BRIDGE_ADDR)
-            .expect("bridge account in state changes");
-        let written_slots = bridge_state
-            .storage
+        let written = result
+            .markers
+            .raw_storage
             .iter()
-            .filter(|(_, slot)| slot.present_value != slot.original_value())
+            .filter(|(addr, _, v)| *addr == crate::precompiles::BRIDGE_ADDR && v.is_some())
             .count();
         assert!(
-            written_slots >= 2,
-            "releaseBtc must persist the release request queue blob, got {written_slots} changed slots"
+            written >= 1,
+            "releaseBtc must persist the release request queue blob, got {written} raw writes"
         );
     }
 

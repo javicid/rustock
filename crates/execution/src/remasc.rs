@@ -167,7 +167,7 @@ pub const FEDERATION_BALANCE_KEY: &str = "federationBalance";
 // ---------------------------------------------------------------------------
 
 /// Read a `U256` coin value from REMASC contract storage via the journal.
-pub fn remasc_sload<CTX: ContextTr>(ctx: &mut CTX, key: U256) -> U256 {
+pub fn remasc_sload<CTX: crate::RskContextTr>(ctx: &mut CTX, key: U256) -> U256 {
     ctx.journal_mut()
         .sload(REMASC_ADDR, key)
         .map(|sl| sl.data)
@@ -175,17 +175,17 @@ pub fn remasc_sload<CTX: ContextTr>(ctx: &mut CTX, key: U256) -> U256 {
 }
 
 /// Write a `U256` coin value to REMASC contract storage via the journal.
-pub fn remasc_sstore<CTX: ContextTr>(ctx: &mut CTX, key: U256, value: U256) {
+pub fn remasc_sstore<CTX: crate::RskContextTr>(ctx: &mut CTX, key: U256, value: U256) {
     let _ = ctx.journal_mut().sstore(REMASC_ADDR, key, value);
 }
 
 /// Read a boolean flag from REMASC contract storage (0 = false, nonzero = true).
-pub fn remasc_load_bool<CTX: ContextTr>(ctx: &mut CTX, key: U256) -> bool {
+pub fn remasc_load_bool<CTX: crate::RskContextTr>(ctx: &mut CTX, key: U256) -> bool {
     remasc_sload(ctx, key) != U256::ZERO
 }
 
 /// Write a boolean flag to REMASC contract storage (false → 0, true → 1).
-pub fn remasc_store_bool<CTX: ContextTr>(ctx: &mut CTX, key: U256, value: bool) {
+pub fn remasc_store_bool<CTX: crate::RskContextTr>(ctx: &mut CTX, key: U256, value: bool) {
     remasc_sstore(ctx, key, if value { U256::from(1) } else { U256::ZERO });
 }
 
@@ -198,7 +198,7 @@ pub fn remasc_store_bool<CTX: ContextTr>(ctx: &mut CTX, key: U256, value: bool) 
 /// Uses `journal.transfer()` which atomically decrements the sender and
 /// increments the recipient, matching rskj's `RemascFeesPayer.transferPayment`.
 /// Returns `true` on success, `false` if REMASC has insufficient funds.
-pub fn remasc_transfer<CTX: ContextTr>(ctx: &mut CTX, recipient: Address, amount: U256) -> bool {
+pub fn remasc_transfer<CTX: crate::RskContextTr>(ctx: &mut CTX, recipient: Address, amount: U256) -> bool {
     if amount.is_zero() {
         return true;
     }
@@ -366,7 +366,7 @@ impl SiblingPayment {
 /// rskj `RemascFeesPayer.payMiningFees`: transfer plus a `mining_fee_topic`
 /// log (topics: [topic, payee-as-word], data: RLP([processingBlockHash, value])).
 /// Format groundtruthed by the mainnet #4010 REMASC receipt.
-fn pay_mining_fees<CTX: ContextTr>(
+fn pay_mining_fees<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     processing_block_hash: alloy_primitives::B256,
     to: Address,
@@ -401,7 +401,7 @@ fn pay_mining_fees<CTX: ContextTr>(
 /// or the genesis federation while none is stored. Members are ordered by
 /// compressed BTC public key (rskj Federation constructor), groundtruthed by
 /// the mainnet #4010 payout order.
-fn federation_rsk_addresses<CTX: ContextTr>(
+fn federation_rsk_addresses<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     config: &RemascConfig,
     bridge_config: &crate::bridge::constants::BridgeConstants,
@@ -429,7 +429,7 @@ fn federation_rsk_addresses<CTX: ContextTr>(
 /// block's cut, split evenly across the federators (remainder to the last one)
 /// and paid every block before RSKIP85; afterwards it accrues until the
 /// per-federator share clears the minimum payable amount.
-fn pay_to_federation<CTX: ContextTr>(
+fn pay_to_federation<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     config: &RemascConfig,
     bridge_config: &crate::bridge::constants::BridgeConstants,
@@ -487,7 +487,7 @@ fn pay_to_federation<CTX: ContextTr>(
 ///
 /// This runs when the REMASC precompile is called (last tx of each block).
 /// It distributes fees from the block that matured `config.maturity` blocks ago.
-pub fn process_miners_fees<CTX: ContextTr>(
+pub fn process_miners_fees<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     config: &RemascConfig,
     bridge_config: &crate::bridge::constants::BridgeConstants,
@@ -589,7 +589,7 @@ pub fn process_miners_fees<CTX: ContextTr>(
 
 /// Distribute rewards when siblings exist.
 /// Matches rskj's `Remasc.payWithSiblings`.
-fn pay_with_siblings<CTX: ContextTr>(
+fn pay_with_siblings<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     config: &RemascConfig,
     processing_hash: alloy_primitives::B256,
@@ -634,7 +634,7 @@ fn pay_with_siblings<CTX: ContextTr>(
 }
 
 /// Add amount to burnedBalance storage.
-fn add_to_burned<CTX: ContextTr>(ctx: &mut CTX, amount: U256) {
+fn add_to_burned<CTX: crate::RskContextTr>(ctx: &mut CTX, amount: U256) {
     if amount.is_zero() {
         return;
     }

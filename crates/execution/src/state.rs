@@ -30,6 +30,10 @@ pub struct ContractMarkers {
     /// block height. revm cannot represent the 1-byte address, so the bump is
     /// applied directly to the trie.
     pub bump_remasc_sender: bool,
+    /// Raw-bytes storage writes (rskj `addStorageBytes`): one variable-length
+    /// value per unitrie storage key, bypassing revm's U256-valued slots.
+    /// `None` deletes the entry.
+    pub raw_storage: Vec<crate::raw_storage::RawWrite>,
 }
 
 /// Apply all state changes from EVM execution to the trie, returning the new root.
@@ -88,6 +92,15 @@ pub fn apply_state_changes(
     for addr in &markers.precompiles {
         let key = TrieKeySlice::from_key(&storage_prefix_key(addr));
         new_root = new_root.put(&key, &[1], store);
+    }
+
+    for (addr, slot, value) in &markers.raw_storage {
+        let slot_b256 = B256::from(*slot);
+        let key = TrieKeySlice::from_key(&storage_key(addr, &slot_b256));
+        new_root = match value {
+            Some(bytes) => new_root.put(&key, bytes, store),
+            None => new_root.delete(&key, store),
+        };
     }
 
     if markers.bump_remasc_sender {

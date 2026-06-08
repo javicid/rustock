@@ -4,7 +4,6 @@
 //! from Bridge contract storage. They are consensus-safe read-only queries.
 
 use alloy_primitives::{Bytes, U256};
-use revm::context_interface::ContextTr;
 use revm::precompile::{PrecompileError, PrecompileOutput};
 
 use super::constants::BridgeConstants;
@@ -12,7 +11,7 @@ use super::serialization;
 use super::storage::*;
 
 /// `getFederationAddress()` → string (ABI-encoded)
-pub fn get_federation_address<CTX: ContextTr>(
+pub fn get_federation_address<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
 ) -> Result<PrecompileOutput, PrecompileError> {
@@ -28,7 +27,7 @@ pub fn get_federation_address<CTX: ContextTr>(
 }
 
 /// `getFederationSize()` → int256
-pub fn get_federation_size<CTX: ContextTr>(
+pub fn get_federation_size<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
 ) -> Result<PrecompileOutput, PrecompileError> {
@@ -41,7 +40,7 @@ pub fn get_federation_size<CTX: ContextTr>(
 }
 
 /// `getFederationThreshold()` → int256
-pub fn get_federation_threshold<CTX: ContextTr>(
+pub fn get_federation_threshold<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
 ) -> Result<PrecompileOutput, PrecompileError> {
@@ -55,7 +54,7 @@ pub fn get_federation_threshold<CTX: ContextTr>(
 }
 
 /// `getFederationCreationBlockNumber()` → int256
-pub fn get_federation_creation_block_number<CTX: ContextTr>(
+pub fn get_federation_creation_block_number<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
 ) -> Result<PrecompileOutput, PrecompileError> {
@@ -64,7 +63,7 @@ pub fn get_federation_creation_block_number<CTX: ContextTr>(
 }
 
 /// `getFederationCreationTime()` → int256
-pub fn get_federation_creation_time<CTX: ContextTr>(
+pub fn get_federation_creation_time<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
 ) -> Result<PrecompileOutput, PrecompileError> {
@@ -77,7 +76,7 @@ pub fn get_federation_creation_time<CTX: ContextTr>(
 }
 
 /// `getFederatorPublicKey(int256 index)` → bytes
-pub fn get_federator_public_key<CTX: ContextTr>(
+pub fn get_federator_public_key<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     gas_cost: u64,
@@ -102,7 +101,7 @@ pub fn get_federator_public_key<CTX: ContextTr>(
 }
 
 /// `getFederatorPublicKeyOfType(int256 index, string keyType)` → bytes
-pub fn get_federator_public_key_of_type<CTX: ContextTr>(
+pub fn get_federator_public_key_of_type<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     gas_cost: u64,
@@ -112,7 +111,7 @@ pub fn get_federator_public_key_of_type<CTX: ContextTr>(
 }
 
 /// `getFeePerKb()` → int256
-pub fn get_fee_per_kb<CTX: ContextTr>(
+pub fn get_fee_per_kb<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
 ) -> Result<PrecompileOutput, PrecompileError> {
@@ -121,7 +120,7 @@ pub fn get_fee_per_kb<CTX: ContextTr>(
 }
 
 /// `getLockingCap()` → int256
-pub fn get_locking_cap<CTX: ContextTr>(
+pub fn get_locking_cap<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
 ) -> Result<PrecompileOutput, PrecompileError> {
@@ -140,7 +139,7 @@ pub fn get_minimum_lock_tx_value(
 }
 
 /// `getRetiringFederationAddress()` → string
-pub fn get_retiring_federation_address<CTX: ContextTr>(
+pub fn get_retiring_federation_address<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
 ) -> Result<PrecompileOutput, PrecompileError> {
@@ -153,7 +152,7 @@ pub fn get_retiring_federation_address<CTX: ContextTr>(
 }
 
 /// `getRetiringFederationSize()` → int256
-pub fn get_retiring_federation_size<CTX: ContextTr>(
+pub fn get_retiring_federation_size<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
 ) -> Result<PrecompileOutput, PrecompileError> {
@@ -166,7 +165,7 @@ pub fn get_retiring_federation_size<CTX: ContextTr>(
 }
 
 /// `getRetiringFederationThreshold()` → int256
-pub fn get_retiring_federation_threshold<CTX: ContextTr>(
+pub fn get_retiring_federation_threshold<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
 ) -> Result<PrecompileOutput, PrecompileError> {
@@ -180,7 +179,7 @@ pub fn get_retiring_federation_threshold<CTX: ContextTr>(
 }
 
 /// `getPendingFederationSize()` → int256
-pub fn get_pending_federation_size<CTX: ContextTr>(
+pub fn get_pending_federation_size<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
 ) -> Result<PrecompileOutput, PrecompileError> {
@@ -193,7 +192,7 @@ pub fn get_pending_federation_size<CTX: ContextTr>(
 }
 
 /// `isBtcTxHashAlreadyProcessed(string hash)` → bool
-pub fn is_btc_tx_hash_already_processed<CTX: ContextTr>(
+pub fn is_btc_tx_hash_already_processed<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     gas_cost: u64,
@@ -211,9 +210,26 @@ pub fn is_btc_tx_hash_already_processed<CTX: ContextTr>(
     }
     let hash_str = &args[offset + 32..offset + 32 + len];
     let hash_hex = String::from_utf8_lossy(hash_str);
-    let key = compound_key(BTC_TX_HASH_AP_KEY, "-", &hash_hex);
-    let val = bridge_sload(ctx, key);
-    Ok(PrecompileOutput::new(gas_cost, abi_encode_bool(!val.is_zero())))
+    // rskj goes through getHeightIfBtcTxhashIsAlreadyProcessed, which checks
+    // the legacy btcTxHashesAP map first at every era (and loads it, so the
+    // post-call save persists the possibly-empty map entry).
+    let mut hash_display = [0u8; 32];
+    let ok = hash_hex.len() == 64
+        && (0..32).all(|i| {
+            u8::from_str_radix(&hash_hex[2 * i..2 * i + 2], 16)
+                .map(|b| {
+                    hash_display[i] = b;
+                    true
+                })
+                .unwrap_or(false)
+        });
+    if !ok {
+        return Ok(PrecompileOutput::new(gas_cost, abi_encode_bool(false)));
+    }
+    let mut hash_internal = hash_display;
+    hash_internal.reverse();
+    let processed = super::tx::is_btc_tx_processed(ctx, &hash_internal);
+    Ok(PrecompileOutput::new(gas_cost, abi_encode_bool(processed)))
 }
 
 // ---------------------------------------------------------------------------

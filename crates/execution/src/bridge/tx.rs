@@ -8,7 +8,6 @@
 
 use alloy_primitives::{Bytes, U256};
 use bitcoin::hashes::{Hash, sha256d};
-use revm::context_interface::ContextTr;
 use revm::precompile::{PrecompileError, PrecompileOutput};
 
 use super::btc_chain::b256_to_bitcoin_hash;
@@ -17,35 +16,106 @@ use super::btc_chain::b256_to_bitcoin_hash;
 pub fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
+
+/// Render a BTC hash (internal byte order) as rskj's `Sha256Hash.toString()`:
+/// DISPLAY-order hex, used in compound storage keys.
+pub fn btc_hash_hex_display(hash: &[u8; 32]) -> String {
+    let mut bytes = *hash;
+    bytes.reverse();
+    to_hex(&bytes)
+}
 use super::btc_store::{get_stored_block, load_chain_head};
 use super::pmt::{MerkleBranch, PartialMerkleTree};
+use super::serialization::{rlp_decode_list, rlp_encode_element, rlp_encode_list};
 use super::storage::*;
 
 // ---------------------------------------------------------------------------
 // Processed tx hash tracking
 // ---------------------------------------------------------------------------
 
-/// Check if a BTC tx hash has already been processed.
-/// Uses compound key `btcTxHashAP-{hash_hex}` (post-RSKIP134 path).
-pub fn is_btc_tx_processed<CTX: ContextTr>(ctx: &mut CTX, btc_tx_hash: &[u8; 32]) -> bool {
-    let hash_hex = to_hex(btc_tx_hash);
-    let key = compound_key(BTC_TX_HASH_AP_KEY, "-", &hash_hex);
-    let val = bridge_sload(ctx, key);
-    !val.is_zero()
+/// Load the legacy processed-tx map ("btcTxHashesAP" — the only form before
+/// RSKIP134), and write it back: rskj loads it on ANY processed-height
+/// lookup and the post-call save rewrites it, creating the (possibly empty)
+/// RLP map entry the first time the bridge reads it. Hashes are kept in
+/// internal byte order; the serialized form uses display order, sorted by
+/// bitcoinj `Sha256Hash.compareTo` (= internal-order lexicographic).
+fn load_legacy_processed_map<CTX: crate::RskContextTr>(ctx: &mut CTX) -> Vec<([u8; 32], u64)> {
+    let key = bridge_storage_key(BTC_TX_HASHES_ALREADY_PROCESSED_KEY);
+    let mut map = Vec::new();
+    if let Some(data) = bridge_load_raw(ctx, key) {
+        if let Some(items) = rlp_decode_list(&data) {
+            let mut i = 0;
+            while i + 1 < items.len() {
+                if items[i].len() == 32 {
+                    let mut hash = [0u8; 32];
+                    hash.copy_from_slice(&items[i]);
+                    hash.reverse(); // display -> internal
+                    let height = U256::from_be_slice(&items[i + 1]).to::<u64>();
+                    map.push((hash, height));
+                }
+                i += 2;
+            }
+        }
+    }
+    store_legacy_processed_map(ctx, map.clone());
+    map
 }
 
-/// Mark a BTC tx hash as processed at a given RSK height.
-pub fn set_btc_tx_processed<CTX: ContextTr>(ctx: &mut CTX, btc_tx_hash: &[u8; 32], height: u64) {
-    let hash_hex = to_hex(btc_tx_hash);
-    let key = compound_key(BTC_TX_HASH_AP_KEY, "-", &hash_hex);
-    bridge_sstore(ctx, key, U256::from(height));
+/// Serialize and store the legacy map (rskj `serializeMapOfHashesToLong`).
+fn store_legacy_processed_map<CTX: crate::RskContextTr>(ctx: &mut CTX, mut map: Vec<([u8; 32], u64)>) {
+    map.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut items = Vec::with_capacity(map.len() * 2);
+    for (hash_internal, height) in &map {
+        let mut display = *hash_internal;
+        display.reverse();
+        items.push(rlp_encode_element(&display));
+        items.push(rlp_encode_uint(U256::from(*height)));
+    }
+    let key = bridge_storage_key(BTC_TX_HASHES_ALREADY_PROCESSED_KEY);
+    bridge_store_raw(ctx, key, Some(rlp_encode_list(&items)));
 }
 
-/// Get the height at which a BTC tx was processed (0 if not processed).
-pub fn get_btc_tx_processed_height<CTX: ContextTr>(ctx: &mut CTX, btc_tx_hash: &[u8; 32]) -> u64 {
-    let hash_hex = to_hex(btc_tx_hash);
+/// Check if a BTC tx hash has already been processed. rskj checks the
+/// legacy map first at every era, then (post-RSKIP134) the per-hash
+/// compound entry.
+pub fn is_btc_tx_processed<CTX: crate::RskContextTr>(ctx: &mut CTX, btc_tx_hash: &[u8; 32]) -> bool {
+    get_btc_tx_processed_height(ctx, btc_tx_hash).is_some()
+}
+
+/// Mark a BTC tx hash as processed at a given RSK height
+/// (rskj `setHeightBtcTxhashAlreadyProcessed`).
+pub fn set_btc_tx_processed<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    btc_tx_hash: &[u8; 32],
+    height: u64,
+    rskip134: bool,
+) {
+    if rskip134 {
+        let hash_hex = btc_hash_hex_display(btc_tx_hash);
+        let key = compound_key(BTC_TX_HASH_AP_KEY, "-", &hash_hex);
+        // serializeLong (RLP).
+        bridge_store_raw(ctx, key, Some(rlp_encode_uint(U256::from(height))));
+    } else {
+        let mut map = load_legacy_processed_map(ctx);
+        map.retain(|(h, _)| h != btc_tx_hash);
+        map.push((*btc_tx_hash, height));
+        store_legacy_processed_map(ctx, map);
+    }
+}
+
+/// Get the height at which a BTC tx was processed
+/// (rskj `getHeightIfBtcTxhashIsAlreadyProcessed`).
+pub fn get_btc_tx_processed_height<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    btc_tx_hash: &[u8; 32],
+) -> Option<u64> {
+    let map = load_legacy_processed_map(ctx);
+    if let Some((_, height)) = map.iter().find(|(h, _)| h == btc_tx_hash) {
+        return Some(*height);
+    }
+    let hash_hex = btc_hash_hex_display(btc_tx_hash);
     let key = compound_key(BTC_TX_HASH_AP_KEY, "-", &hash_hex);
-    bridge_sload(ctx, key).to::<u64>()
+    bridge_load_raw(ctx, key).map(|d| rlp_decode_uint(&d).to::<u64>())
 }
 
 // ---------------------------------------------------------------------------
@@ -54,33 +124,37 @@ pub fn get_btc_tx_processed_height<CTX: ContextTr>(ctx: &mut CTX, btc_tx_hash: &
 
 /// Store the witness merkle root for a BTC block's coinbase transaction.
 /// Keyed by the BTC block hash.
-pub fn set_coinbase_information<CTX: ContextTr>(
+pub fn set_coinbase_information<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     block_hash: &[u8; 32],
     witness_merkle_root: &[u8; 32],
 ) {
-    let hash_hex = to_hex(block_hash);
+    let hash_hex = btc_hash_hex_display(block_hash);
     let key = compound_key(COINBASE_INFORMATION_KEY, "-", &hash_hex);
-    bridge_sstore(ctx, key, U256::from_be_bytes(*witness_merkle_root));
+    // rskj serializeCoinbaseInformation: RLP list of one element.
+    let value = rlp_encode_list(&[rlp_encode_element(witness_merkle_root)]);
+    bridge_store_raw(ctx, key, Some(value));
 }
 
 /// Load the witness merkle root for a BTC block's coinbase transaction.
-pub fn get_coinbase_information<CTX: ContextTr>(
+pub fn get_coinbase_information<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     block_hash: &[u8; 32],
 ) -> Option<[u8; 32]> {
-    let hash_hex = to_hex(block_hash);
+    let hash_hex = btc_hash_hex_display(block_hash);
     let key = compound_key(COINBASE_INFORMATION_KEY, "-", &hash_hex);
-    let val = bridge_sload(ctx, key);
-    if val.is_zero() {
-        None
-    } else {
-        Some(val.to_be_bytes::<32>())
-    }
+    let data = bridge_load_raw(ctx, key)?;
+    let items = rlp_decode_list(&data)?;
+    let root = items.first()?;
+    (root.len() == 32).then(|| {
+        let mut out = [0u8; 32];
+        out.copy_from_slice(root);
+        out
+    })
 }
 
 /// Check if coinbase info exists for a block hash.
-pub fn has_coinbase_information<CTX: ContextTr>(ctx: &mut CTX, block_hash: &[u8; 32]) -> bool {
+pub fn has_coinbase_information<CTX: crate::RskContextTr>(ctx: &mut CTX, block_hash: &[u8; 32]) -> bool {
     get_coinbase_information(ctx, block_hash).is_some()
 }
 
@@ -89,7 +163,7 @@ pub fn has_coinbase_information<CTX: ContextTr>(ctx: &mut CTX, block_hash: &[u8;
 // ---------------------------------------------------------------------------
 
 /// `registerBtcCoinbaseTransaction(bytes btcTx, bytes32 blockHash, bytes pmtSerialized, bytes32 witnessMerkleRoot, bytes32 witnessReservedValue)`
-pub fn register_btc_coinbase_transaction<CTX: ContextTr>(
+pub fn register_btc_coinbase_transaction<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     gas_cost: u64,
@@ -179,7 +253,7 @@ pub fn register_btc_coinbase_transaction<CTX: ContextTr>(
 // ---------------------------------------------------------------------------
 
 /// `hasBtcBlockCoinbaseTransactionInformation(bytes32 blockHash)` → bool
-pub fn has_btc_block_coinbase_info<CTX: ContextTr>(
+pub fn has_btc_block_coinbase_info<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     gas_cost: u64,
@@ -211,7 +285,7 @@ const _CONFIRMATION_ERR_BLOCK_TOO_OLD: i64 = -3;
 const CONFIRMATION_ERR_BTC_NOT_READY: i64 = -4;
 
 /// `getBtcTransactionConfirmations(bytes32 btcTxHash, bytes32 btcBlockHash, uint256 merkleBranchPath, bytes32[] merkleBranchHashes)` → int256
-pub fn get_btc_transaction_confirmations<CTX: ContextTr>(
+pub fn get_btc_transaction_confirmations<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     gas_cost: u64,

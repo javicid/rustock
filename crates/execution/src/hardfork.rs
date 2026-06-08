@@ -206,6 +206,17 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Iris300
     }
 
+    /// RSKIP199: BTC main-chain height -> hash index in bridge storage (Iris300).
+    pub fn has_rskip199(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Iris300
+    }
+
+    /// RSKIP134: per-hash processed-peg-in entries replace the single
+    /// btcTxHashesAP map (Papyrus200).
+    pub fn has_rskip134(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Papyrus200
+    }
+
     /// RSKIP185: peg-out refund to sender on rejection (Iris300).
     pub fn has_rskip185(&self, block_number: u64) -> bool {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Iris300

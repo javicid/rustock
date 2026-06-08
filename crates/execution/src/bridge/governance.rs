@@ -123,7 +123,7 @@ fn federation_change_authorizers(
 }
 
 /// `createFederation()` → int256
-pub fn create_federation<CTX: ContextTr>(
+pub fn create_federation<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
     config: &super::constants::BridgeConstants,
@@ -135,7 +135,7 @@ pub fn create_federation<CTX: ContextTr>(
 }
 
 /// `addFederatorPublicKey(bytes key)` → int256 (pre-RSKIP123 only)
-pub fn add_federator_public_key<CTX: ContextTr>(
+pub fn add_federator_public_key<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     gas_cost: u64,
@@ -152,7 +152,7 @@ pub fn add_federator_public_key<CTX: ContextTr>(
 
 /// `addFederatorPublicKeyMultikey(bytes btcKey, bytes rskKey, bytes mstKey)`
 /// → int256 (post-RSKIP123)
-pub fn add_federator_public_key_multikey<CTX: ContextTr>(
+pub fn add_federator_public_key_multikey<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     gas_cost: u64,
@@ -173,7 +173,7 @@ pub fn add_federator_public_key_multikey<CTX: ContextTr>(
 }
 
 /// `commitFederation(bytes pendingHash)` → int256
-pub fn commit_federation<CTX: ContextTr>(
+pub fn commit_federation<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     gas_cost: u64,
@@ -189,7 +189,7 @@ pub fn commit_federation<CTX: ContextTr>(
 }
 
 /// `rollbackFederation()` → int256
-pub fn rollback_federation<CTX: ContextTr>(
+pub fn rollback_federation<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
     config: &super::constants::BridgeConstants,
@@ -200,7 +200,7 @@ pub fn rollback_federation<CTX: ContextTr>(
     Ok(encode_int_result(gas_cost, code))
 }
 
-fn vote_federation_change<CTX: ContextTr>(
+fn vote_federation_change<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     function: &str,
     args: Vec<Vec<u8>>,
@@ -242,7 +242,7 @@ fn vote_federation_change<CTX: ContextTr>(
 }
 
 /// rskj FederationSupportImpl.executeVoteFederationChangeFunction.
-fn execute_federation_change<CTX: ContextTr>(
+fn execute_federation_change<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     function: &str,
     args: &[Vec<u8>],
@@ -356,7 +356,7 @@ pub(crate) fn federation_activation_age(
 /// keys, move the active federation's UTXOs to the old-federation set, store
 /// active as old / built as new, wipe the pending federation, and log the
 /// legacy commit_federation event.
-fn commit_pending_federation<CTX: ContextTr>(
+fn commit_pending_federation<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     pending_keys: &[Vec<u8>],
     config: &super::constants::BridgeConstants,
@@ -438,7 +438,7 @@ fn commit_pending_federation<CTX: ContextTr>(
 /// the election is cleared.
 /// Returns 1 successful vote/winner, -1 negative fee or duplicate vote,
 /// -2 fee above maximum, -10 unauthorized.
-pub fn vote_fee_per_kb_change<CTX: ContextTr>(
+pub fn vote_fee_per_kb_change<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     gas_cost: u64,
@@ -498,8 +498,8 @@ pub fn vote_fee_per_kb_change<CTX: ContextTr>(
     voters.push(sender);
 
     if voters.len() >= required {
-        let key = bridge_storage_key(FEE_PER_KB_KEY);
-        bridge_sstore(ctx, key, U256::from(fee_satoshis));
+        // rskj setFeePerKb: serializeCoin (RLP).
+        bridge_store_u256(ctx, FEE_PER_KB_KEY, U256::from(fee_satoshis));
         store_fee_per_kb_election(ctx, &[]);
     } else {
         store_fee_per_kb_election(ctx, &election);
@@ -521,7 +521,7 @@ fn serialize_fee_per_kb_spec(coin_encoded: &[u8]) -> Vec<u8> {
     rlp_encode_list(&[rlp_encode_element(b"setFeePerKb"), args])
 }
 
-fn store_fee_per_kb_election<CTX: ContextTr>(
+fn store_fee_per_kb_election<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     election: &[(Vec<u8>, Vec<alloy_primitives::Address>)],
 ) {
@@ -547,7 +547,7 @@ fn store_fee_per_kb_election<CTX: ContextTr>(
     bridge_store_bytes_named(ctx, FEE_PER_KB_ELECTION_KEY, &data);
 }
 
-fn load_fee_per_kb_election<CTX: ContextTr>(
+fn load_fee_per_kb_election<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
 ) -> Vec<(Vec<u8>, Vec<alloy_primitives::Address>)> {
     use super::serialization::rlp_decode_list;
@@ -591,7 +591,7 @@ fn load_fee_per_kb_election<CTX: ContextTr>(
 ///
 /// Increases the RBTC locking cap. Can only increase, never decrease.
 /// Returns true if successful.
-pub fn increase_locking_cap<CTX: ContextTr>(
+pub fn increase_locking_cap<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     gas_cost: u64,
@@ -602,8 +602,7 @@ pub fn increase_locking_cap<CTX: ContextTr>(
 
     let new_cap = U256::from_be_slice(&args[..32]);
 
-    let key = bridge_storage_key(LOCKING_CAP_KEY);
-    let current_cap = bridge_sload(ctx, key);
+    let current_cap = bridge_load_u256(ctx, LOCKING_CAP_KEY);
 
     // Can only increase
     if new_cap <= current_cap {
@@ -611,7 +610,8 @@ pub fn increase_locking_cap<CTX: ContextTr>(
         return Ok(PrecompileOutput::new(gas_cost, output.to_vec().into()));
     }
 
-    bridge_sstore(ctx, key, new_cap);
+    // rskj setLockingCap: serializeCoin (RLP).
+    bridge_store_u256(ctx, LOCKING_CAP_KEY, new_cap);
 
     let mut output = [0u8; 32];
     output[31] = 1; // true
@@ -631,7 +631,7 @@ pub fn increase_locking_cap<CTX: ContextTr>(
 ///   1  = success
 ///  -1  = address already in whitelist
 ///  -2  = invalid address
-pub fn add_lock_whitelist_address<CTX: ContextTr>(
+pub fn add_lock_whitelist_address<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     gas_cost: u64,
@@ -664,7 +664,7 @@ fn is_whitelist_change_authorized(
 ///   1  = success
 ///  -1  = address already in whitelist
 ///  -2  = invalid address
-pub fn add_one_off_lock_whitelist_address<CTX: ContextTr>(
+pub fn add_one_off_lock_whitelist_address<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     gas_cost: u64,
@@ -714,7 +714,7 @@ pub fn add_one_off_lock_whitelist_address<CTX: ContextTr>(
 ///   1  = success
 ///  -1  = address already in unlimited whitelist
 ///  -2  = invalid address
-pub fn add_unlimited_lock_whitelist_address<CTX: ContextTr>(
+pub fn add_unlimited_lock_whitelist_address<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     gas_cost: u64,
@@ -758,7 +758,7 @@ pub fn add_unlimited_lock_whitelist_address<CTX: ContextTr>(
 ///   1  = success
 ///  -1  = address not found
 ///  -2  = invalid address
-pub fn remove_lock_whitelist_address<CTX: ContextTr>(
+pub fn remove_lock_whitelist_address<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     gas_cost: u64,
@@ -806,7 +806,7 @@ pub fn remove_lock_whitelist_address<CTX: ContextTr>(
 /// best-chain height plus the delay, inside the one-off whitelist blob.
 /// Returns 1 success, -1 delay already set, -2 invalid delay,
 /// -10 unauthorized.
-pub fn set_lock_whitelist_disable_block_delay<CTX: ContextTr>(
+pub fn set_lock_whitelist_disable_block_delay<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     gas_cost: u64,
@@ -846,7 +846,7 @@ pub fn set_lock_whitelist_disable_block_delay<CTX: ContextTr>(
 // ---------------------------------------------------------------------------
 
 /// `getActivePowpegRedeemScript()` → bytes
-pub fn get_active_powpeg_redeem_script<CTX: ContextTr>(
+pub fn get_active_powpeg_redeem_script<CTX: crate::RskContextTr>(
     _ctx: &mut CTX,
     gas_cost: u64,
 ) -> Result<PrecompileOutput, PrecompileError> {
@@ -855,12 +855,11 @@ pub fn get_active_powpeg_redeem_script<CTX: ContextTr>(
 }
 
 /// `getActiveFederationCreationBlockHeight()` → uint256
-pub fn get_active_federation_creation_block_height<CTX: ContextTr>(
+pub fn get_active_federation_creation_block_height<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    let key = bridge_storage_key(ACTIVE_FEDERATION_CREATION_BLOCK_HEIGHT_KEY);
-    let val = bridge_sload(ctx, key);
+    let val = bridge_load_u256(ctx, ACTIVE_FEDERATION_CREATION_BLOCK_HEIGHT_KEY);
     let output = val.to_be_bytes::<32>();
     Ok(PrecompileOutput::new(gas_cost, output.to_vec().into()))
 }

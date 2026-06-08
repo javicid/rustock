@@ -8,7 +8,6 @@
 //! `voters` is the lexicographically sorted RLP list of 20-byte addresses.
 
 use alloy_primitives::Address;
-use revm::context_interface::ContextTr;
 
 use super::serialization::{rlp_decode_list, rlp_encode_element, rlp_encode_list};
 use super::storage::{bridge_load_bytes_named, bridge_store_bytes_named};
@@ -56,7 +55,7 @@ pub struct Election {
 }
 
 impl Election {
-    pub fn load<CTX: ContextTr>(ctx: &mut CTX, storage_key: &str) -> Self {
+    pub fn load<CTX: crate::RskContextTr>(ctx: &mut CTX, storage_key: &str) -> Self {
         let data = bridge_load_bytes_named(ctx, storage_key);
         if data.is_empty() {
             return Self::default();
@@ -83,7 +82,7 @@ impl Election {
         Self { entries }
     }
 
-    pub fn store<CTX: ContextTr>(&self, ctx: &mut CTX, storage_key: &str) {
+    pub fn store<CTX: crate::RskContextTr>(&self, ctx: &mut CTX, storage_key: &str) {
         let mut serialized: Vec<(Vec<u8>, &Vec<Address>)> = self
             .entries
             .iter()

@@ -968,7 +968,7 @@ impl RskPrecompileProvider {
     ///
     /// Returns `Ok(Some(result))` if the address was handled, `Ok(None)` to
     /// fall through to the generic (pure-function) precompile path.
-    fn run_stateful<CTX: ContextTr>(
+    fn run_stateful<CTX: crate::RskContextTr>(
         &self,
         context: &mut CTX,
         inputs: &CallInputs,
@@ -1012,6 +1012,13 @@ impl RskPrecompileProvider {
         } else {
             self.run_remasc(context, &input_bytes, inputs.gas_limit)
         };
+
+        // Raw-bytes storage commit discipline (rskj commits the call's child
+        // repository track only when the method succeeds).
+        match &exec_result {
+            Ok(o) if !o.reverted => context.chain_mut().raw_storage.commit_call(),
+            _ => context.chain_mut().raw_storage.discard_call(),
+        }
 
         let mut result = InterpreterResult {
             result: InstructionResult::Return,
@@ -1082,7 +1089,7 @@ impl RskPrecompileProvider {
     /// The depth value matches rskj's `programInvoke.getCallDeep() + 1`:
     /// in revm, `journal().depth()` already includes the precompile's own
     /// call frame, so no adjustment is needed.
-    fn run_environment<CTX: ContextTr>(
+    fn run_environment<CTX: crate::RskContextTr>(
         &self,
         context: &mut CTX,
         input: &[u8],
@@ -1117,7 +1124,7 @@ impl RskPrecompileProvider {
     /// Exposes block header fields to smart contracts via ABI method dispatch.
     /// Gas: 4000 + 2*input.len(). 9 methods, each taking `int256 blockDepth`
     /// (depth 0 = parent of executing block) and returning ABI-encoded `bytes`.
-    fn run_block_header<CTX: ContextTr>(
+    fn run_block_header<CTX: crate::RskContextTr>(
         &self,
         context: &mut CTX,
         input: &[u8],
@@ -1263,7 +1270,7 @@ impl RskPrecompileProvider {
 
     /// Bridge precompile (0x01000006).
     /// BTC–RSK two-way peg with 69 ABI methods.
-    fn run_bridge<CTX: ContextTr>(
+    fn run_bridge<CTX: crate::RskContextTr>(
         &self,
         context: &mut CTX,
         input: &[u8],
@@ -1294,7 +1301,7 @@ impl RskPrecompileProvider {
     /// throws RemascInvalidInvocationException for those, EXCEPT
     /// getStateForDebugging() which has no caller guard and succeeds
     /// (no state changes, so only its return data is modelled loosely).
-    fn run_remasc<CTX: ContextTr>(
+    fn run_remasc<CTX: crate::RskContextTr>(
         &self,
         context: &mut CTX,
         input: &[u8],
@@ -1335,7 +1342,7 @@ impl Clone for RskPrecompileProvider {
     }
 }
 
-impl<CTX: ContextTr> PrecompileProvider<CTX> for RskPrecompileProvider {
+impl<CTX: crate::RskContextTr> PrecompileProvider<CTX> for RskPrecompileProvider {
     type Output = InterpreterResult;
 
     fn set_spec(&mut self, spec: <CTX::Cfg as Cfg>::Spec) -> bool {

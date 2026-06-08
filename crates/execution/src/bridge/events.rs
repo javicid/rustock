@@ -6,7 +6,7 @@
 
 use alloy_primitives::{Address, Bytes, B256};
 use alloy_rlp::Encodable;
-use revm::context_interface::{ContextTr, JournalTr};
+use revm::context_interface::JournalTr;
 use revm::primitives::Log;
 
 use crate::precompiles::BRIDGE_ADDR;
@@ -20,7 +20,7 @@ pub(crate) fn legacy_topic(name: &str) -> B256 {
     B256::new(buf)
 }
 
-fn emit<CTX: ContextTr>(ctx: &mut CTX, topic: B256, data: Vec<u8>) {
+fn emit<CTX: crate::RskContextTr>(ctx: &mut CTX, topic: B256, data: Vec<u8>) {
     ctx.journal_mut().log(Log::new_unchecked(
         BRIDGE_ADDR,
         vec![topic],
@@ -29,7 +29,7 @@ fn emit<CTX: ContextTr>(ctx: &mut CTX, topic: B256, data: Vec<u8>) {
 }
 
 /// rskj `logUpdateCollections`: data = RLP.encodeElement(senderAddress).
-pub fn log_legacy_update_collections<CTX: ContextTr>(ctx: &mut CTX, sender: Address) {
+pub fn log_legacy_update_collections<CTX: crate::RskContextTr>(ctx: &mut CTX, sender: Address) {
     let mut data = Vec::with_capacity(21);
     sender.as_slice().encode(&mut data);
     emit(ctx, legacy_topic("update_collections_topic"), data);
@@ -37,7 +37,7 @@ pub fn log_legacy_update_collections<CTX: ContextTr>(ctx: &mut CTX, sender: Addr
 
 /// rskj `logAddSignature`: data = RLP([btcTxHash-as-hex-string,
 /// federatorBtcPubKeyHash160, rskTxHash]).
-pub fn log_legacy_add_signature<CTX: ContextTr>(
+pub fn log_legacy_add_signature<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     btc_tx_hash_hex: &str,
     federator_pubkey_hash160: &[u8; 20],
@@ -54,7 +54,7 @@ pub fn log_legacy_add_signature<CTX: ContextTr>(
 }
 
 /// rskj `logReleaseBtc`: data = RLP([btcTxHash-as-hex-string, serializedBtcTx]).
-pub fn log_legacy_release_btc<CTX: ContextTr>(
+pub fn log_legacy_release_btc<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     btc_tx_hash_hex: &str,
     serialized_btc_tx: &[u8],
@@ -74,7 +74,7 @@ pub fn log_legacy_release_btc<CTX: ContextTr>(
 /// data = RLP[ RLP[oldFedAddressHash160, RLP[oldKeys...]],
 ///             RLP[newFedAddressHash160, RLP[newKeys...]],
 ///             activationBlockNumber as a DECIMAL ASCII string ].
-pub fn log_legacy_commit_federation<CTX: ContextTr>(
+pub fn log_legacy_commit_federation<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     old_fed_hash160: &[u8; 20],
     old_keys: &[[u8; 33]],
@@ -104,7 +104,7 @@ fn solidity_topic(signature: &str) -> B256 {
     alloy_primitives::keccak256(signature.as_bytes())
 }
 
-fn emit_topics<CTX: ContextTr>(ctx: &mut CTX, topics: Vec<B256>, data: Vec<u8>) {
+fn emit_topics<CTX: crate::RskContextTr>(ctx: &mut CTX, topics: Vec<B256>, data: Vec<u8>) {
     ctx.journal_mut().log(Log::new_unchecked(BRIDGE_ADDR, topics, Bytes::from(data)));
 }
 
@@ -130,7 +130,7 @@ fn abi_single_dynamic(data: &[u8]) -> Vec<u8> {
 }
 
 /// `update_collections(address sender)` — no indexed params.
-pub fn log_solidity_update_collections<CTX: ContextTr>(ctx: &mut CTX, sender: Address) {
+pub fn log_solidity_update_collections<CTX: crate::RskContextTr>(ctx: &mut CTX, sender: Address) {
     emit_topics(
         ctx,
         vec![solidity_topic("update_collections(address)")],
@@ -140,7 +140,7 @@ pub fn log_solidity_update_collections<CTX: ContextTr>(ctx: &mut CTX, sender: Ad
 
 /// `add_signature(bytes32 indexed releaseRskTxHash, address indexed
 /// federatorRskAddress, bytes federatorBtcPublicKey)`.
-pub fn log_solidity_add_signature<CTX: ContextTr>(
+pub fn log_solidity_add_signature<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     release_rsk_tx_hash: &[u8; 32],
     federator_rsk_address: Address,
@@ -158,7 +158,7 @@ pub fn log_solidity_add_signature<CTX: ContextTr>(
 }
 
 /// `release_btc(bytes32 indexed releaseRskTxHash, bytes btcRawTransaction)`.
-pub fn log_solidity_release_btc<CTX: ContextTr>(
+pub fn log_solidity_release_btc<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     release_rsk_tx_hash: &[u8; 32],
     btc_raw_transaction: &[u8],
@@ -175,7 +175,7 @@ pub fn log_solidity_release_btc<CTX: ContextTr>(
 
 /// `lock_btc(address indexed receiver, bytes32 btcTxHash, string
 /// senderBtcAddress, int256 amount)` — RSKIP146 peg-in event (until RSKIP170).
-pub fn log_lock_btc<CTX: ContextTr>(
+pub fn log_lock_btc<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     receiver: Address,
     btc_tx_hash: &[u8; 32],
@@ -202,7 +202,7 @@ pub fn log_lock_btc<CTX: ContextTr>(
 
 /// `pegin_btc(address indexed receiver, bytes32 indexed btcTxHash, int256
 /// amount, int256 protocolVersion)` — replaces lock_btc from RSKIP170.
-pub fn log_pegin_btc<CTX: ContextTr>(
+pub fn log_pegin_btc<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     receiver: Address,
     btc_tx_hash: &[u8; 32],
@@ -225,7 +225,7 @@ pub fn log_pegin_btc<CTX: ContextTr>(
 
 /// `release_requested(bytes32 indexed rskTxHash, bytes32 indexed btcTxHash,
 /// uint256 amount)` — fired when a peg-out BTC transaction is created.
-pub fn log_release_requested<CTX: ContextTr>(
+pub fn log_release_requested<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     rsk_tx_hash: &[u8; 32],
     btc_tx_hash: &[u8; 32],

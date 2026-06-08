@@ -271,7 +271,7 @@ pub fn serialize_federation_only_btc_keys(
     ])
 }
 
-pub fn load_stored_federation<CTX: revm::context_interface::ContextTr>(
+pub fn load_stored_federation<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     storage_key: &str,
 ) -> Option<StoredFederation> {

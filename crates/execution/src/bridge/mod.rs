@@ -300,7 +300,7 @@ pub fn is_invisible_exception(e: &PrecompileError) -> bool {
 /// Called from `RskPrecompileProvider::run_bridge` with the full EVM context.
 /// Parses the ABI selector, dispatches to the appropriate handler, and
 /// persists storage changes on success.
-pub fn execute_bridge<CTX: ContextTr>(
+pub fn execute_bridge<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     input: &[u8],
     gas_limit: u64,
@@ -371,7 +371,7 @@ pub fn execute_bridge<CTX: ContextTr>(
 /// rskj `Bridge.getGasForData` for a parsed call: functionCost plus
 /// `data.length * 2` (23_000 flat for the empty-input releaseBtc form).
 /// Free bridge transactions cost 0 — callers handle that case.
-pub fn bridge_call_gas_cost<CTX: ContextTr>(
+pub fn bridge_call_gas_cost<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     input: &[u8],
     config: &BridgeConstants,
@@ -423,7 +423,7 @@ fn receive_headers_cost(args: &[u8], hardfork_cfg: &RskHardforkConfig, block_num
 /// rskj `BridgeSupport.getBtcTransactionConfirmationsGetCost`:
 /// 27_000 base + blockDepth * 315 + merkleBranchHashes * 144, falling back to
 /// the base cost when the block is unknown or too deep.
-fn btc_tx_confirmations_cost<CTX: ContextTr>(
+fn btc_tx_confirmations_cost<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     config: &BridgeConstants,
@@ -463,7 +463,7 @@ fn abi_array_len(args: &[u8], slot: usize) -> Option<u64> {
 }
 
 /// Dispatch to individual method handlers.
-fn execute_method<CTX: ContextTr>(
+fn execute_method<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     method_name: &str,
     args: &[u8],
@@ -477,7 +477,7 @@ fn execute_method<CTX: ContextTr>(
 
     match method_name {
         // Phase 2: BTC header chain
-        "receiveHeader" => btc_chain::receive_header(ctx, args, config, use_v2),
+        "receiveHeader" => btc_chain::receive_header(ctx, args, config, use_v2, hardfork_cfg),
         "receiveHeaders" => btc_chain::receive_headers(ctx, args, gas_cost, config, use_v2, hardfork_cfg),
         "getBtcBlockchainBestChainHeight" => btc_chain::get_best_chain_height(ctx, gas_cost),
         "getBtcBlockchainBestBlockHeader" => btc_chain::get_best_block_header(ctx, gas_cost),

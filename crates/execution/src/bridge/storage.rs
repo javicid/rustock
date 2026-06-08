@@ -5,7 +5,7 @@
 //! Compound keys use `DataWord.fromLongString` (SHA3 of the concatenated string).
 
 use alloy_primitives::{Address, B256, U256};
-use revm::context_interface::{ContextTr, JournalTr};
+use revm::context_interface::JournalTr;
 use sha3::{Digest, Keccak256};
 
 use crate::precompiles::BRIDGE_ADDR;
@@ -112,160 +112,117 @@ pub const PENDING_FEDERATION_FORMAT_VERSION_KEY: &str = "pendingFederationFormat
 pub const PROPOSED_FEDERATION_FORMAT_VERSION_KEY: &str = "proposedFederationFormatVersion";
 
 // ---------------------------------------------------------------------------
-// Journal-based read/write helpers
+// Raw-bytes read/write helpers (rskj addStorageBytes / getStorageBytes:
+// one variable-length value per unitrie key, via the RawStorage overlay)
 // ---------------------------------------------------------------------------
 
-/// Read a U256 from Bridge contract storage via the journal.
-pub fn bridge_sload<CTX: ContextTr>(ctx: &mut CTX, key: U256) -> U256 {
-    ctx.journal_mut()
-        .sload(BRIDGE_ADDR, key)
-        .map(|sl| sl.data)
-        .unwrap_or(U256::ZERO)
+/// Read a raw-bytes Bridge storage entry (rskj `getStorageBytes`).
+pub fn bridge_load_raw<CTX: crate::RskContextTr>(ctx: &mut CTX, key: U256) -> Option<Vec<u8>> {
+    ctx.chain_mut().raw_storage.get(BRIDGE_ADDR, key)
 }
 
-/// Write a U256 to Bridge contract storage via the journal.
-pub fn bridge_sstore<CTX: ContextTr>(ctx: &mut CTX, key: U256, value: U256) {
-    let _ = ctx.journal_mut().sstore(BRIDGE_ADDR, key, value);
+/// Write a raw-bytes Bridge storage entry (rskj `addStorageBytes`):
+/// `None`/empty deletes the trie node.
+pub fn bridge_store_raw<CTX: crate::RskContextTr>(ctx: &mut CTX, key: U256, value: Option<Vec<u8>>) {
+    ctx.chain_mut().raw_storage.put(BRIDGE_ADDR, key, value);
 }
 
-/// Read raw bytes from Bridge contract storage.
-/// Values larger than 32 bytes are stored across multiple consecutive slots.
-/// For Phase 1, only single-slot (≤32 byte) values are supported.
-pub fn bridge_load_u256<CTX: ContextTr>(ctx: &mut CTX, key_name: &str) -> U256 {
+/// rskj `RLP.encodeBigInteger` for unsigned scalars (the encoding behind
+/// BridgeSerializationUtils serializeCoin/serializeLong/serializeInteger):
+/// minimal big-endian bytes as an RLP element; zero encodes as `0x80`.
+pub fn rlp_encode_uint(value: U256) -> Vec<u8> {
+    let be = value.to_be_bytes::<32>();
+    let start = be.iter().position(|&b| b != 0).unwrap_or(32);
+    super::serialization::rlp_encode_element(&be[start..])
+}
+
+/// Inverse of [`rlp_encode_uint`]; empty data is zero.
+pub fn rlp_decode_uint(data: &[u8]) -> U256 {
+    if data.is_empty() {
+        return U256::ZERO;
+    }
+    if data[0] < 0x80 {
+        return U256::from(data[0]);
+    }
+    let len = (data[0] - 0x80) as usize;
+    if len == 0 || len > 32 || data.len() < 1 + len {
+        return U256::ZERO;
+    }
+    let mut buf = [0u8; 32];
+    buf[32 - len..].copy_from_slice(&data[1..1 + len]);
+    U256::from_be_bytes(buf)
+}
+
+/// Read an RLP-encoded unsigned scalar entry (rskj deserializeCoin/Long/Integer).
+pub fn bridge_load_u256<CTX: crate::RskContextTr>(ctx: &mut CTX, key_name: &str) -> U256 {
     let key = bridge_storage_key(key_name);
-    bridge_sload(ctx, key)
+    match bridge_load_raw(ctx, key) {
+        Some(data) => rlp_decode_uint(&data),
+        None => U256::ZERO,
+    }
 }
 
-/// Write a U256 value to Bridge contract storage by key name.
-pub fn bridge_store_u256<CTX: ContextTr>(ctx: &mut CTX, key_name: &str, value: U256) {
+/// Write an RLP-encoded unsigned scalar entry (rskj serializeCoin/Long/Integer).
+pub fn bridge_store_u256<CTX: crate::RskContextTr>(ctx: &mut CTX, key_name: &str, value: U256) {
     let key = bridge_storage_key(key_name);
-    bridge_sstore(ctx, key, value);
+    bridge_store_raw(ctx, key, Some(rlp_encode_uint(value)));
 }
 
-/// Read a timestamp (u64) from storage.
-pub fn bridge_load_timestamp<CTX: ContextTr>(ctx: &mut CTX, key_name: &str) -> u64 {
+/// Read a timestamp (rskj serializeLong -> RLP).
+pub fn bridge_load_timestamp<CTX: crate::RskContextTr>(ctx: &mut CTX, key_name: &str) -> u64 {
     bridge_load_u256(ctx, key_name).to::<u64>()
 }
 
-/// Write a timestamp (u64) to storage.
-pub fn bridge_store_timestamp<CTX: ContextTr>(ctx: &mut CTX, key_name: &str, value: u64) {
+/// Write a timestamp (rskj serializeLong -> RLP).
+pub fn bridge_store_timestamp<CTX: crate::RskContextTr>(ctx: &mut CTX, key_name: &str, value: u64) {
     bridge_store_u256(ctx, key_name, U256::from(value));
 }
 
-/// Read a BTC block hash (stored as raw 32-byte value) keyed by height.
-/// Uses compound key: `btcBlockHeight-{height_hex}`.
-pub fn bridge_load_btc_block_hash_by_height<CTX: ContextTr>(ctx: &mut CTX, height: u32) -> Option<B256> {
+/// Read a BTC main-chain block hash by height (RSKIP199 index; rskj
+/// `getBtcBestBlockHashByHeight` -- value is `RLP.encodeElement(hash)`).
+pub fn bridge_load_btc_block_hash_by_height<CTX: crate::RskContextTr>(ctx: &mut CTX, height: u32) -> Option<B256> {
     let key = compound_key(BTC_BLOCK_HEIGHT_KEY, "-", &format!("{:x}", height));
-    let val = bridge_sload(ctx, key);
-    if val.is_zero() {
+    let data = bridge_load_raw(ctx, key)?;
+    // RLP element: 0xa0 || 32-byte hash
+    if data.len() == 33 && data[0] == 0xa0 {
+        Some(B256::from_slice(&data[1..]))
+    } else {
         None
-    } else {
-        Some(B256::from(val.to_be_bytes::<32>()))
     }
 }
 
-/// Store a BTC block hash by height (for the main chain index).
-pub fn bridge_store_btc_block_hash_by_height<CTX: ContextTr>(ctx: &mut CTX, height: u32, hash: B256) {
+/// Store a BTC main-chain block hash by height (RSKIP199 index; rskj
+/// `setBtcBestBlockHashByHeight` -- serializeSha256Hash = RLP element).
+pub fn bridge_store_btc_block_hash_by_height<CTX: crate::RskContextTr>(ctx: &mut CTX, height: u32, hash: B256) {
     let key = compound_key(BTC_BLOCK_HEIGHT_KEY, "-", &format!("{:x}", height));
-    bridge_sstore(ctx, key, U256::from_be_bytes(hash.0));
+    let value = super::serialization::rlp_encode_element(hash.as_slice());
+    bridge_store_raw(ctx, key, Some(value));
 }
 
-/// Store a variable-length byte array in Bridge contract storage.
-///
-/// Matches rskj's `Repository.addStorageBytes` / Solidity dynamic byte layout:
-/// - If `value.len() <= 31`: packed into a single slot as `value || (len * 2)`
-/// - If `value.len() > 31`: slot `key` stores `len * 2 + 1`, data is stored
-///   in consecutive slots starting at `keccak256(key)`.
-pub fn bridge_store_bytes<CTX: ContextTr>(ctx: &mut CTX, key: U256, value: &[u8]) {
-    use sha3::{Digest, Keccak256};
-
-    if value.is_empty() {
-        bridge_sstore(ctx, key, U256::ZERO);
-        return;
-    }
-
-    if value.len() <= 31 {
-        let mut buf = [0u8; 32];
-        buf[..value.len()].copy_from_slice(value);
-        buf[31] = (value.len() * 2) as u8;
-        bridge_sstore(ctx, key, U256::from_be_bytes(buf));
-        return;
-    }
-
-    let len = value.len();
-    bridge_sstore(ctx, key, U256::from(len * 2 + 1));
-
-    let hashed_key = Keccak256::digest(key.to_be_bytes::<32>());
-    let base = U256::from_be_bytes(hashed_key.into());
-
-    let chunks = len.div_ceil(32);
-    for i in 0..chunks {
-        let mut chunk = [0u8; 32];
-        let start = i * 32;
-        let end = std::cmp::min(start + 32, len);
-        chunk[..end - start].copy_from_slice(&value[start..end]);
-        let chunk_key = base.wrapping_add(U256::from(i));
-        bridge_sstore(ctx, chunk_key, U256::from_be_bytes(chunk));
-    }
+/// Write a serialized byte-array entry (rskj `addStorageBytes`).
+pub fn bridge_store_bytes<CTX: crate::RskContextTr>(ctx: &mut CTX, key: U256, value: &[u8]) {
+    bridge_store_raw(ctx, key, Some(value.to_vec()));
 }
 
-/// Load a variable-length byte array from Bridge contract storage.
-///
-/// Inverse of `bridge_store_bytes`. Decodes based on the Solidity-style
-/// encoding in the key slot.
-pub fn bridge_load_bytes<CTX: ContextTr>(ctx: &mut CTX, key: U256) -> Vec<u8> {
-    use sha3::{Digest, Keccak256};
-
-    let slot = bridge_sload(ctx, key);
-    if slot.is_zero() {
-        return Vec::new();
-    }
-
-    let raw = slot.to_be_bytes::<32>();
-    let low_bit = raw[31] & 1;
-
-    if low_bit == 0 {
-        // Short encoding: data in upper bytes, length in lower byte
-        let len = (raw[31] / 2) as usize;
-        if len > 31 { return Vec::new(); }
-        raw[..len].to_vec()
-    } else {
-        // Long encoding: key slot has len*2+1, data in keccak256(key)+i
-        let len = (slot - U256::from(1)) / U256::from(2);
-        let len = len.to::<usize>();
-        if len == 0 { return Vec::new(); }
-
-        let hashed_key = Keccak256::digest(key.to_be_bytes::<32>());
-        let base = U256::from_be_bytes(hashed_key.into());
-
-        let mut result = Vec::with_capacity(len);
-        let chunks = len.div_ceil(32);
-        for i in 0..chunks {
-            let chunk_key = base.wrapping_add(U256::from(i));
-            let chunk = bridge_sload(ctx, chunk_key);
-            let chunk_bytes = chunk.to_be_bytes::<32>();
-            let remaining = len - result.len();
-            let to_take = std::cmp::min(32, remaining);
-            result.extend_from_slice(&chunk_bytes[..to_take]);
-        }
-        result
-    }
+/// Read a serialized byte-array entry (rskj `getStorageBytes`; absent -> empty).
+pub fn bridge_load_bytes<CTX: crate::RskContextTr>(ctx: &mut CTX, key: U256) -> Vec<u8> {
+    bridge_load_raw(ctx, key).unwrap_or_default()
 }
 
 /// Store a variable-length byte array at a named key.
-pub fn bridge_store_bytes_named<CTX: ContextTr>(ctx: &mut CTX, key_name: &str, value: &[u8]) {
+pub fn bridge_store_bytes_named<CTX: crate::RskContextTr>(ctx: &mut CTX, key_name: &str, value: &[u8]) {
     let key = bridge_storage_key(key_name);
     bridge_store_bytes(ctx, key, value);
 }
 
 /// Load a variable-length byte array from a named key.
-pub fn bridge_load_bytes_named<CTX: ContextTr>(ctx: &mut CTX, key_name: &str) -> Vec<u8> {
+pub fn bridge_load_bytes_named<CTX: crate::RskContextTr>(ctx: &mut CTX, key_name: &str) -> Vec<u8> {
     let key = bridge_storage_key(key_name);
     bridge_load_bytes(ctx, key)
 }
 
 /// Transfer amount from Bridge contract to recipient.
-pub fn bridge_transfer<CTX: ContextTr>(ctx: &mut CTX, recipient: Address, amount: U256) -> bool {
+pub fn bridge_transfer<CTX: crate::RskContextTr>(ctx: &mut CTX, recipient: Address, amount: U256) -> bool {
     if amount.is_zero() {
         return true;
     }
@@ -388,7 +345,7 @@ pub fn deserialize_unlimited_whitelist(data: &[u8]) -> Vec<[u8; 20]> {
 }
 
 /// Load the one-off lock whitelist from Bridge storage.
-pub fn load_one_off_whitelist<CTX: ContextTr>(ctx: &mut CTX) -> (Vec<([u8; 20], u64)>, i32) {
+pub fn load_one_off_whitelist<CTX: crate::RskContextTr>(ctx: &mut CTX) -> (Vec<([u8; 20], u64)>, i32) {
     let data = bridge_load_bytes_named(ctx, LOCK_WHITELIST_KEY);
     // rskj LockWhitelist defaults disableBlockHeight to Integer.MAX_VALUE:
     // an empty whitelist is ACTIVE (every legacy peg-in is rejected).
@@ -396,7 +353,7 @@ pub fn load_one_off_whitelist<CTX: ContextTr>(ctx: &mut CTX) -> (Vec<([u8; 20], 
 }
 
 /// Store the one-off lock whitelist into Bridge storage.
-pub fn store_one_off_whitelist<CTX: ContextTr>(
+pub fn store_one_off_whitelist<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     entries: &[([u8; 20], u64)],
     disable_height: i32,
@@ -406,13 +363,13 @@ pub fn store_one_off_whitelist<CTX: ContextTr>(
 }
 
 /// Load the unlimited lock whitelist from Bridge storage.
-pub fn load_unlimited_whitelist<CTX: ContextTr>(ctx: &mut CTX) -> Vec<[u8; 20]> {
+pub fn load_unlimited_whitelist<CTX: crate::RskContextTr>(ctx: &mut CTX) -> Vec<[u8; 20]> {
     let data = bridge_load_bytes_named(ctx, UNLIMITED_LOCK_WHITELIST_KEY);
     deserialize_unlimited_whitelist(&data)
 }
 
 /// Store the unlimited lock whitelist into Bridge storage.
-pub fn store_unlimited_whitelist<CTX: ContextTr>(ctx: &mut CTX, entries: &[[u8; 20]]) {
+pub fn store_unlimited_whitelist<CTX: crate::RskContextTr>(ctx: &mut CTX, entries: &[[u8; 20]]) {
     let data = serialize_unlimited_whitelist(entries);
     bridge_store_bytes_named(ctx, UNLIMITED_LOCK_WHITELIST_KEY, &data);
 }
@@ -447,38 +404,21 @@ pub struct BridgeUtxo {
     pub coinbase: bool,
 }
 
-/// Serialize a UTXO to bytes (bitcoinj UTXO.serializeToStream format).
+/// Serialize a UTXO to bytes (bitcoinj `UTXO.serializeToStream` format):
+/// value u64 LE | script length u32 LE (fixed width, NOT a varint) | script |
+/// tx hash in DISPLAY order (bitcoinj `Sha256Hash` bytes) | index u32 LE |
+/// height u32 LE | coinbase u8.
 fn serialize_utxo(utxo: &BridgeUtxo) -> Vec<u8> {
     let mut buf = Vec::new();
-
-    // value: 8 bytes little-endian
     buf.extend_from_slice(&utxo.value_satoshis.to_le_bytes());
-
-    // script length varint + script bytes
-    let script_len = utxo.script.len();
-    if script_len < 0xfd {
-        buf.push(script_len as u8);
-    } else if script_len <= 0xffff {
-        buf.push(0xfd);
-        buf.extend_from_slice(&(script_len as u16).to_le_bytes());
-    } else {
-        buf.push(0xfe);
-        buf.extend_from_slice(&(script_len as u32).to_le_bytes());
-    }
+    buf.extend_from_slice(&(utxo.script.len() as u32).to_le_bytes());
     buf.extend_from_slice(&utxo.script);
-
-    // hash: 32 bytes as-is (big-endian internal representation)
-    buf.extend_from_slice(&utxo.tx_hash);
-
-    // index: 4 bytes little-endian
+    let mut display = utxo.tx_hash;
+    display.reverse(); // internal -> display order
+    buf.extend_from_slice(&display);
     buf.extend_from_slice(&utxo.vout.to_le_bytes());
-
-    // height: 4 bytes little-endian
     buf.extend_from_slice(&utxo.height.to_le_bytes());
-
-    // coinbase: 1 byte
     buf.push(if utxo.coinbase { 1 } else { 0 });
-
     buf
 }
 
@@ -494,24 +434,18 @@ fn deserialize_utxo(data: &[u8]) -> Option<BridgeUtxo> {
     let value_satoshis = u64::from_le_bytes(data[pos..pos + 8].try_into().ok()?);
     pos += 8;
 
-    // script length varint
-    let (script_len, varint_size) = if data[pos] < 0xfd {
-        (data[pos] as usize, 1)
-    } else if data[pos] == 0xfd {
-        if pos + 3 > data.len() { return None; }
-        (u16::from_le_bytes([data[pos + 1], data[pos + 2]]) as usize, 3)
-    } else {
-        if pos + 5 > data.len() { return None; }
-        (u32::from_le_bytes(data[pos + 1..pos + 5].try_into().ok()?) as usize, 5)
-    };
-    pos += varint_size;
+    // script length: fixed 4-byte LE (bitcoinj UTXO format)
+    if pos + 4 > data.len() { return None; }
+    let script_len = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
+    pos += 4;
 
     if pos + script_len > data.len() { return None; }
     let script = data[pos..pos + script_len].to_vec();
     pos += script_len;
 
     if pos + 32 > data.len() { return None; }
-    let tx_hash: [u8; 32] = data[pos..pos + 32].try_into().ok()?;
+    let mut tx_hash: [u8; 32] = data[pos..pos + 32].try_into().ok()?;
+    tx_hash.reverse(); // display -> internal order
     pos += 32;
 
     if pos + 4 > data.len() { return None; }
@@ -560,25 +494,25 @@ pub fn deserialize_utxo_list(data: &[u8]) -> Vec<BridgeUtxo> {
 }
 
 /// Load the active federation's BTC UTXOs from Bridge storage.
-pub fn load_federation_utxos<CTX: ContextTr>(ctx: &mut CTX) -> Vec<BridgeUtxo> {
+pub fn load_federation_utxos<CTX: crate::RskContextTr>(ctx: &mut CTX) -> Vec<BridgeUtxo> {
     let data = bridge_load_bytes_named(ctx, NEW_FEDERATION_BTC_UTXOS_KEY);
     deserialize_utxo_list(&data)
 }
 
 /// Store the OLD (retiring) federation's BTC UTXOs into Bridge storage.
-pub fn store_old_federation_utxos<CTX: ContextTr>(ctx: &mut CTX, utxos: &[BridgeUtxo]) {
+pub fn store_old_federation_utxos<CTX: crate::RskContextTr>(ctx: &mut CTX, utxos: &[BridgeUtxo]) {
     let data = serialize_utxo_list(utxos);
     bridge_store_bytes_named(ctx, OLD_FEDERATION_BTC_UTXOS_KEY, &data);
 }
 
 /// Load the OLD (retiring) federation's BTC UTXOs.
-pub fn load_old_federation_utxos<CTX: ContextTr>(ctx: &mut CTX) -> Vec<BridgeUtxo> {
+pub fn load_old_federation_utxos<CTX: crate::RskContextTr>(ctx: &mut CTX) -> Vec<BridgeUtxo> {
     let data = bridge_load_bytes_named(ctx, OLD_FEDERATION_BTC_UTXOS_KEY);
     deserialize_utxo_list(&data)
 }
 
 /// Store the active federation's BTC UTXOs into Bridge storage.
-pub fn store_federation_utxos<CTX: ContextTr>(ctx: &mut CTX, utxos: &[BridgeUtxo]) {
+pub fn store_federation_utxos<CTX: crate::RskContextTr>(ctx: &mut CTX, utxos: &[BridgeUtxo]) {
     let data = serialize_utxo_list(utxos);
     bridge_store_bytes_named(ctx, NEW_FEDERATION_BTC_UTXOS_KEY, &data);
 }

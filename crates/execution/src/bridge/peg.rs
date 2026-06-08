@@ -76,7 +76,7 @@ fn should_mark_rejected_pegin_as_processed(cfg: &RskHardforkConfig, block_number
     cfg.has_rskip459(block_number) && !cfg.has_rskip551(block_number)
 }
 
-pub fn register_btc_transaction<CTX: ContextTr>(
+pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     gas_cost: u64,
@@ -112,7 +112,8 @@ pub fn register_btc_transaction<CTX: ContextTr>(
     {
         let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
         let use_v2 = hardfork_cfg.has_stored_block_v2(block_number);
-        super::btc_chain::ensure_btc_chain_seeded(ctx, config, use_v2);
+        let rskip199 = hardfork_cfg.has_rskip199(block_number);
+        super::btc_chain::ensure_btc_chain_seeded(ctx, config, use_v2, rskip199);
     }
 
     // Check if already processed
@@ -237,7 +238,7 @@ pub fn register_btc_transaction<CTX: ContextTr>(
                 super::storage::OLD_FEDERATION_BTC_UTXOS_KEY,
             );
         }
-        set_btc_tx_processed(ctx, &btc_tx_hash, rsk_height);
+        set_btc_tx_processed(ctx, &btc_tx_hash, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     }
 
@@ -267,7 +268,7 @@ pub fn register_btc_transaction<CTX: ContextTr>(
     };
     if total_value < min_pegin {
         if should_mark_rejected_pegin_as_processed(hardfork_cfg, rsk_height) {
-            set_btc_tx_processed(ctx, &btc_tx_hash, rsk_height);
+            set_btc_tx_processed(ctx, &btc_tx_hash, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
         }
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     }
@@ -350,7 +351,7 @@ pub fn register_btc_transaction<CTX: ContextTr>(
             let updated = serialize_pegouts_waiting_for_confirmations(&waiting, use_tx_hash);
             bridge_store_bytes(ctx, waiting_key, &updated);
         }
-        set_btc_tx_processed(ctx, &btc_tx_hash, rsk_height);
+        set_btc_tx_processed(ctx, &btc_tx_hash, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     }
 
@@ -399,7 +400,7 @@ pub fn register_btc_transaction<CTX: ContextTr>(
     }
 
     // Mark as processed
-    set_btc_tx_processed(ctx, &btc_tx_hash, rsk_height);
+    set_btc_tx_processed(ctx, &btc_tx_hash, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
 
     Ok(PrecompileOutput::new(gas_cost, Bytes::new()))
 }
@@ -423,7 +424,7 @@ fn btc_sender_pubkey(tx: &BtcTransaction) -> Option<Vec<u8>> {
 /// sender may peg in `amount` at BTC height `height`, consuming the matching
 /// one-off entry. A height past the disable height turns the whitelist off
 /// (but a matching one-off entry is still consumed).
-fn whitelist_allows_and_consume<CTX: ContextTr>(
+fn whitelist_allows_and_consume<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     sender_hash160: &[u8; 20],
     amount: u64,
@@ -448,7 +449,7 @@ fn whitelist_allows_and_consume<CTX: ContextTr>(
 
 /// rskj `BridgeSupport.registerNewUtxos`: register every output paying the
 /// given federation script into the given UTXO storage set.
-fn register_federation_outputs<CTX: ContextTr>(
+fn register_federation_outputs<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     btc_tx: &BtcTransaction,
     fed_script: &bitcoin::ScriptBuf,
@@ -484,7 +485,7 @@ fn register_federation_outputs<CTX: ContextTr>(
 ///
 /// Flyover peg-in variant. Similar to registerBtcTransaction but with
 /// additional derivation hash validation and separate tracking.
-pub fn register_fast_bridge_btc_transaction<CTX: ContextTr>(
+pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     gas_cost: u64,
@@ -522,11 +523,11 @@ pub fn register_fast_bridge_btc_transaction<CTX: ContextTr>(
 
     // Check hash+derivation not already used
     let flyover_key = {
-        let hash_hex = to_hex(&btc_tx_hash);
+        let hash_hex = super::tx::btc_hash_hex_display(&btc_tx_hash);
         compound_key(FAST_BRIDGE_HASH_USED_KEY, "-", &hash_hex)
     };
-    let already_used = bridge_sload(ctx, flyover_key);
-    if !already_used.is_zero() {
+    let already_used = super::storage::bridge_load_raw(ctx, flyover_key).is_some();
+    if already_used {
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     }
 
@@ -595,11 +596,12 @@ pub fn register_fast_bridge_btc_transaction<CTX: ContextTr>(
         ));
     }
 
-    // Mark as used
-    bridge_sstore(ctx, flyover_key, U256::from(1));
+    // Mark as used (rskj saveFlyoverDerivationHash: a single TRUE_VALUE byte)
+    super::storage::bridge_store_raw(ctx, flyover_key, Some(vec![1]));
 
     // Also mark as processed in the standard map
-    set_btc_tx_processed(ctx, &btc_tx_hash, stored_block.height as u64);
+    // Flyover (RSKIP176, iris300) is always post-RSKIP134.
+    set_btc_tx_processed(ctx, &btc_tx_hash, stored_block.height as u64, true);
 
     Ok(PrecompileOutput::new(gas_cost, Bytes::new()))
 }
@@ -620,7 +622,7 @@ pub fn register_fast_bridge_btc_transaction<CTX: ContextTr>(
 ///   (matches `BridgeUtils.recoverBtcAddressFromEthTransaction`)
 /// - Post-RSKIP146: stores to `releaseRequestQueueWithTxHash` (triple format)
 /// - Pre-RSKIP146: stores to `releaseRequestQueue` (pair format)
-pub fn release_btc<CTX: ContextTr>(
+pub fn release_btc<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
     config: &BridgeConstants,
@@ -710,7 +712,7 @@ pub fn release_btc<CTX: ContextTr>(
 ///    - For each entry in `pegoutsWaitingForConfirmations` that has enough RSK block
 ///      confirmations (`rsk2btc_minimum_acceptable_confirmations`), move it to
 ///      `rskTxsWaitingFS` (pegoutsWaitingForSignatures).
-pub fn update_collections<CTX: ContextTr>(
+pub fn update_collections<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
     config: &BridgeConstants,
@@ -730,6 +732,34 @@ pub fn update_collections<CTX: ContextTr>(
         super::events::log_legacy_update_collections(ctx, tx_ctx.rsk_sender);
     }
 
+    // rskj BridgeStorageProvider.save() persists every collection the call
+    // LOADED, including empty ones. updateCollections always loads the
+    // active federation UTXO list (getActiveFederationWallet), the release
+    // request queue, the release tx set and the signatures-waiting map, so
+    // their RLP-empty `[0xc0]` entries materialize on the first call
+    // (mainnet #615). Post-RSKIP146 the with-txhash queue/set variants are
+    // loaded (and thus materialized) too.
+    {
+        let active_utxo_key = active_federation_utxo_key(ctx, config, hardfork_cfg, block_number);
+        let mut touched: Vec<&str> = vec![
+            active_utxo_key,
+            RELEASE_REQUEST_QUEUE_KEY,
+            PEGOUTS_WAITING_FOR_CONFIRMATIONS_KEY,
+            PEGOUTS_WAITING_FOR_SIGNATURES_KEY,
+        ];
+        if use_tx_hash {
+            touched.push(super::storage::RELEASE_REQUEST_QUEUE_WITH_TXHASH_KEY);
+            touched.push(super::storage::PEGOUTS_WAITING_FOR_CONFIRMATIONS_WITH_TXHASH_KEY);
+        }
+        for key_name in touched {
+            let key = bridge_storage_key(key_name);
+            if super::storage::bridge_load_raw(ctx, key).is_none() {
+                // RLP.encodeList() of an empty collection.
+                super::storage::bridge_store_raw(ctx, key, Some(vec![0xc0]));
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Step 0: Funds migration (rskj processFundsMigration) — while the new
     // federation is in its migration window, each updateCollections call
@@ -743,8 +773,8 @@ pub fn update_collections<CTX: ContextTr>(
     // -----------------------------------------------------------------------
     let should_process_requests = if use_rskip271 {
         // RSKIP271: batching — only process when nextPegoutHeight ≤ current block
-        let next_height_key = bridge_storage_key(NEXT_PEGOUT_HEIGHT_KEY);
-        let next_height = bridge_sload(ctx, next_height_key).to::<u64>();
+        let next_height =
+            super::storage::bridge_load_u256(ctx, NEXT_PEGOUT_HEIGHT_KEY).to::<u64>();
         block_number >= next_height
     } else {
         true // Pre-RSKIP271: process every block
@@ -892,8 +922,11 @@ pub fn update_collections<CTX: ContextTr>(
 
                     // Update nextPegoutHeight (RSKIP271)
                     let next_height = block_number + config.number_of_blocks_between_pegouts;
-                    let next_height_key = bridge_storage_key(NEXT_PEGOUT_HEIGHT_KEY);
-                    bridge_sstore(ctx, next_height_key, U256::from(next_height));
+                    super::storage::bridge_store_u256(
+                        ctx,
+                        NEXT_PEGOUT_HEIGHT_KEY,
+                        U256::from(next_height),
+                    );
                 }
 
                 if created_any {
@@ -957,7 +990,7 @@ pub fn update_collections<CTX: ContextTr>(
 }
 
 /// rskj `BridgeSupport.processFundsMigration` (pre-RSKIP294/376 era).
-fn process_funds_migration<CTX: ContextTr>(
+fn process_funds_migration<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     config: &BridgeConstants,
     hardfork_cfg: &RskHardforkConfig,
@@ -1064,7 +1097,7 @@ fn process_funds_migration<CTX: ContextTr>(
 /// the committed (new) federation once it reaches the activation age, the old
 /// federation while the new one awaits activation, or the genesis federation
 /// when none was ever stored.
-pub(crate) fn federation_keys_or_genesis<CTX: ContextTr>(
+pub(crate) fn federation_keys_or_genesis<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     config: &BridgeConstants,
     hardfork_cfg: &RskHardforkConfig,
@@ -1090,7 +1123,7 @@ pub(crate) fn federation_keys_or_genesis<CTX: ContextTr>(
 /// Which UTXO storage set backs the ACTIVE federation: after a commit and
 /// until activation the active federation IS the old one, whose UTXOs were
 /// moved to oldFederationBtcUTXOs (rskj getActiveFederationBtcUTXOs).
-pub(crate) fn active_federation_utxo_key<CTX: ContextTr>(
+pub(crate) fn active_federation_utxo_key<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     config: &BridgeConstants,
     hardfork_cfg: &RskHardforkConfig,
@@ -1107,17 +1140,17 @@ pub(crate) fn active_federation_utxo_key<CTX: ContextTr>(
     super::storage::NEW_FEDERATION_BTC_UTXOS_KEY
 }
 
-fn load_utxos_at<CTX: ContextTr>(ctx: &mut CTX, key: &str) -> Vec<BridgeUtxo> {
+fn load_utxos_at<CTX: crate::RskContextTr>(ctx: &mut CTX, key: &str) -> Vec<BridgeUtxo> {
     super::storage::deserialize_utxo_list(&bridge_load_bytes_named(ctx, key))
 }
 
-fn store_utxos_at<CTX: ContextTr>(ctx: &mut CTX, key: &str, utxos: &[BridgeUtxo]) {
+fn store_utxos_at<CTX: crate::RskContextTr>(ctx: &mut CTX, key: &str, utxos: &[BridgeUtxo]) {
     bridge_store_bytes_named(ctx, key, &super::storage::serialize_utxo_list(utxos));
 }
 
 /// Retiring federation keys (rskj getRetiringFederation): the old federation
 /// while both old+new exist and the new one has reached activation age.
-pub(crate) fn retiring_federation_keys<CTX: ContextTr>(
+pub(crate) fn retiring_federation_keys<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     config: &BridgeConstants,
     hardfork_cfg: &RskHardforkConfig,
@@ -1165,7 +1198,7 @@ pub(crate) fn genesis_federation_keys(config: &BridgeConstants) -> Vec<[u8; 33]>
 ///
 /// The BTC P2SH-multisig scriptSig format (per input):
 ///   OP_0 <der_sig_1> <der_sig_2> ... <redeemScript>
-pub fn add_signature<CTX: ContextTr>(
+pub fn add_signature<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     gas_cost: u64,
@@ -1680,7 +1713,7 @@ fn redeem_script_hash160(redeem_script: &[u8]) -> [u8; 20] {
 
 /// Load federation member compressed public keys from Bridge storage.
 /// Returns sorted keys matching the federation's multisig ordering.
-pub(crate) fn load_federation_member_keys<CTX: ContextTr>(ctx: &mut CTX) -> Vec<[u8; 33]> {
+pub(crate) fn load_federation_member_keys<CTX: crate::RskContextTr>(ctx: &mut CTX) -> Vec<[u8; 33]> {
     let fed_data = bridge_load_bytes_named(ctx, NEW_FEDERATION_KEY);
     if fed_data.is_empty() {
         return Vec::new();
@@ -1713,9 +1746,8 @@ pub(crate) fn load_federation_member_keys<CTX: ContextTr>(ctx: &mut CTX) -> Vec<
 }
 
 /// Read the effective fee per KB from storage, falling back to genesis value.
-fn get_effective_fee_per_kb<CTX: ContextTr>(ctx: &mut CTX, config: &BridgeConstants) -> u64 {
-    let key = bridge_storage_key(super::storage::FEE_PER_KB_KEY);
-    let stored = bridge_sload(ctx, key);
+fn get_effective_fee_per_kb<CTX: crate::RskContextTr>(ctx: &mut CTX, config: &BridgeConstants) -> u64 {
+    let stored = super::storage::bridge_load_u256(ctx, super::storage::FEE_PER_KB_KEY);
     if stored.is_zero() {
         config.genesis_fee_per_kb
     } else {
@@ -1869,12 +1901,11 @@ fn read_dynamic_bytes(args: &[u8], offset: usize) -> Result<Vec<u8>, PrecompileE
 // ---------------------------------------------------------------------------
 
 /// `getNextPegoutCreationBlockNumber()` → int256
-pub fn get_next_pegout_creation_block_number<CTX: ContextTr>(
+pub fn get_next_pegout_creation_block_number<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    let key = bridge_storage_key(NEXT_PEGOUT_HEIGHT_KEY);
-    let val = bridge_sload(ctx, key);
+    let val = super::storage::bridge_load_u256(ctx, NEXT_PEGOUT_HEIGHT_KEY);
     let mut output = [0u8; 32];
     let bytes = val.to_be_bytes::<32>();
     output.copy_from_slice(&bytes);
@@ -1886,7 +1917,7 @@ pub fn get_next_pegout_creation_block_number<CTX: ContextTr>(
 /// Returns the number of pending peg-out requests in the release queue.
 /// Checks both `releaseRequestQueueWithTxHash` (post-RSKIP146) and the
 /// legacy `releaseRequestQueue`.
-pub fn get_queued_pegouts_count<CTX: ContextTr>(
+pub fn get_queued_pegouts_count<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
 ) -> Result<PrecompileOutput, PrecompileError> {
@@ -1908,7 +1939,7 @@ pub fn get_queued_pegouts_count<CTX: ContextTr>(
 }
 
 /// `getEstimatedFeesForNextPegOutEvent()` → uint256
-pub fn get_estimated_fees_for_next_pegout<CTX: ContextTr>(
+pub fn get_estimated_fees_for_next_pegout<CTX: crate::RskContextTr>(
     _ctx: &mut CTX,
     gas_cost: u64,
 ) -> Result<PrecompileOutput, PrecompileError> {
@@ -1923,7 +1954,7 @@ pub fn get_estimated_fees_for_next_pegout<CTX: ContextTr>(
 /// minimum peg-out value like rskj BridgeSupport.getEstimatedFeesForPegOutAmount;
 /// the fee simulation itself shares getEstimatedFeesForNextPegOutEvent's
 /// (stub) fidelity.
-pub fn get_estimated_fees_for_pegout_amount<CTX: ContextTr>(
+pub fn get_estimated_fees_for_pegout_amount<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     gas_cost: u64,

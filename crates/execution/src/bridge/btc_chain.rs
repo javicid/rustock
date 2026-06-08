@@ -25,7 +25,6 @@ use super::btc_store::{
 };
 use super::constants::BridgeConstants;
 use crate::hardfork::RskHardforkConfig;
-use super::storage::{bridge_sload, bridge_sstore, bridge_storage_key};
 
 // Error codes
 const SUCCESS: i64 = 1;
@@ -37,15 +36,18 @@ const ERR_INVALID_POW: i64 = -5;
 /// Process a single BTC header submitted via `receiveHeader(bytes)`.
 ///
 /// Returns ABI-encoded int256 result code.
-pub fn receive_header<CTX: ContextTr>(
+pub fn receive_header<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     config: &BridgeConstants,
     use_v2: bool,
+    hardfork_cfg: &RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
     let gas_cost = 10_600u64;
 
-    ensure_btc_chain_seeded(ctx, config, use_v2);
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let rskip199 = hardfork_cfg.has_rskip199(block_number);
+    ensure_btc_chain_seeded(ctx, config, use_v2, rskip199);
 
     // Decode ABI-encoded `bytes` argument
     let header_bytes = decode_abi_bytes(args).ok_or_else(|| {
@@ -53,8 +55,8 @@ pub fn receive_header<CTX: ContextTr>(
     })?;
 
     // Rate limiting
-    let timestamp_key = bridge_storage_key(super::storage::RECEIVE_HEADERS_TIMESTAMP_KEY);
-    let last_timestamp = bridge_sload(ctx, timestamp_key).to::<u64>();
+    let last_timestamp =
+        super::storage::bridge_load_timestamp(ctx, super::storage::RECEIVE_HEADERS_TIMESTAMP_KEY);
     let current_timestamp = ctx.block().timestamp();
 
     if config.min_seconds_between_calls_receive_header > 0
@@ -107,39 +109,65 @@ pub fn receive_header<CTX: ContextTr>(
     };
 
     if is_new_best {
-        store_chain_head(ctx, &stored, use_v2);
-        // Update main chain height → hash index
-        super::storage::bridge_store_btc_block_hash_by_height(
-            ctx,
-            new_height,
-            bitcoin_hash_to_b256(&block_hash),
-        );
+        set_chain_head(ctx, &stored, use_v2, rskip199);
     }
 
-    // Update timestamp
-    bridge_sstore(ctx, timestamp_key, U256::from(current_timestamp));
+    // Update timestamp (rskj serializeLong -> RLP)
+    super::storage::bridge_store_timestamp(
+        ctx,
+        super::storage::RECEIVE_HEADERS_TIMESTAMP_KEY,
+        current_timestamp.to::<u64>(),
+    );
 
     Ok(encode_int_result(gas_cost, SUCCESS))
 }
 
-/// Process multiple BTC headers submitted via `receiveHeaders(bytes[])`.
-///
-/// Applies each header sequentially. Returns ABI-encoded int256 with the
-/// number of successfully processed headers.
-/// Seed the bridge BTC chain on first use, mirroring rskj's
-/// `BridgeSupport.ensureBtcBlockStore`: a fresh store starts at the
-/// checkpoint preceding the federation creation time (see
-/// `BridgeConstants::btc_checkpoint`), or the BTC genesis block without one.
-pub fn ensure_btc_chain_seeded<CTX: ContextTr>(
+/// Update the chain head (rskj `RepositoryBtcBlockStoreWithCache.setChainHead`
+/// + `setMainChainBlock`): the height->hash main-chain index only exists from
+/// RSKIP199 (iris300).
+fn set_chain_head<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    stored: &StoredBlock,
+    use_v2: bool,
+    rskip199: bool,
+) {
+    store_chain_head(ctx, stored, use_v2);
+    if rskip199 {
+        super::storage::bridge_store_btc_block_hash_by_height(
+            ctx,
+            stored.height,
+            bitcoin_hash_to_b256(&stored.header.block_hash()),
+        );
+    }
+}
+
+/// Seed the bridge BTC chain on first use. rskj does this in two steps that
+/// both persist: `RepositoryBtcBlockStoreWithCache.checkIfInitialized` writes
+/// the BTC GENESIS stored block as chain head, then
+/// `BridgeSupport.ensureBtcBlockStore` runs bitcoinj's
+/// `CheckpointManager.checkpoint`, which adds the checkpoint block (see
+/// `BridgeConstants::btc_checkpoint`) and moves the chain head to it — BOTH
+/// stored-block entries remain in bridge storage (mainnet block #457).
+pub fn ensure_btc_chain_seeded<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     config: &BridgeConstants,
     use_v2: bool,
+    rskip199: bool,
 ) {
     if load_chain_head(ctx).is_some() {
         return;
     }
 
-    let stored = match config.btc_checkpoint {
+    let network = match config.btc_network {
+        super::constants::BtcNetwork::Mainnet => bitcoin::Network::Bitcoin,
+        super::constants::BtcNetwork::Testnet => bitcoin::Network::Testnet,
+        super::constants::BtcNetwork::Regtest => bitcoin::Network::Regtest,
+    };
+    let genesis = bitcoin::constants::genesis_block(network);
+    let genesis_stored = StoredBlock::new(genesis.header, 0, compute_work(genesis.header.bits));
+    put_stored_block(ctx, &genesis_stored, use_v2);
+
+    let head = match config.btc_checkpoint {
         Some((header_hex, height, chain_work_hex)) => {
             let bytes = match alloy_primitives::hex::decode(header_hex) {
                 Ok(b) => b,
@@ -150,26 +178,17 @@ pub fn ensure_btc_chain_seeded<CTX: ContextTr>(
                 Err(_) => return,
             };
             let work = U256::from_be_slice(&alloy_primitives::hex::decode(chain_work_hex).unwrap_or_default());
-            StoredBlock::new(header, height, work)
+            let checkpoint = StoredBlock::new(header, height, work);
+            put_stored_block(ctx, &checkpoint, use_v2);
+            checkpoint
         }
-        None => {
-            let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
-            let work = compute_work(genesis.header.bits);
-            StoredBlock::new(genesis.header, 0, work)
-        }
+        None => genesis_stored,
     };
 
-    let hash = stored.header.block_hash();
-    put_stored_block(ctx, &stored, use_v2);
-    store_chain_head(ctx, &stored, use_v2);
-    super::storage::bridge_store_btc_block_hash_by_height(
-        ctx,
-        stored.height,
-        bitcoin_hash_to_b256(&hash),
-    );
+    set_chain_head(ctx, &head, use_v2, rskip199);
 }
 
-pub fn receive_headers<CTX: ContextTr>(
+pub fn receive_headers<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     gas_cost: u64,
@@ -181,14 +200,15 @@ pub fn receive_headers<CTX: ContextTr>(
         PrecompileError::other("receiveHeaders: invalid ABI encoding")
     })?;
 
-    ensure_btc_chain_seeded(ctx, config, use_v2);
-
     // NOTE: rskj's receiveHeaders has NO rate limiting — the
     // minSecondsBetweenCallsToReceiveHeader window only applies to the
     // singular receiveHeader (RSKIP200). The federation calls this every
     // few blocks.
     let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
     let rskip434 = hardfork_cfg.has_rskip434(block_number);
+    let rskip199 = hardfork_cfg.has_rskip199(block_number);
+
+    ensure_btc_chain_seeded(ctx, config, use_v2, rskip199);
     let is_mainnet = matches!(config.btc_network, super::constants::BtcNetwork::Mainnet);
 
     let max_headers = config.max_btc_headers_per_rsk_block as usize;
@@ -247,12 +267,7 @@ pub fn receive_headers<CTX: ContextTr>(
         };
 
         if is_new_best {
-            store_chain_head(ctx, &stored, use_v2);
-            super::storage::bridge_store_btc_block_hash_by_height(
-                ctx,
-                new_height,
-                bitcoin_hash_to_b256(&block_hash),
-            );
+            set_chain_head(ctx, &stored, use_v2, rskip199);
         }
 
         processed += 1;
@@ -266,7 +281,7 @@ pub fn receive_headers<CTX: ContextTr>(
 // ---------------------------------------------------------------------------
 
 /// `getBtcBlockchainBestChainHeight()` → int256
-pub fn get_best_chain_height<CTX: ContextTr>(
+pub fn get_best_chain_height<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
 ) -> Result<PrecompileOutput, PrecompileError> {
@@ -278,7 +293,7 @@ pub fn get_best_chain_height<CTX: ContextTr>(
 }
 
 /// `getBtcBlockchainBestBlockHeader()` → bytes
-pub fn get_best_block_header<CTX: ContextTr>(
+pub fn get_best_block_header<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
 ) -> Result<PrecompileOutput, PrecompileError> {
@@ -292,7 +307,7 @@ pub fn get_best_block_header<CTX: ContextTr>(
 }
 
 /// `getBtcBlockchainBlockHeaderByHash(bytes32)` → bytes
-pub fn get_block_header_by_hash<CTX: ContextTr>(
+pub fn get_block_header_by_hash<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     gas_cost: u64,
@@ -313,7 +328,7 @@ pub fn get_block_header_by_hash<CTX: ContextTr>(
 }
 
 /// `getBtcBlockchainBlockHeaderByHeight(uint256)` → bytes
-pub fn get_block_header_by_height<CTX: ContextTr>(
+pub fn get_block_header_by_height<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     gas_cost: u64,
@@ -342,7 +357,7 @@ pub fn get_block_header_by_height<CTX: ContextTr>(
 }
 
 /// `getBtcBlockchainParentBlockHeaderByHash(bytes32)` → bytes
-pub fn get_parent_block_header_by_hash<CTX: ContextTr>(
+pub fn get_parent_block_header_by_hash<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     gas_cost: u64,
@@ -464,16 +479,22 @@ fn encode_int_result(gas_cost: u64, value: i64) -> PrecompileOutput {
 // Hash conversion helpers
 // ---------------------------------------------------------------------------
 
-/// Convert a bitcoin `BlockHash` to an alloy `B256`.
+/// Convert a bitcoin `BlockHash` to an alloy `B256` in DISPLAY byte order
+/// (bitcoinj `Sha256Hash` bytes — what rskj renders in storage, ABI values
+/// and serialized hashes).
 pub fn bitcoin_hash_to_b256(hash: &BlockHash) -> alloy_primitives::B256 {
     use bitcoin::hashes::Hash;
-    alloy_primitives::B256::from(*hash.to_raw_hash().as_byte_array())
+    let mut bytes = *hash.to_raw_hash().as_byte_array();
+    bytes.reverse();
+    alloy_primitives::B256::from(bytes)
 }
 
-/// Convert an alloy `B256` to a bitcoin `BlockHash`.
+/// Convert an alloy `B256` in DISPLAY byte order to a bitcoin `BlockHash`.
 pub fn b256_to_bitcoin_hash(b: &alloy_primitives::B256) -> BlockHash {
     use bitcoin::hashes::Hash;
-    BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(b.0))
+    let mut bytes = b.0;
+    bytes.reverse();
+    BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(bytes))
 }
 
 // ---------------------------------------------------------------------------

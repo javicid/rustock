@@ -18,7 +18,6 @@ use bitcoin::consensus::{deserialize, serialize};
 use bitcoin::hashes::Hash;
 use bitcoin::pow::CompactTarget;
 use bitcoin::BlockHash;
-use revm::context_interface::{ContextTr, JournalTr};
 
 use crate::precompiles::BRIDGE_ADDR;
 
@@ -165,15 +164,17 @@ impl StoredBlock {
 const CHAIN_HEAD_KEY: &str = "blockStoreChainHead";
 
 /// Convert a BTC block hash to a U256 storage key.
-/// Matches rskj's `DataWord.valueFromHex(blockHash.toString())`.
+/// Matches rskj's `DataWord.valueFromHex(blockHash.toString())`: bitcoinj
+/// `Sha256Hash` bytes are in DISPLAY order (the conventional big-endian hex),
+/// which is the reverse of the bitcoin crate's internal byte order.
 pub fn btc_hash_to_storage_key(hash: &BlockHash) -> U256 {
-    let raw = hash.to_raw_hash();
-    let bytes: &[u8; 32] = raw.as_byte_array();
-    U256::from_be_bytes(*bytes)
+    let mut bytes = *hash.to_raw_hash().as_byte_array();
+    bytes.reverse();
+    U256::from_be_bytes(bytes)
 }
 
 /// Store the chain head.
-pub fn store_chain_head<CTX: ContextTr>(ctx: &mut CTX, block: &StoredBlock, use_v2: bool) {
+pub fn store_chain_head<CTX: crate::RskContextTr>(ctx: &mut CTX, block: &StoredBlock, use_v2: bool) {
     let key = super::storage::bridge_storage_key(CHAIN_HEAD_KEY);
     let data = if use_v2 {
         block.serialize_compact_v2()
@@ -184,7 +185,7 @@ pub fn store_chain_head<CTX: ContextTr>(ctx: &mut CTX, block: &StoredBlock, use_
 }
 
 /// Load the chain head.
-pub fn load_chain_head<CTX: ContextTr>(ctx: &mut CTX) -> Option<StoredBlock> {
+pub fn load_chain_head<CTX: crate::RskContextTr>(ctx: &mut CTX) -> Option<StoredBlock> {
     let key = super::storage::bridge_storage_key(CHAIN_HEAD_KEY);
     let data = load_raw_bytes(ctx, key);
     if data.is_empty() {
@@ -194,7 +195,7 @@ pub fn load_chain_head<CTX: ContextTr>(ctx: &mut CTX) -> Option<StoredBlock> {
 }
 
 /// Store a StoredBlock by its hash.
-pub fn put_stored_block<CTX: ContextTr>(ctx: &mut CTX, block: &StoredBlock, use_v2: bool) {
+pub fn put_stored_block<CTX: crate::RskContextTr>(ctx: &mut CTX, block: &StoredBlock, use_v2: bool) {
     let hash = block.block_hash();
     let key = btc_hash_to_storage_key(&hash);
     let data = if use_v2 {
@@ -206,7 +207,7 @@ pub fn put_stored_block<CTX: ContextTr>(ctx: &mut CTX, block: &StoredBlock, use_
 }
 
 /// Load a StoredBlock by its hash.
-pub fn get_stored_block<CTX: ContextTr>(ctx: &mut CTX, hash: &BlockHash) -> Option<StoredBlock> {
+pub fn get_stored_block<CTX: crate::RskContextTr>(ctx: &mut CTX, hash: &BlockHash) -> Option<StoredBlock> {
     let key = btc_hash_to_storage_key(hash);
     let data = load_raw_bytes(ctx, key);
     if data.is_empty() {
@@ -216,62 +217,21 @@ pub fn get_stored_block<CTX: ContextTr>(ctx: &mut CTX, hash: &BlockHash) -> Opti
 }
 
 // ---------------------------------------------------------------------------
-// Raw byte storage (multi-slot)
-//
-// Bytes are stored across consecutive storage slots starting from the base key.
-// Slot 0: length (u256), slots 1..N: 32-byte chunks of the data.
-// This matches rskj's Repository.addStorageBytes / getStorageBytes behavior.
+// Raw byte storage: one variable-length value per unitrie key
+// (rskj Repository.addStorageBytes / getStorageBytes).
 // ---------------------------------------------------------------------------
 
-fn store_raw_bytes<CTX: ContextTr>(ctx: &mut CTX, base_key: U256, data: &[u8]) {
-    // Slot 0: data length
-    let _ = ctx
-        .journal_mut()
-        .sstore(BRIDGE_ADDR, base_key, U256::from(data.len()));
-
-    // Subsequent slots: 32-byte chunks
-    let chunks = data.chunks(32);
-    for (i, chunk) in chunks.enumerate() {
-        let slot = base_key.wrapping_add(U256::from(i + 1));
-        let mut padded = [0u8; 32];
-        padded[..chunk.len()].copy_from_slice(chunk);
-        let _ = ctx
-            .journal_mut()
-            .sstore(BRIDGE_ADDR, slot, U256::from_be_bytes(padded));
-    }
+fn store_raw_bytes<CTX: crate::RskContextTr>(ctx: &mut CTX, base_key: U256, data: &[u8]) {
+    ctx.chain_mut()
+        .raw_storage
+        .put(BRIDGE_ADDR, base_key, Some(data.to_vec()));
 }
 
-fn load_raw_bytes<CTX: ContextTr>(ctx: &mut CTX, base_key: U256) -> Vec<u8> {
-    // Slot 0: data length
-    let len_val = ctx
-        .journal_mut()
-        .sload(BRIDGE_ADDR, base_key)
-        .map(|sl| sl.data)
-        .unwrap_or(U256::ZERO);
-
-    let len = len_val.to::<usize>();
-    if len == 0 {
-        return Vec::new();
-    }
-
-    let mut data = Vec::with_capacity(len);
-    let num_slots = len.div_ceil(32);
-
-    for i in 0..num_slots {
-        let slot = base_key.wrapping_add(U256::from(i + 1));
-        let val = ctx
-            .journal_mut()
-            .sload(BRIDGE_ADDR, slot)
-            .map(|sl| sl.data)
-            .unwrap_or(U256::ZERO);
-
-        let bytes = val.to_be_bytes::<32>();
-        let remaining = len - data.len();
-        let to_take = remaining.min(32);
-        data.extend_from_slice(&bytes[..to_take]);
-    }
-
-    data
+fn load_raw_bytes<CTX: crate::RskContextTr>(ctx: &mut CTX, base_key: U256) -> Vec<u8> {
+    ctx.chain_mut()
+        .raw_storage
+        .get(BRIDGE_ADDR, base_key)
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
