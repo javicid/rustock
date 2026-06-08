@@ -116,84 +116,78 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
         super::btc_chain::ensure_btc_chain_seeded(ctx, config, use_v2, rskip199);
     }
 
-    // Check if already processed
-    if is_btc_tx_processed(ctx, &btc_tx_hash) {
-        return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
-    }
-
-    // Validate PMT
-    if !PartialMerkleTree::has_expected_size(&pmt_data) {
-        return Err(PrecompileError::other(
-            "registerBtcTransaction: invalid PMT size",
-        ));
-    }
-
-    let pmt = PartialMerkleTree::parse(&pmt_data).ok_or_else(|| {
-        PrecompileError::other("registerBtcTransaction: failed to parse PMT")
-    })?;
-
-    let pmt_result = pmt.extract_matches().ok_or_else(|| {
-        PrecompileError::other("registerBtcTransaction: PMT verification failed")
-    })?;
-
-    // Check tx hash is in PMT matched hashes
-    if !pmt_result.matched_hashes.contains(&btc_tx_hash) {
-        return Err(PrecompileError::other(
-            "registerBtcTransaction: tx not in PMT",
-        ));
-    }
-
-    // Look up the BTC block by height
-    let block_hash_b256 = bridge_load_btc_block_hash_by_height(ctx, btc_block_height as u32);
-    let block_hash = match block_hash_b256 {
-        Some(h) => b256_to_bitcoin_hash(&h),
-        None => {
-            return Err(PrecompileError::other(
-                "registerBtcTransaction: BTC block not found at height",
-            ))
+    // rskj wraps the registerBtcTransaction body in
+    // `try { ... } catch (RegisterBtcTransactionException e) { log }`: an
+    // already-processed tx or any failed validation
+    // (validationsForRegisterBtcTransaction → "Could not validate
+    // transaction") is logged and the call returns SUCCESSFULLY without
+    // registering anything. Mirror that — these are a no-op success, not a
+    // failed tx. Only a malformed BTC tx (parsed below, a separate
+    // exception) propagates and fails the tx.
+    let validation = (|| -> Result<(), PrecompileError> {
+        // Check if already processed
+        if is_btc_tx_processed(ctx, &btc_tx_hash) {
+            return Err(PrecompileError::other("transaction already processed"));
         }
-    };
 
-    let stored_block = get_stored_block(ctx, &block_hash).ok_or_else(|| {
-        PrecompileError::other("registerBtcTransaction: stored block not found")
-    })?;
+        // Validate PMT
+        if !PartialMerkleTree::has_expected_size(&pmt_data) {
+            return Err(PrecompileError::other("invalid PMT size"));
+        }
+        let pmt = PartialMerkleTree::parse(&pmt_data)
+            .ok_or_else(|| PrecompileError::other("failed to parse PMT"))?;
+        let pmt_result = pmt
+            .extract_matches()
+            .ok_or_else(|| PrecompileError::other("PMT verification failed"))?;
 
-    // Verify merkle root matches
-    let block_merkle_root = {
-        let raw = stored_block.header.merkle_root.to_raw_hash();
-        *raw.as_byte_array()
-    };
+        // Check tx hash is in PMT matched hashes
+        if !pmt_result.matched_hashes.contains(&btc_tx_hash) {
+            return Err(PrecompileError::other("tx not in PMT"));
+        }
 
-    let root_valid = if pmt_result.merkle_root == block_merkle_root {
-        true
-    } else {
-        // Post-RSKIP143: also accept witness merkle root
-        let block_hash_bytes = {
-            let raw = block_hash.to_raw_hash();
+        // Look up the BTC block by height
+        let block_hash = match bridge_load_btc_block_hash_by_height(ctx, btc_block_height as u32) {
+            Some(h) => b256_to_bitcoin_hash(&h),
+            None => return Err(PrecompileError::other("BTC block not found at height")),
+        };
+        let stored_block = get_stored_block(ctx, &block_hash)
+            .ok_or_else(|| PrecompileError::other("stored block not found"))?;
+
+        // Verify merkle root matches
+        let block_merkle_root = {
+            let raw = stored_block.header.merkle_root.to_raw_hash();
             *raw.as_byte_array()
         };
-        match get_coinbase_information(ctx, &block_hash_bytes) {
-            Some(witness_root) => pmt_result.merkle_root == witness_root,
-            None => false,
+        let root_valid = if pmt_result.merkle_root == block_merkle_root {
+            true
+        } else {
+            // Post-RSKIP143: also accept witness merkle root
+            let block_hash_bytes = {
+                let raw = block_hash.to_raw_hash();
+                *raw.as_byte_array()
+            };
+            match get_coinbase_information(ctx, &block_hash_bytes) {
+                Some(witness_root) => pmt_result.merkle_root == witness_root,
+                None => false,
+            }
+        };
+        if !root_valid {
+            return Err(PrecompileError::other("merkle root mismatch"));
         }
-    };
 
-    if !root_valid {
-        return Err(PrecompileError::other(
-            "registerBtcTransaction: merkle root mismatch",
-        ));
-    }
-
-    // Check confirmations (rskj BridgeUtils.validateHeightAndConfirmations:
-    // the block itself counts as one confirmation, and the CALLER-supplied
-    // height is what gets validated).
-    let chain_head = load_chain_head(ctx);
-    let best_height = chain_head.map(|h| h.height).unwrap_or(0);
-    let confirmations = best_height as i64 - btc_block_height as i64 + 1;
-    if confirmations < config.btc2rsk_minimum_acceptable_confirmations as i64 {
-        return Err(PrecompileError::other(
-            "registerBtcTransaction: insufficient confirmations",
-        ));
+        // Check confirmations (rskj BridgeUtils.validateHeightAndConfirmations:
+        // the block itself counts as one confirmation, and the CALLER-supplied
+        // height is what gets validated).
+        let best_height = load_chain_head(ctx).map(|h| h.height).unwrap_or(0);
+        let confirmations = best_height as i64 - btc_block_height as i64 + 1;
+        if confirmations < config.btc2rsk_minimum_acceptable_confirmations as i64 {
+            return Err(PrecompileError::other("insufficient confirmations"));
+        }
+        Ok(())
+    })();
+    if let Err(e) = validation {
+        tracing::debug!("registerBtcTransaction: {e}; returning success (rskj swallows RegisterBtcTransactionException)");
+        return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     }
 
     // Parse the BTC transaction

@@ -3392,6 +3392,79 @@ mod tests {
         assert_eq!(result.tx_results[0].gas_used, 0, "all of the zero gas limit consumed");
     }
 
+    /// Regression for the sync halt at mainnet #6916: the block's first tx is
+    /// a registerBtcTransaction whose referenced BTC block (height 0x07ab2c)
+    /// is absent from the bridge's header chain. rskj wraps the method body in
+    /// try/catch(RegisterBtcTransactionException) and SWALLOWS the failed
+    /// validation ("Could not validate transaction"), so the tx still succeeds
+    /// as a no-op. rustock previously returned an error and produced a FAILED
+    /// receipt, diverging on the receipts root. The receipt must be successful
+    /// with no logs (no pegin event pre-RSKIP146).
+    #[test]
+    fn test_register_btc_transaction_failed_validation_is_success_noop() {
+        let federator = rsk_address_from_pubkey_hex(
+            "03b53899c390573471ba30e5054f78376c5f797fda26dde7a760789f02908cbad2",
+        )
+        .unwrap();
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+        let root = put_account(&root, store.as_ref(), &federator, 0, U256::ZERO);
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let header = dummy_header(6916);
+
+        // Verbatim mainnet #6916 tx 0 calldata (registerBtcTransaction).
+        let input = alloy_primitives::hex::decode(
+            "43dc06560000000000000000000000000000000000000000000000000000000000000060\
+000000000000000000000000000000000000000000000000000000000007ab2c\
+0000000000000000000000000000000000000000000000000000000000000140\
+00000000000000000000000000000000000000000000000000000000000000be\
+010000000197629af066e1b55b8f2498cd4052e183ef6952a0e6ecec81d05641d8b21db61e\
+000000006b483045022100bce3931194856efdc69f0fa67cbbe1f21920ed3f5597395362a9\
+d83855ade722022068220a8599c84fc7136a640751a91de2cc2ebf79fe453c54db566d1012\
+7b1182012103d1408fe5e94e1ec1da9df06edf86de4f43e459a56238216b131f48af96980f\
+58feffffff01f1c817000000000017a91451f103320b435b5fe417b3f3e0f18972ccc710a0\
+872bab0700000000000000000000000000000000000000000000000000000000000000000001\
+aa630800000d14e6e59463afbfd4155db84d7592b5af577ef5dc0e9d906676e9ec81f37401d4\
+72706346992d8220d9138dc144077bdbf5522de323024c2cf3d74e239fc11fb2afc6543956e6\
+fb6f0cc43c5dd4c66fd271eff5f9309768dd7c267d767725f4538a093bb1fa025a85c0cd4967\
+119bc286d9a951a828a7c413e4a8994ded5b9077b5944346e0ee8d09ed2e8622f3ad1e7b3a02\
+2d9696fbf894251e6d487c1cb3b4522650fec9201f035d965ce42cfcc157b388470b6f6ff15d\
+d72fd5651a57586cab8bac3b5531b3f490a97b2363a2ef18121a43873753a08e35991732fb78\
+9265cd9dd43584dbe701bb953f21af68029a30d8b6327cd57d2dd242327c1b135d4c8f5e36b8\
+bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
+3062f66fa39895750a0f0c651f2fc736d69b746ed77319d5c0ecab6539d3655f163f3eccf325\
+846b1c1244e17b6464d5b85c3cd06587cf992067f37c086d17ab6dd35ee7aef6de22ac59ed37\
+468ee5eb15948db42c438fdfb4c5b08d6316a203bcecd9713b9a2b150614ee116dcff986c29c2\
+246745704bbdb010000000000000000000000000000000000000000000000",
+        )
+        .unwrap();
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(0),
+            to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::from(input),
+            v: 28,
+            r: U256::from(1),
+            s: U256::from(1),
+            cached_rlp: None,
+        };
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        let result = executor
+            .execute_block(&header, &[(tx, federator)], &root, store)
+            .expect("block with the #6916 pegin tx must execute");
+        assert_eq!(result.tx_results.len(), 1);
+        assert!(
+            result.tx_results[0].success,
+            "a registerBtcTransaction that fails validation is a no-op SUCCESS in rskj, not a failed tx"
+        );
+        assert!(
+            result.tx_results[0].logs.is_empty(),
+            "a no-op pegin emits no logs pre-RSKIP146"
+        );
+    }
+
     /// Regression for the silent stall at mainnet #4001: the REMASC maturity
     /// is 4_000 blocks, so #4001 is the FIRST block whose system call touches
     /// REMASC storage — on a journal that never loaded the account, the sload
