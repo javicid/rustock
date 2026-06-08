@@ -109,12 +109,10 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
 
     // A fresh bridge BTC store must be seeded with the rskj checkpoint
     // before any chain lookups.
-    {
-        let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
-        let use_v2 = hardfork_cfg.has_stored_block_v2(block_number);
-        let rskip199 = hardfork_cfg.has_rskip199(block_number);
-        super::btc_chain::ensure_btc_chain_seeded(ctx, config, use_v2, rskip199);
-    }
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let use_v2 = hardfork_cfg.has_stored_block_v2(block_number);
+    let rskip199 = hardfork_cfg.has_rskip199(block_number);
+    super::btc_chain::ensure_btc_chain_seeded(ctx, config, use_v2, rskip199);
 
     // rskj wraps the registerBtcTransaction body in
     // `try { ... } catch (RegisterBtcTransactionException e) { log }`: an
@@ -145,13 +143,12 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
             return Err(PrecompileError::other("tx not in PMT"));
         }
 
-        // Look up the BTC block by height
-        let block_hash = match bridge_load_btc_block_hash_by_height(ctx, btc_block_height as u32) {
-            Some(h) => b256_to_bitcoin_hash(&h),
-            None => return Err(PrecompileError::other("BTC block not found at height")),
-        };
-        let stored_block = get_stored_block(ctx, &block_hash)
-            .ok_or_else(|| PrecompileError::other("stored block not found"))?;
+        // Look up the BTC block on the main chain at the caller-supplied
+        // height (walks the chain pre-RSKIP199, indexed lookup afterwards).
+        let stored_block =
+            super::btc_chain::stored_block_at_main_chain_height(ctx, btc_block_height as u32, rskip199)
+                .ok_or_else(|| PrecompileError::other("BTC block not found at height"))?;
+        let block_hash = stored_block.header.block_hash();
 
         // Verify merkle root matches
         let block_merkle_root = {

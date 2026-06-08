@@ -141,6 +141,42 @@ fn set_chain_head<CTX: crate::RskContextTr>(
     }
 }
 
+/// rskj `BtcBlockStoreWithCache.getStoredBlockAtMainChainHeight`: the
+/// main-chain block at `height`.
+///
+/// rskj only persists the height→hash index from RSKIP199 (iris300); before
+/// that it WALKS the main chain from the head down `depth = head - height`
+/// parents (`getStoredBlockAtMainChainDepth`). We mirror that exactly — the
+/// index is empty pre-RSKIP199, so a height lookup must walk. Returns `None`
+/// when the height is above the head or the chain cannot be walked to it.
+pub(crate) fn stored_block_at_main_chain_height<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    height: u32,
+    rskip199: bool,
+) -> Option<StoredBlock> {
+    let head = load_chain_head(ctx)?;
+    if height > head.height {
+        return None; // depth < 0: above the chain head
+    }
+    let depth = head.height - height;
+
+    // From RSKIP199, the indexed lookup; it may be absent for blocks below the
+    // index activation, in which case rskj falls back to the walk.
+    if rskip199 {
+        if let Some(hash) = super::storage::bridge_load_btc_block_hash_by_height(ctx, height) {
+            return get_stored_block(ctx, &b256_to_bitcoin_hash(&hash));
+        }
+    }
+
+    // Walk `depth` parents down from the head (getStoredBlockAtMainChainDepth).
+    let mut block_hash = head.header.block_hash();
+    for _ in 0..depth {
+        block_hash = get_stored_block(ctx, &block_hash)?.header.prev_blockhash;
+    }
+    let block = get_stored_block(ctx, &block_hash)?;
+    (block.height == height).then_some(block)
+}
+
 /// Seed the bridge BTC chain on first use. rskj does this in two steps that
 /// both persist: `RepositoryBtcBlockStoreWithCache.checkIfInitialized` writes
 /// the BTC GENESIS stored block as chain head, then
