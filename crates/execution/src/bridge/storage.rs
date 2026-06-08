@@ -242,19 +242,89 @@ pub fn bridge_transfer<CTX: crate::RskContextTr>(ctx: &mut CTX, recipient: Addre
 //   RLP_list [ hash160_0, hash160_1, ... ]
 // ---------------------------------------------------------------------------
 
+/// Java `Arrays.hashCode(byte[])` (bytes are signed in Java's int arithmetic).
+fn java_bytes_hashcode(bytes: &[u8]) -> i32 {
+    let mut h: i32 = 1;
+    for &b in bytes {
+        h = h.wrapping_mul(31).wrapping_add(b as i8 as i32);
+    }
+    h
+}
+
+/// hashCode of a whitelist map key, replicating co.rsk.bitcoinj
+/// `VersionedChecksummedBytes.hashCode()` =
+/// `com.google.common.base.Objects.hashCode(version, Arrays.hashCode(bytes))`.
+///
+/// This is part of a Java-compatibility constraint (see [`java_hashmap_order`]
+/// and the module docs): the empirically observed mainnet ordering (#3304) is
+/// reproduced only when the array hashed is the VERSION-PREFIXED 21 bytes
+/// `[version] ++ hash160`, not the bare 20-byte hash160 the constructor
+/// stores. We assume the mainnet P2PKH version byte `0x00` (every pre-RSKIP87
+/// whitelist entry observed is a `1...` address); a P2SH (`3...`, version 5)
+/// whitelist entry would need its real version here.
+fn whitelist_key_hashcode(hash160: &[u8; 20]) -> i32 {
+    const VERSION: u8 = 0x00; // mainnet P2PKH
+    let mut versioned = [0u8; 21];
+    versioned[1..].copy_from_slice(hash160);
+    let arr = java_bytes_hashcode(&versioned);
+    // Guava Objects.hashCode(Integer(version), Integer(arr))
+    //   = 31 * (31 * 1 + version) + arr
+    (31i32.wrapping_mul(31i32.wrapping_add(VERSION as i32))).wrapping_add(arr)
+}
+
+/// The order in which a Java 8 `HashMap<Address, _>` iterates `entries` when
+/// they are `put` in the given (current serialized) order.
+///
+/// rskj's `LockWhitelist` holds a `HashMap`, and
+/// `serializeOneOffLockWhitelist` writes entries in that map's iteration
+/// order — so the on-chain bytes (and thus the state root) depend on Java's
+/// HashMap bucket layout. This is a Java-compatibility constraint: the
+/// serialized order is tied to the JDK's HashMap iteration order, so we must
+/// replicate Java 8's bucket layout bit-for-bit to match historical mainnet
+/// state. See the TODO entry.
+///
+/// Java 8 semantics replicated: capacity starts at 16, load factor 0.75
+/// (resize when size exceeds 3/4 capacity); bucket = `spread(h) & (cap-1)`
+/// with `spread(h) = h ^ (h >>> 16)`; within a bucket, insertion order;
+/// resize re-buckets while preserving per-bucket order (lo/hi split). Each
+/// `save` re-inserts in the prior serialized order, exactly as rskj does on
+/// deserialize, so this fixed point matches rskj across blocks.
+fn java_hashmap_order(hashcodes: &[i32]) -> Vec<usize> {
+    let n = hashcodes.len();
+    let mut cap = 16usize;
+    while n > cap * 3 / 4 {
+        cap <<= 1;
+    }
+    let spread = |h: i32| -> u32 {
+        let hu = h as u32;
+        hu ^ (hu >> 16)
+    };
+    let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); cap];
+    for (idx, &h) in hashcodes.iter().enumerate() {
+        buckets[(spread(h) as usize) & (cap - 1)].push(idx);
+    }
+    buckets.into_iter().flatten().collect()
+}
+
 /// Serialize one-off whitelist entries with disable block height.
 ///
 /// Matches rskj's `BridgeSerializationUtils.serializeOneOffLockWhitelist`.
-/// `entries`: (BTC hash160, max transfer value in satoshis)
+/// `entries`: (BTC hash160, max transfer value in satoshis), in the prior
+/// serialized order; this function reorders them into Java HashMap iteration
+/// order (see [`java_hashmap_order`]) before writing.
 /// `disable_height`: BTC height at which the whitelist turns off
 /// (`i32::MAX` = not set, matching rskj's LockWhitelist default).
 pub fn serialize_one_off_whitelist(entries: &[([u8; 20], u64)], disable_height: i32) -> Vec<u8> {
     use super::serialization::{rlp_encode_element, rlp_encode_list, rlp_encode_u64};
 
+    let hashcodes: Vec<i32> = entries.iter().map(|(h, _)| whitelist_key_hashcode(h)).collect();
+    let order = java_hashmap_order(&hashcodes);
+
     let size = entries.len() * 2 + 1;
     let mut items = Vec::with_capacity(size);
 
-    for (hash160, max_val) in entries {
+    for &i in &order {
+        let (hash160, max_val) = &entries[i];
         items.push(rlp_encode_element(hash160));
         items.push(rlp_encode_u64(*max_val));
     }
@@ -525,6 +595,42 @@ pub fn store_federation_utxos<CTX: crate::RskContextTr>(ctx: &mut CTX, utxos: &[
 mod tests {
     use super::*;
 
+    /// Groundtruth from mainnet #3304: a second `addLockWhitelistAddress` makes
+    /// the one-off whitelist hold two entries, and rskj serializes them in its
+    /// `HashMap<Address,_>` iteration order — NOT insertion order. Entries are
+    /// inserted [a344… (#3303), 54f6be… (#3304)] but the on-chain bytes put
+    /// 54f6be first. Validated by the pre-RSKIP126 (orchid) state root at
+    /// #3304 matching the mainnet header.
+    #[test]
+    fn one_off_whitelist_uses_java_hashmap_order_3304() {
+        let a344 = hex_to_20("a344a19d31b92bd0f0077eb0553e7b48ce738f34");
+        let f6be = hex_to_20("54f6be1e1ef1dae347a47972103d1e0f8d235c5b");
+        // Inserted in chain order [a344, 54f6be]; max value 1e9, disable = MAX.
+        let out = serialize_one_off_whitelist(&[(a344, 1_000_000_000), (f6be, 1_000_000_000)], i32::MAX);
+        assert_eq!(
+            alloy_primitives::hex::encode(&out),
+            "f8399454f6be1e1ef1dae347a47972103d1e0f8d235c5b843b9aca0094a344a19d31b92bd0f0077eb0553e7b48ce738f34843b9aca00847fffffff"
+        );
+    }
+
+    /// A single entry is order-independent (groundtruth: mainnet #3303 root).
+    #[test]
+    fn one_off_whitelist_single_entry() {
+        let a344 = hex_to_20("a344a19d31b92bd0f0077eb0553e7b48ce738f34");
+        let out = serialize_one_off_whitelist(&[(a344, 1_000_000_000)], i32::MAX);
+        assert_eq!(
+            alloy_primitives::hex::encode(&out),
+            "df94a344a19d31b92bd0f0077eb0553e7b48ce738f34843b9aca00847fffffff"
+        );
+    }
+
+    fn hex_to_20(s: &str) -> [u8; 20] {
+        let v = alloy_primitives::hex::decode(s).unwrap();
+        let mut a = [0u8; 20];
+        a.copy_from_slice(&v);
+        a
+    }
+
     #[test]
     fn storage_key_short() {
         let key = bridge_storage_key("btcTxHashesAP");
@@ -727,11 +833,12 @@ mod tests {
         let data = serialize_one_off_whitelist(&entries_in, disable_h);
         let (entries_out, dh) = deserialize_one_off_whitelist(&data).unwrap();
 
+        // serialize_one_off_whitelist reorders into Java HashMap iteration
+        // order (see java_hashmap_order), so the roundtrip preserves the entry
+        // SET and each entry's max value, not insertion order.
         assert_eq!(entries_out.len(), 2);
-        assert_eq!(entries_out[0].0, hash1);
-        assert_eq!(entries_out[0].1, 500_000);
-        assert_eq!(entries_out[1].0, hash2);
-        assert_eq!(entries_out[1].1, 2_000_000);
+        assert!(entries_out.contains(&(hash1, 500_000)));
+        assert!(entries_out.contains(&(hash2, 2_000_000)));
         assert_eq!(dh, disable_h);
     }
 

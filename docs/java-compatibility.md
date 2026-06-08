@@ -364,6 +364,99 @@ hardfork-specific logic.
 
 ---
 
+## 8. Java `HashMap` Iteration Order in Consensus Serialization
+
+**Source**: `rskj/.../peg/BridgeSerializationUtils.java`
+(`serializeOneOffLockWhitelist`), `rskj/.../peg/whitelist/LockWhitelist.java`,
+`co.rsk.bitcoinj.core.VersionedChecksummedBytes`
+
+### The problem
+
+Some consensus-critical Bridge state is serialized by **iterating a Java
+`HashMap`** and writing entries in iteration order. `HashMap` iteration order
+is not insertion order and not sorted — it is the order in which entries sit
+in the hash-table buckets, which depends on each key's `hashCode()`, the
+table capacity, and the JVM's bucketing/resize algorithm. Because the
+serialized bytes feed directly into the unitrie (and thus the block's state
+root), **the state root depends on Java's `HashMap` layout**.
+
+This is a Java-compatibility constraint, not a deliberate design choice: the
+serialized order is tied to a specific JDK's `HashMap` iteration behavior, so
+the Rust client must reproduce Java 8's `HashMap` ordering bit-for-bit to
+match historical mainnet state. (It also pins a Java node to a compatible JDK,
+since the iteration order is implementation-dependent.)
+
+### Where it appears
+
+The **one-off lock whitelist** (`addLockWhitelistAddress` /
+`addOneOffLockWhitelistAddress`). rskj's `LockWhitelist` holds a
+`HashMap<Address, LockWhitelistEntry>`; `serializeOneOffLockWhitelist` writes
+`RLP([hash160_0, maxVal_0, hash160_1, maxVal_1, ..., disableBlockHeight])`
+with the `hash160`/`maxVal` pairs in **map iteration order**.
+
+With a single entry, order is irrelevant. With two or more, insertion order
+and `HashMap` order diverge. This surfaced as the first orchid-converted
+state-root mismatch at **mainnet #3304** — the second `addLockWhitelistAddress`
+on mainnet. (Pre-RSKIP126 state roots are not validated during normal sync, so
+such a divergence stays invisible until the first unitrie state-root check at
+Wasabi100 / #1,591,000 — or until the diagnostic
+`RUSTOCK_ORCHID_CHECK_INTERVAL` per-block converter check catches it at its
+origin.)
+
+### Java 8 `HashMap` semantics replicated
+
+- Initial capacity 16, load factor 0.75 (resize when `size` exceeds
+  `0.75 * capacity`).
+- Bucket index: `spread(h) & (capacity - 1)` where `spread(h) = h ^ (h >>> 16)`.
+- Within a bucket: insertion order.
+- Resize doubles capacity and re-buckets while preserving per-bucket order
+  (the lo/hi split). rskj deserializes into a fresh `HashMap` in the stored
+  order each block, so re-serializing is a fixed point we mirror by reordering
+  the current entries.
+
+### Key `hashCode`
+
+The map key is a `co.rsk.bitcoinj.core.Address`, whose `hashCode()` (inherited
+from `VersionedChecksummedBytes`) is:
+
+```java
+com.google.common.base.Objects.hashCode(version, Arrays.hashCode(bytes))
+// = 31 * (31 * 1 + version) + Arrays.hashCode(bytes)
+```
+
+Empirically (validated against the #3304 mainnet state root), the array hashed
+must be the **version-prefixed 21 bytes** `[version] ++ hash160`, with the
+mainnet P2PKH `version = 0x00`.
+
+### Rust implementation
+
+`crates/execution/src/bridge/storage.rs`:
+
+- `java_bytes_hashcode` — Java `Arrays.hashCode(byte[])` (signed bytes).
+- `whitelist_key_hashcode` — the `Address` key hash above.
+- `java_hashmap_order` — Java 8 `HashMap` iteration order for a set of keys.
+- `serialize_one_off_whitelist` reorders entries via `java_hashmap_order`
+  before RLP-encoding.
+
+Locked in by groundtruth unit tests against the #3303 (single-entry) and
+#3304 (two-entry) state roots.
+
+### Open caveats (see TODO)
+
+- The exact key-hash variant (Guava-wrapped vs bare `Arrays.hashCode` over the
+  21-byte array) is indistinguishable with only two entries; both reproduce
+  #3304. Validate at the first 3+-entry whitelist block.
+- The `version` byte is assumed `0x00` (mainnet P2PKH); a P2SH whitelist entry
+  would need its real version.
+- Post-RSKIP87, the unlimited whitelist is merged into the same map before
+  `getAll` filters one-off entries, so unlimited keys can perturb one-off
+  ordering — handle when both coexist.
+- Other Bridge collections serialized from Java `Map`/`Set` (e.g. UTXO sets,
+  the processed-tx set) may carry the same ordering dependency; audit if a
+  state-root mismatch points at one.
+
+---
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`
