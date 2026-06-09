@@ -2916,12 +2916,14 @@ name = "rustock-cli"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "alloy-rlp",
  "anyhow",
  "async-trait",
  "clap",
  "hex",
  "k256",
  "rand 0.8.5",
+ "rocksdb",
  "rustock-core",
  "rustock-execution",
  "rustock-networking",

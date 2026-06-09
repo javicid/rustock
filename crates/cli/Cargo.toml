@@ -22,3 +22,7 @@ tracing-subscriber = { workspace = true }
 rand = { workspace = true }
 hex = "0.4.3"
 tracing-appender = "0.2.4"
+
+[dev-dependencies]
+rocksdb = "0.22.0"
+alloy-rlp = { workspace = true }
