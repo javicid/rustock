@@ -666,6 +666,42 @@ journal spec being pinned pre-Spurious-Dragon (`RskHandler::load_accounts` →
 
 ---
 
+## 14. RSKIP123 Multikey Federation Serialization (wasabi)
+
+Before RSKIP123 (wasabi, #1,591,000) the Bridge serializes a federation with
+`serializeFederationOnlyBtcKeys`: each member is its 33-byte compressed BTC
+key. From wasabi on, `FederationStorageProviderImpl.saveNewFederation`
+switches to `serializeFederation`, where each member is
+`RLP[btcKey, rskKey, mstKey]` (`FederationMember.serialize`), wrapped as an RLP
+element inside the member list. For the legacy genesis federation, members
+carry only a BTC key, so `rsk = mst = btc`
+(`FederationMember.getFederationMemberFromKey`) — three identical keys per
+member. It also persists `newFederationFormatVersion = 1000`
+(`STANDARD_MULTISIG_FEDERATION`, via `serializeInteger` → `0x8203e8`). Member
+order is `BTC_RSK_MST_PUBKEYS_COMPARATOR`, which for legacy members reduces to
+BTC-key byte order (identical to the only-BTC ordering).
+
+Crucially, rskj's `BridgeStorageProvider.save()` runs at the end of *every*
+Bridge transaction and re-serializes the active federation **if the call loaded
+it**. So the first post-wasabi Bridge tx that loads the federation migrates the
+stored `newFederation` cell in place (and creates the format-version cell). On
+mainnet that is #1,591,009's `updateCollections` (blocks #1,591,000–008 carried
+no federation-loading Bridge tx). The value is stable thereafter.
+
+rustock wrote only the legacy single-key format and never the format-version
+cell, diverging at #1,591,009 (the first block whose state root is checked
+*and* whose Bridge state changes). Fix (`crates/execution/src/bridge/`):
+`serialize_federation_multikey` (federation.rs), a version-aware
+`load_stored_federation` that auto-detects multikey members (so getters keep
+reading the BTC key after migration), and `save_new_federation_multikey` called
+from `update_collections` (peg.rs). Ground-truthed against rskj's
+#1,591,008→#1,591,009 `newFederation` bytes. The broader gap — *every*
+federation-loading Bridge method re-serializes on save in rskj — is harmless
+once migrated (the value is idempotent), but if a future block's first
+fed-loading Bridge tx is *not* `updateCollections`, extend the trigger there.
+
+---
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`
