@@ -242,83 +242,21 @@ pub fn bridge_transfer<CTX: crate::RskContextTr>(ctx: &mut CTX, recipient: Addre
 //   RLP_list [ hash160_0, hash160_1, ... ]
 // ---------------------------------------------------------------------------
 
-/// Java `Arrays.hashCode(byte[])` (bytes are signed in Java's int arithmetic).
-fn java_bytes_hashcode(bytes: &[u8]) -> i32 {
-    let mut h: i32 = 1;
-    for &b in bytes {
-        h = h.wrapping_mul(31).wrapping_add(b as i8 as i32);
-    }
-    h
-}
-
-/// hashCode of a whitelist map key, replicating co.rsk.bitcoinj
-/// `VersionedChecksummedBytes.hashCode()` =
-/// `com.google.common.base.Objects.hashCode(version, Arrays.hashCode(bytes))`.
-///
-/// This is part of a Java-compatibility constraint (see [`java_hashmap_order`]
-/// and the module docs): the empirically observed mainnet ordering (#3304) is
-/// reproduced only when the array hashed is the VERSION-PREFIXED 21 bytes
-/// `[version] ++ hash160`, not the bare 20-byte hash160 the constructor
-/// stores. We assume the mainnet P2PKH version byte `0x00` (every pre-RSKIP87
-/// whitelist entry observed is a `1...` address); a P2SH (`3...`, version 5)
-/// whitelist entry would need its real version here.
-fn whitelist_key_hashcode(hash160: &[u8; 20]) -> i32 {
-    const VERSION: u8 = 0x00; // mainnet P2PKH
-    let mut versioned = [0u8; 21];
-    versioned[1..].copy_from_slice(hash160);
-    let arr = java_bytes_hashcode(&versioned);
-    // Guava Objects.hashCode(Integer(version), Integer(arr))
-    //   = 31 * (31 * 1 + version) + arr
-    (31i32.wrapping_mul(31i32.wrapping_add(VERSION as i32))).wrapping_add(arr)
-}
-
-/// The order in which a Java 8 `HashMap<Address, _>` iterates `entries` when
-/// they are `put` in the given (current serialized) order.
-///
-/// rskj's `LockWhitelist` holds a `HashMap`, and
-/// `serializeOneOffLockWhitelist` writes entries in that map's iteration
-/// order — so the on-chain bytes (and thus the state root) depend on Java's
-/// HashMap bucket layout. This is a Java-compatibility constraint: the
-/// serialized order is tied to the JDK's HashMap iteration order, so we must
-/// replicate Java 8's bucket layout bit-for-bit to match historical mainnet
-/// state. See the TODO entry.
-///
-/// Java 8 semantics replicated: capacity starts at 16, load factor 0.75
-/// (resize when size exceeds 3/4 capacity); bucket = `spread(h) & (cap-1)`
-/// with `spread(h) = h ^ (h >>> 16)`; within a bucket, insertion order;
-/// resize re-buckets while preserving per-bucket order (lo/hi split). Each
-/// `save` re-inserts in the prior serialized order, exactly as rskj does on
-/// deserialize, so this fixed point matches rskj across blocks.
-fn java_hashmap_order(hashcodes: &[i32]) -> Vec<usize> {
-    let n = hashcodes.len();
-    let mut cap = 16usize;
-    while n > cap * 3 / 4 {
-        cap <<= 1;
-    }
-    let spread = |h: i32| -> u32 {
-        let hu = h as u32;
-        hu ^ (hu >> 16)
-    };
-    let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); cap];
-    for (idx, &h) in hashcodes.iter().enumerate() {
-        buckets[(spread(h) as usize) & (cap - 1)].push(idx);
-    }
-    buckets.into_iter().flatten().collect()
-}
-
 /// Serialize one-off whitelist entries with disable block height.
 ///
 /// Matches rskj's `BridgeSerializationUtils.serializeOneOffLockWhitelist`.
-/// `entries`: (BTC hash160, max transfer value in satoshis), in the prior
-/// serialized order; this function reorders them into Java HashMap iteration
-/// order (see [`java_hashmap_order`]) before writing.
+/// `entries`: (BTC hash160, max transfer value in satoshis); rskj's
+/// `LockWhitelist` keeps them in a `TreeMap` ordered by
+/// `Address.getHash160()` (`UnsignedBytes.lexicographicalComparator`), so the
+/// serialized list is sorted by hash160 ascending — independent of insertion
+/// order.
 /// `disable_height`: BTC height at which the whitelist turns off
 /// (`i32::MAX` = not set, matching rskj's LockWhitelist default).
 pub fn serialize_one_off_whitelist(entries: &[([u8; 20], u64)], disable_height: i32) -> Vec<u8> {
     use super::serialization::{rlp_encode_element, rlp_encode_list, rlp_encode_u64};
 
-    let hashcodes: Vec<i32> = entries.iter().map(|(h, _)| whitelist_key_hashcode(h)).collect();
-    let order = java_hashmap_order(&hashcodes);
+    let mut order: Vec<usize> = (0..entries.len()).collect();
+    order.sort_by(|&a, &b| entries[a].0.cmp(&entries[b].0));
 
     let size = entries.len() * 2 + 1;
     let mut items = Vec::with_capacity(size);
@@ -381,7 +319,12 @@ pub fn deserialize_one_off_whitelist(data: &[u8]) -> Option<(Vec<([u8; 20], u64)
 pub fn serialize_unlimited_whitelist(entries: &[[u8; 20]]) -> Vec<u8> {
     use super::serialization::{rlp_encode_element, rlp_encode_list};
 
-    let items: Vec<Vec<u8>> = entries.iter().map(|h| rlp_encode_element(h)).collect();
+    // rskj's LockWhitelist is a TreeMap keyed by hash160
+    // (UnsignedBytes.lexicographicalComparator), so entries serialize sorted
+    // by hash160 ascending regardless of insertion order.
+    let mut sorted = entries.to_vec();
+    sorted.sort_unstable();
+    let items: Vec<Vec<u8>> = sorted.iter().map(|h| rlp_encode_element(h)).collect();
     rlp_encode_list(&items)
 }
 
@@ -483,9 +426,12 @@ fn serialize_utxo(utxo: &BridgeUtxo) -> Vec<u8> {
     buf.extend_from_slice(&utxo.value_satoshis.to_le_bytes());
     buf.extend_from_slice(&(utxo.script.len() as u32).to_le_bytes());
     buf.extend_from_slice(&utxo.script);
-    let mut display = utxo.tx_hash;
-    display.reverse(); // internal -> display order
-    buf.extend_from_slice(&display);
+    // bitcoinj `Transaction.getHash()` is a `Sha256Hash.wrapReversed(...)`, so
+    // `UTXO.serializeToStream` writes `hash.getBytes()` already in display
+    // order. `tx_hash` is kept in that same (display) order, so store it as-is
+    // — reversing it produced the internal order, byte-diverging the
+    // newFederationBtcUTXOs cell from rskj's unitrie.
+    buf.extend_from_slice(&utxo.tx_hash);
     buf.extend_from_slice(&utxo.vout.to_le_bytes());
     buf.extend_from_slice(&utxo.height.to_le_bytes());
     buf.push(if utxo.coinbase { 1 } else { 0 });
@@ -514,8 +460,7 @@ fn deserialize_utxo(data: &[u8]) -> Option<BridgeUtxo> {
     pos += script_len;
 
     if pos + 32 > data.len() { return None; }
-    let mut tx_hash: [u8; 32] = data[pos..pos + 32].try_into().ok()?;
-    tx_hash.reverse(); // display -> internal order
+    let tx_hash: [u8; 32] = data[pos..pos + 32].try_into().ok()?;
     pos += 32;
 
     if pos + 4 > data.len() { return None; }
@@ -602,15 +547,60 @@ mod tests {
     /// 54f6be first. Validated by the pre-RSKIP126 (orchid) state root at
     /// #3304 matching the mainnet header.
     #[test]
-    fn one_off_whitelist_uses_java_hashmap_order_3304() {
+    fn one_off_whitelist_sorted_by_hash160_3304() {
         let a344 = hex_to_20("a344a19d31b92bd0f0077eb0553e7b48ce738f34");
         let f6be = hex_to_20("54f6be1e1ef1dae347a47972103d1e0f8d235c5b");
-        // Inserted in chain order [a344, 54f6be]; max value 1e9, disable = MAX.
+        // Inserted [a344, 54f6be] but serialized sorted by hash160 ascending
+        // (0x54.. < 0xa3..), max value 1e9, disable = MAX. Groundtruth #3304.
         let out = serialize_one_off_whitelist(&[(a344, 1_000_000_000), (f6be, 1_000_000_000)], i32::MAX);
         assert_eq!(
             alloy_primitives::hex::encode(&out),
             "f8399454f6be1e1ef1dae347a47972103d1e0f8d235c5b843b9aca0094a344a19d31b92bd0f0077eb0553e7b48ce738f34843b9aca00847fffffff"
         );
+    }
+
+    /// Byte-exact ground truth: the mainnet one-off `lockWhitelist` cell at
+    /// #1,590,999 (7 entries) — dumped from a synced rskj unitrie. Feeding the
+    /// entries scrambled must reproduce rskj's bytes (sorted by hash160), which
+    /// a Java-HashMap ordering would not for 7 entries.
+    #[test]
+    fn rskj_one_off_whitelist_sorted_groundtruth_1590999() {
+        use alloy_primitives::hex;
+        let rskj = hex::decode(
+            "f8bb9403c6fea3c7907b95312ef0f426c32fca56caa3e3843b9aca00943cdc5e1928a1efc9\
+             4d0c7c39fcc3e7491757b3d9843b9aca00945ca39d0128aca2c6b84529ad27c3f4064d233c60\
+             843b9aca0094a7ca049069dfbf48b1d199348385c94dd92dcc6b843b9aca0094b298512d102b\
+             4e642c6c511781d9cbf7bf5e3a37843b9aca0094cebb2851a9c7cfe2582c12ecaf7f3ff4383d\
+             1dc0843b9aca0094f8bcb4cca48194b12d173e87e1323195ac36b78e843b9aca00847fffffff",
+        ).unwrap();
+        let (mut entries, disable) = deserialize_one_off_whitelist(&rskj).unwrap();
+        assert_eq!(entries.len(), 7);
+        assert_eq!(disable, i32::MAX);
+        entries.reverse(); // scramble
+        assert_eq!(serialize_one_off_whitelist(&entries, disable), rskj);
+    }
+
+    /// Byte-exact ground truth: the mainnet `unlimitedLockWhitelist` cell at
+    /// #1,590,999 (17 entries). Scrambled input must reproduce rskj's bytes.
+    #[test]
+    fn rskj_unlimited_whitelist_sorted_groundtruth_1590999() {
+        use alloy_primitives::hex;
+        let rskj = hex::decode(
+            "f901659400cfa4fb2adbef0e3f25af5259b1492f394f073e941a906a2b7f8afbf6a7ebb4c2e\
+             4868cdc8008bcb59422843c7a3977c7e1ca2a14cd60bb0b25bedfb851943301648cdf96ebff17\
+             81631125828f8fa783e55e948bdfd9f9014183674a3906d085231b856e09a722949d1b66dbad1\
+             39fa294c47c83415d302f96ce437694aeac85aa74701e3744fd72bf3d5f7b04aab7111b94b8a9\
+             6cc5ce2a670cc0d601bf35e871e69bd5364f94bad8369d720c3d6d3f5ebff8666d786fd317030c\
+             94c685d3bc07a5411a9731516e74e082dc7447548294c825a1ecf2a6830c4401620c3a16f19950\
+             57c2ab94c83874014a9e10b1533d43f0f485b4dbc45449d394c931202b0968fdbc4030b2abce46\
+             e0286530b0c194d1919c38b5613a11d62706029b126dd186c589a294e136bc6703ba25ff58b7ef\
+             530d47f5cb9bc4769494e8e0b6af4b0be3212369c382cce3dee39a6fa84c94f5c4d9f264488827\
+             3cdc7ef706f81b1def114b95",
+        ).unwrap();
+        let mut entries = deserialize_unlimited_whitelist(&rskj);
+        assert_eq!(entries.len(), 17);
+        entries.reverse(); // scramble
+        assert_eq!(serialize_unlimited_whitelist(&entries), rskj);
     }
 
     /// A single entry is order-independent (groundtruth: mainnet #3303 root).
@@ -896,6 +886,39 @@ mod tests {
         assert_eq!(decoded.height, utxo.height);
         assert_eq!(decoded.script, utxo.script);
         assert_eq!(decoded.coinbase, utxo.coinbase);
+    }
+
+    /// Byte-exact ground truth: the first UTXO blob of the mainnet
+    /// `newFederationBtcUTXOs` cell at #1,590,999, dumped from a synced rskj
+    /// `~/.rsk/mainnet` unitrie. The BTC tx hash is stored in bitcoinj display
+    /// order (`Sha256Hash.getBytes()` of the reversed-wrapped tx hash), NOT
+    /// reversed again.
+    #[test]
+    fn rskj_utxo_groundtruth_hash_order() {
+        use alloy_primitives::hex;
+        // value=0xed342c1c LE, scriptLen=23 LE, P2SH script, 32-byte hash,
+        // vout=1, height=0, coinbase=0.
+        let expected = hex::decode(
+            "1c2c34ed0000000017000000a914b8e177b09d37441023682cc939767648b0ff4823\
+             87073efb7a2a2c7f15c38d24a771ce85e24af772ae035162b9ba349a376a207279\
+             010000000000000000",
+        ).unwrap();
+
+        let script = hex::decode("a914b8e177b09d37441023682cc939767648b0ff482387").unwrap();
+        let tx_hash: [u8; 32] = hex::decode(
+            "073efb7a2a2c7f15c38d24a771ce85e24af772ae035162b9ba349a376a207279",
+        ).unwrap().try_into().unwrap();
+        let utxo = BridgeUtxo {
+            tx_hash,
+            vout: 1,
+            value_satoshis: 0xed34_2c1c,
+            height: 0,
+            script,
+            coinbase: false,
+        };
+        assert_eq!(serialize_utxo(&utxo), expected, "rskj UTXO byte layout");
+        // Round-trips back to the same (display-order) hash.
+        assert_eq!(deserialize_utxo(&expected).unwrap().tx_hash, tx_hash);
     }
 
     #[test]

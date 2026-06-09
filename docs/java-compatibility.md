@@ -565,6 +565,38 @@ those. Precompile markers continue to be written through `ContractMarkers::preco
 
 ---
 
+## 11. Bridge UTXO and Lock-Whitelist Serialization Order
+
+Two byte-exact Bridge-storage incompatibilities surfaced by diffing rustock's
+mainnet unitrie against rskj's at #1,590,999 (same entries, different bytes):
+
+### 11a. Federation UTXO BTC tx-hash byte order
+
+`UTXO.serializeToStream` writes `hash.getBytes()`. In bitcoinj a transaction's
+hash is a `Sha256Hash.wrapReversed(...)`, so `getBytes()` is already in *display*
+(reversed) order. rustock keeps `tx_hash` in display order
+(`btc_txid_event_bytes`), but `serialize_utxo` reversed it again to internal
+order before storing — byte-diverging every `newFederationBtcUTXOs` entry. Fix:
+store `tx_hash` as-is (and read it as-is on deserialize). In-memory semantics are
+unchanged; only the stored bytes are corrected.
+(`crates/execution/src/bridge/storage.rs`).
+
+### 11b. Lock-whitelist entries are sorted by hash160, not Java HashMap order
+
+rskj's `LockWhitelist` holds its entries in a
+`SortedMap<Address, LockWhitelistEntry>` — a `TreeMap` ordered by
+`Comparator.comparing(Address::getHash160, UnsignedBytes.lexicographicalComparator())`.
+So `serializeOneOffLockWhitelist` and `serializeUnlimitedLockWhitelist` emit
+addresses sorted by their 20-byte hash160 ascending, independent of insertion
+order. rustock had (mis)reproduced this as Java *HashMap* bucket order; that only
+happened to match the 2-entry #3304 groundtruth (where sorted and HashMap order
+coincide). The 7- and 17-entry whitelist cells at #1,590,999 are plainly sorted.
+Fix: sort entries by hash160 ascending in both serializers; the Java-HashMap
+bucket-order helpers were removed. (`crates/execution/src/bridge/storage.rs`,
+superseding the approach in commit `a75a432`).
+
+---
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`
