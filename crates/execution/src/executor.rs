@@ -124,7 +124,10 @@ impl RskExecutor {
         .with_bridge_config(self.bridge_constants.clone());
         let invisible_flag = precompile_provider.invisible_exception_flag();
         let mut evm = ctx.build_mainnet().with_precompiles(precompile_provider);
-        crate::rsk_instructions::install(&mut evm.instruction);
+        crate::rsk_instructions::install(
+            &mut evm.instruction,
+            self.hardfork_cfg.has_rskip140(header.number),
+        );
 
         let exec_out = {
             use revm::context::ContextSetters;
@@ -200,7 +203,10 @@ impl RskExecutor {
         let invisible_flag = precompile_provider.invisible_exception_flag();
         let called_precompiles = precompile_provider.called_precompiles_slot();
         let mut evm = ctx.build_mainnet().with_precompiles(precompile_provider);
-        crate::rsk_instructions::install(&mut evm.instruction);
+        crate::rsk_instructions::install(
+            &mut evm.instruction,
+            self.hardfork_cfg.has_rskip140(header.number),
+        );
 
         let mut total_gas = 0u64;
         let mut total_fees = U256::ZERO;
@@ -1038,6 +1044,90 @@ mod tests {
             r2.state_changes.get(&child).expect("child contract").info.nonce, 1,
             "internal CREATE post-RSKIP125 bumps the created contract nonce to 1"
         );
+    }
+
+    /// Wasabi enables the Constantinople shift opcodes (RSKIP120) and CREATE2
+    /// (RSKIP125) but not EXTCODEHASH (RSKIP140, papyrus). The spec must be
+    /// PETERSBURG from wasabi (not BYZANTIUM, which lacks shifts).
+    #[test]
+    fn test_wasabi_spec_enables_shift_opcodes() {
+        let cfg = RskHardforkConfig::mainnet();
+        assert_eq!(cfg.spec_id(729_000), SpecId::BYZANTIUM, "orchid");
+        assert_eq!(cfg.spec_id(1_590_999), SpecId::BYZANTIUM, "pre-wasabi");
+        assert_eq!(cfg.spec_id(1_591_000), SpecId::PETERSBURG, "wasabi");
+        assert!(!cfg.has_rskip140(1_591_000), "no EXTCODEHASH at wasabi");
+        assert!(cfg.has_rskip140(2_392_700), "EXTCODEHASH from papyrus");
+    }
+
+    /// Regression for mainnet #1,613,128..#1,661,216 era: a contract whose
+    /// runtime uses SHR (solc >=0.5 selector dispatch) must execute post-wasabi
+    /// instead of hitting an invalid opcode that consumes the whole gas limit.
+    /// #1,661,216's setCompleted(uint256) call cost 42,023 gas in rskj but
+    /// rustock charged the full 6,721,975 limit (SHR invalid under BYZANTIUM).
+    #[test]
+    fn test_shr_opcode_executes_post_wasabi() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+        let block_store =
+            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+
+        // Runtime: PUSH1 4; PUSH1 0; SHR (4 >> 0 = 4); PUSH1 0; SSTORE; STOP.
+        let runtime: Vec<u8> = vec![
+            0x60, 0x04, 0x60, 0x00, 0x1c, 0x60, 0x00, 0x55, 0x00,
+        ];
+        let mut init = vec![
+            0x60, 0x09, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, 0x09, 0x60, 0x00, 0xf3,
+        ];
+        init.extend_from_slice(&runtime);
+
+        let deploy = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(1_000_000),
+            to: Bytes::new(),
+            value: U256::ZERO,
+            input: Bytes::from(init),
+            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+        };
+        let header1 = dummy_header(1_591_500);
+        let r1 = executor
+            .execute_block(&header1, &[(deploy, sender)], &root, store.clone())
+            .expect("deploy block");
+        assert!(r1.tx_results[0].success);
+        let deployed = sender.create(0);
+        let root2 =
+            crate::state::apply_state_changes(&root, store.as_ref(), &r1.state_changes, &r1.markers);
+
+        let call = rustock_core::Transaction {
+            nonce: 1,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(1_000_000),
+            to: Bytes::copy_from_slice(deployed.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::new(),
+            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+        };
+        let header2 = dummy_header(1_591_501);
+        let r2 = executor
+            .execute_block(&header2, &[(call, sender)], &root2, store.clone())
+            .expect("call block");
+        assert!(r2.tx_results[0].success, "SHR must be a valid opcode at wasabi");
+        assert!(
+            r2.tx_results[0].gas_used < 1_000_000,
+            "SHR call must not consume the whole gas limit (invalid opcode)"
+        );
+        let slot0 = r2
+            .state_changes
+            .get(&deployed)
+            .expect("contract")
+            .storage
+            .get(&U256::ZERO)
+            .expect("slot 0");
+        assert_eq!(slot0.present_value, U256::from(4), "4 >> 0 == 4");
     }
 
     /// Regression for mainnet #1,071,481: before RSKIP453 (lovell700) an

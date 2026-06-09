@@ -35,11 +35,22 @@ use revm::primitives::{Address, B256, U256};
 const CALL_STATIC_GAS: u64 = 700;
 
 /// Install the rskj-semantics CALL family into an instruction table.
-pub fn install<WIRE, HOST>(instructions: &mut EthInstructions<WIRE, HOST>)
+///
+/// `extcodehash_enabled` reflects RSKIP140 (papyrus): the spec is PETERSBURG
+/// from wasabi on (for the RSKIP120 shift opcodes and RSKIP125 CREATE2), but
+/// EXTCODEHASH only activates at papyrus — so before that it must throw an
+/// invalid-opcode exception (consuming all gas), matching rskj's VM.
+pub fn install<WIRE, HOST>(instructions: &mut EthInstructions<WIRE, HOST>, extcodehash_enabled: bool)
 where
     WIRE: InterpreterTypes,
     HOST: Host,
 {
+    if !extcodehash_enabled {
+        instructions.insert_instruction(
+            opcode::EXTCODEHASH,
+            Instruction::new(invalid_opcode::<WIRE, HOST>, 0),
+        );
+    }
     instructions.insert_instruction(
         opcode::CALL,
         Instruction::new(rsk_call::<WIRE, HOST>, CALL_STATIC_GAS),
@@ -78,6 +89,14 @@ where
             Instruction::new(traced_exp::<WIRE, HOST>, 10),
         );
     }
+}
+
+/// An opcode that is not yet activated at this block height: rskj throws an
+/// invalid-opcode exception, which halts the frame and consumes all gas.
+fn invalid_opcode<WIRE: InterpreterTypes, H: Host + ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+) {
+    context.interpreter.halt(InstructionResult::OpcodeNotFound);
 }
 
 macro_rules! traced_op {

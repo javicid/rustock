@@ -197,6 +197,11 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Wasabi100
     }
 
+    /// RSKIP140 (papyrus): the EXTCODEHASH opcode becomes available.
+    pub fn has_rskip140(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Papyrus200
+    }
+
     /// RSKIP383: longer federation activation age (Fingerroot500).
     pub fn has_rskip383(&self, block_number: u64) -> bool {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Fingerroot500
@@ -350,10 +355,15 @@ impl RskHardforkConfig {
 fn upgrade_to_spec_id(upgrade: RskNetworkUpgrade) -> SpecId {
     match upgrade {
         RskNetworkUpgrade::Genesis
-        | RskNetworkUpgrade::Orchid
-        | RskNetworkUpgrade::Wasabi100 => SpecId::BYZANTIUM,
+        | RskNetworkUpgrade::Orchid => SpecId::BYZANTIUM,
 
-        RskNetworkUpgrade::Papyrus200
+        // Wasabi enables the Constantinople shift opcodes (RSKIP120) and
+        // CREATE2 (RSKIP125), but NOT EXTCODEHASH (RSKIP140, papyrus).
+        // PETERSBURG is the closest spec (Constantinople minus EIP-1283 SSTORE
+        // gas, which RSK never adopted); EXTCODEHASH is gated off separately
+        // until papyrus in rsk_instructions::install.
+        RskNetworkUpgrade::Wasabi100
+        | RskNetworkUpgrade::Papyrus200
         | RskNetworkUpgrade::Iris300
         | RskNetworkUpgrade::Hop400
         | RskNetworkUpgrade::Fingerroot500 => SpecId::PETERSBURG,
