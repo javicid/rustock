@@ -153,7 +153,7 @@ impl RskExecutor {
         let output = exec.output().map(|o| o.to_vec()).unwrap_or_default();
         let logs = exec.into_logs();
 
-        let created_address = Self::extract_created_address(tx, &success);
+        let created_address = Self::extract_created_address(tx, sender, &success);
 
         Ok(TxExecutionResult {
             gas_used,
@@ -495,7 +495,7 @@ impl RskExecutor {
             let gas_used = result.gas_used();
             let output = result.output().map(|o| o.to_vec()).unwrap_or_default();
             let logs = result.into_logs();
-            let created_address = Self::extract_created_address(tx, &success);
+            let created_address = Self::extract_created_address(tx, *sender, &success);
 
             if !success {
                 // rskj cacheTrack rollback: a failed tx drops its bridge
@@ -585,18 +585,16 @@ impl RskExecutor {
     /// sender + nonce (matching CREATE opcode address derivation).
     fn extract_created_address(
         tx: &rustock_core::Transaction,
+        sender: Address,
         success: &bool,
     ) -> Option<Address> {
         if !success || !tx.to.is_empty() {
             return None;
         }
-        // Contract creation transactions don't report the address in
-        // revm's transact_one result. In RSK the address follows the
-        // standard CREATE scheme, but we'd need the sender here to
-        // compute it. Return None for now — the receipt data is still
-        // correct for consensus since RSK doesn't include
-        // created_address in the receipt RLP.
-        None
+        // Standard CREATE scheme: keccak(rlp([sender, nonce]))[12:]. RSK
+        // doesn't include the created address in the receipt RLP, so this is
+        // only needed for the empty-data-CREATE skip_created bookkeeping.
+        Some(sender.create(tx.nonce))
     }
 }
 
@@ -763,6 +761,51 @@ mod tests {
         let ist = make_cfg_env(SpecId::ISTANBUL, 30, false);
         assert_eq!(ist.gas_params.sstore_static_gas(), 800);
         assert_eq!(ist.gas_params.sstore_reset_without_cold_load_cost(), 4_200);
+    }
+
+    /// rskj `TransactionExecutor.create()`: a CREATE *transaction* carrying
+    /// empty data creates the account "without code nor storage. It doesn't
+    /// even call setupContract()". revm still flags it created-locally, so we
+    /// must record the created address in `skip_created` to suppress the
+    /// storage-prefix marker — which requires computing the address. The
+    /// stub used to return None, leaving 13 spurious markers at #1,591,000.
+    /// Ground truth: the canonical CREATE address vector (sender
+    /// 0x6ac7…dbf0, nonce 0 → 0xcd23…cd8d).
+    #[test]
+    fn extract_created_address_matches_create_scheme() {
+        let sender: Address = "0x6ac7ea33f8831ea9dcc53393aaa88b25a785dbf0"
+            .parse()
+            .unwrap();
+        let create_tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::ZERO,
+            gas_limit: U256::from(21_000),
+            to: Bytes::new(),
+            value: U256::ZERO,
+            input: Bytes::new(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+        assert_eq!(
+            RskExecutor::extract_created_address(&create_tx, sender, &true),
+            Some("0xcd234a471b72ba2f1ccf0a70fcaba648a5eecd8d".parse().unwrap()),
+        );
+        // A reverted CREATE tx leaves no account.
+        assert_eq!(
+            RskExecutor::extract_created_address(&create_tx, sender, &false),
+            None,
+        );
+        // A call (non-empty `to`) is never a creation.
+        let call_tx = rustock_core::Transaction {
+            to: Bytes::copy_from_slice(sender.as_slice()),
+            ..create_tx
+        };
+        assert_eq!(
+            RskExecutor::extract_created_address(&call_tx, sender, &true),
+            None,
+        );
     }
 
     /// Regression for mainnet #671,450: the feePerKb election must apply the

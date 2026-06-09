@@ -563,6 +563,29 @@ block (revm's EIP-6780 handling, `JournalInner::load_account`), so a contract
 created and re-called within one block would lose it; the `has_code` term covers
 those. Precompile markers continue to be written through `ContractMarkers::precompiles`.
 
+### 10a. Empty-data CREATE transactions must be excluded explicitly
+
+The `is_created_locally()` term above is necessary but not sufficient. A
+top-level **CREATE transaction carrying empty data** still goes through revm's
+`create_account_checkpoint` (so it is `CreatedLocal`), yet rskj's
+`TransactionExecutor.create()` explicitly does *not* call `setupContract()` for
+it — "if there is no data, then the account is created, but without code nor
+storage. It doesn't even call setupContract() to setup a storage root". The
+resulting account is `c28000` (nonce 0, balance 0, no code, no storage) with no
+storage-prefix cell. The `CREATE`/`CREATE2` *opcodes* always call
+`setupContract` (even with empty init code), so only the transaction case is
+special.
+
+rustock records these addresses in `ContractMarkers::skip_created` during the
+transaction loop (`executor.rs`: when `tx.to.is_empty() && tx.input.is_empty()`
+and the tx succeeds) and excludes them in the marker test. This requires the
+created address, computed with the standard scheme
+`keccak(rlp([sender, nonce]))[12:]` (`extract_created_address`). That helper
+was originally a stub returning `None`, so the skip never fired and 13 such
+accounts kept spurious markers at \#1,590,999; computing the real address closes
+the gap. Ground truth: the canonical CREATE vector (sender `0x6ac7…dbf0`,
+nonce 0 → `0xcd23…cd8d`).
+
 ---
 
 ## 11. Bridge UTXO and Lock-Whitelist Serialization Order
