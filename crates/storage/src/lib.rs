@@ -145,6 +145,14 @@ impl BlockStore {
             .context("Failed to set exec head")
     }
 
+    /// Clears the executed-head marker so the node replays execution from
+    /// genesis on next start, reusing already-downloaded headers and bodies
+    /// instead of re-fetching them from peers.
+    pub fn clear_exec_head(&self) -> Result<()> {
+        self.db.delete(KEY_EXEC_HEAD)
+            .context("Failed to clear exec head")
+    }
+
     /// Returns the last executed block hash and its Unitrie state root.
     pub fn exec_head(&self) -> Result<Option<(B256, B256)>> {
         let bytes = self.db.get(KEY_EXEC_HEAD)
