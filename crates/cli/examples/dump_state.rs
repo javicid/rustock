@@ -51,14 +51,21 @@ fn main() -> anyhow::Result<()> {
     let out_path = args.next().expect("usage: dump_state <data-dir> <out-file>");
 
     let store = BlockStore::open(&data_dir)?;
-    let (exec_hash, state_root) = store
-        .exec_head()?
-        .expect("no exec_head persisted");
-    let hdr = store.header(exec_hash)?;
-    let number = hdr.as_ref().map(|h| h.number).unwrap_or(0);
-    let orchid_root = hdr.as_ref().map(|h| h.state_root);
-    eprintln!("exec head #{number} hash={exec_hash:?} unitrie_root={state_root:?}");
-    eprintln!("header(orchid) state_root={orchid_root:?}");
+    // Optional 3rd arg: an explicit root hash to walk (e.g. a computed root
+    // persisted on a halted block before the state-root check). Defaults to
+    // the executed head's root.
+    let state_root = match args.next() {
+        Some(hex) => alloy_primitives::B256::from_slice(
+            &alloy_primitives::hex::decode(hex.trim_start_matches("0x"))?,
+        ),
+        None => {
+            let (exec_hash, root) = store.exec_head()?.expect("no exec_head persisted");
+            let hdr = store.header(exec_hash)?;
+            let number = hdr.as_ref().map(|h| h.number).unwrap_or(0);
+            eprintln!("exec head #{number} hash={exec_hash:?} unitrie_root={root:?}");
+            root
+        }
+    };
 
     let trie_store: Arc<dyn TrieStore> = Arc::new(RocksDbTrieStore::from_db(store.db().clone()));
     let data = trie_store
