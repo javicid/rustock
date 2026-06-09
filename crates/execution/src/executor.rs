@@ -130,8 +130,9 @@ impl RskExecutor {
             use revm::context::ContextSetters;
             use revm::handler::Handler;
             evm.ctx.set_tx(tx_env);
-            let mut handler = crate::rsk_handler::RskHandler::new(
+            let mut handler = crate::rsk_handler::RskHandler::with_rskip125(
                 !self.hardfork_cfg.has_rskip453(header.number),
+                self.hardfork_cfg.has_rskip125(header.number),
                 invisible_flag,
             );
             let out = handler
@@ -480,8 +481,9 @@ impl RskExecutor {
                 use revm::context::ContextSetters;
                 use revm::handler::Handler;
                 evm.ctx.set_tx(tx_env);
-                let mut handler = crate::rsk_handler::RskHandler::new(
+                let mut handler = crate::rsk_handler::RskHandler::with_rskip125(
                 !self.hardfork_cfg.has_rskip453(header.number),
+                self.hardfork_cfg.has_rskip125(header.number),
                 invisible_flag.clone(),
             );
                 handler
@@ -963,6 +965,78 @@ mod tests {
             Address::from_slice(&slot0.present_value.to_be_bytes::<32>()[12..]),
             expected_child,
             "CREATE inside a freshly deployed contract must use nonce 0"
+        );
+    }
+
+    /// Regression for mainnet #1,613,128: post-RSKIP125 (wasabi) an internal
+    /// CREATE/CREATE2 opcode bumps the created contract's nonce to 1 (rskj
+    /// Program.createContract). A top-level CREATE *transaction* still keeps
+    /// nonce 0 (TransactionExecutor.create never bumps). The transferAndCall
+    /// callback there created an empty contract rskj stored as nonce 1
+    /// (`c20100`) while rustock, zeroing every created nonce, stored `c28000`.
+    #[test]
+    fn test_internal_create_nonce_one_post_rskip125() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+        let block_store =
+            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+
+        // Runtime: CREATE(0,0,0) (empty init → no-code child); SSTORE(0, child).
+        let runtime: Vec<u8> = vec![
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0xf0, 0x60, 0x00, 0x55, 0x00,
+        ];
+        let mut init = vec![
+            0x60, 0x0b, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, 0x0b, 0x60, 0x00, 0xf3,
+        ];
+        init.extend_from_slice(&runtime);
+
+        // Deploy the creator via a top-level CREATE tx (post-wasabi).
+        let deploy = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(1_000_000),
+            to: Bytes::new(),
+            value: U256::ZERO,
+            input: Bytes::from(init),
+            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+        };
+        let header1 = dummy_header(1_591_500);
+        let r1 = executor
+            .execute_block(&header1, &[(deploy, sender)], &root, store.clone())
+            .expect("deploy block");
+        assert!(r1.tx_results[0].success);
+        let deployed = sender.create(0);
+        assert_eq!(
+            r1.state_changes.get(&deployed).expect("creator").info.nonce, 0,
+            "a top-level CREATE tx keeps nonce 0 even post-RSKIP125"
+        );
+        let root2 =
+            crate::state::apply_state_changes(&root, store.as_ref(), &r1.state_changes, &r1.markers);
+
+        // Call the creator → it runs an internal CREATE.
+        let call = rustock_core::Transaction {
+            nonce: 1,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(1_000_000),
+            to: Bytes::copy_from_slice(deployed.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::new(),
+            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+        };
+        let header2 = dummy_header(1_591_501);
+        let r2 = executor
+            .execute_block(&header2, &[(call, sender)], &root2, store.clone())
+            .expect("create block");
+        assert!(r2.tx_results[0].success);
+
+        let child = deployed.create(0);
+        assert_eq!(
+            r2.state_changes.get(&child).expect("child contract").info.nonce, 1,
+            "internal CREATE post-RSKIP125 bumps the created contract nonce to 1"
         );
     }
 

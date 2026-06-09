@@ -55,6 +55,11 @@ pub struct RskHandler<CTX, ERROR, FRAME> {
     /// Pre-RSKIP453 (lovell700): internal creates with an unpayable code
     /// deposit deploy with empty code instead of failing.
     empty_create_on_unpayable_deposit: bool,
+    /// Post-RSKIP125 (wasabi): a contract created by the CREATE/CREATE2
+    /// *opcode* has its nonce bumped to 1 (`Program.createContract`). A
+    /// top-level CREATE *transaction* never bumps it (`TransactionExecutor
+    /// .create`), so this only applies to internal create frames.
+    rskip125_active: bool,
     /// Shared with `RskPrecompileProvider`: set when a direct Bridge call
     /// hits rskj's invisible-exception path (parse failure post-RSKIP88).
     /// rskj marks the execution summary failed, so the sender gets NO
@@ -70,8 +75,17 @@ impl<CTX, ERROR, FRAME> RskHandler<CTX, ERROR, FRAME> {
         empty_create_on_unpayable_deposit: bool,
         invisible_exception: Arc<AtomicBool>,
     ) -> Self {
+        Self::with_rskip125(empty_create_on_unpayable_deposit, false, invisible_exception)
+    }
+
+    pub fn with_rskip125(
+        empty_create_on_unpayable_deposit: bool,
+        rskip125_active: bool,
+        invisible_exception: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             empty_create_on_unpayable_deposit,
+            rskip125_active,
             invisible_exception,
             _phantom: core::marker::PhantomData,
         }
@@ -175,7 +189,9 @@ where
         if let ItemOrResult::Result(frame_result) = res {
             return Ok(frame_result);
         }
-        zero_created_contract_nonce(evm);
+        // Top-level CREATE transaction: rskj's TransactionExecutor.create never
+        // bumps the nonce (even post-RSKIP125), so it stays 0.
+        set_created_contract_nonce(evm, 0);
 
         loop {
             let call_or_result = rsk_frame_run(evm, self.empty_create_on_unpayable_deposit)?;
@@ -187,7 +203,11 @@ where
                     }
                     match evm.frame_init(init)? {
                         ItemOrResult::Item(_) => {
-                            zero_created_contract_nonce(evm);
+                            // Internal CREATE/CREATE2 opcode: post-RSKIP125
+                            // (wasabi) rskj's Program.createContract bumps the
+                            // created contract's nonce to 1; before, it is 0.
+                            let nonce = u64::from(self.rskip125_active);
+                            set_created_contract_nonce(evm, nonce);
                             continue;
                         }
                         // Do not pop the frame since no new frame was created
@@ -354,7 +374,7 @@ fn trace_frame_init(init: &FrameInit) {
 /// If the top (just-initialized) frame is a CREATE frame, reset the created
 /// account's nonce to 0. On revert the AccountCreated journal entry discards
 /// the account wholesale, so no extra journaling is needed.
-fn zero_created_contract_nonce<EVM>(evm: &mut EVM)
+fn set_created_contract_nonce<EVM>(evm: &mut EVM, nonce: u64)
 where
     EVM: EvmTr<
         Context: ContextTr<Journal: JournalTr<State = EvmState>>,
@@ -365,6 +385,6 @@ where
         return;
     };
     if let Ok(mut acc) = evm.ctx().journal_mut().load_account_mut(created_address) {
-        acc.set_nonce(0);
+        acc.set_nonce(nonce);
     }
 }

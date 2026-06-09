@@ -191,6 +191,12 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Wasabi100
     }
 
+    /// RSKIP125 (wasabi): a contract created by the CREATE/CREATE2 opcode has
+    /// its nonce initialized to 1.
+    pub fn has_rskip125(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Wasabi100
+    }
+
     /// RSKIP383: longer federation activation age (Fingerroot500).
     pub fn has_rskip383(&self, block_number: u64) -> bool {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Fingerroot500
