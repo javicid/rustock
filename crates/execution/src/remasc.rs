@@ -195,6 +195,14 @@ pub fn remasc_load_bool<CTX: crate::RskContextTr>(ctx: &mut CTX, key: U256) -> b
 /// Returns `true` on success, `false` if REMASC has insufficient funds.
 pub fn remasc_transfer<CTX: crate::RskContextTr>(ctx: &mut CTX, recipient: Address, amount: U256) -> bool {
     if amount.is_zero() {
+        // rskj `RemascFeesPayer.transferPayment` does `addBalance(toAddress, value)`
+        // with no zero-guard, so a 0-value payment still creates/touches the
+        // recipient. Under RSK's frontier rules the empty account then persists
+        // (mainnet: miner beneficiaries paid a 0 REMASC reward, e.g. the miner
+        // of #142347, missing from rustock's unitrie at #1,590,999). Touch it
+        // so revm materialises the empty account exactly as rskj does.
+        let _ = ctx.journal_mut().load_account(recipient);
+        ctx.journal_mut().touch_account(recipient);
         return true;
     }
     matches!(ctx.journal_mut().transfer(REMASC_ADDR, recipient, amount), Ok(None))

@@ -616,6 +616,33 @@ raw-storage (`addStorageBytes`) overlay as a 1-byte value, matching the REMASC
 
 ---
 
+## 13. Zero-Value REMASC Payment Creates the Recipient
+
+`RemascFeesPayer.transferPayment` (`co.rsk.remasc`) pays a miner with:
+
+```java
+this.repository.addBalance(contractAddress, value.negate());
+this.repository.addBalance(toAddress, value);
+```
+
+`MutableRepository.addBalance` always calls `getAccountStateOrCreateNew`, so a
+payment of `value == 0` still **creates** the recipient account; under RSK's
+frontier rules that empty account (nonce 0, balance 0, no code, no marker)
+persists in the unitrie. There is no zero-guard.
+
+rustock's `remasc_transfer` short-circuited `amount.is_zero()` and returned
+without touching the recipient, so miners paid a 0 REMASC reward were absent
+from rustock's unitrie. Ground truth: two such beneficiaries (e.g. the miner of
+block #142,347) exist as empty accounts in rskj at #1,590,999 but were missing
+from rustock. Fix: on a zero amount, `load_account` + `touch_account` the
+recipient so revm materialises the empty account exactly as rskj does
+(`crates/execution/src/remasc.rs`). The frontier materialisation relies on the
+journal spec being pinned pre-Spurious-Dragon (`RskHandler::load_accounts` →
+`HOMESTEAD`), and the empty account correctly gets no storage-prefix marker
+(see §10).
+
+---
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`

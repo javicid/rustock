@@ -5080,4 +5080,43 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
         });
         assert!(found, "no siblings → brokenSelectionRule cell present and = 0x00");
     }
+
+    /// A 0-value REMASC mining-fee payment must still create the recipient
+    /// account (rskj RemascFeesPayer.transferPayment → addBalance(to, 0), no
+    /// zero-guard). Under frontier rules the empty account persists. Ground
+    /// truth: miner beneficiaries paid a 0 reward (e.g. #142347's miner) exist
+    /// as empty accounts in rskj's mainnet unitrie at #1,590,999.
+    #[test]
+    fn remasc_zero_payment_creates_recipient_account() {
+        use revm::context_interface::{ContextTr, JournalTr};
+        let store: Arc<dyn TrieStore> = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let hardfork = RskHardforkConfig::mainnet();
+        let header = dummy_header(1);
+        let spec_id = hardfork.spec_id(header.number);
+        let block_env = block_env_from_header(&header, &hardfork);
+        let db = RskDatabase::new(root.clone(), store.clone(), block_store);
+        let cfg = make_cfg_env(spec_id, hardfork.chain_id, hardfork.has_rskip544(header.number));
+        let mut chain_ext = crate::raw_storage::RskChainExt::default();
+        chain_ext.raw_storage.set_reader(store, root.clone());
+        let ctx = revm::Context::mainnet()
+            .with_db(WrapDatabaseRef(db))
+            .with_block(block_env)
+            .with_cfg(cfg)
+            .with_chain(chain_ext);
+        let mut evm = ctx.build_mainnet();
+        // RskHandler::load_accounts pins the journal spec to HOMESTEAD
+        // (pre-Spurious-Dragon) so finalize materialises empty touched
+        // accounts; replicate that here since we bypass the handler.
+        evm.ctx.journal_mut().set_spec_id(revm::primitives::hardfork::SpecId::HOMESTEAD);
+
+        let miner = Address::repeat_byte(0x77);
+        assert!(crate::remasc::remasc_transfer(&mut evm.ctx, miner, U256::ZERO));
+
+        let state = evm.ctx.journal_mut().finalize();
+        let acct = state.get(&miner).expect("zero-paid miner account must exist");
+        assert!(acct.is_touched(), "recipient must be touched");
+        assert!(acct.is_created(), "frontier materialises the empty account");
+    }
 }
