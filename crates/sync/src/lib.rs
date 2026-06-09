@@ -12,7 +12,7 @@ pub mod txpool;
 pub use events::SyncEvent;
 pub use handler::SyncHandler;
 pub use manager::SyncManager;
-pub use service::SyncService;
+pub use service::{ExternalBlockSource, SyncService};
 pub use state::SyncState;
 pub use tracker::PeerChunkTracker;
 pub use tx_relay::TxRelay;

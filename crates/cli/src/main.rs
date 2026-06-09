@@ -11,6 +11,37 @@ use anyhow::{Result, Context};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+/// Reads block bodies from a synced rskj `blocks` LevelDB (keyed by block
+/// hash → RLP[header, txs, ommers]) so the node can reuse an existing local
+/// chain instead of re-downloading bodies from peers.
+struct RskjBlockSource {
+    db: rocksdb::DB,
+}
+
+impl RskjBlockSource {
+    fn open(path: &str) -> Result<Self> {
+        let mut opts = rocksdb::Options::default();
+        let mut bbt = rocksdb::BlockBasedOptions::default();
+        bbt.set_block_cache(&rocksdb::Cache::new_lru_cache(512 * 1024 * 1024));
+        opts.set_block_based_table_factory(&bbt);
+        let db = rocksdb::DB::open_for_read_only(&opts, path, false)
+            .context("Failed to open rskj blocks LevelDB")?;
+        Ok(Self { db })
+    }
+}
+
+impl rustock_sync::ExternalBlockSource for RskjBlockSource {
+    fn body_by_hash(
+        &self,
+        hash: alloy_primitives::B256,
+    ) -> Option<(Vec<rustock_core::Transaction>, Vec<rustock_core::types::header::Header>)> {
+        use alloy_rlp::Decodable;
+        let data = self.db.get(hash.as_slice()).ok().flatten()?;
+        let block = rustock_core::Block::decode(&mut &data[..]).ok()?;
+        Some((block.transactions, block.ommers))
+    }
+}
+
 struct TxRelaySubmitter(Arc<TxRelay>);
 
 #[async_trait::async_trait]
@@ -85,6 +116,12 @@ struct Args {
     /// If not set, 127.0.0.1 is used.
     #[arg(long)]
     external_ip: Option<std::net::IpAddr>,
+
+    /// Path to a synced rskj `blocks` LevelDB (e.g. ~/.rsk/mainnet/database/blocks).
+    /// When set, block bodies are read from it before requesting them from
+    /// peers — reusing an existing local chain instead of re-downloading.
+    #[arg(long)]
+    import_blocks_db: Option<String>,
 }
 
 #[tokio::main]
@@ -223,9 +260,14 @@ async fn main() -> Result<()> {
     let initial_state_root = load_or_build_state(&store, &config, trie_store_for_exec.as_ref())?;
     info!("Initial state root: {:?}", initial_state_root.compute_hash(trie_store_for_exec.as_ref()));
 
-    let sync_service = SyncService::new(sync_manager.clone(), peer_store.clone(), event_rx)
+    let mut sync_service = SyncService::new(sync_manager.clone(), peer_store.clone(), event_rx)
         .with_tx_pool(pool.clone())
         .with_block_processor(block_processor, trie_store_for_exec, initial_state_root);
+    if let Some(path) = &args.import_blocks_db {
+        let source = RskjBlockSource::open(path)?;
+        info!("Sourcing block bodies from rskj LevelDB at {path} (peers only for what it lacks)");
+        sync_service = sync_service.with_block_source(Arc::new(source));
+    }
     let tx_relay = Arc::new(TxRelay::with_pool(peer_store.clone(), pool.clone()));
 
     let mut node = Node::with_peer_store(node_config, peer_store.clone());

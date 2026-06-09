@@ -64,6 +64,14 @@ fn create_skeleton_request(start_number: u64) -> P2pMessage {
     P2pMessage::RskMessage(RskMessage::new(RskSubMessage::SkeletonRequest(req)))
 }
 
+/// An external, local source of block bodies — e.g. a synced rskj LevelDB —
+/// consulted before requesting bodies from peers. Lets the node reuse an
+/// existing on-disk chain instead of re-downloading it over the network.
+pub trait ExternalBlockSource: Send + Sync {
+    /// Returns `(transactions, ommers)` for the block with this hash, if known.
+    fn body_by_hash(&self, hash: B256) -> Option<(Vec<Transaction>, Vec<Header>)>;
+}
+
 /// Skeleton-based forward sync with pipelining, multi-peer downloads,
 /// and overlapping skeleton pre-fetch.
 pub struct SyncService {
@@ -90,6 +98,8 @@ pub struct SyncService {
     /// Start height of the last skeleton pre-fetch request, so the request
     /// is sent once per round instead of on every incoming event.
     last_prefetch_start: Option<u64>,
+    /// Optional local block source (e.g. rskj's LevelDB) tried before peers.
+    block_source: Option<Arc<dyn ExternalBlockSource>>,
 }
 
 impl SyncService {
@@ -115,6 +125,26 @@ impl SyncService {
             blocks_since_flush: 0,
             sidelined: HashMap::new(),
             last_prefetch_start: None,
+            block_source: None,
+        }
+    }
+
+    /// Attach a local block source (e.g. rskj's LevelDB) consulted for bodies
+    /// before requesting them from peers.
+    pub fn with_block_source(mut self, source: Arc<dyn ExternalBlockSource>) -> Self {
+        self.block_source = Some(source);
+        self
+    }
+
+    /// Fill a missing body from the local block source, if available. Returns
+    /// true when the body was found and stored (so no peer request is needed).
+    fn try_fill_body_locally(&self, hash: B256) -> bool {
+        let Some(source) = &self.block_source else {
+            return false;
+        };
+        match source.body_by_hash(hash) {
+            Some((txs, ommers)) => self.manager.store.put_body(hash, &txs, &ommers).is_ok(),
+            None => false,
         }
     }
 
@@ -826,7 +856,9 @@ impl SyncService {
         for num in start..=our_height {
             if let Ok(Some(hash)) = self.manager.store.canonical_hash(num) {
                 if let Ok(Some(header)) = self.manager.store.header(hash) {
-                    if matches!(self.manager.store.body(hash), Ok(None)) {
+                    if matches!(self.manager.store.body(hash), Ok(None))
+                        && !self.try_fill_body_locally(hash)
+                    {
                         missing_bodies += 1;
                     }
                     pending.push((hash, header));
