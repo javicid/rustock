@@ -62,12 +62,25 @@ pub fn apply_state_changes(
         new_root = put_account_info(&new_root, store, addr, account);
 
         if account.status.contains(AccountStatus::Created) {
-            if !markers.skip_created.contains(addr) {
+            // rskj calls `setupContract` (which writes the storage-prefix
+            // marker) only for genuine CREATEs — never for an empty account
+            // that merely received value. Under RSK's pre-Spurious-Dragon
+            // ("frontier forever") account rules, revm's JournalInner::finalize
+            // *materializes* every touched, empty, previously-non-existent
+            // account by calling `mark_created()` (global `Created` only, no
+            // `CreatedLocal`). Treating those as contract creations wrote
+            // spurious `account_key || 0x00 = 0x01` cells absent from rskj's
+            // unitrie (mainnet: ~20 EOAs that took value, by #1,591,000).
+            // A real CREATE goes through `create_account_checkpoint`
+            // (`mark_created_locally` → `CreatedLocal`) and deploys code, so
+            // gate the marker on having code or being locally created.
+            let code_bytes = account.info.code.as_ref().map(|c| c.original_bytes());
+            let has_code = code_bytes.as_ref().is_some_and(|c| !c.is_empty());
+            if !markers.skip_created.contains(addr) && (has_code || account.is_created_locally()) {
                 let key = TrieKeySlice::from_key(&storage_prefix_key(addr));
                 new_root = new_root.put(&key, &[1], store);
             }
-            if let Some(ref code) = account.info.code {
-                let code_bytes = code.original_bytes();
+            if let Some(code_bytes) = code_bytes {
                 if !code_bytes.is_empty() {
                     let key_bytes = code_key(addr);
                     let key = TrieKeySlice::from_key(&key_bytes);
@@ -329,7 +342,15 @@ mod tests {
         let (store, root) = empty_trie();
         let addr = Address::repeat_byte(0xEE);
 
-        let info = make_account_info(1, U256::ZERO);
+        // A genuine CREATE deploys code; rskj setupContract writes the marker.
+        let code = vec![0x60, 0x00];
+        let info = AccountInfo {
+            balance: U256::ZERO,
+            nonce: 1,
+            code_hash: B256::ZERO,
+            code: Some(revm::bytecode::Bytecode::new_raw(code.into())),
+            account_id: None,
+        };
         let account = Account {
             info: info.clone(),
             original_info: Box::new(info),
@@ -348,6 +369,41 @@ mod tests {
         let markers = ContractMarkers { skip_created: vec![addr], ..Default::default() };
         let skipped_root = apply_state_changes(&root, &store, &state, &markers);
         assert_eq!(skipped_root.get(&marker_key, &store), None, "empty-data CREATE skips the marker");
+    }
+
+    /// rskj does NOT call setupContract for an empty account that merely
+    /// received value: revm materializes it under pre-Spurious-Dragon rules
+    /// (`Created` set by `mark_created()`, no `CreatedLocal`, no code), and
+    /// such accounts must NOT get a storage-prefix marker. Ground truth:
+    /// mainnet unitrie at #1,590,999 — rustock previously wrote ~20 spurious
+    /// `account_key || 0x00 = 0x01` cells absent from rskj's trie.
+    #[test]
+    fn materialized_empty_account_gets_no_storage_prefix_marker() {
+        let (store, root) = empty_trie();
+        let addr = Address::repeat_byte(0xAB);
+
+        // Empty (no code), Created (global) but NOT created-locally — exactly
+        // how JournalInner::finalize marks a touched empty new account.
+        let info = make_account_info(0, U256::ZERO);
+        let account = Account {
+            info: info.clone(),
+            original_info: Box::new(info),
+            transaction_id: 0,
+            storage: Default::default(),
+            status: AccountStatus::Created | AccountStatus::Touched,
+        };
+        assert!(!account.is_created_locally());
+        let mut state = EvmState::default();
+        state.insert(addr, account);
+
+        let new_root = apply_state_changes(&root, &store, &state, &ContractMarkers::default());
+        let marker_key = TrieKeySlice::from_key(&storage_prefix_key(&addr));
+        assert_eq!(
+            new_root.get(&marker_key, &store), None,
+            "materialized empty account must not get a storage-prefix marker",
+        );
+        // The account record itself is still written (frontier-forever).
+        assert!(read_account(&new_root, &store, &addr).is_some());
     }
 
     #[test]

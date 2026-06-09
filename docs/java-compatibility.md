@@ -524,6 +524,47 @@ TODO.
 
 ---
 
+## 10. Storage-Prefix Marker Only for Genuine Contract Creations
+
+rskj writes a "storage root" sentinel — `0x01` at the trie key
+`getAccountStoragePrefixKey(addr) = accountKey || 0x00` — via
+`MutableRepository.setupContract` (`org.ethereum.db.MutableRepository`). It is
+called **only** for genuine contract setups:
+
+- a `CREATE` transaction with non-empty data (`TransactionExecutor.create`; an
+  empty-data create "doesn't even call setupContract()"),
+- the `CREATE`/`CREATE2` opcodes (`Program.createContract`),
+- a successful precompiled-contract call (`TransactionExecutor.executePrecompiled`
+  / `Program.callToPrecompiledAddress`),
+- precompile activation bookkeeping (`BlockExecutor.maintainPrecompiledContractStorageRoots`)
+  and genesis contracts.
+
+It is **not** called for an ordinary account that merely received value.
+
+revm complicates this under RSK's "frontier forever" rules (Spurious Dragon
+never activates): `JournalInner::finalize` *materialises* every account that is
+touched, empty, and previously non-existent by calling `Account::mark_created()`
+— setting the global `Created` flag (with **no** `CreatedLocal`) purely so the
+empty account survives the commit. A genuine CREATE instead goes through
+`JournalInner::create_account_checkpoint`, which calls `mark_created_locally()`
+(`CreatedLocal` + `Created`) and deploys code.
+
+rustock originally wrote the marker for *every* `Created` account, so these
+materialised empties got spurious `accountKey || 0x00 = 0x01` cells that rskj's
+unitrie does not have. Ground truth: dumping rskj's mainnet unitrie at
+\#1,590,999 vs rustock's showed ~20 such extra cells (all code-less, storage-less
+EOAs that had taken value), which would diverge the wasabi100 state root.
+
+Fix (`crates/execution/src/state.rs`): inside the `Created` branch, write the
+marker only when the account has non-empty code **or** is `is_created_locally()`
+(and is not in `skip_created`). `CreatedLocal` alone is insufficient — it is
+cleared when an account is cold-loaded again in a later transaction of the same
+block (revm's EIP-6780 handling, `JournalInner::load_account`), so a contract
+created and re-called within one block would lose it; the `has_code` term covers
+those. Precompile markers continue to be written through `ContractMarkers::precompiles`.
+
+---
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`
