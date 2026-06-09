@@ -751,6 +751,12 @@ pub fn update_collections<CTX: crate::RskContextTr>(
         }
     }
 
+    // updateCollections loads the active federation (getActiveFederationWallet),
+    // so rskj's save() re-serializes it. Post-RSKIP123 the first such save
+    // migrates `newFederation` to the multikey member format and writes
+    // `newFederationFormatVersion` (mainnet #1,591,009).
+    super::federation::save_new_federation_multikey(ctx, hardfork_cfg, block_number);
+
     // -----------------------------------------------------------------------
     // Step 0: Funds migration (rskj processFundsMigration) — while the new
     // federation is in its migration window, each updateCollections call

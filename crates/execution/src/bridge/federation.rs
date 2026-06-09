@@ -196,6 +196,41 @@ pub fn rsk_address_from_public_key(key: &[u8]) -> Option<alloy_primitives::Addre
 mod tests {
     use super::*;
 
+    /// Ground truth: rskj's mainnet `newFederation` cell transitions from the
+    /// only-BTC-keys format (#1,591,008) to the RSKIP123 multikey member
+    /// format (#1,591,009), where each member is `RLP[btc, rsk, mst]` with
+    /// rsk = mst = btc for the legacy genesis federation. Both byte strings
+    /// are dumped from the synced ~/.rsk/mainnet unitrie.
+    #[test]
+    fn rskj_multikey_federation_serialization_groundtruth_1591009() {
+        use super::super::serialization::{rlp_decode_list, rlp_decode_u64};
+        use alloy_primitives::hex;
+
+        let old = hex::decode(
+            "f9020a845bbe1690830c7085f901fea10245ef34f5ee218005c9c21227133e8568a4f3f11aeab919c66ff7b816ae1ffeeaa1024cd9f00935993695af7e6c35165550a79eeac9fdfe95df83c5fdd8692ba2ef9ea1027319afb15481dbeb3c426bcc37f9a30e7f51ceff586936d85548d9395bcc2344a10294c817150f78607566e961b3c71df53a22022a80acbb982f83c0c8baac040adca102ac1901b6fba2c1dbd47d894d2bd76c8ba1d296d65f6ab47f1c6b22afb53e73eba102c6018fcbd3e89f3cf9c7f48b3232ea3638eb8bf217e59ee290f5f0cfb2fb9259a1031aabbeb9b27258f98c2bf21f36677ae7bae09eb2d8c958ef41a20a6e88626d26a103250c11be0561b1d7ae168b1f59e39cbc1fd1ba3cf4d2140c1a365b2723a2bf93a10340df69f28d69eef60845da7d81ff60a9060d4da35c767f017b0dd4e20448fb44a10372cd46831f3b6afd4c044d160b7667e8ebf659d6cb51a825a3104df6ee0638c6a103ae72827d25030818c4947a800187b1fbcc33ae751e248ae60094cc989fb880f6a103b53899c390573471ba30e5054f78376c5f797fda26dde7a760789f02908cbad2a103b65cd7c22e70c0823882c6e71ac2c279ed31cbe29cb4a1c00572ce539c0c4573a103d789669ec532f756461d3d6d83b316ed0c4272d48dc3b60cce0f494e9a09d3e7a103ecd8af1e93c57a1b8c7f917bd9980af798adeb0205e9687865673353eb041e8d",
+        )
+        .unwrap();
+        let new = hex::decode(
+            "f90642845bbe1690830c7085f90636b868f866a10245ef34f5ee218005c9c21227133e8568a4f3f11aeab919c66ff7b816ae1ffeeaa10245ef34f5ee218005c9c21227133e8568a4f3f11aeab919c66ff7b816ae1ffeeaa10245ef34f5ee218005c9c21227133e8568a4f3f11aeab919c66ff7b816ae1ffeeab868f866a1024cd9f00935993695af7e6c35165550a79eeac9fdfe95df83c5fdd8692ba2ef9ea1024cd9f00935993695af7e6c35165550a79eeac9fdfe95df83c5fdd8692ba2ef9ea1024cd9f00935993695af7e6c35165550a79eeac9fdfe95df83c5fdd8692ba2ef9eb868f866a1027319afb15481dbeb3c426bcc37f9a30e7f51ceff586936d85548d9395bcc2344a1027319afb15481dbeb3c426bcc37f9a30e7f51ceff586936d85548d9395bcc2344a1027319afb15481dbeb3c426bcc37f9a30e7f51ceff586936d85548d9395bcc2344b868f866a10294c817150f78607566e961b3c71df53a22022a80acbb982f83c0c8baac040adca10294c817150f78607566e961b3c71df53a22022a80acbb982f83c0c8baac040adca10294c817150f78607566e961b3c71df53a22022a80acbb982f83c0c8baac040adcb868f866a102ac1901b6fba2c1dbd47d894d2bd76c8ba1d296d65f6ab47f1c6b22afb53e73eba102ac1901b6fba2c1dbd47d894d2bd76c8ba1d296d65f6ab47f1c6b22afb53e73eba102ac1901b6fba2c1dbd47d894d2bd76c8ba1d296d65f6ab47f1c6b22afb53e73ebb868f866a102c6018fcbd3e89f3cf9c7f48b3232ea3638eb8bf217e59ee290f5f0cfb2fb9259a102c6018fcbd3e89f3cf9c7f48b3232ea3638eb8bf217e59ee290f5f0cfb2fb9259a102c6018fcbd3e89f3cf9c7f48b3232ea3638eb8bf217e59ee290f5f0cfb2fb9259b868f866a1031aabbeb9b27258f98c2bf21f36677ae7bae09eb2d8c958ef41a20a6e88626d26a1031aabbeb9b27258f98c2bf21f36677ae7bae09eb2d8c958ef41a20a6e88626d26a1031aabbeb9b27258f98c2bf21f36677ae7bae09eb2d8c958ef41a20a6e88626d26b868f866a103250c11be0561b1d7ae168b1f59e39cbc1fd1ba3cf4d2140c1a365b2723a2bf93a103250c11be0561b1d7ae168b1f59e39cbc1fd1ba3cf4d2140c1a365b2723a2bf93a103250c11be0561b1d7ae168b1f59e39cbc1fd1ba3cf4d2140c1a365b2723a2bf93b868f866a10340df69f28d69eef60845da7d81ff60a9060d4da35c767f017b0dd4e20448fb44a10340df69f28d69eef60845da7d81ff60a9060d4da35c767f017b0dd4e20448fb44a10340df69f28d69eef60845da7d81ff60a9060d4da35c767f017b0dd4e20448fb44b868f866a10372cd46831f3b6afd4c044d160b7667e8ebf659d6cb51a825a3104df6ee0638c6a10372cd46831f3b6afd4c044d160b7667e8ebf659d6cb51a825a3104df6ee0638c6a10372cd46831f3b6afd4c044d160b7667e8ebf659d6cb51a825a3104df6ee0638c6b868f866a103ae72827d25030818c4947a800187b1fbcc33ae751e248ae60094cc989fb880f6a103ae72827d25030818c4947a800187b1fbcc33ae751e248ae60094cc989fb880f6a103ae72827d25030818c4947a800187b1fbcc33ae751e248ae60094cc989fb880f6b868f866a103b53899c390573471ba30e5054f78376c5f797fda26dde7a760789f02908cbad2a103b53899c390573471ba30e5054f78376c5f797fda26dde7a760789f02908cbad2a103b53899c390573471ba30e5054f78376c5f797fda26dde7a760789f02908cbad2b868f866a103b65cd7c22e70c0823882c6e71ac2c279ed31cbe29cb4a1c00572ce539c0c4573a103b65cd7c22e70c0823882c6e71ac2c279ed31cbe29cb4a1c00572ce539c0c4573a103b65cd7c22e70c0823882c6e71ac2c279ed31cbe29cb4a1c00572ce539c0c4573b868f866a103d789669ec532f756461d3d6d83b316ed0c4272d48dc3b60cce0f494e9a09d3e7a103d789669ec532f756461d3d6d83b316ed0c4272d48dc3b60cce0f494e9a09d3e7a103d789669ec532f756461d3d6d83b316ed0c4272d48dc3b60cce0f494e9a09d3e7b868f866a103ecd8af1e93c57a1b8c7f917bd9980af798adeb0205e9687865673353eb041e8da103ecd8af1e93c57a1b8c7f917bd9980af798adeb0205e9687865673353eb041e8da103ecd8af1e93c57a1b8c7f917bd9980af798adeb0205e9687865673353eb041e8d",
+        )
+        .unwrap();
+
+        let outer = rlp_decode_list(&old).unwrap();
+        let time = rlp_decode_u64(&outer[0]);
+        let block = rlp_decode_u64(&outer[1]);
+        let keys: Vec<[u8; 33]> = rlp_decode_list(&outer[2])
+            .unwrap()
+            .into_iter()
+            .map(|k| k.try_into().unwrap())
+            .collect();
+        assert_eq!(keys.len(), 15);
+
+        // Multikey re-serialization must match rskj byte-for-byte.
+        assert_eq!(serialize_federation_multikey(&keys, time, block), new);
+        // And the only-BTC form must still round-trip to the pre-wasabi bytes.
+        assert_eq!(serialize_federation_only_btc_keys(&keys, time, block), old);
+    }
+
     #[test]
     fn federation_threshold() {
         let members: Vec<FederationMember> = (0..5)
@@ -271,6 +306,39 @@ pub fn serialize_federation_only_btc_keys(
     ])
 }
 
+/// Post-RSKIP123 (wasabi) federation serialization. Each member is
+/// `RLP[btcKey, rskKey, mstKey]`, wrapped as an RLP element inside the member
+/// list (rskj `BridgeSerializationUtils.serializeFederation` /
+/// `FederationMember.serialize`). Legacy members carry only a BTC key, so
+/// `rsk = mst = btc` (`FederationMember.getFederationMemberFromKey`). Members
+/// are ordered by `BTC_RSK_MST_PUBKEYS_COMPARATOR`, which for legacy members
+/// reduces to BTC-key byte order — identical to the only-BTC-keys ordering.
+pub fn serialize_federation_multikey(
+    keys: &[[u8; 33]],
+    creation_time_millis: u64,
+    creation_block: u64,
+) -> Vec<u8> {
+    use super::serialization::{rlp_encode_element, rlp_encode_list, rlp_encode_u64};
+    let mut sorted = keys.to_vec();
+    sorted.sort();
+    let member_items: Vec<Vec<u8>> = sorted
+        .iter()
+        .map(|k| {
+            let member = rlp_encode_list(&[
+                rlp_encode_element(k),
+                rlp_encode_element(k),
+                rlp_encode_element(k),
+            ]);
+            rlp_encode_element(&member)
+        })
+        .collect();
+    rlp_encode_list(&[
+        rlp_encode_u64(creation_time_millis),
+        rlp_encode_u64(creation_block),
+        rlp_encode_list(&member_items),
+    ])
+}
+
 pub fn load_stored_federation<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     storage_key: &str,
@@ -285,13 +353,51 @@ pub fn load_stored_federation<CTX: crate::RskContextTr>(
     if outer.len() != 3 {
         return None;
     }
+    // The member list is either only-BTC-keys (each element is a 33-byte
+    // compressed key) or, post-RSKIP123, multikey (each element is
+    // RLP[btcKey, rskKey, mstKey]). rustock tracks only BTC keys, so take the
+    // first sub-element of a multikey member. Detect by element length.
     let keys = rlp_decode_list(&outer[2])?
         .into_iter()
-        .filter_map(|k| k.try_into().ok())
+        .filter_map(|m| {
+            if m.len() == 33 {
+                m.try_into().ok()
+            } else {
+                rlp_decode_list(&m)?.into_iter().next()?.try_into().ok()
+            }
+        })
         .collect();
     Some(StoredFederation {
         keys,
         creation_time_millis: rlp_decode_u64(&outer[0]),
         creation_block: rlp_decode_u64(&outer[1]),
     })
+}
+
+/// rskj `FederationStorageProviderImpl.saveNewFederation`: when a Bridge call
+/// has loaded the active (new) federation, `save()` re-serializes it. Once
+/// RSKIP123 (wasabi) is active it switches to the multikey member format and
+/// persists the format-version cell (`newFederationFormatVersion = 1000`,
+/// `STANDARD_MULTISIG_FEDERATION`). The first such save after activation
+/// migrates the stored federation in place (mainnet #1,591,009's
+/// updateCollections); the value is stable thereafter. No-op before RSKIP123.
+pub fn save_new_federation_multikey<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
+    block_number: u64,
+) {
+    use super::serialization::rlp_encode_u64;
+    use super::storage::{
+        bridge_store_bytes_named, NEW_FEDERATION_FORMAT_VERSION_KEY, NEW_FEDERATION_KEY,
+    };
+    if !hardfork_cfg.has_rskip123(block_number) {
+        return;
+    }
+    let Some(fed) = load_stored_federation(ctx, NEW_FEDERATION_KEY) else {
+        return;
+    };
+    bridge_store_bytes_named(ctx, NEW_FEDERATION_FORMAT_VERSION_KEY, &rlp_encode_u64(1000));
+    let data =
+        serialize_federation_multikey(&fed.keys, fed.creation_time_millis, fed.creation_block);
+    bridge_store_bytes_named(ctx, NEW_FEDERATION_KEY, &data);
 }
