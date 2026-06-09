@@ -269,6 +269,17 @@ impl RskExecutor {
                 .map_err(|e| ExecutionError::Evm(format!("REMASC: {e:?}")))?;
                 {
                     use revm::context_interface::ContextTr;
+                    // rskj `RemascStorageProvider.saveSiblings` runs on every
+                    // REMASC `save()` (after processMinersFees, with no guard),
+                    // writing `addStorageBytes(REMASC, "siblings",
+                    // RLP.encodedEmptyList())` = a single 0xc0 byte. The cell is
+                    // created at block #1 and its value never changes, but it is
+                    // part of the unitrie (and the state root) from then on.
+                    let siblings_slot = crate::remasc::remasc_storage_key("siblings");
+                    evm.ctx
+                        .chain_mut()
+                        .raw_storage
+                        .put(REMASC_ADDR, siblings_slot, Some(vec![0xc0]));
                     evm.ctx.chain_mut().raw_storage.commit_call();
                 }
 
@@ -3498,6 +3509,41 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
             .expect("REMASC past maturity must execute on a fresh journal");
         assert!(result.tx_results[0].success);
         assert_eq!(result.gas_used, 0);
+    }
+
+    /// rskj `RemascStorageProvider.saveSiblings` runs on every REMASC `save()`
+    /// (even pre-maturity), writing `addStorageBytes(REMASC, "siblings",
+    /// RLP.encodedEmptyList()=0xc0)`. The cell must appear in the unitrie from
+    /// block #1; its absence diverged rustock from rskj at the first uncle
+    /// block (#3397). Groundtruthed against rskj's #3397 unitrie dump.
+    #[test]
+    fn remasc_writes_empty_siblings_cell() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+
+        // Block #1: REMASC returns early (pre-maturity) but still writes siblings.
+        let header = dummy_header(1);
+        let remasc_tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::ZERO,
+            gas_limit: U256::ZERO,
+            to: Bytes::copy_from_slice(crate::precompiles::REMASC_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::new(),
+            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+        };
+
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        let result = executor
+            .execute_block(&header, &[(remasc_tx, Address::ZERO)], &root, store)
+            .unwrap();
+
+        let siblings_slot = crate::remasc::remasc_storage_key("siblings");
+        let found = result.markers.raw_storage.iter().any(|(addr, slot, val)| {
+            *addr == REMASC_ADDR && *slot == siblings_slot && val.as_deref() == Some(&[0xc0][..])
+        });
+        assert!(found, "REMASC must write the 0xc0 siblings cell every block");
     }
 
     /// Regression for mainnet block #3307: before RSKIP136 (bahamas, 3_397)

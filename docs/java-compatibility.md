@@ -457,6 +457,73 @@ Locked in by groundtruth unit tests against the #3303 (single-entry) and
 
 ---
 
+## 9. Unitrie Account & Storage Encoding (byte-exact match with rskj)
+
+The pre-RSKIP126 (Orchid) state root is validated by converting rustock's
+unitrie to the Orchid format — and that conversion *normalises* account
+nonce/balance (it decodes and re-encodes them) and re-keys storage cells by
+their slot hash. So three unitrie-encoding incompatibilities were invisible to
+the Orchid diagnostic yet would diverge the real unitrie state root at the
+wasabi100 (#1,591,000) check. All three were surfaced together as the first
+mainnet block with an uncle (#3,397) and ground-truthed by dumping rskj's
+own #3,397 unitrie (`co.rsk.cli.tools.ExportState` against a synced
+`~/.rsk/mainnet`); after the fixes rustock's #3,397 unitrie matches rskj's
+byte-for-byte (7,588 leaves).
+
+### 9a. Account balance: `RLP.encodeSignedCoinNonNullZero`
+
+rskj's `AccountState.getEncoded()` (`org.ethereum.core.AccountState`) encodes
+the two fields differently:
+
+- **nonce** — `RLP.encodeBigInteger`: zero is RLP-empty (`0x80`), non-zero is
+  the unsigned minimal big-endian bytes. This is standard RLP.
+- **balance** — `RLP.encodeSignedCoinNonNullZero`: zero is the single byte
+  `0x00` (NOT RLP-empty `0x80`), and a non-zero balance is
+  `RLP.encodeElement(Coin.getBytes())` where `Coin.getBytes()` is
+  `BigInteger.toByteArray()` — *signed* two's-complement, so a leading `0x00`
+  is prepended whenever the most-significant bit of the minimal encoding is set.
+
+rustock had encoded balance with the same standard RLP as nonce (zero → `0x80`),
+which differs for every zero-balance account (the REMASC contract record is
+`c28000` in rskj vs the old `c28080`; a fresh nonce-1 EOA is `c20100` vs
+`c20180`). Handled in `crates/trie/src/account.rs` (`encode_coin_nonnull_zero`
+on encode, a lenient `decode_coin` that accepts `0x00`, signed leading zeros and
+the legacy `0x80` on decode).
+
+### 9b. Storage key for the all-zero slot: `ByteUtil.stripLeadingZeroes`
+
+`TrieKeyMapper.getAccountStorageKey` builds a storage key as
+`accountStoragePrefix || keccak(subkey)[0:10] || stripLeadingZeroes(subkey)`.
+rskj's `ByteUtil.stripLeadingZeroes` is called with the default
+`valueForZero = ZERO_BYTE_ARRAY`, so an **all-zero** slot (storage slot `0`)
+strips to a single `0x00` byte, not to empty. rustock stripped it to empty,
+shortening the unitrie key of every slot-0 cell by one byte. Handled in
+`crates/trie/src/key_mapper.rs` (`strip_leading_zeros` returns one `0x00` byte
+for all-zero input).
+
+### 9c. REMASC `siblings` storage cell
+
+`RemascStorageProvider.save()` calls `saveSiblings()` on **every** REMASC
+execution (the last tx of every block), with no guard:
+`addStorageBytes(REMASC_ADDR, DataWord.fromString("siblings"),
+RLP.encodedEmptyList())` — a single `0xc0` byte. The cell is created at block #1
+and never changes value, but it is part of the unitrie (and the state root) from
+then on. rustock never wrote it; the cell first became visible in the Orchid
+diagnostic at #3,397 (siblings are not re-keyed away like the other normalised
+content). Handled in `crates/execution/src/executor.rs` (the REMASC system-tx
+branch writes the cell through the raw-storage overlay every block).
+
+**Open item — Orchid converter vs `addStorageBytes`:** with the siblings cell
+now present, rustock's Orchid converter (`orchid_state_root`) no longer
+reproduces the pre-126 header root (it includes/mis-structures the cell where
+rskj's `TrieConverter` does not). This is a *diagnostic-only* limitation — the
+real consensus check is the unitrie root from wasabi100 onward — but it means
+`RUSTOCK_ORCHID_CHECK_INTERVAL` can no longer be used as a pre-126 bisect tool
+until the converter's `addStorageBytes` handling is aligned with rskj. Logged in
+TODO.
+
+---
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`

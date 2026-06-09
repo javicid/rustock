@@ -19,9 +19,16 @@ fn secure_prefix(data: &[u8]) -> [u8; SECURE_KEY_SIZE] {
     prefix
 }
 
+/// rskj `ByteUtil.stripLeadingZeroes` with the default `valueForZero =
+/// ZERO_BYTE_ARRAY`: a leading run of zeros is removed, but an ALL-zero input
+/// returns a single `0x00` byte (not empty). The storage slot 0x00..00 must
+/// keep that trailing byte or its unitrie key (hence the state root) diverges.
 fn strip_leading_zeros(data: &[u8]) -> &[u8] {
-    let start = data.iter().position(|&b| b != 0).unwrap_or(data.len());
-    &data[start..]
+    match data.iter().position(|&b| b != 0) {
+        Some(start) => &data[start..],
+        None if data.is_empty() => data,
+        None => &data[data.len() - 1..], // all zeros → single 0x00 byte
+    }
 }
 
 /// Computes the trie key for an account address.
@@ -108,8 +115,10 @@ mod tests {
         let addr = Address::ZERO;
         let slot = B256::ZERO;
         let key = storage_key(&addr, &slot);
-        // account_key (31) + 1 (storage prefix) + 10 (secure) + 0 (stripped all zeros) = 42
-        assert_eq!(key.len(), 42);
+        // account_key (31) + 1 (storage prefix) + 10 (secure) + 1 (all-zero slot
+        // strips to a single 0x00 byte, rskj ByteUtil.stripLeadingZeroes) = 43
+        assert_eq!(key.len(), 43);
+        assert_eq!(*key.last().unwrap(), 0x00);
     }
 
     #[test]
@@ -121,6 +130,23 @@ mod tests {
         let key = storage_key(&addr, &slot);
         // account_key (31) + 1 (storage prefix) + 10 (secure) + 1 (stripped) = 43
         assert_eq!(key.len(), 43);
+    }
+
+    /// Ground truth from rskj's unitrie (mainnet #3397 dump): the REMASC
+    /// `siblings` storage cell (`addStorageBytes(REMASC, DataWord("siblings"),
+    /// ...)`) lives at this exact 50-byte unitrie key.
+    #[test]
+    fn rskj_remasc_siblings_storage_key() {
+        let remasc: Address = "0x0000000000000000000000000000000001000008".parse().unwrap();
+        // DataWord.fromString("siblings"): UTF-8 right-aligned in 32 bytes.
+        let mut slot = [0u8; 32];
+        let name = b"siblings";
+        slot[32 - name.len()..].copy_from_slice(name);
+        let key = storage_key(&remasc, &B256::from(slot));
+        assert_eq!(
+            alloy_primitives::hex::encode(key),
+            "00611cb96d0a346b10bab90000000000000000000000000000000001000008005a7de95ffc33d519294c7369626c696e6773"
+        );
     }
 
     #[test]
