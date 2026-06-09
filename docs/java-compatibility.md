@@ -702,6 +702,32 @@ fed-loading Bridge tx is *not* `updateCollections`, extend the trigger there.
 
 ---
 
+## 15. RSKIP125 Created-Contract Nonce (wasabi)
+
+rskj has no EIP-161, so before wasabi a freshly created contract keeps nonce 0.
+From RSKIP125 (wasabi, #1,591,000) on, `Program.createContract` calls
+`increaseNonce(contractAddress)` after `createAccount`, so a contract created by
+the **CREATE/CREATE2 opcode** starts at nonce 1. A top-level CREATE
+*transaction* is unaffected: `TransactionExecutor.create` only does
+`createAccount` (and `setupContract` for non-empty data) — it never bumps the
+nonce, at any era (see §10a).
+
+revm seeds a created account's nonce to 1 from the per-era `CfgEnv` spec, so
+`RskHandler` reset it to 0 to reproduce rskj's frontier behavior. That reset is
+correct for the top-level tx frame (always) and for every create pre-wasabi, but
+post-RSKIP125 an internal create must keep nonce 1. Fix
+(`crates/execution/src/rsk_handler.rs`): the first (transaction) create frame is
+always set to 0; internal create frames are set to `1` when RSKIP125 is active,
+`0` otherwise (`has_rskip125`, threaded via `RskHandler::with_rskip125`). The
+address a contract derives for a sub-CREATE is unchanged — it uses the nonce
+*before* the bump — so only the stored nonce differs.
+
+Diverged at mainnet #1,613,128: a `transferAndCall` (ERC677) callback ran an
+internal CREATE that deployed an empty contract; rskj stored it as nonce 1
+(`c20100`), rustock as nonce 0 (`c28000`) — the only differing unitrie cell.
+
+---
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`
