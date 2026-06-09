@@ -202,6 +202,12 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Papyrus200
     }
 
+    /// RSKIP90 (orchid): EXTCODESIZE of an active precompile reports 2^256-1
+    /// (and EXTCODEHASH the empty-code hash post-RSKIP140).
+    pub fn has_rskip90(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Orchid
+    }
+
     /// RSKIP383: longer federation activation age (Fingerroot500).
     pub fn has_rskip383(&self, block_number: u64) -> bool {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Fingerroot500

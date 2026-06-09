@@ -123,10 +123,16 @@ impl RskExecutor {
         )
         .with_bridge_config(self.bridge_constants.clone());
         let invisible_flag = precompile_provider.invisible_exception_flag();
+        let extcodesize_max_precompiles: Vec<Address> = if self.hardfork_cfg.has_rskip90(header.number) {
+            rsk_precompiles(&self.hardfork_cfg, header.number).addresses().copied().collect()
+        } else {
+            Vec::new()
+        };
         let mut evm = ctx.build_mainnet().with_precompiles(precompile_provider);
         crate::rsk_instructions::install(
             &mut evm.instruction,
             self.hardfork_cfg.has_rskip140(header.number),
+            &extcodesize_max_precompiles,
         );
 
         let exec_out = {
@@ -202,10 +208,16 @@ impl RskExecutor {
         let bridge_ctx_slot = precompile_provider.bridge_tx_context_slot();
         let invisible_flag = precompile_provider.invisible_exception_flag();
         let called_precompiles = precompile_provider.called_precompiles_slot();
+        let extcodesize_max_precompiles: Vec<Address> = if self.hardfork_cfg.has_rskip90(header.number) {
+            rsk_precompiles(&self.hardfork_cfg, header.number).addresses().copied().collect()
+        } else {
+            Vec::new()
+        };
         let mut evm = ctx.build_mainnet().with_precompiles(precompile_provider);
         crate::rsk_instructions::install(
             &mut evm.instruction,
             self.hardfork_cfg.has_rskip140(header.number),
+            &extcodesize_max_precompiles,
         );
 
         let mut total_gas = 0u64;
@@ -1128,6 +1140,63 @@ mod tests {
             .get(&U256::ZERO)
             .expect("slot 0");
         assert_eq!(slot0.present_value, U256::from(4), "4 >> 0 == 4");
+    }
+
+    /// Regression for mainnet #1,661,324: rskj's VM.doCODESIZE (RSKIP90, orchid)
+    /// reports EXTCODESIZE of an active precompile as 2^256-1. A proxy that
+    /// guards `extcodesize(impl) != 0` before forwarding to the BlockHeader
+    /// precompile (0x01000010) reverted in rustock (size 0) but not in rskj.
+    #[test]
+    fn test_extcodesize_of_precompile_is_max() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+        let block_store =
+            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+
+        // Runtime: PUSH20 0x..01000010; EXTCODESIZE; PUSH1 0; SSTORE; STOP.
+        let mut runtime: Vec<u8> = vec![0x73];
+        runtime.extend_from_slice(crate::precompiles::BLOCK_HEADER_ADDR.as_slice());
+        runtime.extend_from_slice(&[0x3b, 0x60, 0x00, 0x55, 0x00]);
+        let mut init = vec![
+            0x60, runtime.len() as u8, 0x60, 0x0c, 0x60, 0x00, 0x39,
+            0x60, runtime.len() as u8, 0x60, 0x00, 0xf3,
+        ];
+        init.extend_from_slice(&runtime);
+
+        let deploy = rustock_core::Transaction {
+            nonce: 0, gas_price: U256::ZERO, gas_limit: U256::from(1_000_000),
+            to: Bytes::new(), value: U256::ZERO, input: Bytes::from(init),
+            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+        };
+        let header1 = dummy_header(1_700_000);
+        let r1 = executor
+            .execute_block(&header1, &[(deploy, sender)], &root, store.clone())
+            .expect("deploy block");
+        assert!(r1.tx_results[0].success);
+        let deployed = sender.create(0);
+        let root2 =
+            crate::state::apply_state_changes(&root, store.as_ref(), &r1.state_changes, &r1.markers);
+
+        let call = rustock_core::Transaction {
+            nonce: 1, gas_price: U256::ZERO, gas_limit: U256::from(1_000_000),
+            to: Bytes::copy_from_slice(deployed.as_slice()), value: U256::ZERO,
+            input: Bytes::new(), v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+        };
+        let header2 = dummy_header(1_700_001);
+        let r2 = executor
+            .execute_block(&header2, &[(call, sender)], &root2, store.clone())
+            .expect("call block");
+        assert!(r2.tx_results[0].success);
+        let slot0 = r2.state_changes.get(&deployed).expect("contract")
+            .storage.get(&U256::ZERO).expect("slot 0");
+        assert_eq!(
+            slot0.present_value, U256::MAX,
+            "EXTCODESIZE of an active precompile must be 2^256-1 (RSKIP90)"
+        );
     }
 
     /// Regression for mainnet #1,071,481: before RSKIP453 (lovell700) an
