@@ -75,7 +75,7 @@ impl PeerSession {
                             continue;
                         }
                         P2pMessage::Disconnect(reason) => {
-                            trace!(target: "rustock::net", "Peer {:?} disconnected, reason code: {}", self.peer_id, reason);
+                            debug!(target: "rustock::net", "Peer {:?} disconnected, reason code: {}", self.peer_id, reason);
                             break;
                         }
                         _ => {}
@@ -95,7 +95,7 @@ impl PeerSession {
                 else => break,
             }
         }
-        trace!(target: "rustock::net", "Peer {:?} session ended", self.peer_id);
+        debug!(target: "rustock::net", "Peer {:?} session ended", self.peer_id);
         Ok(())
     }
 }

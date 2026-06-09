@@ -176,7 +176,7 @@ impl Node {
 
         loop {
             let (stream, peer_addr) = listener.accept().await?;
-            trace!(target: "rustock::net", "New connection from: {}", peer_addr);
+            debug!(target: "rustock::net", "New connection from: {}", peer_addr);
 
             let config = self.config.clone();
             let handlers = all_handlers.clone();
