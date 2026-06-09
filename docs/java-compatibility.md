@@ -597,6 +597,25 @@ superseding the approach in commit `a75a432`).
 
 ---
 
+## 12. REMASC `brokenSelectionRule` Cell Written via `addStorageBytes`
+
+`RemascStorageProvider.saveBrokenSelectionRule` writes the flag with
+`addStorageBytes(REMASC, "brokenSelectionRule", new byte[]{0|1})` — a literal
+single byte — on every `save()` once the field has been set
+(`Remasc.processMinersFees`: `setBrokenSelectionRule(!siblings.isEmpty() && broken)`).
+So the cell is present in the unitrie even when the rule is *not* broken
+(value `0x00`), exactly like the `siblings` cell.
+
+rustock stored it with a plain SSTORE of `0`/`1`. SSTORE of `0` writes no trie
+cell (zero is the absence of a slot), so the `brokenSelectionRule = 00` cell was
+missing from rustock's unitrie at #1,590,999. Fixed by writing it through the
+raw-storage (`addStorageBytes`) overlay as a 1-byte value, matching the REMASC
+`siblings` handling (`crates/execution/src/remasc.rs`). The cross-block read
+(`getBrokenSelectionRule`) still works: a stored `00`/`01` byte reads back as
+`0`/`1` through the normal storage path.
+
+---
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`

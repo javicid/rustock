@@ -184,11 +184,6 @@ pub fn remasc_load_bool<CTX: crate::RskContextTr>(ctx: &mut CTX, key: U256) -> b
     remasc_sload(ctx, key) != U256::ZERO
 }
 
-/// Write a boolean flag to REMASC contract storage (false → 0, true → 1).
-pub fn remasc_store_bool<CTX: crate::RskContextTr>(ctx: &mut CTX, key: U256, value: bool) {
-    remasc_sstore(ctx, key, if value { U256::from(1) } else { U256::ZERO });
-}
-
 // ---------------------------------------------------------------------------
 // Balance transfer helper
 // ---------------------------------------------------------------------------
@@ -533,7 +528,16 @@ pub fn process_miners_fees<CTX: crate::RskContextTr>(
     let broken_key = remasc_storage_key(BROKEN_SELECTION_RULE_KEY);
     let previous_broken = remasc_load_bool(ctx, broken_key);
     let broken = is_broken_selection_rule(&processing_header, &siblings);
-    remasc_store_bool(ctx, broken_key, !siblings.is_empty() && broken);
+    // rskj `RemascStorageProvider.saveBrokenSelectionRule` writes a literal
+    // 1-byte value (0/1) via `addStorageBytes` once the field is set, so the
+    // cell is present in the unitrie even when false. A plain SSTORE of 0
+    // stores no cell at all (mainnet: missing `brokenSelectionRule = 00` cell
+    // at #1,590,999), so write it through the raw-storage (addStorageBytes)
+    // overlay like the REMASC `siblings` cell.
+    let broken_now = !siblings.is_empty() && broken;
+    ctx.chain_mut()
+        .raw_storage
+        .put(REMASC_ADDR, broken_key, Some(vec![broken_now as u8]));
 
     // Calculate synthetic reward slice
     let synthetic_reward = reward_balance / U256::from(config.synthetic_span);

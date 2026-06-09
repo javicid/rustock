@@ -5046,15 +5046,13 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
         );
         assert!(result.tx_results[0].success);
 
-        // brokenSelectionRule should be set to true
-        let remasc_addr = crate::precompiles::REMASC_ADDR;
-        let remasc_state = result.state_changes.get(&remasc_addr).unwrap();
+        // brokenSelectionRule is written as a raw 1-byte addStorageBytes cell
+        // (rskj saveBrokenSelectionRule), here = 0x01 (true).
         let broken_key = crate::remasc::remasc_storage_key(crate::remasc::BROKEN_SELECTION_RULE_KEY);
-        assert_eq!(
-            remasc_state.storage.get(&broken_key).unwrap().present_value,
-            U256::from(1),
-            "brokenSelectionRule should be true when sibling fees > 2x"
-        );
+        let found = result.markers.raw_storage.iter().any(|(addr, slot, val)| {
+            *addr == REMASC_ADDR && *slot == broken_key && val.as_deref() == Some(&[0x01][..])
+        });
+        assert!(found, "brokenSelectionRule cell should be 0x01 when sibling fees > 2x");
     }
 
     /// Test no siblings → brokenSelectionRule stays false.
@@ -5074,12 +5072,12 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
         );
         assert!(result.tx_results[0].success);
 
-        let remasc_addr = crate::precompiles::REMASC_ADDR;
-        let remasc_state = result.state_changes.get(&remasc_addr).unwrap();
+        // rskj still writes the cell every block — as the literal byte 0x00
+        // (false) — so the cell must be present with value 0x00, not absent.
         let broken_key = crate::remasc::remasc_storage_key(crate::remasc::BROKEN_SELECTION_RULE_KEY);
-        let broken = remasc_state.storage.get(&broken_key)
-            .map(|s| s.present_value)
-            .unwrap_or(U256::ZERO);
-        assert_eq!(broken, U256::ZERO, "no siblings → brokenSelectionRule = false");
+        let found = result.markers.raw_storage.iter().any(|(addr, slot, val)| {
+            *addr == REMASC_ADDR && *slot == broken_key && val.as_deref() == Some(&[0x00][..])
+        });
+        assert!(found, "no siblings → brokenSelectionRule cell present and = 0x00");
     }
 }
