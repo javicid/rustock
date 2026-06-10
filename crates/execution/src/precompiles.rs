@@ -356,6 +356,16 @@ fn u64_to_java_bigint_bytes(val: u64) -> Vec<u8> {
     u256_to_java_bigint_bytes(U256::from(val))
 }
 
+/// Minimal unsigned big-endian bytes (empty for zero) — the raw form of a
+/// header RLP element. rskj's `GetGasLimit` returns `header.getGasLimit()`
+/// verbatim (the decoded RLP bytes), so unlike the BigInteger-encoded fields
+/// there is no 0x00 sign prefix when the high bit is set.
+fn u256_to_raw_minimal_bytes(val: U256) -> Vec<u8> {
+    let be = val.to_be_bytes::<32>();
+    let start = be.iter().position(|&b| b != 0).unwrap_or(32);
+    be[start..].to_vec()
+}
+
 /// Extract merged mining tags from a block header's bitcoin coinbase tx.
 ///
 /// Finds the last occurrence of `RSKBLOCK:` in the coinbase transaction,
@@ -1198,7 +1208,7 @@ impl RskPrecompileProvider {
         } else if selector == selector_of("getBlockHash(int256)") {
             hash.as_slice().to_vec()
         } else if selector == selector_of("getGasLimit(int256)") {
-            u256_to_java_bigint_bytes(header.gas_limit)
+            u256_to_raw_minimal_bytes(header.gas_limit)
         } else if selector == selector_of("getGasUsed(int256)") {
             u64_to_java_bigint_bytes(header.gas_used)
         } else if selector == selector_of("getDifficulty(int256)") {
@@ -2202,6 +2212,28 @@ mod tests {
         let mut padded = [0u8; 32];
         padded[32 - bytes.len()..].copy_from_slice(&bytes);
         assert_eq!(U256::from_be_bytes(padded), val);
+    }
+
+    #[test]
+    fn test_gas_limit_raw_bytes_no_sign_prefix() {
+        // rskj GetGasLimit returns the raw header bytes: 10,000,000 =
+        // 0x989680 (high bit of 0x98 set) stays 3 bytes — the signed
+        // BigInteger helper would prepend 0x00.
+        assert_eq!(
+            u256_to_raw_minimal_bytes(U256::from(10_000_000u64)),
+            vec![0x98, 0x96, 0x80]
+        );
+        assert_eq!(
+            u256_to_java_bigint_bytes(U256::from(10_000_000u64)),
+            vec![0x00, 0x98, 0x96, 0x80]
+        );
+        // 6,800,000 = 0x67C280: both forms agree (high bit clear).
+        assert_eq!(
+            u256_to_raw_minimal_bytes(U256::from(6_800_000u64)),
+            vec![0x67, 0xC2, 0x80]
+        );
+        // Zero: raw RLP element is empty (vs BigInteger's [0x00]).
+        assert_eq!(u256_to_raw_minimal_bytes(U256::ZERO), Vec::<u8>::new());
     }
 
     #[test]
