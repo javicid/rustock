@@ -920,6 +920,52 @@ verifyLockDoesNotSurpassLockingCap/getBtcLockedInFederation`,
 
 ---
 
+## 21. RSKIP146 Pegout-Set Split Cells (one set, two storage cells)
+
+Post-RSKIP146 (papyrus200) rskj keeps ONE in-memory
+`ReleaseTransactionSet` but persists it across TWO bridge storage cells,
+split by whether each entry carries a requesting RSK tx hash:
+
+- `releaseTransactionSet` (legacy): `getEntriesWithoutHash()` only, pair
+  format `[btc_tx_raw, block_number]`.
+- `releaseTransactionSetWithTxHash`: `getEntriesWithHash()` only, triple
+  format `[btc_tx_raw, block_number, rsk_tx_hash]`.
+
+`getReleaseTransactionSet` loads BOTH cells into the one set;
+`saveReleaseTransactionSet` writes BOTH cells on every save (each sorted by
+serialized BTC tx bytes). Post-RSKIP146, every new entry carries a hash —
+new pegouts land in the with-txhash cell while the legacy cell is
+re-written as the empty list `0xc0`. The same load-merge/save-split applies
+to the release request queue (`releaseRequestQueue` /
+`releaseRequestQueueWithTxHash`).
+
+Entry hash sources (all post-RSKIP146, with `logReleaseBtcRequested`):
+- `updateCollections` pegout creation: the updateCollections RSK tx hash.
+- `generateRejectionRelease` (whitelist/cap-rejected peg-in refund): the
+  `registerBtcTransaction` RSK tx hash.
+- `processFundsMigration`: the updateCollections RSK tx hash, with the
+  release_requested amount = sum of the selected (spent) UTXO values.
+
+**Trigger**: mainnet #2,421,462 — the first pegout created after
+papyrus200. rustock wrote the new (hash-bearing) entry into the LEGACY cell
+and left the with-txhash cell empty; rskj has them exactly swapped. Exact
+gas match (69,280), two-leaf unitrie diff (same payload, wrong cell).
+
+**rskj source**: `co.rsk.peg.BridgeStorageProvider
+.getReleaseTransactionSet/saveReleaseTransactionSet`,
+`BridgeSerializationUtils.serializeReleaseTransactionSet[WithTxHash]`
+(getEntriesWithoutHash/getEntriesWithHash split),
+`BridgeSupport.generateRejectionRelease/processFundsMigration`
+(PAPYRUS-2.0.0).
+
+**rustock**: `bridge/peg.rs` (`load_pegout_confirmation_set` /
+`store_pegout_confirmation_set`, used by updateCollections pegout creation
++ confirmation promotion, peg-in rejection refunds, funds migration;
+rejection and migration entries now carry the RSK tx hash and log
+release_requested).
+
+---
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`

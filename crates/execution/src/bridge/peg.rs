@@ -82,6 +82,7 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     gas_cost: u64,
     config: &BridgeConstants,
     hardfork_cfg: &RskHardforkConfig,
+    tx_ctx: &BridgeTxContext,
 ) -> Result<PrecompileOutput, PrecompileError> {
     if args.len() < 96 {
         return Err(PrecompileError::other(
@@ -333,21 +334,24 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
             built.as_ref().map(|b| b.tx.compute_txid().to_string())
         );
         if let Some(built) = built {
+            // rskj generateRejectionRelease: post-RSKIP146 the entry carries
+            // this registerBtcTransaction tx hash and logs release_requested.
             let use_tx_hash = hardfork_cfg.has_rskip146(rsk_height);
-            let waiting_key = bridge_storage_key(PEGOUTS_WAITING_FOR_CONFIRMATIONS_KEY);
-            let existing = bridge_load_bytes(ctx, waiting_key);
-            let mut waiting = deserialize_pegouts_waiting_for_confirmations(&existing, use_tx_hash);
+            let mut waiting = load_pegout_confirmation_set(ctx, use_tx_hash);
             waiting.push(PegoutWaitingForConfirmations {
                 btc_tx_raw: btc_serialize(&built.tx),
                 rsk_block_height: rsk_height,
-                // TODO(rustock): post-RSKIP146 the rejection is keyed by the
-                // registerBtcTransaction RSK tx hash and logs
-                // release_requested; wire the tx context when sync nears
-                // papyrus200 rejections.
-                rsk_tx_hash: None,
+                rsk_tx_hash: use_tx_hash.then_some(tx_ctx.rsk_tx_hash),
             });
-            let updated = serialize_pegouts_waiting_for_confirmations(&waiting, use_tx_hash);
-            bridge_store_bytes(ctx, waiting_key, &updated);
+            if use_tx_hash {
+                super::events::log_release_requested(
+                    ctx,
+                    &tx_ctx.rsk_tx_hash,
+                    &btc_txid_event_bytes(&built.tx),
+                    total_value,
+                );
+            }
+            store_pegout_confirmation_set(ctx, &waiting, use_tx_hash);
         }
         set_btc_tx_processed(ctx, &btc_tx_hash, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
@@ -805,7 +809,7 @@ pub fn update_collections<CTX: crate::RskContextTr>(
     // moves the retiring federation's balance into the active federation
     // with a migration transaction queued like a peg-out.
     // -----------------------------------------------------------------------
-    process_funds_migration(ctx, config, hardfork_cfg, block_number);
+    process_funds_migration(ctx, config, hardfork_cfg, block_number, tx_ctx);
 
     // -----------------------------------------------------------------------
     // Step 1: Process peg-out requests (rskj processPegoutRequests)
@@ -844,10 +848,7 @@ pub fn update_collections<CTX: crate::RskContextTr>(
                 let active_utxo_key =
                     active_federation_utxo_key(ctx, config, hardfork_cfg, block_number);
                 let mut available = load_utxos_at(ctx, active_utxo_key);
-                let waiting_key = bridge_storage_key(PEGOUTS_WAITING_FOR_CONFIRMATIONS_KEY);
-                let existing_data = bridge_load_bytes(ctx, waiting_key);
-                let mut waiting =
-                    deserialize_pegouts_waiting_for_confirmations(&existing_data, use_tx_hash);
+                let mut waiting = load_pegout_confirmation_set(ctx, use_tx_hash);
                 let mut created_any = false;
 
                 // Settle one successfully built peg-out: remove the spent
@@ -969,9 +970,7 @@ pub fn update_collections<CTX: crate::RskContextTr>(
                 }
 
                 if created_any {
-                    let updated =
-                        serialize_pegouts_waiting_for_confirmations(&waiting, use_tx_hash);
-                    bridge_store_bytes(ctx, waiting_key, &updated);
+                    store_pegout_confirmation_set(ctx, &waiting, use_tx_hash);
                     store_utxos_at(ctx, active_utxo_key, &available);
                 }
             }
@@ -984,9 +983,7 @@ pub fn update_collections<CTX: crate::RskContextTr>(
     // promotes a single entry per updateCollections call)
     // -----------------------------------------------------------------------
     {
-        let waiting_key = bridge_storage_key(PEGOUTS_WAITING_FOR_CONFIRMATIONS_KEY);
-        let waiting_data = bridge_load_bytes(ctx, waiting_key);
-        let mut waiting = deserialize_pegouts_waiting_for_confirmations(&waiting_data, use_tx_hash);
+        let mut waiting = load_pegout_confirmation_set(ctx, use_tx_hash);
         let min_confirmations = config.rsk2btc_minimum_acceptable_confirmations as u64;
         let confirmed_pos = waiting.iter().position(|e| {
             block_number
@@ -1001,8 +998,7 @@ pub fn update_collections<CTX: crate::RskContextTr>(
                 entry.rsk_block_height,
                 entry.btc_tx_raw.len()
             );
-            let updated = serialize_pegouts_waiting_for_confirmations(&waiting, use_tx_hash);
-            bridge_store_bytes(ctx, waiting_key, &updated);
+            store_pegout_confirmation_set(ctx, &waiting, use_tx_hash);
 
             // rskj getPegoutWaitingForSignatureKey:
             // - RSKIP375+: the pegout creation RSK tx hash
@@ -1034,6 +1030,7 @@ fn process_funds_migration<CTX: crate::RskContextTr>(
     config: &BridgeConstants,
     hardfork_cfg: &RskHardforkConfig,
     block_number: u64,
+    tx_ctx: &BridgeTxContext,
 ) {
     let Some(retiring_keys) =
         retiring_federation_keys(ctx, config, hardfork_cfg, block_number)
@@ -1099,18 +1096,27 @@ fn process_funds_migration<CTX: crate::RskContextTr>(
         };
 
         if let Some(built) = built {
+            // rskj processFundsMigration: post-RSKIP146 the entry carries the
+            // updateCollections tx hash and logs release_requested with the
+            // migrated amount (sum of the selected UTXO values).
             let use_tx_hash = hardfork_cfg.has_rskip146(block_number);
-            let waiting_key = bridge_storage_key(PEGOUTS_WAITING_FOR_CONFIRMATIONS_KEY);
-            let existing = bridge_load_bytes(ctx, waiting_key);
-            let mut waiting =
-                deserialize_pegouts_waiting_for_confirmations(&existing, use_tx_hash);
+            let mut waiting = load_pegout_confirmation_set(ctx, use_tx_hash);
             waiting.push(PegoutWaitingForConfirmations {
                 btc_tx_raw: btc_serialize(&built.tx),
                 rsk_block_height: block_number,
-                rsk_tx_hash: None,
+                rsk_tx_hash: use_tx_hash.then_some(tx_ctx.rsk_tx_hash),
             });
-            let updated = serialize_pegouts_waiting_for_confirmations(&waiting, use_tx_hash);
-            bridge_store_bytes(ctx, waiting_key, &updated);
+            if use_tx_hash {
+                let amount_migrated: u64 =
+                    built.used_utxos.iter().map(|u| u.value_satoshis).sum();
+                super::events::log_release_requested(
+                    ctx,
+                    &tx_ctx.rsk_tx_hash,
+                    &btc_txid_event_bytes(&built.tx),
+                    amount_migrated,
+                );
+            }
+            store_pegout_confirmation_set(ctx, &waiting, use_tx_hash);
 
             old_utxos.retain(|u| {
                 !built
@@ -1565,6 +1571,52 @@ pub fn serialize_pegouts_waiting_for_confirmations(
         }
     }
     rlp_encode_list(&items)
+}
+
+/// rskj `BridgeStorageProvider.getReleaseTransactionSet`: one in-memory set
+/// loaded from the legacy cell (pair entries, no hash), merged post-RSKIP146
+/// with the with-txhash cell (triple entries).
+pub fn load_pegout_confirmation_set<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    use_tx_hash: bool,
+) -> Vec<PegoutWaitingForConfirmations> {
+    let legacy_key = bridge_storage_key(PEGOUTS_WAITING_FOR_CONFIRMATIONS_KEY);
+    let mut entries =
+        deserialize_pegouts_waiting_for_confirmations(&bridge_load_bytes(ctx, legacy_key), false);
+    if use_tx_hash {
+        let key = bridge_storage_key(PEGOUTS_WAITING_FOR_CONFIRMATIONS_WITH_TXHASH_KEY);
+        entries.extend(deserialize_pegouts_waiting_for_confirmations(
+            &bridge_load_bytes(ctx, key),
+            true,
+        ));
+    }
+    entries
+}
+
+/// rskj `BridgeStorageProvider.saveReleaseTransactionSet`: the hash-less
+/// entries go to the legacy cell (pair format); post-RSKIP146 the
+/// hash-bearing entries go to the with-txhash cell (triple format) — BOTH
+/// cells are written on every save.
+pub fn store_pegout_confirmation_set<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    entries: &[PegoutWaitingForConfirmations],
+    use_tx_hash: bool,
+) {
+    let legacy_key = bridge_storage_key(PEGOUTS_WAITING_FOR_CONFIRMATIONS_KEY);
+    if !use_tx_hash {
+        let bytes = serialize_pegouts_waiting_for_confirmations(entries, false);
+        bridge_store_bytes(ctx, legacy_key, &bytes);
+        return;
+    }
+    let (with, without): (Vec<_>, Vec<_>) = entries
+        .iter()
+        .cloned()
+        .partition(|e| e.rsk_tx_hash.is_some());
+    let legacy_bytes = serialize_pegouts_waiting_for_confirmations(&without, false);
+    bridge_store_bytes(ctx, legacy_key, &legacy_bytes);
+    let with_key = bridge_storage_key(PEGOUTS_WAITING_FOR_CONFIRMATIONS_WITH_TXHASH_KEY);
+    let with_bytes = serialize_pegouts_waiting_for_confirmations(&with, true);
+    bridge_store_bytes(ctx, with_key, &with_bytes);
 }
 
 pub fn deserialize_pegouts_waiting_for_confirmations(
@@ -2163,6 +2215,47 @@ mod tests {
         // BTreeMap ensures sorted order: hash1 (0x11...) < hash2 (0xAA...)
         assert_eq!(decoded[&hash1], btc1);
         assert_eq!(decoded[&hash2], btc2);
+    }
+
+    /// Byte-exact ground truth: the mainnet `releaseTransactionSetWithTxHash`
+    /// cell at #2,421,462 (one pegout created by updateCollections), dumped
+    /// from a synced rskj unitrie. rskj splits the ONE in-memory set across
+    /// the legacy cell (hash-less entries, pairs) and the with-txhash cell
+    /// (hash-bearing entries, triples); this entry carries the requesting RSK
+    /// tx hash and lives ONLY in the with-txhash cell (legacy stays 0xc0).
+    #[test]
+    fn rskj_pegout_set_with_txhash_groundtruth_2421462() {
+        use alloy_primitives::hex;
+        let rskj = hex::decode(
+            "f901ddb901b5010000000105fa7bc00829cc15870c0bab2fb67c4d0e8dcfb08cb926148c9fbc0eb159252001000000fd3e01\
+             0000000000004d35015521027319afb15481dbeb3c426bcc37f9a30e7f51ceff586936d85548d9395bcc2344210294c81715\
+             0f78607566e961b3c71df53a22022a80acbb982f83c0c8baac040adc2102a9c6848e302193179ce6479516c2d97f6967e136\
+             5c707e3b9d3e0cb683ccb8222103250c11be0561b1d7ae168b1f59e39cbc1fd1ba3cf4d2140c1a365b2723a2bf93210372cd\
+             46831f3b6afd4c044d160b7667e8ebf659d6cb51a825a3104df6ee0638c62103ae72827d25030818c4947a800187b1fbcc33\
+             ae751e248ae60094cc989fb880f62103b53899c390573471ba30e5054f78376c5f797fda26dde7a760789f02908cbad22103\
+             b65cd7c22e70c0823882c6e71ac2c279ed31cbe29cb4a1c00572ce539c0c45732103ecd8af1e93c57a1b8c7f917bd9980af7\
+             98adeb0205e9687865673353eb041e8d59aeffffffff02026b1000000000001976a914410deef0190ff5ef7bb4da984c804b\
+             fe12a843c888ac20c375470000000017a914279d4b44e8cf5e3f04c0ea21c78f1a0ecaa4cd9f87000000008324f2d6a08036\
+             e82984f100a1213c8ac65fb620aa65dab57ddaba3577b55bd81d0a40234a",
+        )
+        .unwrap();
+        let decoded = deserialize_pegouts_waiting_for_confirmations(&rskj, true);
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].rsk_block_height, 2_421_462);
+        assert_eq!(
+            hex::encode(decoded[0].rsk_tx_hash.unwrap()),
+            "8036e82984f100a1213c8ac65fb620aa65dab57ddaba3577b55bd81d0a40234a"
+        );
+        assert_eq!(serialize_pegouts_waiting_for_confirmations(&decoded, true), rskj);
+        // The same entries serialized for the LEGACY cell must exclude the
+        // hash-bearing entry entirely (rskj getEntriesWithoutHash) — that
+        // cell stays an empty list.
+        let hashless: Vec<PegoutWaitingForConfirmations> = decoded
+            .iter()
+            .filter(|e| e.rsk_tx_hash.is_none())
+            .cloned()
+            .collect();
+        assert_eq!(serialize_pegouts_waiting_for_confirmations(&hashless, false), vec![0xc0]);
     }
 
     /// PegoutsWaitingForConfirmations: legacy pair format roundtrip.
