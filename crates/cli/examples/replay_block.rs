@@ -1,10 +1,12 @@
-//! Re-execute a single canonical block on top of the executed-head state and
-//! print per-transaction results (gas, success) plus the rsk_handler frame
-//! trace. Deterministic, offline diagnostic for gas/state divergences.
+//! Re-execute canonical blocks from the executed head up to a target block
+//! (in memory, nothing persisted) and report the target's per-transaction
+//! results, logs, and computed state/receipts roots vs the header.
+//! Deterministic, offline diagnostic for gas/state/receipts divergences.
 //!
 //! Usage: cargo run -p rustock-cli --release --example replay_block -- <data-dir> <number>
 
-use rustock_execution::{RskExecutor, RskHardforkConfig};
+use rustock_core::Block;
+use rustock_execution::{BlockProcessor, RskHardforkConfig};
 use rustock_storage::{BlockStore, CachedTrieStore};
 use rustock_trie::{TrieNode, TrieStore};
 use std::sync::Arc;
@@ -22,60 +24,59 @@ fn main() -> anyhow::Result<()> {
     let number: u64 = args.next().expect("usage: replay_block <data-dir> <number>").parse()?;
 
     let store = Arc::new(BlockStore::open(&data_dir)?);
-    let (_, state_root) = store.exec_head()?.expect("no exec_head");
+    let (exec_hash, state_root) = store.exec_head()?.expect("no exec_head");
+    let exec_number = store.header(exec_hash)?.expect("exec head header").number;
+    assert!(number > exec_number, "target #{number} not past exec head #{exec_number}");
+
     let trie_store: Arc<dyn TrieStore> =
         Arc::new(CachedTrieStore::with_defaults(store.db().clone()));
     let root_data = trie_store.get(state_root.as_slice()).expect("root node");
-    let root = TrieNode::from_message(&root_data, trie_store.as_ref());
+    let mut root = TrieNode::from_message(&root_data, trie_store.as_ref());
 
-    let hash = store.canonical_hash(number)?.expect("canonical hash");
-    let header = store.header(hash)?.expect("header");
-    let (txs, _ommers) = store.body(hash)?.expect("body");
+    let processor = BlockProcessor::new(RskHardforkConfig::mainnet(), store.clone());
 
-    let with_senders: Vec<_> = txs
-        .iter()
-        .map(|tx| {
-            // The synthetic REMASC tx (v=r=s=0, gas_limit=0) has no signer.
-            let is_remasc = tx.v == 0
-                && tx.r.is_zero()
-                && tx.s.is_zero()
-                && tx.gas_limit.is_zero();
-            let sender = if is_remasc {
-                alloy_primitives::Address::ZERO
-            } else {
-                tx.recover_sender(30).expect("recover sender")
-            };
-            (tx.clone(), sender)
-        })
-        .collect();
+    for n in exec_number + 1..=number {
+        let hash = store.canonical_hash(n)?.expect("canonical hash");
+        let header = store.header(hash)?.expect("header");
+        let (transactions, ommers) = store.body(hash)?.expect("body");
+        let block = Block { header, transactions, ommers };
+        let processed = processor.execute_block(&block, &root, trie_store.clone())?;
 
-    let executor = RskExecutor::new(RskHardforkConfig::mainnet(), store.clone());
-    let result = executor.execute_block(&header, &with_senders, &root, trie_store.clone())?;
+        if n < number {
+            if processed.state_root_hash.as_slice() != block.header.state_root.as_slice() {
+                eprintln!(
+                    "intermediate block #{n} already diverges: computed={:?} header={:?}",
+                    processed.state_root_hash, block.header.state_root
+                );
+            }
+            root = processed.new_state_root;
+            continue;
+        }
 
-    eprintln!("=== block #{number} per-tx results ===");
-    let mut total = 0u64;
-    for (i, r) in result.tx_results.iter().enumerate() {
+        eprintln!("=== block #{n} per-tx results ===");
+        for (i, r) in processed.receipts.iter().enumerate() {
+            eprintln!("  tx[{i}] status={:?} gas_used={}", r.status, r.gas_used);
+            for log in &r.logs {
+                eprintln!("    log address={:?}", log.address);
+                for t in &log.topics {
+                    eprintln!("      topic {t:?}");
+                }
+                eprintln!("      data 0x{}", alloy_primitives::hex::encode(&log.data));
+            }
+        }
+        eprintln!("total gas_used={}", processed.gas_used);
         eprintln!(
-            "  tx[{i}] success={} gas_used={} output_len={}",
-            r.success,
-            r.gas_used,
-            r.output.len()
+            "state root:    computed={:?} header={:?} match={}",
+            processed.state_root_hash,
+            block.header.state_root,
+            processed.state_root_hash.as_slice() == block.header.state_root.as_slice()
         );
-        total += r.gas_used;
+        eprintln!(
+            "receipts root: computed={:?} header={:?} match={}",
+            processed.receipts_root,
+            block.header.receipts_root,
+            processed.receipts_root == block.header.receipts_root
+        );
     }
-    eprintln!("total gas_used={total}");
-
-    let new_root = rustock_execution::apply_state_changes(
-        &root,
-        trie_store.as_ref(),
-        &result.state_changes,
-        &result.markers,
-    );
-    let computed = new_root.compute_hash(trie_store.as_ref());
-    eprintln!(
-        "state root: computed={computed:?} header={:?} match={}",
-        header.state_root,
-        computed.as_slice() == header.state_root.as_slice()
-    );
     Ok(())
 }

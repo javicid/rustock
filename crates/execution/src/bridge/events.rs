@@ -173,6 +173,64 @@ pub fn log_solidity_release_btc<CTX: crate::RskContextTr>(
     );
 }
 
+/// `commit_federation(bytes oldFederationBtcPublicKeys, string
+/// oldFederationBtcAddress, bytes newFederationBtcPublicKeys, string
+/// newFederationBtcAddress, int256 activationHeight)` — RSKIP146 federation
+/// commit event (rskj logCommitFederationInSolidityFormat). The key bytes
+/// are the federation's sorted compressed BTC pubkeys flat-concatenated;
+/// the addresses are Base58Check P2SH strings.
+pub fn log_solidity_commit_federation<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    old_keys: &[[u8; 33]],
+    old_fed_address: &str,
+    new_keys: &[[u8; 33]],
+    new_fed_address: &str,
+    activation_block: u64,
+) {
+    emit_topics(
+        ctx,
+        vec![solidity_topic("commit_federation(bytes,string,bytes,string,int256)")],
+        commit_federation_event_data(
+            old_keys,
+            old_fed_address,
+            new_keys,
+            new_fed_address,
+            activation_block,
+        ),
+    );
+}
+
+fn commit_federation_event_data(
+    old_keys: &[[u8; 33]],
+    old_fed_address: &str,
+    new_keys: &[[u8; 33]],
+    new_fed_address: &str,
+    activation_block: u64,
+) -> Vec<u8> {
+    let old_flat = old_keys.concat();
+    let new_flat = new_keys.concat();
+    let dynamics: [&[u8]; 4] = [
+        &old_flat,
+        old_fed_address.as_bytes(),
+        &new_flat,
+        new_fed_address.as_bytes(),
+    ];
+    let head_len = 5 * 32;
+    let mut tail = Vec::new();
+    let mut head = Vec::with_capacity(head_len);
+    for d in dynamics {
+        head.extend_from_slice(&u256_word(alloy_primitives::U256::from(
+            (head_len + tail.len()) as u64,
+        )));
+        tail.extend_from_slice(&u256_word(alloy_primitives::U256::from(d.len() as u64)));
+        tail.extend_from_slice(d);
+        tail.resize(tail.len().next_multiple_of(32), 0);
+    }
+    head.extend_from_slice(&u256_word(alloy_primitives::U256::from(activation_block)));
+    head.extend_from_slice(&tail);
+    head
+}
+
 /// `lock_btc(address indexed receiver, bytes32 btcTxHash, string
 /// senderBtcAddress, int256 amount)` — RSKIP146 peg-in event (until RSKIP170).
 pub fn log_lock_btc<CTX: crate::RskContextTr>(
@@ -245,6 +303,94 @@ pub fn log_release_requested<CTX: crate::RskContextTr>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Groundtruth from mainnet #2,426,478 tx 1 (commitFederation of the 2019
+    /// federation change; receipt from public-node.rsk.co): the RSKIP146
+    /// Solidity commit_federation event — 9 old keys, 15 new keys, both
+    /// federations' Base58 P2SH addresses, activation 2,444,978 (= 2,426,478
+    /// + 18,500). Verifies the 5-param ABI layout byte-for-byte.
+    #[test]
+    fn solidity_commit_federation_event_matches_mainnet_2426478() {
+        use alloy_primitives::hex;
+        assert_eq!(
+            solidity_topic("commit_federation(bytes,string,bytes,string,int256)"),
+            B256::from_slice(
+                &hex::decode("5b9466a0b50d1cab12eeb0b3b5d387ece7659afcc56bb15704535e6954de8c4e")
+                    .unwrap()
+            )
+        );
+        let parse = |hexes: &[&str]| -> Vec<[u8; 33]> {
+            hexes
+                .iter()
+                .map(|h| hex::decode(h).unwrap().try_into().unwrap())
+                .collect()
+        };
+        let old_keys = parse(&[
+            "027319afb15481dbeb3c426bcc37f9a30e7f51ceff586936d85548d9395bcc2344",
+            "0294c817150f78607566e961b3c71df53a22022a80acbb982f83c0c8baac040adc",
+            "02a9c6848e302193179ce6479516c2d97f6967e1365c707e3b9d3e0cb683ccb822",
+            "03250c11be0561b1d7ae168b1f59e39cbc1fd1ba3cf4d2140c1a365b2723a2bf93",
+            "0372cd46831f3b6afd4c044d160b7667e8ebf659d6cb51a825a3104df6ee0638c6",
+            "03ae72827d25030818c4947a800187b1fbcc33ae751e248ae60094cc989fb880f6",
+            "03b53899c390573471ba30e5054f78376c5f797fda26dde7a760789f02908cbad2",
+            "03b65cd7c22e70c0823882c6e71ac2c279ed31cbe29cb4a1c00572ce539c0c4573",
+            "03ecd8af1e93c57a1b8c7f917bd9980af798adeb0205e9687865673353eb041e8d",
+        ]);
+        let new_keys = parse(&[
+            "0245ef34f5ee218005c9c21227133e8568a4f3f11aeab919c66ff7b816ae1ffeea",
+            "024cd9f00935993695af7e6c35165550a79eeac9fdfe95df83c5fdd8692ba2ef9e",
+            "027319afb15481dbeb3c426bcc37f9a30e7f51ceff586936d85548d9395bcc2344",
+            "0294c817150f78607566e961b3c71df53a22022a80acbb982f83c0c8baac040adc",
+            "02ac1901b6fba2c1dbd47d894d2bd76c8ba1d296d65f6ab47f1c6b22afb53e73eb",
+            "02c6018fcbd3e89f3cf9c7f48b3232ea3638eb8bf217e59ee290f5f0cfb2fb9259",
+            "031aabbeb9b27258f98c2bf21f36677ae7bae09eb2d8c958ef41a20a6e88626d26",
+            "03250c11be0561b1d7ae168b1f59e39cbc1fd1ba3cf4d2140c1a365b2723a2bf93",
+            "0340df69f28d69eef60845da7d81ff60a9060d4da35c767f017b0dd4e20448fb44",
+            "0372cd46831f3b6afd4c044d160b7667e8ebf659d6cb51a825a3104df6ee0638c6",
+            "03ae72827d25030818c4947a800187b1fbcc33ae751e248ae60094cc989fb880f6",
+            "03b53899c390573471ba30e5054f78376c5f797fda26dde7a760789f02908cbad2",
+            "03b65cd7c22e70c0823882c6e71ac2c279ed31cbe29cb4a1c00572ce539c0c4573",
+            "03d789669ec532f756461d3d6d83b316ed0c4272d48dc3b60cce0f494e9a09d3e7",
+            "03ecd8af1e93c57a1b8c7f917bd9980af798adeb0205e9687865673353eb041e8d",
+        ]);
+        let data = commit_federation_event_data(
+            &old_keys,
+            "35JUi1FxabGdhygLhnNUEFG4AgvpNMgxK1",
+            &new_keys,
+            "3JYaMbjuKXkURNpLpDDDWMzUcNMt2GreNc",
+            2_444_978,
+        );
+        let expected = hex::decode(
+            "00000000000000000000000000000000000000000000000000000000000000a000000000000000000000000000000000\
+             000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000260\
+             000000000000000000000000000000000000000000000000000000000000048000000000000000000000000000000000\
+             00000000000000000000000000254eb20000000000000000000000000000000000000000000000000000000000000129\
+             027319afb15481dbeb3c426bcc37f9a30e7f51ceff586936d85548d9395bcc23440294c817150f78607566e961b3c71d\
+             f53a22022a80acbb982f83c0c8baac040adc02a9c6848e302193179ce6479516c2d97f6967e1365c707e3b9d3e0cb683\
+             ccb82203250c11be0561b1d7ae168b1f59e39cbc1fd1ba3cf4d2140c1a365b2723a2bf930372cd46831f3b6afd4c044d\
+             160b7667e8ebf659d6cb51a825a3104df6ee0638c603ae72827d25030818c4947a800187b1fbcc33ae751e248ae60094\
+             cc989fb880f603b53899c390573471ba30e5054f78376c5f797fda26dde7a760789f02908cbad203b65cd7c22e70c082\
+             3882c6e71ac2c279ed31cbe29cb4a1c00572ce539c0c457303ecd8af1e93c57a1b8c7f917bd9980af798adeb0205e968\
+             7865673353eb041e8d000000000000000000000000000000000000000000000000000000000000000000000000000000\
+             0000000000000000000000000000002233354a5569314678616247646879674c686e4e5545464734416776704e4d6778\
+             4b3100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\
+             000000000000000000000000000001ef0245ef34f5ee218005c9c21227133e8568a4f3f11aeab919c66ff7b816ae1ffe\
+             ea024cd9f00935993695af7e6c35165550a79eeac9fdfe95df83c5fdd8692ba2ef9e027319afb15481dbeb3c426bcc37\
+             f9a30e7f51ceff586936d85548d9395bcc23440294c817150f78607566e961b3c71df53a22022a80acbb982f83c0c8ba\
+             ac040adc02ac1901b6fba2c1dbd47d894d2bd76c8ba1d296d65f6ab47f1c6b22afb53e73eb02c6018fcbd3e89f3cf9c7\
+             f48b3232ea3638eb8bf217e59ee290f5f0cfb2fb9259031aabbeb9b27258f98c2bf21f36677ae7bae09eb2d8c958ef41\
+             a20a6e88626d2603250c11be0561b1d7ae168b1f59e39cbc1fd1ba3cf4d2140c1a365b2723a2bf930340df69f28d69ee\
+             f60845da7d81ff60a9060d4da35c767f017b0dd4e20448fb440372cd46831f3b6afd4c044d160b7667e8ebf659d6cb51\
+             a825a3104df6ee0638c603ae72827d25030818c4947a800187b1fbcc33ae751e248ae60094cc989fb880f603b53899c3\
+             90573471ba30e5054f78376c5f797fda26dde7a760789f02908cbad203b65cd7c22e70c0823882c6e71ac2c279ed31cb\
+             e29cb4a1c00572ce539c0c457303d789669ec532f756461d3d6d83b316ed0c4272d48dc3b60cce0f494e9a09d3e703ec\
+             d8af1e93c57a1b8c7f917bd9980af798adeb0205e9687865673353eb041e8d0000000000000000000000000000000000\
+             0000000000000000000000000000000000000000000000000000000000000022334a59614d626a754b586b55524e704c\
+             70444444574d7a55634e4d74324772654e63000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap();
+        assert_eq!(data, expected);
+    }
 
     /// Groundtruth from mainnet block #615 tx 1 receipt (public-node.rsk.co):
     /// topic 0x00000000000000007570646174655f636f6c6c656374696f6e735f746f706963,

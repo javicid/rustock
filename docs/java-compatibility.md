@@ -1003,6 +1003,35 @@ mainnet cell: `rskj_election_signed_byte_spec_order_groundtruth_2426416`.
 
 ---
 
+## 23. RSKIP146 commit_federation Event (Solidity format)
+
+Post-RSKIP146, `BridgeEventLoggerImpl.logCommitFederation` emits the
+Solidity-format event instead of the legacy padded-string-topic one:
+
+- Signature `commit_federation(bytes,string,bytes,string,int256)`, topic
+  `0x5b9466a0b50d1cab12eeb0b3b5d387ece7659afcc56bb15704535e6954de8c4e`,
+  no indexed params.
+- Data (standard ABI): old federation's sorted compressed BTC pubkeys
+  flat-concatenated as one `bytes`, old federation Base58Check P2SH
+  address as `string`, the same pair for the new federation, and the
+  activation height (`block + federationActivationAge`) as `int256`.
+
+**Trigger**: mainnet #2,426,478 — the commitFederation of the 2019
+federation change. rustock emitted the legacy RLP event; receipts root
+mismatched with exact gas (62,032) and exact state root (the storage side
+of the commit was already correct).
+
+**rskj source**: `co.rsk.peg.utils.BridgeEventLoggerImpl
+.logCommitFederation/logCommitFederationInSolidityFormat`,
+`BridgeEvents.COMMIT_FEDERATION` (PAPYRUS-2.0.0).
+
+**rustock**: `bridge/events.rs` (`log_solidity_commit_federation`,
+`commit_federation_event_data` with byte-exact mainnet groundtruth test),
+`bridge/governance.rs` (`commit_pending_federation` gates legacy vs
+Solidity on RSKIP146; `p2sh_base58_address`).
+
+---
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`

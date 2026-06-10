@@ -459,21 +459,47 @@ fn commit_pending_federation<CTX: crate::RskContextTr>(
     }
     store_pending_federation(ctx, None, multikey);
 
-    // Legacy commit_federation event (pre-RSKIP146).
+    // commit_federation event: Solidity format from RSKIP146, legacy before.
     let old_redeem =
         super::peg::build_federation_redeem_script(&old_keys, old_keys.len() / 2 + 1);
     let new_redeem =
         super::peg::build_federation_redeem_script(&new_keys, new_keys.len() / 2 + 1);
+    let old_hash160 = super::peg::redeem_script_hash160_pub(&old_redeem);
+    let new_hash160 = super::peg::redeem_script_hash160_pub(&new_redeem);
     let activation =
         block_number + federation_activation_age(config, hardfork_cfg, block_number);
-    super::events::log_legacy_commit_federation(
-        ctx,
-        &super::peg::redeem_script_hash160_pub(&old_redeem),
-        &old_keys,
-        &super::peg::redeem_script_hash160_pub(&new_redeem),
-        &new_keys,
-        activation,
-    );
+    if hardfork_cfg.has_rskip146(block_number) {
+        super::events::log_solidity_commit_federation(
+            ctx,
+            &old_keys,
+            &p2sh_base58_address(&old_hash160, config),
+            &new_keys,
+            &p2sh_base58_address(&new_hash160, config),
+            activation,
+        );
+    } else {
+        super::events::log_legacy_commit_federation(
+            ctx,
+            &old_hash160,
+            &old_keys,
+            &new_hash160,
+            &new_keys,
+            activation,
+        );
+    }
+}
+
+/// Base58Check P2SH address string for a script hash (rskj
+/// `Address.toBase58`; mainnet version 0x05, testnet/regtest 0xc4).
+fn p2sh_base58_address(hash160: &[u8; 20], config: &super::constants::BridgeConstants) -> String {
+    let version: u8 = match config.btc_network {
+        super::constants::BtcNetwork::Mainnet => 5,
+        _ => 196,
+    };
+    let mut payload = [0u8; 21];
+    payload[0] = version;
+    payload[1..].copy_from_slice(hash160);
+    bitcoin::base58::encode_check(&payload)
 }
 
 // ---------------------------------------------------------------------------
