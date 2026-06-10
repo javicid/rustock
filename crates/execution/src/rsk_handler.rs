@@ -67,6 +67,16 @@ pub struct RskHandler<CTX, ERROR, FRAME> {
     /// receipt stays SUCCESS with only the spent gas (mainnet #764,123:
     /// receipt 47,408 gas, fee charged for the full 1,000,000 limit).
     invisible_exception: Arc<AtomicBool>,
+    /// Pre-RSKIP150 (twoToThree, mainnet 2_018_000): rskj's
+    /// `Program.callToPrecompiledAddress` saves a successful precompile's
+    /// FULL output to the caller's memory at outOffs (`memorySave`, NOT
+    /// limited by the CALL's outSize), silently extending memory without
+    /// charging gas — so the caller's later memory expansions are measured
+    /// from the extended size (mainnet #1,661,324: a Solidity 0.5 proxy
+    /// calls BlockHeaderContract with outSize=0; rskj's RETURNDATACOPY then
+    /// pays no expansion). `Some` holds the block's active precompile
+    /// addresses; `None` disables the quirk (RSKIP150 active).
+    pre_rskip150_precompiles: Option<Vec<Address>>,
     _phantom: core::marker::PhantomData<(CTX, ERROR, FRAME)>,
 }
 
@@ -75,18 +85,20 @@ impl<CTX, ERROR, FRAME> RskHandler<CTX, ERROR, FRAME> {
         empty_create_on_unpayable_deposit: bool,
         invisible_exception: Arc<AtomicBool>,
     ) -> Self {
-        Self::with_rskip125(empty_create_on_unpayable_deposit, false, invisible_exception)
+        Self::with_rskip125(empty_create_on_unpayable_deposit, false, invisible_exception, None)
     }
 
     pub fn with_rskip125(
         empty_create_on_unpayable_deposit: bool,
         rskip125_active: bool,
         invisible_exception: Arc<AtomicBool>,
+        pre_rskip150_precompiles: Option<Vec<Address>>,
     ) -> Self {
         Self {
             empty_create_on_unpayable_deposit,
             rskip125_active,
             invisible_exception,
+            pre_rskip150_precompiles,
             _phantom: core::marker::PhantomData,
         }
     }
@@ -196,11 +208,21 @@ where
         loop {
             let call_or_result = rsk_frame_run(evm, self.empty_create_on_unpayable_deposit)?;
 
+            // Pre-RSKIP150 unbounded precompile output write, applied to the
+            // caller after `frame_return_result` (see field docs).
+            let mut unbounded_output: Option<(usize, Bytes)> = None;
+
             let result = match call_or_result {
                 ItemOrResult::Item(init) => {
                     if *TRACE_FRAMES {
                         trace_frame_init(&init);
                     }
+                    let callee = match &init.frame_input {
+                        revm::interpreter::interpreter_action::FrameInput::Call(c) => {
+                            Some(c.bytecode_address)
+                        }
+                        _ => None,
+                    };
                     match evm.frame_init(init)? {
                         ItemOrResult::Item(_) => {
                             // Internal CREATE/CREATE2 opcode: post-RSKIP125
@@ -210,8 +232,24 @@ where
                             set_created_contract_nonce(evm, nonce);
                             continue;
                         }
-                        // Do not pop the frame since no new frame was created
-                        ItemOrResult::Result(result) => result,
+                        // Do not pop the frame since no new frame was created:
+                        // this is how a CALL to a precompile resolves.
+                        ItemOrResult::Result(result) => {
+                            if let (Some(precompiles), Some(callee), FrameResult::Call(outcome)) =
+                                (&self.pre_rskip150_precompiles, callee, &result)
+                            {
+                                if precompiles.contains(&callee)
+                                    && outcome.instruction_result().is_ok()
+                                    && outcome.result.output.len() > outcome.memory_length()
+                                {
+                                    unbounded_output = Some((
+                                        outcome.memory_start(),
+                                        outcome.result.output.clone(),
+                                    ));
+                                }
+                            }
+                            result
+                        }
                     }
                 }
                 ItemOrResult::Result(result) => result,
@@ -227,6 +265,9 @@ where
 
             if let Some(result) = evm.frame_return_result(result)? {
                 return Ok(result);
+            }
+            if let Some((mem_start, output)) = unbounded_output {
+                write_unbounded_precompile_output(evm, mem_start, &output);
             }
         }
     }
@@ -374,6 +415,35 @@ fn trace_frame_init(init: &FrameInit) {
 /// If the top (just-initialized) frame is a CREATE frame, reset the created
 /// account's nonce to 0. On revert the AccountCreated journal entry discards
 /// the account wholesale, so no extra journaling is needed.
+/// Pre-RSKIP150 `Program.memorySave(outOffs, out)`: write a successful
+/// precompile's FULL output into the caller's memory, extending it
+/// word-aligned WITHOUT charging gas (rskj `Memory.extend` grows the
+/// gas-visible softSize for free on this path). The extended size is
+/// recorded in the caller's `MemoryGas` so later expansions are priced
+/// from it, exactly like rskj's `calcMemGas(oldMemSize, ...)`.
+fn write_unbounded_precompile_output<EVM>(evm: &mut EVM, mem_start: usize, output: &[u8])
+where
+    EVM: EvmTr<
+        Context: ContextTr<Journal: JournalTr<State = EvmState>>,
+        Frame = EthFrame<EthInterpreter>,
+    >,
+{
+    let gas_params = evm.ctx().cfg().gas_params().clone();
+    let frame = evm.frame_stack().get();
+    let interpreter = &mut frame.interpreter;
+    let Some(end) = mem_start.checked_add(output.len()) else {
+        return;
+    };
+    let new_words = end.div_ceil(32);
+    if new_words > interpreter.gas.memory().words_num {
+        interpreter.memory.resize(new_words * 32);
+        let cost = gas_params.memory_cost(new_words);
+        // Record the new size as already paid for; nothing is charged.
+        let _ = interpreter.gas.memory_mut().set_words_num(new_words, cost);
+    }
+    interpreter.memory.set(mem_start, output);
+}
+
 fn set_created_contract_nonce<EVM>(evm: &mut EVM, nonce: u64)
 where
     EVM: EvmTr<

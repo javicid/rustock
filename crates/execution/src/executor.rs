@@ -123,11 +123,15 @@ impl RskExecutor {
         )
         .with_bridge_config(self.bridge_constants.clone());
         let invisible_flag = precompile_provider.invisible_exception_flag();
+        let active_precompiles: Vec<Address> =
+            rsk_precompiles(&self.hardfork_cfg, header.number).addresses().copied().collect();
         let extcodesize_max_precompiles: Vec<Address> = if self.hardfork_cfg.has_rskip90(header.number) {
-            rsk_precompiles(&self.hardfork_cfg, header.number).addresses().copied().collect()
+            active_precompiles.clone()
         } else {
             Vec::new()
         };
+        let pre_rskip150_precompiles = (!self.hardfork_cfg.has_rskip150(header.number))
+            .then(|| active_precompiles.clone());
         let mut evm = ctx.build_mainnet().with_precompiles(precompile_provider);
         crate::rsk_instructions::install(
             &mut evm.instruction,
@@ -143,6 +147,7 @@ impl RskExecutor {
                 !self.hardfork_cfg.has_rskip453(header.number),
                 self.hardfork_cfg.has_rskip125(header.number),
                 invisible_flag,
+                pre_rskip150_precompiles,
             );
             let out = handler
                 .run(&mut evm)
@@ -208,11 +213,15 @@ impl RskExecutor {
         let bridge_ctx_slot = precompile_provider.bridge_tx_context_slot();
         let invisible_flag = precompile_provider.invisible_exception_flag();
         let called_precompiles = precompile_provider.called_precompiles_slot();
+        let active_precompiles: Vec<Address> =
+            rsk_precompiles(&self.hardfork_cfg, header.number).addresses().copied().collect();
         let extcodesize_max_precompiles: Vec<Address> = if self.hardfork_cfg.has_rskip90(header.number) {
-            rsk_precompiles(&self.hardfork_cfg, header.number).addresses().copied().collect()
+            active_precompiles.clone()
         } else {
             Vec::new()
         };
+        let pre_rskip150_precompiles = (!self.hardfork_cfg.has_rskip150(header.number))
+            .then_some(active_precompiles);
         let mut evm = ctx.build_mainnet().with_precompiles(precompile_provider);
         crate::rsk_instructions::install(
             &mut evm.instruction,
@@ -503,6 +512,7 @@ impl RskExecutor {
                 !self.hardfork_cfg.has_rskip453(header.number),
                 self.hardfork_cfg.has_rskip125(header.number),
                 invisible_flag.clone(),
+                pre_rskip150_precompiles.clone(),
             );
                 handler
                     .run(&mut evm)

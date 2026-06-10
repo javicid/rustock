@@ -23,6 +23,8 @@ pub enum RskNetworkUpgrade {
     Genesis,
     Orchid,
     Wasabi100,
+    /// rskj "twoToThree" (mainnet 2,018,000): RSKIP150 only.
+    TwoToThree,
     Papyrus200,
     Iris300,
     Hop400,
@@ -44,6 +46,7 @@ pub const MAINNET_ACTIVATIONS: &[(u64, RskNetworkUpgrade)] = &[
     (0, RskNetworkUpgrade::Genesis),
     (729_000, RskNetworkUpgrade::Orchid),
     (1_591_000, RskNetworkUpgrade::Wasabi100),
+    (2_018_000, RskNetworkUpgrade::TwoToThree),
     (2_392_700, RskNetworkUpgrade::Papyrus200),
     (3_614_800, RskNetworkUpgrade::Iris300),
     (4_598_500, RskNetworkUpgrade::Hop400),
@@ -61,6 +64,10 @@ pub const TESTNET_ACTIVATIONS: &[(u64, RskNetworkUpgrade)] = &[
     (0, RskNetworkUpgrade::Genesis),
     (0, RskNetworkUpgrade::Orchid),
     (863_000, RskNetworkUpgrade::Wasabi100),
+    // rskj testnet activates twoToThree (504_000) BEFORE wasabi100, which the
+    // linear ladder cannot express; modeling it as wasabi-coincident loses
+    // RSKIP150 only in the testnet 504_000..863_000 window.
+    (863_000, RskNetworkUpgrade::TwoToThree),
     (1_580_000, RskNetworkUpgrade::Papyrus200),
     (2_060_500, RskNetworkUpgrade::Iris300),
     (3_103_000, RskNetworkUpgrade::Hop400),
@@ -200,6 +207,14 @@ impl RskHardforkConfig {
     /// RSKIP140 (papyrus): the EXTCODEHASH opcode becomes available.
     pub fn has_rskip140(&self, block_number: u64) -> bool {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Papyrus200
+    }
+
+    /// RSKIP150 (twoToThree, mainnet 2_018_000): a precompile's return value
+    /// is written to the caller's memory bounded by the CALL's outSize.
+    /// Before it, rskj `Program.memorySave` writes the FULL output at
+    /// outOffs, silently (gas-free) extending the caller's memory.
+    pub fn has_rskip150(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::TwoToThree
     }
 
     /// RSKIP90 (orchid): EXTCODESIZE of an active precompile reports 2^256-1
@@ -369,6 +384,7 @@ fn upgrade_to_spec_id(upgrade: RskNetworkUpgrade) -> SpecId {
         // gas, which RSK never adopted); EXTCODEHASH is gated off separately
         // until papyrus in rsk_instructions::install.
         RskNetworkUpgrade::Wasabi100
+        | RskNetworkUpgrade::TwoToThree
         | RskNetworkUpgrade::Papyrus200
         | RskNetworkUpgrade::Iris300
         | RskNetworkUpgrade::Hop400
@@ -393,6 +409,19 @@ mod tests {
         let cfg = RskHardforkConfig::mainnet();
         assert_eq!(cfg.spec_id(0), SpecId::BYZANTIUM);
         assert_eq!(cfg.spec_id(728_999), SpecId::BYZANTIUM);
+    }
+
+    #[test]
+    fn test_mainnet_rskip150_at_two_to_three() {
+        let cfg = RskHardforkConfig::mainnet();
+        assert!(!cfg.has_rskip150(2_017_999));
+        assert!(cfg.has_rskip150(2_018_000));
+        // twoToThree keeps the PETERSBURG spec and wasabi features.
+        assert_eq!(cfg.spec_id(2_018_000), SpecId::PETERSBURG);
+        assert!(cfg.has_rskip125(2_018_000));
+        // ...but not papyrus features.
+        assert!(!cfg.has_rskip140(2_018_000));
+        assert!(cfg.has_rskip150(2_392_700));
     }
 
     #[test]

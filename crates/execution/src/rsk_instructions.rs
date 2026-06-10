@@ -21,9 +21,7 @@
 
 use revm::bytecode::opcode;
 use revm::handler::instructions::EthInstructions;
-use revm::interpreter::instructions::contract::{
-    get_memory_input_and_out_ranges, load_account_delegated_handle_error,
-};
+use revm::interpreter::instructions::contract::load_account_delegated_handle_error;
 use revm::interpreter::interpreter_types::{InputsTr, InterpreterTypes, LoopControl, MemoryTr, RuntimeFlag, StackTr};
 use revm::interpreter::{
     CallInput, CallInputs, CallScheme, CallValue, FrameInput, Host, Instruction,
@@ -88,6 +86,32 @@ pub fn install<WIRE, HOST>(
         opcode::STATICCALL,
         Instruction::new(rsk_static_call::<WIRE, HOST>, CALL_STATIC_GAS),
     );
+
+    // Divergence-hunt diagnostic (env-gated, temporary): log pc/op/gas for
+    // EVERY opcode. The wrapper re-dispatches to the default PETERSBURG
+    // table, except for the rsk-custom opcodes which dispatch to the local
+    // overrides installed above.
+    if std::env::var_os("RUSTOCK_TRACE_ALL_OPS").is_some() {
+        EXTCODEHASH_ENABLED.with(|f| f.set(extcodehash_enabled));
+        let default_table = revm::interpreter::instructions::instruction_table_gas_changes_spec::<
+            WIRE,
+            HOST,
+        >(revm::primitives::hardfork::SpecId::PETERSBURG);
+        for op in 0u16..=255 {
+            let op = op as u8;
+            let static_gas = match op {
+                opcode::EXTCODESIZE | opcode::CALL | opcode::CALLCODE
+                | opcode::DELEGATECALL | opcode::STATICCALL => CALL_STATIC_GAS,
+                opcode::EXTCODEHASH if !extcodehash_enabled => 0,
+                _ => default_table[op as usize].static_gas(),
+            };
+            instructions.insert_instruction(
+                op,
+                Instruction::new(traced_all::<WIRE, HOST>, static_gas),
+            );
+        }
+        return;
+    }
 
     // Divergence-hunt diagnostics (env-gated): log the inputs of opcodes
     // whose gas charge can dwarf the remaining gas, to locate the exact
@@ -167,10 +191,106 @@ macro_rules! traced_op {
     };
 }
 
+thread_local! {
+    /// RSKIP140 flag for the all-ops tracer's EXTCODEHASH dispatch.
+    static EXTCODEHASH_ENABLED: core::cell::Cell<bool> = const { core::cell::Cell::new(true) };
+}
+
+/// All-ops tracer: log pc/opcode/gas (post-static-charge), then dispatch to
+/// the real implementation (custom rsk op or default PETERSBURG table).
+fn traced_all<WIRE: InterpreterTypes, HOST: Host>(
+    context: InstructionContext<'_, HOST, WIRE>,
+) {
+    use revm::interpreter::interpreter_types::{Jumps, LegacyBytecode};
+    let pc = context.interpreter.bytecode.pc().saturating_sub(1);
+    // step() already advanced pc by 1, so the executing opcode is at pc-1.
+    let op = context
+        .interpreter
+        .bytecode
+        .bytecode_slice()
+        .get(pc)
+        .copied()
+        .unwrap_or(opcode::STOP);
+    tracing::debug!(
+        "OPTRACE pc={pc:04x} op={:02x} {} gas={}",
+        op,
+        revm::bytecode::opcode::OpCode::new(op).map(|o| o.as_str()).unwrap_or("?"),
+        context.interpreter.gas.remaining(),
+    );
+    match op {
+        opcode::EXTCODESIZE => rsk_extcodesize(context),
+        opcode::CALL => rsk_call(context),
+        opcode::CALLCODE => rsk_call_code(context),
+        opcode::DELEGATECALL => rsk_delegate_call(context),
+        opcode::STATICCALL => rsk_static_call(context),
+        opcode::EXTCODEHASH if !EXTCODEHASH_ENABLED.with(|f| f.get()) => {
+            invalid_opcode(context)
+        }
+        _ => {
+            let table = revm::interpreter::instructions::instruction_table_gas_changes_spec::<
+                WIRE,
+                HOST,
+            >(revm::primitives::hardfork::SpecId::PETERSBURG);
+            table[op as usize].execute(context)
+        }
+    }
+}
+
 traced_op!(traced_keccak, "KECCAK256", 2, revm::interpreter::instructions::system::keccak256);
 traced_op!(traced_codecopy, "CODECOPY", 3, revm::interpreter::instructions::system::codecopy);
 traced_op!(traced_return, "RETURN", 2, revm::interpreter::instructions::control::ret);
 traced_op!(traced_exp, "EXP", 2, revm::interpreter::instructions::arithmetic::exp);
+
+/// revm's `get_memory_input_and_out_ranges`, except the OUT range keeps the
+/// REAL offset when outSize == 0 (revm substitutes a usize::MAX sentinel).
+/// Pre-RSKIP150 the handler writes a successful precompile's full output at
+/// rskj's actual outOffs (`Program.memorySave`), so the offset must survive
+/// zero-size out regions.
+fn rsk_memory_input_and_out_ranges<WIRE: InterpreterTypes>(
+    interpreter: &mut revm::interpreter::Interpreter<WIRE>,
+    gas_params: &revm::context_interface::cfg::GasParams,
+) -> Option<(core::ops::Range<usize>, core::ops::Range<usize>)> {
+    let Some([in_offset, in_len, out_offset, out_len]) = interpreter.stack.popn() else {
+        interpreter.halt_underflow();
+        return None;
+    };
+
+    let mut in_range = rsk_call_memory_range(interpreter, gas_params, in_offset, in_len)?;
+    if !in_range.is_empty() {
+        let off = interpreter.memory.local_memory_offset();
+        in_range = in_range.start.saturating_add(off)..in_range.end.saturating_add(off);
+    }
+    let out_range = rsk_call_memory_range(interpreter, gas_params, out_offset, out_len)?;
+    Some((in_range, out_range))
+}
+
+fn rsk_call_memory_range<WIRE: InterpreterTypes>(
+    interpreter: &mut revm::interpreter::Interpreter<WIRE>,
+    gas_params: &revm::context_interface::cfg::GasParams,
+    offset: U256,
+    len: U256,
+) -> Option<core::ops::Range<usize>> {
+    let Ok(len) = usize::try_from(len) else {
+        interpreter.halt(InstructionResult::InvalidOperandOOG);
+        return None;
+    };
+    let offset = if len != 0 {
+        let Ok(offset) = usize::try_from(offset) else {
+            interpreter.halt(InstructionResult::InvalidOperandOOG);
+            return None;
+        };
+        if !interpreter.resize_memory(gas_params, offset, len) {
+            return None;
+        }
+        offset
+    } else {
+        // Zero-size region: keep the true offset when it fits, falling back
+        // to revm's usize::MAX sentinel (which disables the pre-RSKIP150
+        // unbounded write) for pathological offsets.
+        usize::try_from(offset).unwrap_or(usize::MAX)
+    };
+    Some(offset..offset.saturating_add(len))
+}
 
 /// rskj `VM.getMessageCall` gas math, shared by the four call opcodes.
 ///
@@ -266,7 +386,7 @@ pub fn rsk_call<WIRE: InterpreterTypes, H: Host + ?Sized>(
     }
 
     let Some((input, return_memory_offset)) =
-        get_memory_input_and_out_ranges(context.interpreter, context.host.gas_params())
+        rsk_memory_input_and_out_ranges(context.interpreter, context.host.gas_params())
     else {
         return;
     };
@@ -308,7 +428,7 @@ pub fn rsk_call_code<WIRE: InterpreterTypes, H: Host + ?Sized>(
     let local_gas_limit = u64::try_from(local_gas_limit).unwrap_or(u64::MAX);
 
     let Some((input, return_memory_offset)) =
-        get_memory_input_and_out_ranges(context.interpreter, context.host.gas_params())
+        rsk_memory_input_and_out_ranges(context.interpreter, context.host.gas_params())
     else {
         return;
     };
@@ -350,7 +470,7 @@ pub fn rsk_delegate_call<WIRE: InterpreterTypes, H: Host + ?Sized>(
     let local_gas_limit = u64::try_from(local_gas_limit).unwrap_or(u64::MAX);
 
     let Some((input, return_memory_offset)) =
-        get_memory_input_and_out_ranges(context.interpreter, context.host.gas_params())
+        rsk_memory_input_and_out_ranges(context.interpreter, context.host.gas_params())
     else {
         return;
     };
@@ -392,7 +512,7 @@ pub fn rsk_static_call<WIRE: InterpreterTypes, H: Host + ?Sized>(
     let local_gas_limit = u64::try_from(local_gas_limit).unwrap_or(u64::MAX);
 
     let Some((input, return_memory_offset)) =
-        get_memory_input_and_out_ranges(context.interpreter, context.host.gas_params())
+        rsk_memory_input_and_out_ranges(context.interpreter, context.host.gas_params())
     else {
         return;
     };
@@ -425,4 +545,31 @@ pub fn rsk_static_call<WIRE: InterpreterTypes, H: Host + ?Sized>(
                 return_memory_offset,
             },
         ))));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use revm::context_interface::cfg::GasParams;
+    use revm::interpreter::interpreter::EthInterpreter;
+    use revm::interpreter::Interpreter;
+
+    /// Pre-RSKIP150 the handler writes a precompile's full output at the
+    /// CALL's real outOffs even when outSize == 0, so the range must keep
+    /// the true offset (revm substitutes usize::MAX for zero-size regions).
+    #[test]
+    fn zero_size_call_range_keeps_real_offset() {
+        let mut interp = Interpreter::<EthInterpreter>::default();
+        let params = GasParams::default();
+
+        let r = rsk_call_memory_range(&mut interp, &params, U256::from(0x80), U256::ZERO)
+            .expect("range");
+        assert_eq!(r, 0x80..0x80);
+
+        // Offsets that don't fit usize fall back to revm's sentinel.
+        let r = rsk_call_memory_range(&mut interp, &params, U256::MAX, U256::ZERO)
+            .expect("range");
+        assert_eq!(r.start, usize::MAX);
+        assert!(r.is_empty());
+    }
 }

@@ -728,6 +728,69 @@ internal CREATE that deployed an empty contract; rskj stored it as nonce 1
 
 ---
 
+## 16. Pre-RSKIP150 Unbounded Precompile Output Write (gas-free memory extension)
+
+**rskj behavior**: before RSKIP150 ("twoToThree", mainnet 2,018,000 / testnet
+504,000), an internal CALL-family invocation of a precompile saves the
+precompile's FULL output into the caller's memory at the CALL's outOffs,
+ignoring the declared outSize (`Program.callToPrecompiledAddress` →
+`saveOutAfterExecution` → `Program.memorySave(outOffs, out)`; the limited
+`memorySaveLimited(outOffs, out, outSize)` only arrives with RSKIP150). The
+write goes through `Memory.write(..., limited=false)` → `Memory.extend`,
+which silently grows the gas-visible memory size (`softSize`, word-aligned)
+WITHOUT charging expansion gas — so every later memory expansion in the
+caller is measured from the extended size, and MSIZE reports it.
+
+**Trigger**: mainnet #1,661,324 — a Solidity 0.5 proxy (0xEDD695…4080)
+forwards `getCoinbaseAddress(int256)` to the BlockHeaderContract precompile
+(0x01000010) with outSize=0 and then ABI-decodes via RETURNDATACOPY. rskj's
+hidden 96-byte write extends memory from 0xc0 to 0xe0 for free, so the
+RETURNDATACOPY pays no expansion; rustock charged +3 gas per call (89 calls
+= +267 on the block's gasUsed, computed 1,025,939 vs header 1,025,672).
+Ground-truthed against rskj's own per-opcode dump (`dump.block` config +
+`ExecuteBlocks` on a clone of a synced DB): after the fix the entire
+54,742-opcode trace (pc/opcode/gas) is byte-identical.
+
+**rskj source**: `org.ethereum.vm.program.Program#callToPrecompiledAddress`,
+`#saveOutAfterExecution` (`@Deprecated executePrecompiled`, pre-RSKIP197
+path), `org.ethereum.vm.program.Memory#write/#extend`.
+
+**rustock**: `RskHandler::run_exec_loop` captures successful precompile call
+results (frame-less `frame_init` returns) and, pre-RSKIP150, replays the
+unbounded write via `write_unbounded_precompile_output` (resize +
+`MemoryGas::set_words_num` with no charge). The CALL instructions preserve
+the REAL outOffs for zero-size out regions (`rsk_memory_input_and_out_ranges`
+in `rsk_instructions.rs`; revm substitutes a `usize::MAX` sentinel).
+`RskNetworkUpgrade::TwoToThree` + `has_rskip150` gate it. Note: on testnet
+rskj activates twoToThree (504,000) BEFORE wasabi (863,000); the linear
+upgrade ladder models it as wasabi-coincident (RSKIP150 missing only in the
+testnet 504k–863k window).
+
+**Related edge (not implemented, in TODO)**: pre-RSKIP150 a precompile
+returning Java `null` (e.g. Bridge void methods via internal CALL) makes
+`memorySave` throw an NPE that fails the calling frame with all its gas;
+rustock's precompiles return empty bytes instead. No mainnet block hit this
+so far (direct precompile transactions don't go through this path).
+
+---
+
+## 17. BlockHeaderContract `getGasLimit` Returns Raw Header Bytes
+
+**rskj behavior**: `GetGasLimit.internalExecute` returns
+`block.getGasLimit()` — the header's raw RLP element bytes (minimal unsigned
+big-endian) — while the other numeric methods (`getMinGasPrice`,
+`getDifficulty`, `getGasUsed`) return `BigInteger.toByteArray()` (signed,
+0x00-prefixed when the high bit is set).
+
+**rskj source**: `co.rsk.pcc.blockheader.GetGasLimit`.
+
+**rustock**: `u256_to_raw_minimal_bytes` in `precompiles.rs` (vs
+`u256_to_java_bigint_bytes` for the BigInteger fields). Indistinguishable
+while mainnet gas limits keep the top byte < 0x80 (6.8M = 0x67C280), but a
+10M (0x989680) limit would have diverged.
+
+---
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`
