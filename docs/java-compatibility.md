@@ -875,6 +875,51 @@ selector 0x1183d5d1 is createFederation, not updateCollections).
 
 ---
 
+## 20. RSKIP134 Locking Cap (lazy initialization + peg-in gate)
+
+Post-papyrus200 (RSKIP134, mainnet #2,392,700) the Bridge enforces a peg-in
+locking cap, with consensus-visible storage semantics:
+
+- **Lazy initialization**: `BridgeSupport.getLockingCap()` initializes the
+  cap to `bridgeConstants.getInitialLockingCap()` (mainnet 300 BTC =
+  30,000,000,000 sat; testnet 200 BTC; regtest 1,000 BTC) the FIRST time it
+  is read with no stored value, and the provider persists it on the bridge
+  save (`saveLockingCap`, `serializeCoin` → RLP scalar `0x8506fc23ac00`).
+  Reads happen from the peg-in gate, from `increaseLockingCap`, and from
+  the (local-only) `getLockingCap` method — so the first mainnet peg-in
+  after papyrus200 materializes the `lockingCap` cell.
+- **Peg-in gate**: `verifyLockDoesNotSurpassLockingCap` runs only when the
+  whitelist check passed (`&&` short-circuit — a whitelist rejection never
+  initializes the cap). Federation current funds = `maxRbtc` (21M BTC) −
+  Bridge contract balance (truncating wei→satoshi); if funds + amount
+  exceed the cap, the peg-in is refunded via the same
+  `generateRejectionRelease` as a whitelist rejection.
+- **increaseLockingCap**: value ≤ 0 or not a long →
+  `BridgeIllegalArgumentException` (tx fails post-RSKIP88); then authorizer
+  check (minimum ONE of the increase-locking-cap keys) BEFORE any cap read
+  — an unauthorized call does not initialize the cell; then the new cap
+  must be ≥ current (equal allowed) and ≤ current ×
+  `lockingCapIncrementsMultiplier` (2). A failed bound check still
+  persists the lazily-initialized value.
+
+**Trigger**: mainnet #2,395,450 — first peg-in after papyrus200. rskj wrote
+`lockingCap = RLP(30_000_000_000)`; rustock had no locking-cap layer in the
+peg-in path: state root mismatch with exact gas match (216,376), single
+missing unitrie leaf.
+
+**rskj source**: `co.rsk.peg.BridgeSupport.getLockingCap/increaseLockingCap/
+verifyLockDoesNotSurpassLockingCap/getBtcLockedInFederation`,
+`BridgeStorageProvider.saveLockingCap` (PAPYRUS-2.0.0),
+`BridgeMainNetConstants` (initialLockingCap, increaseLockingCapAuthorizer).
+
+**rustock**: `bridge/peg.rs` (`get_or_init_locking_cap`,
+`verify_lock_does_not_surpass_locking_cap`, gate in
+`register_btc_transaction`), `bridge/governance.rs`
+(`increase_locking_cap`), `bridge/getters.rs` (`get_locking_cap`),
+`bridge/constants.rs` (locking-cap constants per network).
+
+---
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`

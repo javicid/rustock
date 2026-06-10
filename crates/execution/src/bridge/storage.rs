@@ -55,6 +55,7 @@ pub const RELEASE_REQUEST_QUEUE_WITH_TXHASH_KEY: &str = "releaseRequestQueueWith
 pub const PEGOUTS_WAITING_FOR_CONFIRMATIONS_WITH_TXHASH_KEY: &str = "releaseTransactionSetWithTxHash";
 pub const RECEIVE_HEADERS_TIMESTAMP_KEY: &str = "receiveHeadersLastTimestamp";
 pub const NEXT_PEGOUT_HEIGHT_KEY: &str = "nextPegoutHeight";
+pub const LOCKING_CAP_KEY: &str = "lockingCap";
 
 // Compound key bases
 pub const BTC_TX_HASH_AP_KEY: &str = "btcTxHashAP";
@@ -539,6 +540,18 @@ pub fn store_federation_utxos<CTX: crate::RskContextTr>(ctx: &mut CTX, utxos: &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Groundtruth from mainnet #2,395,450: the first post-papyrus200 peg-in
+    /// lazily initializes the `lockingCap` cell to the initial 300 BTC —
+    /// the rskj unitrie leaf holds RLP(30_000_000_000) = 0x8506fc23ac00.
+    #[test]
+    fn locking_cap_initial_cell_encoding_2395450() {
+        let cfg = super::super::constants::BridgeConstants::mainnet();
+        assert_eq!(cfg.initial_locking_cap, 30_000_000_000);
+        let bytes = rlp_encode_uint(U256::from(cfg.initial_locking_cap));
+        assert_eq!(alloy_primitives::hex::encode(&bytes), "8506fc23ac00");
+        assert_eq!(rlp_decode_uint(&bytes), U256::from(30_000_000_000u64));
+    }
 
     /// Groundtruth from mainnet #3304: a second `addLockWhitelistAddress` makes
     /// the one-off whitelist hold two entries, and rskj serializes them in its

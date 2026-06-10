@@ -92,9 +92,8 @@ fn abi_decode_int256_as_u64(args: &[u8], slot: usize) -> Option<u64> {
 // Storage key constants for governance
 // ---------------------------------------------------------------------------
 
-// Use the shared constant from storage.rs
-use super::storage::FEE_PER_KB_KEY;
-const LOCKING_CAP_KEY: &str = "lockingCap";
+// Use the shared constants from storage.rs (LOCKING_CAP_KEY, FEE_PER_KB_KEY
+// come in via the glob import above).
 
 // ---------------------------------------------------------------------------
 // Federation change methods
@@ -642,31 +641,53 @@ fn load_fee_per_kb_election<CTX: crate::RskContextTr>(
 
 /// `increaseLockingCap(int256 newCap)` → bool
 ///
-/// Increases the RBTC locking cap. Can only increase, never decrease.
-/// Returns true if successful.
+/// rskj `Bridge.increaseLockingCap` + `BridgeSupport.increaseLockingCap`:
+/// a non-positive or over-long value throws BridgeIllegalArgumentException;
+/// the sender must match an increase-locking-cap authorizer key (minimum
+/// ONE); the new cap may not be below the current one (equal is allowed)
+/// nor above current × lockingCapIncrementsMultiplier. Reading the current
+/// cap lazily initializes it (getLockingCap), so a failed bound check still
+/// persists the initial value — but a failed authorizer check does not.
 pub fn increase_locking_cap<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     gas_cost: u64,
+    config: &super::constants::BridgeConstants,
+    tx_ctx: &crate::precompiles::BridgeTxContext,
 ) -> Result<PrecompileOutput, PrecompileError> {
     if args.len() < 32 {
         return Err(PrecompileError::other("increaseLockingCap: args too short"));
     }
 
-    let new_cap = U256::from_be_slice(&args[..32]);
+    // int256 satoshis; rskj getCoinFromBigInteger (longValueExact) and the
+    // <= 0 check both end in BridgeIllegalArgumentException.
+    let raw = U256::from_be_slice(&args[..32]);
+    if raw.is_zero() || raw > U256::from(i64::MAX as u64) {
+        return Err(PrecompileError::other("increaseLockingCap: invalid value"));
+    }
+    let new_cap = raw.to::<u64>();
 
-    let current_cap = bridge_load_u256(ctx, LOCKING_CAP_KEY);
+    let authorized = config.increase_locking_cap_authorizer_keys.iter().any(|hex| {
+        alloy_primitives::hex::decode(hex)
+            .ok()
+            .and_then(|k| super::federation::rsk_address_from_public_key(&k))
+            .is_some_and(|a| a == tx_ctx.rsk_sender)
+    });
+    let mut output = [0u8; 32];
+    if !authorized {
+        return Ok(PrecompileOutput::new(gas_cost, output.to_vec().into()));
+    }
 
-    // Can only increase
-    if new_cap <= current_cap {
-        let output = [0u8; 32];
+    let current_cap = super::peg::get_or_init_locking_cap(ctx, config);
+    if new_cap < current_cap
+        || new_cap > current_cap.saturating_mul(config.locking_cap_increments_multiplier)
+    {
         return Ok(PrecompileOutput::new(gas_cost, output.to_vec().into()));
     }
 
     // rskj setLockingCap: serializeCoin (RLP).
-    bridge_store_u256(ctx, LOCKING_CAP_KEY, new_cap);
+    bridge_store_u256(ctx, LOCKING_CAP_KEY, U256::from(new_cap));
 
-    let mut output = [0u8; 32];
     output[31] = 1; // true
     Ok(PrecompileOutput::new(gas_cost, output.to_vec().into()))
 }

@@ -282,7 +282,14 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
         btc_block_height,
         wl_allowed
     );
-    if !wl_allowed {
+    // Locking cap gate (rskj verifyLockDoesNotSurpassLockingCap, RSKIP134):
+    // evaluated only when the whitelist passed (rskj short-circuits the &&,
+    // so a whitelist rejection never lazily initializes the cap). A cap
+    // rejection produces the same refund release as a whitelist one.
+    let allowed = wl_allowed
+        && (!hardfork_cfg.has_rskip134(rsk_height)
+            || verify_lock_does_not_surpass_locking_cap(ctx, config, total_value));
+    if !allowed {
         // TODO(rustock): a rejected peg-in paying BOTH live federations would
         // need per-input redeem scripts in the refund; none exists on
         // mainnet pre-wasabi. Inputs paying the retiring federation use its
@@ -409,6 +416,41 @@ fn btc_sender_pubkey(tx: &BtcTransaction) -> Option<Vec<u8>> {
         }
         _ => None,
     }
+}
+
+/// rskj `BridgeSupport.getLockingCap` (RSKIP134): lazily initializes the cap
+/// to the network's initial value on first read, persisting it (the provider
+/// caches the value and `saveLockingCap` writes it on the bridge save).
+pub(super) fn get_or_init_locking_cap<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    config: &BridgeConstants,
+) -> u64 {
+    if bridge_load_bytes_named(ctx, LOCKING_CAP_KEY).is_empty() {
+        bridge_store_u256(ctx, LOCKING_CAP_KEY, U256::from(config.initial_locking_cap));
+        return config.initial_locking_cap;
+    }
+    bridge_load_u256(ctx, LOCKING_CAP_KEY).to::<u64>()
+}
+
+/// rskj `BridgeSupport.verifyLockDoesNotSurpassLockingCap`: the federation's
+/// current funds are maxRbtc (21M BTC) minus the Bridge contract balance;
+/// the peg-in is rejected when funds + amount exceed the cap.
+fn verify_lock_does_not_surpass_locking_cap<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    config: &BridgeConstants,
+    total_amount_satoshis: u64,
+) -> bool {
+    let cap = get_or_init_locking_cap(ctx, config);
+    let bridge_balance_wei = ctx
+        .journal_mut()
+        .load_account(crate::precompiles::BRIDGE_ADDR)
+        .map(|a| a.info.balance)
+        .unwrap_or_default();
+    // co.rsk.core.Coin.toBitcoin: truncating wei -> satoshi division.
+    let balance_satoshis = (bridge_balance_wei / U256::from(10_000_000_000u64)).to::<u64>();
+    const MAX_RBTC_SATOSHIS: u64 = 2_100_000_000_000_000; // Constants maxRbtc, 21M BTC
+    let fed_current_funds = MAX_RBTC_SATOSHIS.saturating_sub(balance_satoshis);
+    fed_current_funds + total_amount_satoshis <= cap
 }
 
 /// rskj `LockWhitelist.isWhitelistedFor` + `consume`: returns whether the

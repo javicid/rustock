@@ -82,6 +82,18 @@ pub struct BridgeConstants {
     pub fee_per_kb_authorizer_keys: &'static [&'static str],
     /// Maximum votable fee per KB (rskj FeePerKbConstants.maxFeePerKb).
     pub max_fee_per_kb: u64,
+
+    // -- Locking cap (RSKIP134) --
+
+    /// Initial locking cap in satoshis, lazily set and persisted on first
+    /// read post-RSKIP134 (rskj BridgeConstants.initialLockingCap).
+    pub initial_locking_cap: u64,
+    /// Max factor one increaseLockingCap call may multiply the cap by
+    /// (rskj lockingCapIncrementsMultiplier).
+    pub locking_cap_increments_multiplier: u64,
+    /// increaseLockingCap authorizer keys (uncompressed hex,
+    /// AddressBasedAuthorizer with minimum ONE).
+    pub increase_locking_cap_authorizer_keys: &'static [&'static str],
     /// Federation-change authorizer keys (rskj FederationConstants,
     /// AddressBasedAuthorizer with minimum MAJORITY).
     pub federation_change_authorizer_keys: &'static [&'static str],
@@ -182,6 +194,14 @@ impl BridgeConstants {
                 "04bb6435dc1ea12da843ebe213893d136c1624acd681fff82551498ae00bf28e9323164b00daf925fa75177463b8254a2aae8a1713e4d851a84ea369c193e9ce51",
             ],
             max_fee_per_kb: 5_000_000,
+            initial_locking_cap: 30_000_000_000, // 300 BTC
+            locking_cap_increments_multiplier: 2,
+            // BridgeMainNetConstants increaseLockingCapAuthorizedKeys (minimum ONE)
+            increase_locking_cap_authorizer_keys: &[
+                "0448f51638348b034995b1fd934fe14c92afde783e69f120a46ee16eb6bdc2e4f6b5e37772094c68c0dea2b1be3d96ea9651a9eebda7304914c8047f4e3e251378",
+                "0484c66f75548baf93e322574adac4e4579b6a53f8d11fab640e14c90118e6983ef24b0de349a3e88f72e81e771ae1c897cef446fd7f4da71778c532aee3b6c41b",
+                "04bb6435dc1ea12da843ebe213893d136c1624acd681fff82551498ae00bf28e9323164b00daf925fa75177463b8254a2aae8a1713e4d851a84ea369c193e9ce51",
+            ],
             // FederationMainNetConstants authorizer keys (majority = 2 of 3)
             federation_change_authorizer_keys: &[
                 "04e593d4cde25137b13f19462bc4c02e97ba2ed5a3860813497abf9b4eeb9259e37e0384d12cfd2d9a7a0ba606b31ee34317a9d7f4a8591c6bcf5dfd5563248b2f",
@@ -254,6 +274,14 @@ impl BridgeConstants {
                 "0455db9b3867c14e84a6f58bd2165f13bfdba0703cb84ea85788373a6a109f3717e40483aa1f8ef947f435ccdf10e530dd8b3025aa2d4a7014f12180ee3a301d27",
             ],
             max_fee_per_kb: 5_000_000,
+            initial_locking_cap: 20_000_000_000, // 200 BTC
+            locking_cap_increments_multiplier: 2,
+            // BridgeTestNetConstants increaseLockingCapAuthorizedKeys (minimum ONE)
+            increase_locking_cap_authorizer_keys: &[
+                "04701d1d27f8c2ae97912d96fb1f82f10c2395fd320e7a869049268c6b53d2060dfb2e22e3248955332d88cd2ae29a398f8f3858e48dd6d8ffbc37dfd6d1aa4934",
+                "045ef89e4a5645dc68895dbc33b4c966c3a0a52bb837ecdd2ba448604c4f47266456d1191420e1d32bbe8741f8315fde4d1440908d400e5998dbed6549d499559b",
+                "0455db9b3867c14e84a6f58bd2165f13bfdba0703cb84ea85788373a6a109f3717e40483aa1f8ef947f435ccdf10e530dd8b3025aa2d4a7014f12180ee3a301d27",
+            ],
             // FederationTestNetConstants authorizer keys (majority = 2 of 3)
             federation_change_authorizer_keys: &[
                 "04d9052c2022f6f35da53f04f02856ff5e59f9836eec03daad0328d12c5c66140205da540498e46cd05bf63c1201382dd84c100f0d52a10654159965aea452c3f2",
@@ -307,6 +335,12 @@ impl BridgeConstants {
                 "0430c7d0146029db553d60cf11e8d39df1c63979ee2e4cd1e4d4289a5d88cfcbf3a09b06b5cbc88b5bfeb4b87a94cefab81c8d44655e7e813fc3e18f51cfe7e8a0",
             ],
             max_fee_per_kb: 5_000_000,
+            initial_locking_cap: 100_000_000_000, // 1,000 BTC (BridgeConstants base default)
+            locking_cap_increments_multiplier: 2,
+            // BridgeRegTestConstants increaseLockingCapAuthorizedKeys (minimum ONE)
+            increase_locking_cap_authorizer_keys: &[
+                "04450bbaab83ec48b3cb8fbb077c950ee079733041c039a8c4f1539e5181ca1a27589eeaf0fbf430e49d2909f14c767bf6909ad6845831f683416ee12b832e36ed",
+            ],
             // FederationRegTestConstants authorizer keys (majority = 3 of 5)
             federation_change_authorizer_keys: &[
                 "04dde17c5fab31ffc53c91c2390136c325bb8690dc135b0840075dd7b86910d8ab9e88baad0c32f3eea8833446a6bc5ff1cd2efa99ecb17801bcb65fc16fc7d991",

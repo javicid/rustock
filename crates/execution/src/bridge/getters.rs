@@ -119,13 +119,17 @@ pub fn get_fee_per_kb<CTX: crate::RskContextTr>(
     Ok(PrecompileOutput::new(gas_cost, abi_encode_u256(val)))
 }
 
-/// `getLockingCap()` → int256
+/// `getLockingCap()` → int256 (satoshis)
+///
+/// rskj BridgeSupport.getLockingCap lazily initializes the cap on first
+/// read (local-only method, so the write never reaches consensus state).
 pub fn get_locking_cap<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
+    config: &super::constants::BridgeConstants,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    let val = bridge_load_u256(ctx, "lockingCap");
-    Ok(PrecompileOutput::new(gas_cost, abi_encode_u256(val)))
+    let val = super::peg::get_or_init_locking_cap(ctx, config);
+    Ok(PrecompileOutput::new(gas_cost, abi_encode_u256(U256::from(val))))
 }
 
 /// `getMinimumLockTxValue()` → int256
