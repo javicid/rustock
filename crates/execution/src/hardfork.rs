@@ -249,6 +249,12 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Papyrus200
     }
 
+    /// RSKIP143: segwit/P2SH peg-in sender types become processable
+    /// (Papyrus200).
+    pub fn has_rskip143(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Papyrus200
+    }
+
     /// RSKIP185: peg-out refund to sender on rejection (Iris300).
     pub fn has_rskip185(&self, block_number: u64) -> bool {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Iris300

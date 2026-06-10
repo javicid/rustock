@@ -1161,6 +1161,44 @@ being initialized. Regression test
 
 ---
 
+## 28. RSKIP143 BtcLockSender: peg-in sender types (processable vs lockable)
+
+rskj classifies a peg-in's sender from the FIRST input via
+`BtcLockSenderProvider` (P2PKH → P2SH-P2WPKH → P2SH-MULTISIG →
+P2SH-P2WSH, first match wins), then applies two distinct gates:
+
+- `txIsProcessable`: P2PKH always; everything else only post-RSKIP143
+  (papyrus200). Unparseable/unprocessable → plain return, tx NOT marked
+  as processed.
+- `txIsLockable`: P2PKH and (post-RSKIP143) P2SH-P2WPKH. A processable
+  but non-lockable sender (P2SH-MULTISIG, P2SH-P2WSH) is refunded via
+  `generateRejectionRelease` ("tx type not supported") WITHOUT
+  consulting the whitelist or locking cap, then marked processed.
+
+The sender's BTC address (whitelist key, refund output) is the P2SH
+script hash for the P2SH variants — the refund output is a P2SH script,
+not P2PKH. Parser details: P2PKH = scriptSig `[sig, valid pubkey]`;
+P2SH-P2WPKH = 1-chunk scriptSig + 2-push witness with compressed pubkey,
+address = hash160(0x0014||hash160(pubkey)); P2SH-MULTISIG = scriptSig
+`[.., sigs.., multisig redeem]`, address = hash160(redeem); P2SH-P2WSH =
+1-chunk scriptSig + ≥3-push witness ending in a multisig redeem, address
+= hash160(0x0020||sha256(redeem)).
+
+**Trigger**: mainnet #2,851,909 tx 2 — a P2SH-multisig peg-in of ~19.7
+BTC. rskj refunded it (rejection entry in the with-txhash pegout set +
+processed mark + release_requested); rustock's P2PKH-only parser bailed
+without doing anything: two-leaf state diff + missing event.
+
+**rskj source**: `co.rsk.peg.btcLockSender.*` (PAPYRUS-2.0.0),
+`BridgeUtils.txIsProcessable`, `BridgeSupport.txIsLockable/
+registerBtcTransaction`.
+
+**rustock**: `bridge/peg.rs` (`PeginSender`, `classify_pegin_sender`,
+`is_sent_to_multisig`, lockable/processable gates, P2SH refunds,
+`sender_base58_address` for the lock_btc event).
+
+---
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`

@@ -265,31 +265,49 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     }
 
-    // Legacy (protocol v0) peg-ins require a P2PKH sender; without one the
-    // sender is undetermined and rskj aborts without marking as processed.
-    let Some(sender_pubkey) = btc_sender_pubkey(&btc_tx) else {
+    // Sender classification (rskj BtcLockSenderProvider). No parser match,
+    // or a non-P2PKH type before RSKIP143 (txIsProcessable), aborts WITHOUT
+    // marking the tx as processed.
+    let Some(sender) = classify_pegin_sender(&btc_tx) else {
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     };
-    let sender_hash160 = pubkey_hash160(&sender_pubkey);
+    let rskip143 = hardfork_cfg.has_rskip143(rsk_height);
+    if !matches!(sender, PeginSender::P2pkh { .. }) && !rskip143 {
+        return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
+    }
+    // rskj txIsLockable: only P2PKH and (post-RSKIP143) P2SH-P2WPKH senders
+    // can lock; other processable types are refunded ("Btc tx type not
+    // supported, returning funds to sender") without consulting the
+    // whitelist or the locking cap.
+    let (sender_hash160, sender_is_p2sh, sender_pubkey, lockable): ([u8; 20], bool, Option<&[u8]>, bool) =
+        match &sender {
+            PeginSender::P2pkh { pubkey } => (pubkey_hash160(pubkey), false, Some(pubkey), true),
+            PeginSender::P2shP2wpkh { pubkey, p2sh_hash } => {
+                (*p2sh_hash, true, Some(pubkey), true)
+            }
+            PeginSender::P2shMultisig { p2sh_hash } | PeginSender::P2shP2wsh { p2sh_hash } => {
+                (*p2sh_hash, true, None, false)
+            }
+        };
 
     // Lock whitelist gate (rskj verifyLockSenderIsWhitelisted): the matching
     // one-off entry is consumed on success; rejection generates a refund
     // peg-out back to the sender (generateRejectionRelease).
-    let wl_allowed = whitelist_allows_and_consume(ctx, &sender_hash160, total_value, btc_block_height);
-    tracing::debug!(
-        "pegin whitelist check: sender {} amount {} btc_height {} -> {}",
-        to_hex(&sender_hash160),
-        total_value,
-        btc_block_height,
-        wl_allowed
-    );
     // Locking cap gate (rskj verifyLockDoesNotSurpassLockingCap, RSKIP134):
     // evaluated only when the whitelist passed (rskj short-circuits the &&,
     // so a whitelist rejection never lazily initializes the cap). A cap
     // rejection produces the same refund release as a whitelist one.
-    let allowed = wl_allowed
+    let allowed = lockable
+        && whitelist_allows_and_consume(ctx, &sender_hash160, total_value, btc_block_height)
         && (!hardfork_cfg.has_rskip134(rsk_height)
             || verify_lock_does_not_surpass_locking_cap(ctx, config, total_value));
+    tracing::debug!(
+        "pegin lock check: sender {} amount {} btc_height {} -> {}",
+        to_hex(&sender_hash160),
+        total_value,
+        btc_block_height,
+        allowed
+    );
     if !allowed {
         // TODO(rustock): a rejected peg-in paying BOTH live federations would
         // need per-input redeem scripts in the refund; none exists on
@@ -319,7 +337,11 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
         };
         let fee_per_kb = get_effective_fee_per_kb(ctx, config);
         let tx_version = if hardfork_cfg.has_rskip201(rsk_height) { 2 } else { 1 };
-        let refund_script = p2pkh_output_script(&sender_hash160);
+        let refund_script = if sender_is_p2sh {
+            p2sh_output_script(&sender_hash160)
+        } else {
+            p2pkh_output_script(&sender_hash160)
+        };
         let built = super::release_tx::build_empty_wallet_to(
             &pegin_utxos,
             &refund_script,
@@ -363,11 +385,12 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     // the sender's public key (ethereumj ECKey.getAddress over the
     // UNCOMPRESSED point — mainnet #267,460 used a 65-byte pubkey).
     // OP_RETURN-embedded destinations are pegin v1, RSKIP170+.
+    let sender_rsk_address =
+        sender_pubkey.and_then(super::federation::rsk_address_from_public_key);
     let rsk_destination = if hardfork_cfg.has_rskip170(rsk_height) {
-        extract_rsk_destination(&btc_tx)
-            .or_else(|| super::federation::rsk_address_from_public_key(&sender_pubkey))
+        extract_rsk_destination(&btc_tx).or(sender_rsk_address)
     } else {
-        super::federation::rsk_address_from_public_key(&sender_pubkey)
+        sender_rsk_address
     };
 
     // Credit the derived destination address (transfer from Bridge balance)
@@ -382,8 +405,8 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
             let protocol_version = if has_op_return_destination(&btc_tx) { 1 } else { 0 };
             super::events::log_pegin_btc(ctx, dest, &txid_bytes, total_value, protocol_version);
         } else if hardfork_cfg.has_rskip146(rsk_height) {
-            let sender = btc_sender_base58(&btc_tx, config).unwrap_or_default();
-            super::events::log_lock_btc(ctx, dest, &txid_bytes, &sender, total_value);
+            let sender_addr = sender_base58_address(&sender_hash160, sender_is_p2sh, config);
+            super::events::log_lock_btc(ctx, dest, &txid_bytes, &sender_addr, total_value);
         }
     }
 
@@ -407,19 +430,122 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     Ok(PrecompileOutput::new(gas_cost, Bytes::new()))
 }
 
-/// The peg-in sender's public key from the first input's P2PKH scriptSig
-/// (`<sig> <pubkey>`, compressed or uncompressed) — rskj BtcLockSender.
-fn btc_sender_pubkey(tx: &BtcTransaction) -> Option<Vec<u8>> {
-    let script = tx.input.first()?.script_sig.as_bytes();
-    let chunks = super::release_tx::parse_chunks(script)?;
-    match chunks.as_slice() {
-        [super::release_tx::Chunk::Data(_sig), super::release_tx::Chunk::Data(pubkey)]
-            if pubkey.len() == 33 || pubkey.len() == 65 =>
-        {
-            Some(pubkey.clone())
+/// rskj `BtcLockSender.TxType`: the peg-in sender classification derived
+/// from the FIRST input. `hash160` is the sender's BTC address hash (pubkey
+/// hash for P2PKH, script hash for the P2SH variants) — what rskj's
+/// `senderBtcAddress` carries into the whitelist check and the refund.
+enum PeginSender {
+    P2pkh { pubkey: Vec<u8> },
+    P2shP2wpkh { pubkey: Vec<u8>, p2sh_hash: [u8; 20] },
+    P2shMultisig { p2sh_hash: [u8; 20] },
+    P2shP2wsh { p2sh_hash: [u8; 20] },
+}
+
+/// bitcoinj `Script.isSentToMultiSig` over a redeem script.
+fn is_sent_to_multisig(redeem: &[u8]) -> bool {
+    use super::release_tx::{parse_chunks, Chunk};
+    let decode_op_n = |op: u8| -> Option<u8> {
+        // bitcoinj decodeFromOpN: OP_1..OP_16 (OP_0/OP_1NEGATE decode below 1).
+        match op {
+            0x51..=0x60 => Some(op - 0x50),
+            _ => None,
         }
-        _ => None,
+    };
+    let Some(chunks) = parse_chunks(redeem) else { return false };
+    if chunks.len() < 4 {
+        return false;
     }
+    let Chunk::Op(last) = chunks[chunks.len() - 1] else { return false };
+    if last != 0xae && last != 0xaf {
+        return false; // CHECKMULTISIG / CHECKMULTISIGVERIFY
+    }
+    let Chunk::Op(n_op) = chunks[chunks.len() - 2] else { return false };
+    let Some(num_keys) = decode_op_n(n_op) else { return false };
+    if chunks.len() != 3 + num_keys as usize {
+        return false;
+    }
+    if chunks[1..chunks.len() - 2].iter().any(|c| !matches!(c, Chunk::Data(_))) {
+        return false;
+    }
+    let Chunk::Op(m_op) = chunks[0] else { return false };
+    decode_op_n(m_op).is_some()
+}
+
+/// rskj `BtcLockSenderProvider.tryGetBtcLockSender`: try P2PKH, then
+/// P2SH-P2WPKH, then P2SH-MULTISIG, then P2SH-P2WSH — all on the first
+/// input. Returns `None` when no parser matches (rskj then returns from
+/// registerBtcTransaction WITHOUT marking the tx as processed).
+fn classify_pegin_sender(tx: &BtcTransaction) -> Option<PeginSender> {
+    use super::release_tx::{parse_chunks, Chunk};
+    let first = tx.input.first()?;
+    let chunks = parse_chunks(first.script_sig.as_bytes())?;
+
+    // P2PKH: scriptSig is exactly [sig, pubkey] with a valid curve point
+    // (rskj derives both the BTC and RSK addresses from it).
+    if let [Chunk::Data(_sig), Chunk::Data(pubkey)] = chunks.as_slice() {
+        if compress_pubkey(pubkey).is_some() {
+            return Some(PeginSender::P2pkh { pubkey: pubkey.clone() });
+        }
+    }
+
+    let witness: Vec<&[u8]> = first.witness.iter().collect();
+
+    // P2SH-P2WPKH: single-chunk scriptSig, witness [sig, compressed pubkey];
+    // P2SH hash = hash160(0x0014 || hash160(pubkey)).
+    if chunks.len() == 1 && witness.len() == 2 {
+        let pubkey = witness[1];
+        if pubkey.len() == 33 && compress_pubkey(pubkey).is_some() {
+            let mut redeem = vec![0x00, 0x14];
+            redeem.extend_from_slice(&pubkey_hash160(pubkey));
+            return Some(PeginSender::P2shP2wpkh {
+                pubkey: pubkey.to_vec(),
+                p2sh_hash: pubkey_hash160(&redeem),
+            });
+        }
+    }
+
+    // P2SH-MULTISIG: scriptSig [.., sigs.., redeem] with a multisig redeem;
+    // P2SH hash = hash160(redeem).
+    if chunks.len() >= 3 {
+        if let Some(Chunk::Data(redeem)) = chunks.last() {
+            if is_sent_to_multisig(redeem) {
+                return Some(PeginSender::P2shMultisig { p2sh_hash: pubkey_hash160(redeem) });
+            }
+        }
+    }
+
+    // P2SH-P2WSH: single-chunk scriptSig, witness [.., sigs.., redeem] with
+    // a multisig redeem; P2SH hash = hash160(0x0020 || sha256(redeem)).
+    if chunks.len() == 1 && witness.len() >= 3 {
+        let redeem = witness[witness.len() - 1];
+        if is_sent_to_multisig(redeem) {
+            use sha2::Digest;
+            let mut merged = vec![0x00, 0x20];
+            merged.extend_from_slice(&sha2::Sha256::digest(redeem));
+            return Some(PeginSender::P2shP2wsh { p2sh_hash: pubkey_hash160(&merged) });
+        }
+    }
+
+    None
+}
+
+/// Base58Check address string for the peg-in sender (rskj
+/// `senderBtcAddress.toString()`, used in the lock_btc event).
+fn sender_base58_address(
+    hash160: &[u8; 20],
+    p2sh: bool,
+    config: &BridgeConstants,
+) -> String {
+    let version: u8 = match (config.btc_network, p2sh) {
+        (super::constants::BtcNetwork::Mainnet, false) => 0,
+        (super::constants::BtcNetwork::Mainnet, true) => 5,
+        (_, false) => 111,
+        (_, true) => 196,
+    };
+    let mut payload = [0u8; 21];
+    payload[0] = version;
+    payload[1..].copy_from_slice(hash160);
+    bitcoin::base58::encode_check(&payload)
 }
 
 /// rskj `BridgeSupport.getLockingCap` (RSKIP134): lazily initializes the cap
@@ -1448,27 +1574,6 @@ fn has_op_return_destination(tx: &BtcTransaction) -> bool {
     tx.output.iter().any(|o| o.script_pubkey.is_op_return())
 }
 
-/// Base58Check P2PKH address of the peg-in sender (first input's public key).
-fn btc_sender_base58(tx: &BtcTransaction, config: &BridgeConstants) -> Option<String> {
-    let first_input = tx.input.first()?;
-    let script_bytes = first_input.script_sig.as_bytes();
-    if script_bytes.len() < 34 {
-        return None;
-    }
-    let pubkey_len = script_bytes[script_bytes.len() - 34] as usize;
-    if pubkey_len != 33 {
-        return None;
-    }
-    let pubkey = &script_bytes[script_bytes.len() - 33..];
-    let network = match config.btc_network {
-        super::constants::BtcNetwork::Mainnet => bitcoin::Network::Bitcoin,
-        super::constants::BtcNetwork::Testnet => bitcoin::Network::Testnet,
-        super::constants::BtcNetwork::Regtest => bitcoin::Network::Regtest,
-    };
-    let key = bitcoin::PublicKey::from_slice(pubkey).ok()?;
-    Some(bitcoin::Address::p2pkh(key.pubkey_hash(), network).to_string())
-}
-
 /// Compress a SEC1 public key (33- or 65-byte) to its 33-byte form.
 fn compress_pubkey(key: &[u8]) -> Option<[u8; 33]> {
     use k256::elliptic_curve::sec1::ToEncodedPoint;
@@ -1984,10 +2089,9 @@ fn extract_rsk_destination(btc_tx: &BtcTransaction) -> Option<RskAddress> {
         }
     }
 
-    // 2. Fall back to deriving from the first input's P2PKH public key
-    // (compressed or uncompressed).
-    btc_sender_pubkey(btc_tx)
-        .and_then(|pk| super::federation::rsk_address_from_public_key(&pk))
+    // No OP_RETURN destination; the caller falls back to the sender's
+    // pubkey-derived address.
+    None
 }
 
 /// Convert BTC satoshis to RBTC wei.
@@ -2522,7 +2626,53 @@ mod tests {
             }],
             output: vec![],
         };
-        assert_eq!(btc_sender_pubkey(&tx), Some(pubkey));
+        match classify_pegin_sender(&tx) {
+            Some(PeginSender::P2pkh { pubkey: parsed }) => assert_eq!(parsed, pubkey),
+            other => panic!("expected P2PKH sender, got {}", other.is_some()),
+        }
+    }
+
+    /// rskj BtcLockSenderProvider: a P2SH-multisig first input (OP_0,
+    /// signatures, multisig redeem) classifies as P2SHMULTISIG with the
+    /// sender address = P2SH(hash160(redeem)) — processable post-RSKIP143
+    /// but NOT lockable (refunded). Groundtruth shape from mainnet
+    /// #2,851,909 tx 2.
+    #[test]
+    fn classify_p2sh_multisig_pegin_sender() {
+        // 2-of-3 multisig redeem with valid-shape compressed keys.
+        let mut redeem = vec![0x52];
+        for i in 0..3u8 {
+            redeem.push(33);
+            let mut k = [0x02u8; 33];
+            k[32] = i;
+            redeem.extend_from_slice(&k);
+        }
+        redeem.push(0x53);
+        redeem.push(0xae);
+        let mut script = vec![0x00, 71];
+        script.extend_from_slice(&[0x30; 71]);
+        script.push(71);
+        script.extend_from_slice(&[0x30; 71]);
+        script.push(0x4c); // PUSHDATA1
+        script.push(redeem.len() as u8);
+        script.extend_from_slice(&redeem);
+        let tx = BtcTransaction {
+            version: bitcoin::transaction::Version(1),
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: Default::default(),
+                script_sig: bitcoin::ScriptBuf::from_bytes(script),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![],
+        };
+        match classify_pegin_sender(&tx) {
+            Some(PeginSender::P2shMultisig { p2sh_hash }) => {
+                assert_eq!(p2sh_hash, pubkey_hash160(&redeem));
+            }
+            other => panic!("expected P2SH-multisig sender, got {}", other.is_some()),
+        }
     }
 
     /// Conversion: 1 satoshi = 10^10 wei.
