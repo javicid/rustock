@@ -36,6 +36,11 @@ fn main() -> anyhow::Result<()> {
     let processor = BlockProcessor::new(RskHardforkConfig::mainnet(), store.clone());
 
     for n in exec_number + 1..=number {
+        // The all-ops tracer flag is read per execute_block; enable it only
+        // for the target block so range replays stay tractable.
+        if n == number && std::env::var_os("RUSTOCK_TRACE_TARGET_OPS").is_some() {
+            std::env::set_var("RUSTOCK_TRACE_ALL_OPS", "1");
+        }
         let hash = store.canonical_hash(n)?.expect("canonical hash");
         let header = store.header(hash)?.expect("header");
         let (transactions, ommers) = store.body(hash)?.expect("body");

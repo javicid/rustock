@@ -77,6 +77,13 @@ pub struct RskHandler<CTX, ERROR, FRAME> {
     /// pays no expansion). `Some` holds the block's active precompile
     /// addresses; `None` disables the quirk (RSKIP150 active).
     pre_rskip150_precompiles: Option<Vec<Address>>,
+    /// Active precompile addresses at this block, used to replicate rskj's
+    /// returnDataBuffer semantics: `Program.callToAddress` resets the
+    /// caller's buffer only inside `executeCode` (callee HAS code) and
+    /// `callToPrecompiledAddress`; a call that executes nothing — empty-code
+    /// callee, depth limit, insufficient endowment — leaves the PREVIOUS
+    /// call's return data in place, where canonical EVM (EIP-211) clears it.
+    active_precompiles: Vec<Address>,
     _phantom: core::marker::PhantomData<(CTX, ERROR, FRAME)>,
 }
 
@@ -85,7 +92,13 @@ impl<CTX, ERROR, FRAME> RskHandler<CTX, ERROR, FRAME> {
         empty_create_on_unpayable_deposit: bool,
         invisible_exception: Arc<AtomicBool>,
     ) -> Self {
-        Self::with_rskip125(empty_create_on_unpayable_deposit, false, invisible_exception, None)
+        Self::with_rskip125(
+            empty_create_on_unpayable_deposit,
+            false,
+            invisible_exception,
+            None,
+            Vec::new(),
+        )
     }
 
     pub fn with_rskip125(
@@ -93,12 +106,14 @@ impl<CTX, ERROR, FRAME> RskHandler<CTX, ERROR, FRAME> {
         rskip125_active: bool,
         invisible_exception: Arc<AtomicBool>,
         pre_rskip150_precompiles: Option<Vec<Address>>,
+        active_precompiles: Vec<Address>,
     ) -> Self {
         Self {
             empty_create_on_unpayable_deposit,
             rskip125_active,
             invisible_exception,
             pre_rskip150_precompiles,
+            active_precompiles,
             _phantom: core::marker::PhantomData,
         }
     }
@@ -211,6 +226,10 @@ where
             // Pre-RSKIP150 unbounded precompile output write, applied to the
             // caller after `frame_return_result` (see field docs).
             let mut unbounded_output: Option<(usize, Bytes)> = None;
+            // rskj returnDataBuffer preservation: the caller's previous
+            // return data, restored after `frame_return_result` when rskj
+            // would not have touched the buffer (see field docs).
+            let mut preserved_return_buffer: Option<Bytes> = None;
 
             let result = match call_or_result {
                 ItemOrResult::Item(init) => {
@@ -233,7 +252,9 @@ where
                             continue;
                         }
                         // Do not pop the frame since no new frame was created:
-                        // this is how a CALL to a precompile resolves.
+                        // this is how a CALL to a precompile, an empty-code
+                        // account, or a failed pre-check (depth/endowment)
+                        // resolves.
                         ItemOrResult::Result(result) => {
                             if let (Some(precompiles), Some(callee), FrameResult::Call(outcome)) =
                                 (&self.pre_rskip150_precompiles, callee, &result)
@@ -247,6 +268,34 @@ where
                                         outcome.result.output.clone(),
                                     ));
                                 }
+                            }
+                            // rskj: only executed code and precompile calls
+                            // reset the caller's returnDataBuffer; a CALL
+                            // resolved without running anything keeps the
+                            // previous buffer (mainnet #2,669,886: RETURNDATASIZE
+                            // after a value transfer to an empty account still
+                            // reports the prior call's 32-byte output).
+                            // For CREATE only the pre-checks (depth/endowment)
+                            // return before rskj's reset.
+                            let rskj_preserves = match &result {
+                                FrameResult::Call(_) => callee
+                                    .is_some_and(|c| !self.active_precompiles.contains(&c)),
+                                FrameResult::Create(outcome) => matches!(
+                                    outcome.instruction_result(),
+                                    InstructionResult::CallTooDeep
+                                        | InstructionResult::OutOfFunds
+                                ),
+                            };
+                            if rskj_preserves {
+                                use revm::interpreter::interpreter_types::ReturnData;
+                                preserved_return_buffer = Some(
+                                    evm.frame_stack()
+                                        .get()
+                                        .interpreter
+                                        .return_data
+                                        .buffer()
+                                        .clone(),
+                                );
                             }
                             result
                         }
@@ -268,6 +317,11 @@ where
             }
             if let Some((mem_start, output)) = unbounded_output {
                 write_unbounded_precompile_output(evm, mem_start, &output);
+            }
+            if let Some(buffer) = preserved_return_buffer {
+                use revm::interpreter::interpreter_types::ReturnData;
+                // Undo revm's insert_call_outcome buffer clear (EIP-211).
+                evm.frame_stack().get().interpreter.return_data.set_buffer(buffer);
             }
         }
     }

@@ -1095,6 +1095,44 @@ gate per input, returning with earlier inputs kept), regression test
 
 ---
 
+## 26. returnDataBuffer survives calls that execute nothing (no EIP-211 clear)
+
+rskj's `Program` resets the caller's `returnDataBuffer` only inside
+`executeCode` (the callee HAS code), inside `callToPrecompiledAddress`,
+and inside `getProgramResult` (CREATE with the init actually attempted).
+A CALL-family op that resolves WITHOUT running anything — empty-code
+callee (plain value transfer), call-depth limit, insufficient endowment
+— returns early and leaves the PREVIOUS call's return data in the
+buffer. Canonical EVM (EIP-211) clears the buffer on every call-family
+instruction. The same applies to CREATE's depth/endowment pre-checks.
+
+So in rskj, `RETURNDATASIZE`/`RETURNDATACOPY` after a value transfer to
+an EOA still see the prior call's output — and Solidity's generated
+`call(...)` return-value handling (`if returndatasize == expected`)
+takes the OTHER branch.
+
+**Trigger**: mainnet #2,669,886 — a Uniswap-style router's
+addLiquidityETH ends with a dust refund (`to.call{value}("")` to an
+EOA); the following RETURNDATASIZE check saw 0 in rustock vs 32 (the
+prior mint() output) in rskj: −76 gas from the divergent branch, same
+logs, receipts+state root mismatch via cumulative gas/fees only.
+Diagnosed with the per-opcode oracle (first divergence: one JUMPI taking
+different branches at equal gas).
+
+**rskj source**: `org.ethereum.vm.program.Program.callToAddress`
+(empty-code path commits without touching the buffer) /
+`executeCode`/`callToPrecompiledAddress`/`getProgramResult`
+(PAPYRUS-2.0.0; unchanged in modern rskj).
+
+**rustock**: `rsk_handler.rs` `run_exec_loop` — when `frame_init`
+resolves a Call without creating a frame and the callee is not an
+active precompile (or a Create fails its depth/endowment pre-checks),
+the caller's return buffer is snapshotted and restored after
+`frame_return_result` undoes revm's EIP-211 clear. Regression test
+`test_empty_code_call_preserves_return_data_buffer`.
+
+---
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`
