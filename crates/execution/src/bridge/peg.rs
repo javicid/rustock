@@ -1901,6 +1901,16 @@ fn apply_signatures_to_tx(
         if input_signed_by(tx, i, fed_key, &sighashes[i]) {
             break;
         }
+        // rskj getSigInsertionIndex -> findKeyInRedeem throws when the
+        // federator's key is not in this input's redeem script (e.g. a
+        // NEW-federation member signing a migration tx that spends the OLD
+        // federation's UTXOs); processSigning catches it and returns,
+        // keeping any inputs already signed in this call. The signature
+        // verified fine against the federator's own key, so without this
+        // gate it would fill a placeholder it has no claim to (#2,448,984).
+        if !super::release_tx::redeem_script_keys(&redeems[i]).contains(fed_key) {
+            return signed;
+        }
         let mut encoded = sigs[i].clone();
         encoded.push(0x01); // SIGHASH_ALL
         let script_sig = tx.input[i].script_sig.as_bytes().to_vec();
@@ -2095,6 +2105,61 @@ pub fn get_estimated_fees_for_pegout_amount<CTX: crate::RskContextTr>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression for mainnet #2,448,984: a federator whose key is NOT in an
+    /// input's redeem script (a NEW-federation member signing the migration
+    /// tx that spends the OLD federation's UTXOs) must not have its
+    /// signature applied — rskj's getSigInsertionIndex/findKeyInRedeem
+    /// throws and processSigning returns. The signature itself verifies
+    /// against the federator's own key, so only redeem membership blocks it.
+    #[test]
+    fn add_signature_rejects_key_not_in_redeem_script() {
+        use k256::ecdsa::signature::hazmat::PrehashSigner;
+        use k256::ecdsa::{Signature, SigningKey};
+
+        let key_pair = |seed: u8| {
+            let sk = SigningKey::from_slice(&[seed; 32]).unwrap();
+            let pk: [u8; 33] = sk
+                .verifying_key()
+                .to_encoded_point(true)
+                .as_bytes()
+                .try_into()
+                .unwrap();
+            (sk, pk)
+        };
+        let members: Vec<_> = (1u8..=3).map(key_pair).collect();
+        let (outsider_sk, outsider_pk) = key_pair(9);
+        let member_keys: Vec<[u8; 33]> = members.iter().map(|(_, pk)| *pk).collect();
+        let redeem = build_federation_redeem_script(&member_keys, 2);
+
+        let mut tx = BtcTransaction {
+            version: bitcoin::transaction::Version::ONE,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::null(),
+                script_sig: bitcoin::ScriptBuf::from_bytes(
+                    super::super::release_tx::placeholder_scriptsig(&redeem, 2),
+                ),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![],
+        };
+        let sighash = super::super::release_tx::legacy_sighash_all(&tx, 0, &redeem);
+        let sign = |sk: &SigningKey| {
+            let sig: Signature = sk.sign_prehash(&sighash).unwrap();
+            sig.to_der().as_bytes().to_vec()
+        };
+
+        // Outsider: verifies against its own key but is not in the redeem.
+        let before = tx.input[0].script_sig.clone();
+        assert!(!apply_signatures_to_tx(&mut tx, &[sign(&outsider_sk)], &outsider_pk));
+        assert_eq!(tx.input[0].script_sig, before, "script must be untouched");
+
+        // Member: applied normally.
+        assert!(apply_signatures_to_tx(&mut tx, &[sign(&members[0].0)], &members[0].1));
+        assert_ne!(tx.input[0].script_sig, before);
+    }
 
     #[test]
     fn satoshi_to_wei_conversion() {

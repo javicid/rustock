@@ -1059,6 +1059,42 @@ before papyrus), `executor.rs` install sites + regression test
 
 ---
 
+## 25. addSignature: redeem-script membership gates application (not the event)
+
+In `BridgeSupport.processSigning`, a federator's signatures are verified
+against the federator's OWN public key — membership in the *federation*
+admits the call, but only membership in the input's *redeem script*
+admits the insertion: `Script.getSigInsertionIndex` →
+`findKeyInRedeem` throws `IllegalStateException` when the key is not
+among the redeem keys, and processSigning catches it ("a member of the
+active federation is trying to sign a tx of the retiring one") and
+returns. Crucially the `add_signature` event was already emitted before
+verification (pre-RSKIP326), so an ineffective vote is
+indistinguishable from an effective one in the logs of that tx.
+
+The mid-loop return also means inputs signed in earlier iterations of
+the same call KEEP their signatures (the cached BtcTransaction was
+mutated in place and is persisted by the provider save).
+
+**Trigger**: mainnet #2,448,984 — the first funds-migration pegout of
+the 2019 federation change being signed. tx[4]'s federator is a
+new-federation-only member; its signature verifies against its own key
+but its key is not in the old federation's 5-of-9 redeem script. rskj
+skipped the insertion (completing the pegout at tx[5]); rustock's
+`sig_insertion_index` returned a fallback index and inserted it,
+completing at tx[4] with a foreign signature — receipts root mismatch
+(`release_btc` one tx early), exact gas.
+
+**rskj source**: `co.rsk.peg.BridgeSupport.processSigning`
+(PAPYRUS-2.0.0), `co.rsk.bitcoinj.script.Script.getSigInsertionIndex/
+findKeyInRedeem`.
+
+**rustock**: `bridge/peg.rs` `apply_signatures_to_tx` (redeem-membership
+gate per input, returning with earlier inputs kept), regression test
+`add_signature_rejects_key_not_in_redeem_script`.
+
+---
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`
