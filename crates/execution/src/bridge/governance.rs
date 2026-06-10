@@ -578,14 +578,20 @@ fn store_fee_per_kb_election<CTX: crate::RskContextTr>(
     election: &[(Vec<u8>, Vec<alloy_primitives::Address>)],
 ) {
     use super::serialization::{rlp_encode_element, rlp_encode_list};
-    let mut entries: Vec<(Vec<u8>, &Vec<alloy_primitives::Address>)> = election
+    // rskj sorts by ABICallSpec.byBytesComparator: SIGNED-byte order of
+    // getEncoded() = "setFeePerKb" || serializeCoin(fee).
+    let mut entries: Vec<(Vec<u8>, Vec<u8>, &Vec<alloy_primitives::Address>)> = election
         .iter()
-        .map(|(coin, voters)| (serialize_fee_per_kb_spec(coin), voters))
+        .map(|(coin, voters)| {
+            let mut encoded = b"setFeePerKb".to_vec();
+            encoded.extend_from_slice(coin);
+            (encoded, serialize_fee_per_kb_spec(coin), voters)
+        })
         .collect();
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries.sort_by(|a, b| super::vote::signed_bytes_cmp(&a.0, &b.0));
 
     let mut items = Vec::with_capacity(entries.len() * 2);
-    for (spec, voters) in entries {
+    for (_, spec, voters) in entries {
         items.push(spec);
         let mut sorted: Vec<&alloy_primitives::Address> = voters.iter().collect();
         sorted.sort();

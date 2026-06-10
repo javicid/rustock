@@ -966,6 +966,43 @@ release_requested).
 
 ---
 
+## 22. Election Spec Ordering: SIGNED-byte comparison of getEncoded()
+
+`BridgeSerializationUtils.serializeElection` sorts the vote specs with
+`ABICallSpec.byBytesComparator`, which is Guava
+`SignedBytes.lexicographicalComparator()` over `ABICallSpec.getEncoded()`:
+
+- **getEncoded() is NOT the RLP serialization** — it is the raw
+  concatenation of the function-name UTF-8 bytes and each argument's raw
+  bytes.
+- **Bytes compare as SIGNED Java bytes**: 0x80–0xff are negative and sort
+  BEFORE 0x00–0x7f. A compressed pubkey arg starting `03b6...` sorts before
+  `0325...` and `0372...` — the opposite of unsigned order.
+
+Voters within an entry sort by *unsigned* lexicographic order
+(`RskAddress.LEXICOGRAPHICAL_COMPARATOR`, Guava UnsignedBytes) — the two
+comparators differ on purpose.
+
+This applies to both elections: `federationElection` and
+`feePerKbElection` (spec encoded = `"setFeePerKb" || serializeCoin(fee)`).
+
+**Trigger**: mainnet #2,426,416 — the third concurrent add-multi vote of
+the 2019 federation change introduced a member key whose second byte was
+0xb6 (negative as i8). rustock sorted the three specs unsigned (25, 72,
+b6); rskj signed (b6, 25, 72): same entries, same lengths, different
+order, one-leaf state-root divergence with exact gas match (156,016).
+
+**rskj source**: `co.rsk.peg.ABICallSpec.byBytesComparator/getEncoded`,
+`BridgeSerializationUtils.serializeElection/serializeVoters`
+(PAPYRUS-2.0.0; unchanged in modern rskj).
+
+**rustock**: `bridge/vote.rs` (`signed_bytes_cmp`, `AbiCallSpec::encoded`,
+`Election::to_bytes`), `bridge/governance.rs`
+(`store_fee_per_kb_election`). Byte-exact groundtruth test from the
+mainnet cell: `rskj_election_signed_byte_spec_order_groundtruth_2426416`.
+
+---
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`
