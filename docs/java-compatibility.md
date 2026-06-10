@@ -791,6 +791,30 @@ while mainnet gas limits keep the top byte < 0x80 (6.8M = 0x67C280), but a
 
 ---
 
+## 18. ethereumj ABI: Empty `bytes` Pads to One Full Zero Word
+
+**rskj behavior**: native contracts encode return values with ethereumj's
+`SolidityType.BytesType.encode`, which pads with `((len - 1) / 32 + 1) * 32`
+bytes. Java integer division gives `-1/32 == 0`, so an EMPTY byte array pads
+to 32 zero bytes: the ABI encoding of empty `bytes` is 96 bytes
+(offset + length=0 + one zero word), not the canonical 64.
+
+**Trigger**: mainnet #1,669,062 — `getCoinbaseAddress(4000)` hits
+BlockHeaderContract's `MAX_DEPTH` bound (`BlockAccessor.getBlock`:
+`depth >= 4000 → Optional.empty`) and returns the empty result. The caller's
+RETURNDATACOPY copies 3 words in rskj vs 2 in rustock: −3 gas (header
+3,013,192 vs computed 3,013,189). After the fix the full 176,338-opcode
+trace is byte-identical to rskj's.
+
+**rskj source**: `org.ethereum.solidity.SolidityType.BytesType#encode`.
+
+**rustock**: `abi_encode_bytes` in `precompiles.rs` (used by the
+BlockHeaderContract and HDWalletUtils result paths). The bridge's separate
+encoders still encode canonically; no current bridge method/event emits
+empty dynamic bytes (TODO note to audit if one ever does).
+
+---
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`

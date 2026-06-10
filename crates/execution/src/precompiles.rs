@@ -319,11 +319,23 @@ fn parse_int256_as_depth(data: &[u8]) -> Result<i16, DepthError> {
     }
 }
 
-/// ABI-encode raw bytes as a Solidity `bytes` return value.
+/// ABI-encode raw bytes as a Solidity `bytes` return value, replicating
+/// ethereumj's `SolidityType.BytesType.encode`.
 ///
 /// Layout: 32-byte offset (0x20) | 32-byte length | data (right-padded to 32).
+///
+/// ethereumj pads with `((len - 1) / 32 + 1) * 32` — Java's `-1/32 == 0`
+/// makes EMPTY bytes pad to one full zero word (96 bytes total instead of
+/// the canonical 64). The extra returndata word is consensus-visible
+/// (RETURNDATACOPY copy gas): mainnet #1,669,062 calls
+/// getCoinbaseAddress(4000) (≥ MAX_DEPTH → empty result) and rskj's reply
+/// is 96 bytes.
 fn abi_encode_bytes(data: &[u8]) -> Vec<u8> {
-    let padded_len = data.len().div_ceil(32) * 32;
+    let padded_len = if data.is_empty() {
+        32
+    } else {
+        data.len().div_ceil(32) * 32
+    };
     let mut out = vec![0u8; 64 + padded_len];
     // offset → 0x20
     out[31] = 0x20;
@@ -1151,6 +1163,9 @@ impl RskPrecompileProvider {
             ));
         }
 
+        if std::env::var_os("RUSTOCK_TRACE_BH").is_some() {
+            tracing::debug!("BH enter input=0x{}", alloy_primitives::hex::encode(input));
+        }
         let selector = [input[0], input[1], input[2], input[3]];
         let empty_result = || PrecompileOutput::new(gas_cost, abi_encode_bytes(&[]).into());
 
@@ -1275,6 +1290,14 @@ impl RskPrecompileProvider {
             ));
         };
 
+        if std::env::var_os("RUSTOCK_TRACE_BH").is_some() {
+            tracing::debug!(
+                "BH input=0x{} target=#{} result=0x{}",
+                alloy_primitives::hex::encode(input),
+                target_number,
+                alloy_primitives::hex::encode(&result_bytes),
+            );
+        }
         Ok(PrecompileOutput::new(gas_cost, abi_encode_bytes(&result_bytes).into()))
     }
 
@@ -2041,12 +2064,15 @@ mod tests {
 
     #[test]
     fn test_abi_encode_bytes_empty() {
+        // ethereumj BytesType.encode pads EMPTY bytes to one full zero word
+        // ((0-1)/32+1 == 1 in Java), so the encoding is 96 bytes, not the
+        // canonical 64 (offset + length + one padding word).
         let encoded = abi_encode_bytes(&[]);
-        assert_eq!(encoded.len(), 64);
+        assert_eq!(encoded.len(), 96);
         // offset = 0x20
         assert_eq!(encoded[31], 0x20);
-        // length = 0
-        assert!(encoded[32..64].iter().all(|&b| b == 0));
+        // length = 0, padding word = 0
+        assert!(encoded[32..96].iter().all(|&b| b == 0));
     }
 
     #[test]
@@ -2323,16 +2349,17 @@ mod tests {
         assert_eq!(encoded, expected, "ABI encoding of 32-byte hash must match Solidity spec");
     }
 
-    /// Verify ABI encoding of empty bytes: offset=0x20, length=0, no data.
+    /// Verify ABI encoding of empty bytes matches ethereumj (NOT canonical
+    /// Solidity): offset=0x20, length=0, plus one zero padding word.
     #[test]
     fn test_abi_encode_bytes_solidity_compat_empty() {
         let encoded = abi_encode_bytes(&[]);
 
-        let mut expected = vec![0u8; 64];
+        let mut expected = vec![0u8; 96];
         expected[31] = 0x20;
-        // length = 0 (all zeros)
+        // length = 0, padding word = 0 (all zeros)
 
-        assert_eq!(encoded, expected, "ABI encoding of empty bytes must be 64 bytes");
+        assert_eq!(encoded, expected, "empty bytes must encode ethereumj-style to 96 bytes");
     }
 
     /// Verify ABI encoding of Java BigInteger bytes for rskj's MIN_GAS_PRICE.
