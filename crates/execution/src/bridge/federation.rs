@@ -218,17 +218,27 @@ mod tests {
         let outer = rlp_decode_list(&old).unwrap();
         let time = rlp_decode_u64(&outer[0]);
         let block = rlp_decode_u64(&outer[1]);
-        let keys: Vec<[u8; 33]> = rlp_decode_list(&outer[2])
+        let members: Vec<StoredMember> = rlp_decode_list(&outer[2])
             .unwrap()
-            .into_iter()
-            .map(|k| k.try_into().unwrap())
+            .iter()
+            .map(|k| StoredMember::from_stored(k).unwrap())
             .collect();
-        assert_eq!(keys.len(), 15);
+        assert_eq!(members.len(), 15);
 
         // Multikey re-serialization must match rskj byte-for-byte.
-        assert_eq!(serialize_federation_multikey(&keys, time, block), new);
+        assert_eq!(serialize_federation_multikey(&members, time, block), new);
         // And the only-BTC form must still round-trip to the pre-wasabi bytes.
+        let keys: Vec<[u8; 33]> = members.iter().map(|m| m.btc).collect();
         assert_eq!(serialize_federation_only_btc_keys(&keys, time, block), old);
+
+        // The multikey bytes decode back to the same members.
+        let reloaded = rlp_decode_list(&new).unwrap();
+        let remembers: Vec<StoredMember> = rlp_decode_list(&reloaded[2])
+            .unwrap()
+            .iter()
+            .map(|k| StoredMember::from_stored(k).unwrap())
+            .collect();
+        assert_eq!(remembers, members);
     }
 
     #[test]
@@ -280,14 +290,70 @@ mod tests {
     }
 }
 
-/// A federation stored under newFederation/oldFederation in the legacy
-/// only-BTC-keys format (pre-RSKIP123):
-/// `RLP[ creationTime(millis), creationBlockNumber, RLP[key...] ]`.
+/// A federation member as stored in bridge state: compressed BTC, RSK and
+/// MST public keys (rskj `FederationMember`). Legacy (pre-RSKIP123) members
+/// carry only a BTC key, with rsk = mst = btc
+/// (`FederationMember.getFederationMemberFromKey`). The derived ordering is
+/// rskj's `BTC_RSK_MST_PUBKEYS_COMPARATOR` (lexicographic by btc, rsk, mst).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct StoredMember {
+    pub btc: [u8; 33],
+    pub rsk: [u8; 33],
+    pub mst: [u8; 33],
+}
+
+impl StoredMember {
+    pub fn from_btc(key: [u8; 33]) -> Self {
+        Self { btc: key, rsk: key, mst: key }
+    }
+
+    /// rskj `BridgeSerializationUtils.serializeFederationMember`:
+    /// `RLP[btcKey, rskKey, mstKey]`, all compressed.
+    pub fn to_rlp(&self) -> Vec<u8> {
+        use super::serialization::{rlp_encode_element, rlp_encode_list};
+        rlp_encode_list(&[
+            rlp_encode_element(&self.btc),
+            rlp_encode_element(&self.rsk),
+            rlp_encode_element(&self.mst),
+        ])
+    }
+
+    /// Decode a member from either stored shape: a bare 33-byte compressed
+    /// BTC key (pre-RSKIP123) or `RLP[btc, rsk, mst]` (post-RSKIP123). rskj
+    /// picks the format by the presence of the format-version cell; the two
+    /// shapes are unambiguous (a compressed key starts with 0x02/0x03, an
+    /// RLP list with >= 0xc0), so shape detection is equivalent.
+    pub fn from_stored(data: &[u8]) -> Option<Self> {
+        if data.len() == 33 {
+            return Some(Self::from_btc(data.try_into().ok()?));
+        }
+        let keys = super::serialization::rlp_decode_list(data)?;
+        if keys.len() != 3 {
+            return None;
+        }
+        Some(Self {
+            btc: keys[0].as_slice().try_into().ok()?,
+            rsk: keys[1].as_slice().try_into().ok()?,
+            mst: keys[2].as_slice().try_into().ok()?,
+        })
+    }
+}
+
+/// A federation stored under newFederation/oldFederation:
+/// `RLP[ creationTime(millis), creationBlockNumber, RLP[member...] ]`, where
+/// each member is a bare BTC key (pre-RSKIP123) or an element-wrapped
+/// `RLP[btc, rsk, mst]` (post-RSKIP123).
 #[derive(Debug, Clone)]
 pub struct StoredFederation {
-    pub keys: Vec<[u8; 33]>,
+    pub members: Vec<StoredMember>,
     pub creation_time_millis: u64,
     pub creation_block: u64,
+}
+
+impl StoredFederation {
+    pub fn btc_keys(&self) -> Vec<[u8; 33]> {
+        self.members.iter().map(|m| m.btc).collect()
+    }
 }
 
 pub fn serialize_federation_only_btc_keys(
@@ -309,29 +375,18 @@ pub fn serialize_federation_only_btc_keys(
 /// Post-RSKIP123 (wasabi) federation serialization. Each member is
 /// `RLP[btcKey, rskKey, mstKey]`, wrapped as an RLP element inside the member
 /// list (rskj `BridgeSerializationUtils.serializeFederation` /
-/// `FederationMember.serialize`). Legacy members carry only a BTC key, so
-/// `rsk = mst = btc` (`FederationMember.getFederationMemberFromKey`). Members
-/// are ordered by `BTC_RSK_MST_PUBKEYS_COMPARATOR`, which for legacy members
-/// reduces to BTC-key byte order — identical to the only-BTC-keys ordering.
+/// `serializeFederationMember`). Members are ordered by
+/// `BTC_RSK_MST_PUBKEYS_COMPARATOR` (the derived `StoredMember` ordering).
 pub fn serialize_federation_multikey(
-    keys: &[[u8; 33]],
+    members: &[StoredMember],
     creation_time_millis: u64,
     creation_block: u64,
 ) -> Vec<u8> {
     use super::serialization::{rlp_encode_element, rlp_encode_list, rlp_encode_u64};
-    let mut sorted = keys.to_vec();
+    let mut sorted = members.to_vec();
     sorted.sort();
-    let member_items: Vec<Vec<u8>> = sorted
-        .iter()
-        .map(|k| {
-            let member = rlp_encode_list(&[
-                rlp_encode_element(k),
-                rlp_encode_element(k),
-                rlp_encode_element(k),
-            ]);
-            rlp_encode_element(&member)
-        })
-        .collect();
+    let member_items: Vec<Vec<u8>> =
+        sorted.iter().map(|m| rlp_encode_element(&m.to_rlp())).collect();
     rlp_encode_list(&[
         rlp_encode_u64(creation_time_millis),
         rlp_encode_u64(creation_block),
@@ -354,21 +409,14 @@ pub fn load_stored_federation<CTX: crate::RskContextTr>(
         return None;
     }
     // The member list is either only-BTC-keys (each element is a 33-byte
-    // compressed key) or, post-RSKIP123, multikey (each element is
-    // RLP[btcKey, rskKey, mstKey]). rustock tracks only BTC keys, so take the
-    // first sub-element of a multikey member. Detect by element length.
-    let keys = rlp_decode_list(&outer[2])?
-        .into_iter()
-        .filter_map(|m| {
-            if m.len() == 33 {
-                m.try_into().ok()
-            } else {
-                rlp_decode_list(&m)?.into_iter().next()?.try_into().ok()
-            }
-        })
+    // compressed key) or, post-RSKIP123, multikey (each element wraps
+    // RLP[btcKey, rskKey, mstKey]).
+    let members = rlp_decode_list(&outer[2])?
+        .iter()
+        .filter_map(|m| StoredMember::from_stored(m))
         .collect();
     Some(StoredFederation {
-        keys,
+        members,
         creation_time_millis: rlp_decode_u64(&outer[0]),
         creation_block: rlp_decode_u64(&outer[1]),
     })
@@ -398,6 +446,6 @@ pub fn save_new_federation_multikey<CTX: crate::RskContextTr>(
     };
     bridge_store_bytes_named(ctx, NEW_FEDERATION_FORMAT_VERSION_KEY, &rlp_encode_u64(1000));
     let data =
-        serialize_federation_multikey(&fed.keys, fed.creation_time_millis, fed.creation_block);
+        serialize_federation_multikey(&fed.members, fed.creation_time_millis, fed.creation_block);
     bridge_store_bytes_named(ctx, NEW_FEDERATION_KEY, &data);
 }

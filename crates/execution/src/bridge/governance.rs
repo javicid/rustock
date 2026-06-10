@@ -31,6 +31,7 @@ use alloy_primitives::{Bytes, U256};
 use revm::context_interface::ContextTr;
 use revm::precompile::{PrecompileError, PrecompileOutput};
 
+use super::federation::StoredMember;
 use super::serialization;
 use super::storage::*;
 
@@ -160,15 +161,24 @@ pub fn add_federator_public_key_multikey<CTX: crate::RskContextTr>(
     hardfork_cfg: &crate::hardfork::RskHardforkConfig,
     tx_ctx: &crate::precompiles::BridgeTxContext,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    // TODO(rustock): multikey members (RSKIP123, wasabi100) store three keys
-    // per member; the vote piping is in place but the pending-federation and
-    // federation serialization formats must move to the member format before
-    // the first post-wasabi federation change.
-    let Ok(btc_key) = decode_bytes_arg(args) else {
+    // rskj Bridge.addFederatorPublicKeyMultikey passes the three RAW arg
+    // byte arrays into the ABICallSpec (key parsing happens at vote-execution
+    // time); the spec args are what the stored election serializes.
+    let (Ok(btc_key), Ok(rsk_key), Ok(mst_key)) = (
+        decode_bytes_arg_at(args, 0),
+        decode_bytes_arg_at(args, 1),
+        decode_bytes_arg_at(args, 2),
+    ) else {
         return Ok(encode_int_result(gas_cost, -10));
     };
-    let code =
-        vote_federation_change(ctx, "add-multi", vec![btc_key], config, hardfork_cfg, tx_ctx);
+    let code = vote_federation_change(
+        ctx,
+        "add-multi",
+        vec![btc_key, rsk_key, mst_key],
+        config,
+        hardfork_cfg,
+        tx_ctx,
+    );
     Ok(encode_int_result(gas_cost, code))
 }
 
@@ -229,9 +239,9 @@ fn vote_federation_change<CTX: crate::RskContextTr>(
     let mut code = 1i64;
     if let Some(winner) = election.winner(required) {
         code = execute_federation_change(ctx, function, &args, false, config, hardfork_cfg);
-        // create/commit clear the whole election inside the action;
+        // create/commit/rollback clear the whole election inside the action;
         // clearWinners then removes the winning entry.
-        if matches!(function, "create" | "commit") && code == 1 {
+        if matches!(function, "create" | "commit" | "rollback") && code == 1 {
             election.clear();
         } else {
             election.remove(winner);
@@ -251,6 +261,13 @@ fn execute_federation_change<CTX: crate::RskContextTr>(
     hardfork_cfg: &crate::hardfork::RskHardforkConfig,
 ) -> i64 {
     let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let multikey = hardfork_cfg.has_rskip123(block_number);
+    // FederationMember stores all keys COMPRESSED, however they were passed.
+    let parse_key = |bytes: &[u8]| -> Option<[u8; 33]> {
+        use k256::elliptic_curve::sec1::ToEncodedPoint;
+        let parsed = k256::PublicKey::from_sec1_bytes(bytes).ok()?;
+        parsed.to_encoded_point(true).as_bytes().try_into().ok()
+    };
     match function {
         "create" => {
             if !bridge_load_bytes_named(ctx, PENDING_FEDERATION_KEY).is_empty() {
@@ -268,39 +285,43 @@ fn execute_federation_change<CTX: crate::RskContextTr>(
             if dry_run {
                 return 1;
             }
-            bridge_store_bytes_named(
-                ctx,
-                PENDING_FEDERATION_KEY,
-                &serialize_pending_federation(&[]),
-            );
+            store_pending_federation(ctx, Some(&[]), multikey);
             1
         }
         "add" | "add-multi" => {
-            if function == "add" && hardfork_cfg.has_rskip123(block_number) {
+            if function == "add" && multikey {
                 return -10; // "add" disabled post-RSKIP123
             }
             let pending_data = bridge_load_bytes_named(ctx, PENDING_FEDERATION_KEY);
             if pending_data.is_empty() {
                 return -1; // FEDERATION_NON_EXISTENT
             }
-            let key_bytes = &args[0];
-            // BtcECKey.fromPublicOnly failure -> BridgeIllegalArgumentException
-            if k256::PublicKey::from_sec1_bytes(key_bytes).is_err() {
-                return -10;
-            }
+            // BtcECKey/ECKey.fromPublicOnly failure -> BridgeIllegalArgumentException -> -10
+            let member = if function == "add" {
+                let Some(btc) = parse_key(&args[0]) else { return -10 };
+                StoredMember::from_btc(btc)
+            } else {
+                let (Some(btc), Some(rsk), Some(mst)) = (
+                    args.first().and_then(|k| parse_key(k)),
+                    args.get(1).and_then(|k| parse_key(k)),
+                    args.get(2).and_then(|k| parse_key(k)),
+                ) else {
+                    return -10;
+                };
+                StoredMember { btc, rsk, mst }
+            };
             let mut members = deserialize_pending_federation(&pending_data);
-            if members.iter().any(|k| k == key_bytes) {
+            if members
+                .iter()
+                .any(|m| m.btc == member.btc || m.rsk == member.rsk || m.mst == member.mst)
+            {
                 return -2; // FEDERATOR_ALREADY_PRESENT
             }
             if dry_run {
                 return 1;
             }
-            members.push(key_bytes.clone());
-            bridge_store_bytes_named(
-                ctx,
-                PENDING_FEDERATION_KEY,
-                &serialize_pending_federation(&members),
-            );
+            members.push(member);
+            store_pending_federation(ctx, Some(&members), multikey);
             1
         }
         "commit" => {
@@ -312,10 +333,11 @@ fn execute_federation_change<CTX: crate::RskContextTr>(
             if members.len() < 2 {
                 return -2; // INSUFFICIENT_MEMBERS
             }
-            // PendingFederation.getHash: keccak over the sorted-keys RLP.
+            // PendingFederation.getHash: keccak over the sorted BTC keys RLP
+            // (serializePendingFederationOnlyBtcKeys at every era).
             let pending_hash = {
                 use sha3::{Digest, Keccak256};
-                Keccak256::digest(serialize_pending_federation(&members))
+                Keccak256::digest(serialize_pending_federation_btc_keys(&members))
             };
             if args[0] != pending_hash[..] {
                 return -3; // PENDING_FEDERATION_MISMATCHED_HASH
@@ -333,7 +355,7 @@ fn execute_federation_change<CTX: crate::RskContextTr>(
             if dry_run {
                 return 1;
             }
-            bridge_store_bytes_named(ctx, PENDING_FEDERATION_KEY, &[]);
+            store_pending_federation(ctx, None, multikey);
             1
         }
         _ => -10, // NON_EXISTING_FUNCTION_CALLED
@@ -358,25 +380,19 @@ pub(crate) fn federation_activation_age(
 /// legacy commit_federation event.
 fn commit_pending_federation<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
-    pending_keys: &[Vec<u8>],
+    pending_members: &[StoredMember],
     config: &super::constants::BridgeConstants,
     hardfork_cfg: &crate::hardfork::RskHardforkConfig,
 ) {
     use revm::context_interface::Block as _;
     let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
     let timestamp = ctx.block().timestamp().to::<u64>();
+    let multikey = hardfork_cfg.has_rskip123(block_number);
 
-    // Built federation: compressed sorted keys, creation time = block
-    // timestamp (raw seconds value stored through Instant.ofEpochMilli
-    // pre-RSKIP419), creation block = this block.
-    let mut new_keys: Vec<[u8; 33]> = pending_keys
-        .iter()
-        .filter_map(|k| {
-            use k256::elliptic_curve::sec1::ToEncodedPoint;
-            let parsed = k256::PublicKey::from_sec1_bytes(k).ok()?;
-            parsed.to_encoded_point(true).as_bytes().try_into().ok()
-        })
-        .collect();
+    // Built federation: the pending members, creation time = block timestamp
+    // (raw seconds value stored through Instant.ofEpochMilli pre-RSKIP419),
+    // creation block = this block.
+    let mut new_keys: Vec<[u8; 33]> = pending_members.iter().map(|m| m.btc).collect();
     new_keys.sort();
 
     // Move active-federation UTXOs to the old set.
@@ -386,26 +402,63 @@ fn commit_pending_federation<CTX: crate::RskContextTr>(
 
     // Current ACTIVE federation becomes the old one (genesis when none).
     let active = super::federation::load_stored_federation(ctx, NEW_FEDERATION_KEY);
-    let (old_keys, old_time, old_block) = match &active {
-        Some(fed) => (fed.keys.clone(), fed.creation_time_millis, fed.creation_block),
+    let (old_members, old_time, old_block) = match &active {
+        Some(fed) => (fed.members.clone(), fed.creation_time_millis, fed.creation_block),
         None => (
-            super::peg::genesis_federation_keys(config),
+            super::peg::genesis_federation_keys(config)
+                .into_iter()
+                .map(StoredMember::from_btc)
+                .collect(),
             config.genesis_federation_creation_time_millis,
             1,
         ),
     };
+    let old_keys: Vec<[u8; 33]> = old_members.iter().map(|m| m.btc).collect();
 
-    bridge_store_bytes_named(
-        ctx,
-        OLD_FEDERATION_KEY,
-        &super::federation::serialize_federation_only_btc_keys(&old_keys, old_time, old_block),
-    );
-    bridge_store_bytes_named(
-        ctx,
-        NEW_FEDERATION_KEY,
-        &super::federation::serialize_federation_only_btc_keys(&new_keys, timestamp, block_number),
-    );
-    bridge_store_bytes_named(ctx, PENDING_FEDERATION_KEY, &[]);
+    // rskj saveOldFederation/saveNewFederation: post-RSKIP123 both store the
+    // multikey member format plus their format-version cells.
+    if multikey {
+        bridge_store_bytes_named(
+            ctx,
+            OLD_FEDERATION_FORMAT_VERSION_KEY,
+            &serialization::rlp_encode_u64(1000),
+        );
+        bridge_store_bytes_named(
+            ctx,
+            OLD_FEDERATION_KEY,
+            &super::federation::serialize_federation_multikey(&old_members, old_time, old_block),
+        );
+        bridge_store_bytes_named(
+            ctx,
+            NEW_FEDERATION_FORMAT_VERSION_KEY,
+            &serialization::rlp_encode_u64(1000),
+        );
+        bridge_store_bytes_named(
+            ctx,
+            NEW_FEDERATION_KEY,
+            &super::federation::serialize_federation_multikey(
+                pending_members,
+                timestamp,
+                block_number,
+            ),
+        );
+    } else {
+        bridge_store_bytes_named(
+            ctx,
+            OLD_FEDERATION_KEY,
+            &super::federation::serialize_federation_only_btc_keys(&old_keys, old_time, old_block),
+        );
+        bridge_store_bytes_named(
+            ctx,
+            NEW_FEDERATION_KEY,
+            &super::federation::serialize_federation_only_btc_keys(
+                &new_keys,
+                timestamp,
+                block_number,
+            ),
+        );
+    }
+    store_pending_federation(ctx, None, multikey);
 
     // Legacy commit_federation event (pre-RSKIP146).
     let old_redeem =
@@ -872,32 +925,81 @@ pub fn get_active_federation_creation_block_height<CTX: crate::RskContextTr>(
 // Federation RLP serialization (matching BridgeSerializationUtils)
 // ---------------------------------------------------------------------------
 
-/// Serialize a pending federation as an RLP list of member public keys.
-fn serialize_pending_federation(member_keys: &[Vec<u8>]) -> Vec<u8> {
-    // rskj PendingFederation.serializeOnlyBtcKeys sorts by the key bytes
-    // (BtcECKey.PUBKEY_COMPARATOR); the keccak of this serialization is the
-    // hash the commit vote must match.
-    let mut sorted = member_keys.to_vec();
-    sorted.sort();
-    let encoded_keys: Vec<Vec<u8>> = sorted
+/// rskj `BridgeSerializationUtils.serializeBtcPublicKeys`: sorted compressed
+/// BTC keys as RLP elements. This is the legacy (pre-RSKIP123) pending
+/// federation format AND the preimage of `PendingFederation.getHash()` at
+/// every era (the hash a commit vote must match).
+fn serialize_pending_federation_btc_keys(members: &[StoredMember]) -> Vec<u8> {
+    let mut keys: Vec<[u8; 33]> = members.iter().map(|m| m.btc).collect();
+    keys.sort();
+    let encoded_keys: Vec<Vec<u8>> = keys
         .iter()
         .map(|k| serialization::rlp_encode_element(k))
         .collect();
     serialization::rlp_encode_list(&encoded_keys)
 }
 
-/// Deserialize a pending federation from RLP → list of member public keys.
-fn deserialize_pending_federation(data: &[u8]) -> Vec<Vec<u8>> {
-    serialization::rlp_decode_list(data).unwrap_or_default()
+/// rskj `BridgeSerializationUtils.serializePendingFederation` (post-RSKIP123):
+/// sorted members, each `RLP[btc, rsk, mst]` embedded directly in the outer
+/// list — NOT wrapped as an RLP element, unlike the Federation serialization.
+fn serialize_pending_federation_multikey(members: &[StoredMember]) -> Vec<u8> {
+    let mut sorted = members.to_vec();
+    sorted.sort();
+    let encoded: Vec<Vec<u8>> = sorted.iter().map(|m| m.to_rlp()).collect();
+    serialization::rlp_encode_list(&encoded)
+}
+
+/// Deserialize a pending federation from either stored shape (see
+/// `StoredMember::from_stored`).
+fn deserialize_pending_federation(data: &[u8]) -> Vec<StoredMember> {
+    serialization::rlp_decode_list(data)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|m| StoredMember::from_stored(m))
+        .collect()
+}
+
+/// rskj `BridgeStorageProvider.savePendingFederation`: once RSKIP123 is
+/// active, EVERY save also writes the format-version cell
+/// (`pendingFederationFormatVersion` = RLP(1000)) — including the saves that
+/// clear the pending federation (commit/rollback store null, which deletes
+/// the data cell but still writes the version cell).
+fn store_pending_federation<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    members: Option<&[StoredMember]>,
+    multikey: bool,
+) {
+    if multikey {
+        bridge_store_bytes_named(
+            ctx,
+            PENDING_FEDERATION_FORMAT_VERSION_KEY,
+            &serialization::rlp_encode_u64(1000),
+        );
+    }
+    let data = members.map_or_else(Vec::new, |m| {
+        if multikey {
+            serialize_pending_federation_multikey(m)
+        } else {
+            serialize_pending_federation_btc_keys(m)
+        }
+    });
+    bridge_store_bytes_named(ctx, PENDING_FEDERATION_KEY, &data);
 }
 
 
 /// Decode a single `bytes` ABI argument from calldata.
 fn decode_bytes_arg(args: &[u8]) -> Result<Vec<u8>, PrecompileError> {
-    if args.len() < 32 {
+    decode_bytes_arg_at(args, 0)
+}
+
+/// Decode the `index`-th `bytes` ABI argument (head word `index` holds the
+/// payload offset).
+fn decode_bytes_arg_at(args: &[u8], index: usize) -> Result<Vec<u8>, PrecompileError> {
+    let head = index * 32;
+    if args.len() < head + 32 {
         return Err(PrecompileError::other("bytes arg: too short"));
     }
-    let offset = U256::from_be_slice(&args[0..32]).to::<usize>();
+    let offset = U256::from_be_slice(&args[head..head + 32]).to::<usize>();
     if offset + 32 > args.len() {
         return Err(PrecompileError::other("bytes arg: offset out of bounds"));
     }
@@ -945,31 +1047,77 @@ mod tests {
     // BridgeSerializationUtilsTest.serializeAndDeserializeFederationOnlyBtcKeys
     // -----------------------------------------------------------------------
 
-    /// Ported from rskj: pending federation roundtrip (list of public keys).
+    /// Ported from rskj: pending federation roundtrip (legacy btc-keys list).
     #[test]
     fn rskj_pending_federation_roundtrip() {
-        let keys: Vec<Vec<u8>> = vec![
-            vec![0x02; 33],
-            vec![0x03; 33],
-            vec![0x04; 33],
-        ];
+        let members: Vec<StoredMember> = [[0x02u8; 33], [0x03; 33], [0x04; 33]]
+            .into_iter()
+            .map(StoredMember::from_btc)
+            .collect();
 
-        let encoded = serialize_pending_federation(&keys);
+        let encoded = serialize_pending_federation_btc_keys(&members);
         let decoded = deserialize_pending_federation(&encoded);
-
-        assert_eq!(decoded.len(), 3);
-        assert_eq!(decoded[0], keys[0]);
-        assert_eq!(decoded[1], keys[1]);
-        assert_eq!(decoded[2], keys[2]);
+        assert_eq!(decoded, members);
     }
 
-    /// Ported from rskj: empty pending federation.
+    /// Ported from rskj: empty pending federation (both formats serialize to
+    /// the empty RLP list, 0xc0).
     #[test]
     fn rskj_pending_federation_empty() {
-        let keys: Vec<Vec<u8>> = vec![];
-        let encoded = serialize_pending_federation(&keys);
-        let decoded = deserialize_pending_federation(&encoded);
-        assert!(decoded.is_empty());
+        assert_eq!(serialize_pending_federation_btc_keys(&[]), vec![0xc0]);
+        assert_eq!(serialize_pending_federation_multikey(&[]), vec![0xc0]);
+        assert!(deserialize_pending_federation(&[0xc0]).is_empty());
+    }
+
+    /// rskj BridgeSerializationUtils.serializePendingFederation: members
+    /// sorted by BTC_RSK_MST_PUBKEYS_COMPARATOR, each `RLP[btc, rsk, mst]`
+    /// embedded DIRECTLY in the outer list (no element wrap, unlike the
+    /// Federation serialization).
+    #[test]
+    fn pending_federation_multikey_format() {
+        let m1 = StoredMember { btc: [0x03; 33], rsk: [0x02; 33], mst: [0x02; 33] };
+        let m2 = StoredMember { btc: [0x02; 33], rsk: [0x03; 33], mst: [0x02; 33] };
+
+        let encoded = serialize_pending_federation_multikey(&[m1, m2]);
+        // Each member: 0xf8 0x66 (list, 102 bytes) + 3 × (0xa1 + 33 bytes).
+        let member = |m: &StoredMember| {
+            let mut v = vec![0xf8, 0x66];
+            for k in [m.btc, m.rsk, m.mst] {
+                v.push(0xa1);
+                v.extend_from_slice(&k);
+            }
+            v
+        };
+        // Sorted: m2 (btc 0x02..) before m1 (btc 0x03..). Payload is
+        // 2 × 104 = 208 bytes -> long-list header 0xf8 0xd0.
+        let mut expected = vec![0xf8, 0xd0];
+        expected.extend(member(&m2));
+        expected.extend(member(&m1));
+        assert_eq!(encoded, expected);
+        assert_eq!(deserialize_pending_federation(&encoded), vec![m2, m1]);
+    }
+
+    /// The format-version cell value: rskj serializeInteger(1000) =
+    /// RLP 0x8203e8 — the exact leaf mainnet #2,132,960 writes on
+    /// createFederation (pendingFederationFormatVersion).
+    #[test]
+    fn federation_format_version_cell_encoding() {
+        assert_eq!(serialization::rlp_encode_u64(1000), vec![0x82, 0x03, 0xe8]);
+    }
+
+    /// PendingFederation.getHash is keccak over the SORTED BTC-KEYS
+    /// serialization at every era — even post-RSKIP123 when the stored
+    /// pending federation uses the multikey format.
+    #[test]
+    fn pending_federation_hash_uses_btc_keys_serialization() {
+        use sha3::{Digest, Keccak256};
+        let m1 = StoredMember { btc: [0x03; 33], rsk: [0x05; 33], mst: [0x06; 33] };
+        let m2 = StoredMember { btc: [0x02; 33], rsk: [0x07; 33], mst: [0x08; 33] };
+        let hash = Keccak256::digest(serialize_pending_federation_btc_keys(&[m1, m2]));
+        // Same hash regardless of rsk/mst keys and member order.
+        let m1b = StoredMember { btc: [0x03; 33], rsk: [0x09; 33], mst: [0x0a; 33] };
+        let hash2 = Keccak256::digest(serialize_pending_federation_btc_keys(&[m2, m1b]));
+        assert_eq!(hash, hash2);
     }
 
     /// Ported from rskj: committed federation roundtrip with known values.

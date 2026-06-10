@@ -64,5 +64,18 @@ fn main() -> anyhow::Result<()> {
         total += r.gas_used;
     }
     eprintln!("total gas_used={total}");
+
+    let new_root = rustock_execution::apply_state_changes(
+        &root,
+        trie_store.as_ref(),
+        &result.state_changes,
+        &result.markers,
+    );
+    let computed = new_root.compute_hash(trie_store.as_ref());
+    eprintln!(
+        "state root: computed={computed:?} header={:?} match={}",
+        header.state_root,
+        computed.as_slice() == header.state_root.as_slice()
+    );
     Ok(())
 }

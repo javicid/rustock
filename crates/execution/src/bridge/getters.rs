@@ -187,7 +187,9 @@ pub fn get_pending_federation_size<CTX: crate::RskContextTr>(
     if fed_data.is_empty() {
         return Ok(PrecompileOutput::new(gas_cost, abi_encode_int(-1)));
     }
-    let size = decode_federation_size(&fed_data);
+    // The pending federation is a flat member list (legacy keys or multikey
+    // member lists), unlike the Federation format.
+    let size = serialization::rlp_decode_list(&fed_data).map_or(0, |items| items.len());
     Ok(PrecompileOutput::new(gas_cost, abi_encode_int(size as i64)))
 }
 
@@ -281,13 +283,11 @@ fn abi_encode_bytes(data: &[u8]) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 /// Decode the number of members from serialized federation data.
+/// Federation RLP: [creation_time, creation_block, [member...]].
 fn decode_federation_size(data: &[u8]) -> usize {
     if let Some(items) = serialization::rlp_decode_list(data) {
-        // Federation RLP: [[member_keys...], creation_time, creation_block]
-        if let Some(first) = items.first() {
-            if let Some(members) = serialization::rlp_decode_list(first) {
-                return members.len();
-            }
+        if let Some(members) = items.get(2).and_then(|m| serialization::rlp_decode_list(m)) {
+            return members.len();
         }
     }
     0
@@ -296,8 +296,8 @@ fn decode_federation_size(data: &[u8]) -> usize {
 /// Decode the creation time from serialized federation data.
 fn decode_federation_creation_time(data: &[u8]) -> u64 {
     if let Some(items) = serialization::rlp_decode_list(data) {
-        if items.len() >= 2 {
-            let time_bytes = &items[1];
+        if !items.is_empty() {
+            let time_bytes = &items[0];
             if time_bytes.is_empty() {
                 return 0;
             }
@@ -311,13 +311,16 @@ fn decode_federation_creation_time(data: &[u8]) -> u64 {
     0
 }
 
-/// Decode the BTC public keys from serialized federation data.
+/// Decode the BTC public keys from serialized federation data (both the
+/// legacy and the post-RSKIP123 multikey member shapes).
 fn decode_federation_keys(data: &[u8]) -> Vec<Vec<u8>> {
     if let Some(items) = serialization::rlp_decode_list(data) {
-        if let Some(first) = items.first() {
-            if let Some(members) = serialization::rlp_decode_list(first) {
-                return members;
-            }
+        if let Some(members) = items.get(2).and_then(|m| serialization::rlp_decode_list(m)) {
+            return members
+                .iter()
+                .filter_map(|m| super::federation::StoredMember::from_stored(m))
+                .map(|m| m.btc.to_vec())
+                .collect();
         }
     }
     Vec::new()

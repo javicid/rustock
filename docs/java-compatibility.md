@@ -815,6 +815,66 @@ empty dynamic bytes (TODO note to audit if one ever does).
 
 ---
 
+## 19. RSKIP123 Federation-Change Storage (format-version cells, multikey members)
+
+**rskj behavior**: once RSKIP123 (wasabi, mainnet #1,591,000) is active,
+`BridgeStorageProvider`'s save path writes a format-version cell
+(`RLP(1000)` = `0x8203e8`, `STANDARD_MULTISIG_FEDERATION`) next to each
+federation cell it saves:
+
+- `savePendingFederation` writes `pendingFederationFormatVersion` on EVERY
+  save — including the saves that CLEAR the pending federation
+  (`commitFederation` / `rollbackFederation` set it to null, which deletes
+  the data cell but still writes the version cell). The flag-based dirty
+  tracking (`shouldSavePendingFederation`) means any `setPendingFederation`
+  call triggers it.
+- `saveNewFederation` / `saveOldFederation` write
+  `newFederationFormatVersion` / `oldFederationFormatVersion`. The old-
+  federation version cell is written even when the old federation is being
+  cleared at migration end (`getOldFederationFormatVersion` defaults to 1000
+  for null).
+
+Serialization formats (all members carry compressed btc/rsk/mst keys,
+sorted by `FederationMember.BTC_RSK_MST_PUBKEYS_COMPARATOR`):
+
+- Federation (new/old): `RLP[time, block, RLP[elem(RLP[btc,rsk,mst])...]]` —
+  each member's RLP list is wrapped as an RLP *element*.
+- Pending federation: `RLP[RLP[btc,rsk,mst]...]` — member lists embedded
+  DIRECTLY in the outer list (no element wrap), an asymmetry between
+  `serializeFederation` and `serializePendingFederation`.
+- `PendingFederation.getHash()` is keccak over the SORTED-BTC-KEYS
+  serialization (`serializePendingFederationOnlyBtcKeys`) at every era —
+  even when the stored bytes are multikey.
+
+Also: `Bridge.addFederatorPublicKeyMultikey` puts the three RAW argument
+byte arrays into the vote's `ABICallSpec` (the stored election serializes
+them verbatim); key parsing happens at vote-execution time, and any parse
+failure is `BridgeIllegalArgumentException` → -10. `rollbackFederation`
+clears the WHOLE election on success (like create/commit), not just the
+winning entry.
+
+**Trigger**: mainnet #2,132,960 — the 2019 federation change starts with a
+winning `createFederation()` vote. rskj writes the empty pending federation
+(`0xc0`) AND `pendingFederationFormatVersion = 0x8203e8`; rustock wrote only
+the former: state root mismatch with exact gas match (84,501). Found by
+unitrie leaf-diff vs the synced rskj DB (single extra leaf), and the
+executing method identified by re-running the block under rskj
+`ExecuteBlocks` with TRACE logging (`TRACE [bridge] createFederation` —
+selector 0x1183d5d1 is createFederation, not updateCollections).
+
+**rskj source**: `co.rsk.peg.BridgeStorageProvider` (Wasabi-era;
+`FederationStorageProviderImpl` in modern rskj),
+`BridgeSerializationUtils`, `PendingFederation`, `BridgeSupport
+.commitFederation/rollbackFederation`, `Bridge.addFederatorPublicKeyMultikey`.
+
+**rustock**: `bridge/federation.rs` (`StoredMember` triplets,
+`serialize_federation_multikey`), `bridge/governance.rs`
+(`store_pending_federation`, `serialize_pending_federation_multikey`,
+3-arg add-multi votes, rollback election clear, multikey commit),
+`bridge/peg.rs` (old-federation version cell at migration end).
+
+---
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`

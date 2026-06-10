@@ -1025,8 +1025,9 @@ fn process_funds_migration<CTX: crate::RskContextTr>(
     if should_migrate {
         let threshold = retiring_keys.len() / 2 + 1;
         let retiring_redeem = build_federation_redeem_script(&retiring_keys, threshold);
-        let new_threshold = new_fed.keys.len() / 2 + 1;
-        let new_redeem = build_federation_redeem_script(&new_fed.keys, new_threshold);
+        let new_btc_keys = new_fed.btc_keys();
+        let new_threshold = new_btc_keys.len() / 2 + 1;
+        let new_redeem = build_federation_redeem_script(&new_btc_keys, new_threshold);
         let active_script = p2sh_output_script(&redeem_script_hash160(&new_redeem));
 
         // createMigrationTransaction: target the full balance, halving on
@@ -1085,7 +1086,17 @@ fn process_funds_migration<CTX: crate::RskContextTr>(
     }
 
     if past_migration_age {
-        // clearRetiredFederation: the old federation is gone for good.
+        // clearRetiredFederation: the old federation is gone for good. rskj
+        // saveOldFederation writes the format-version cell on every save once
+        // RSKIP123 is active — even this clearing one (the federation cell is
+        // deleted, the version cell stays).
+        if hardfork_cfg.has_rskip123(block_number) {
+            bridge_store_bytes_named(
+                ctx,
+                OLD_FEDERATION_FORMAT_VERSION_KEY,
+                &super::serialization::rlp_encode_u64(1000),
+            );
+        }
         bridge_store_bytes_named(ctx, OLD_FEDERATION_KEY, &[]);
     }
 }
@@ -1107,12 +1118,12 @@ pub(crate) fn federation_keys_or_genesis<CTX: crate::RskContextTr>(
     match (new, old) {
         (Some(n), Some(o)) => {
             if block_number >= n.creation_block + age {
-                n.keys
+                n.btc_keys()
             } else {
-                o.keys
+                o.btc_keys()
             }
         }
-        (Some(n), None) => n.keys,
+        (Some(n), None) => n.btc_keys(),
         (None, _) => genesis_federation_keys(config),
     }
 }
@@ -1157,7 +1168,7 @@ pub(crate) fn retiring_federation_keys<CTX: crate::RskContextTr>(
     let old = super::federation::load_stored_federation(ctx, OLD_FEDERATION_KEY)?;
     let age = super::governance::federation_activation_age(config, hardfork_cfg, block_number);
     if block_number >= new.creation_block + age {
-        Some(old.keys)
+        Some(old.btc_keys())
     } else {
         None
     }
