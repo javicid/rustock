@@ -52,6 +52,7 @@ thread_local! {
 pub fn install<WIRE, HOST>(
     instructions: &mut EthInstructions<WIRE, HOST>,
     extcodehash_enabled: bool,
+    istanbul_opcodes_enabled: bool,
     extcodesize_max_precompiles: &[Address],
 ) where
     WIRE: InterpreterTypes,
@@ -60,6 +61,32 @@ pub fn install<WIRE, HOST>(
     if !extcodehash_enabled {
         instructions.insert_instruction(
             opcode::EXTCODEHASH,
+            Instruction::new(invalid_opcode::<WIRE, HOST>, 0),
+        );
+    }
+    // RSKIP152 CHAINID / RSKIP151 SELFBALANCE (papyrus200): the spec stays
+    // PETERSBURG (RSK never adopted the Istanbul gas repricings), so revm's
+    // spec-checked impls would throw NotActivated — install uncheck-ed
+    // versions with rskj's tier costs (CHAINID BASE=2, SELFBALANCE LOW=5).
+    if istanbul_opcodes_enabled {
+        instructions.insert_instruction(
+            opcode::CHAINID,
+            Instruction::new(rsk_chainid::<WIRE, HOST>, 2),
+        );
+        instructions.insert_instruction(
+            opcode::SELFBALANCE,
+            Instruction::new(rsk_selfbalance::<WIRE, HOST>, 5),
+        );
+    } else {
+        // Pre-papyrus rskj throws invalid-opcode (all frame gas consumed);
+        // revm's spec-checked impls would halt NotActivated returning the
+        // remaining gas instead.
+        instructions.insert_instruction(
+            opcode::CHAINID,
+            Instruction::new(invalid_opcode::<WIRE, HOST>, 0),
+        );
+        instructions.insert_instruction(
+            opcode::SELFBALANCE,
             Instruction::new(invalid_opcode::<WIRE, HOST>, 0),
         );
     }
@@ -93,6 +120,7 @@ pub fn install<WIRE, HOST>(
     // overrides installed above.
     if std::env::var_os("RUSTOCK_TRACE_ALL_OPS").is_some() {
         EXTCODEHASH_ENABLED.with(|f| f.set(extcodehash_enabled));
+        ISTANBUL_OPCODES_ENABLED.with(|f| f.set(istanbul_opcodes_enabled));
         let default_table = revm::interpreter::instructions::instruction_table_gas_changes_spec::<
             WIRE,
             HOST,
@@ -103,6 +131,8 @@ pub fn install<WIRE, HOST>(
                 opcode::EXTCODESIZE | opcode::CALL | opcode::CALLCODE
                 | opcode::DELEGATECALL | opcode::STATICCALL => CALL_STATIC_GAS,
                 opcode::EXTCODEHASH if !extcodehash_enabled => 0,
+                opcode::CHAINID if istanbul_opcodes_enabled => 2,
+                opcode::SELFBALANCE if istanbul_opcodes_enabled => 5,
                 _ => default_table[op as usize].static_gas(),
             };
             instructions.insert_instruction(
@@ -142,6 +172,29 @@ fn invalid_opcode<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
 ) {
     context.interpreter.halt(InstructionResult::OpcodeNotFound);
+}
+
+/// CHAINID without revm's ISTANBUL spec check (RSKIP152 activates it at
+/// papyrus200 while the spec stays PETERSBURG).
+fn rsk_chainid<WIRE: InterpreterTypes, H: Host + ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+) {
+    if !context.interpreter.stack.push(context.host.chain_id()) {
+        context.interpreter.halt_overflow();
+    }
+}
+
+/// SELFBALANCE without revm's ISTANBUL spec check (RSKIP151, papyrus200).
+fn rsk_selfbalance<WIRE: InterpreterTypes, H: Host + ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+) {
+    let Some(balance) = context.host.balance(context.interpreter.input.target_address()) else {
+        context.interpreter.halt_fatal();
+        return;
+    };
+    if !context.interpreter.stack.push(balance.data) {
+        context.interpreter.halt_overflow();
+    }
 }
 
 /// EXTCODESIZE with rskj's RSKIP90 quirk: the code size of an active precompile
@@ -194,6 +247,8 @@ macro_rules! traced_op {
 thread_local! {
     /// RSKIP140 flag for the all-ops tracer's EXTCODEHASH dispatch.
     static EXTCODEHASH_ENABLED: core::cell::Cell<bool> = const { core::cell::Cell::new(true) };
+    /// RSKIP151/152 flag for the all-ops tracer's CHAINID/SELFBALANCE dispatch.
+    static ISTANBUL_OPCODES_ENABLED: core::cell::Cell<bool> = const { core::cell::Cell::new(true) };
 }
 
 /// All-ops tracer: log pc/opcode/gas (post-static-charge), then dispatch to
@@ -225,6 +280,20 @@ fn traced_all<WIRE: InterpreterTypes, HOST: Host>(
         opcode::STATICCALL => rsk_static_call(context),
         opcode::EXTCODEHASH if !EXTCODEHASH_ENABLED.with(|f| f.get()) => {
             invalid_opcode(context)
+        }
+        opcode::CHAINID => {
+            if ISTANBUL_OPCODES_ENABLED.with(|f| f.get()) {
+                rsk_chainid(context)
+            } else {
+                invalid_opcode(context)
+            }
+        }
+        opcode::SELFBALANCE => {
+            if ISTANBUL_OPCODES_ENABLED.with(|f| f.get()) {
+                rsk_selfbalance(context)
+            } else {
+                invalid_opcode(context)
+            }
         }
         _ => {
             let table = revm::interpreter::instructions::instruction_table_gas_changes_spec::<

@@ -136,6 +136,7 @@ impl RskExecutor {
         crate::rsk_instructions::install(
             &mut evm.instruction,
             self.hardfork_cfg.has_rskip140(header.number),
+            self.hardfork_cfg.has_chainid(header.number),
             &extcodesize_max_precompiles,
         );
 
@@ -226,6 +227,7 @@ impl RskExecutor {
         crate::rsk_instructions::install(
             &mut evm.instruction,
             self.hardfork_cfg.has_rskip140(header.number),
+            self.hardfork_cfg.has_chainid(header.number),
             &extcodesize_max_precompiles,
         );
 
@@ -1150,6 +1152,79 @@ mod tests {
             .get(&U256::ZERO)
             .expect("slot 0");
         assert_eq!(slot0.present_value, U256::from(4), "4 >> 0 == 4");
+    }
+
+    /// Regression for mainnet #2,430,894: CHAINID (RSKIP152) and SELFBALANCE
+    /// (RSKIP151) activate at papyrus200 while the SpecId stays PETERSBURG —
+    /// revm's spec-checked impls halted NotActivated and the tx consumed its
+    /// whole gas limit (rskj: success, 235,956 gas). Pre-papyrus both must
+    /// still be invalid opcodes consuming all frame gas.
+    #[test]
+    fn test_chainid_selfbalance_activate_at_papyrus() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+        let sender = Address::repeat_byte(0xAB);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+        let block_store =
+            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+
+        // Runtime: CHAINID; PUSH1 0; SSTORE; SELFBALANCE; PUSH1 1; SSTORE; STOP
+        let runtime: Vec<u8> = vec![0x46, 0x60, 0x00, 0x55, 0x47, 0x60, 0x01, 0x55, 0x00];
+        let mut init = vec![
+            0x60, 0x09, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, 0x09, 0x60, 0x00, 0xf3,
+        ];
+        init.extend_from_slice(&runtime);
+        let deploy = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(1_000_000),
+            to: Bytes::new(),
+            value: U256::ZERO,
+            input: Bytes::from(init),
+            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+        };
+        let r1 = executor
+            .execute_block(&dummy_header(2_392_700), &[(deploy, sender)], &root, store.clone())
+            .expect("deploy block");
+        assert!(r1.tx_results[0].success);
+        let deployed = sender.create(0);
+        let root2 =
+            crate::state::apply_state_changes(&root, store.as_ref(), &r1.state_changes, &r1.markers);
+
+        let call = |nonce: u64| rustock_core::Transaction {
+            nonce,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(1_000_000),
+            to: Bytes::copy_from_slice(deployed.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::new(),
+            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+        };
+        // Post-papyrus: both opcodes execute; CHAINID pushes 30 (RSK mainnet).
+        let r2 = executor
+            .execute_block(&dummy_header(2_392_701), &[(call(1), sender)], &root2, store.clone())
+            .expect("papyrus call block");
+        assert!(r2.tx_results[0].success, "CHAINID/SELFBALANCE valid at papyrus200");
+        let storage = &r2.state_changes.get(&deployed).expect("contract").storage;
+        assert_eq!(
+            storage.get(&U256::ZERO).unwrap().present_value,
+            U256::from(30),
+            "CHAINID == 30"
+        );
+        assert_eq!(
+            storage.get(&U256::from(1)).unwrap().present_value,
+            U256::ZERO,
+            "SELFBALANCE of the fresh contract == 0"
+        );
+
+        // Pre-papyrus: invalid opcode, the whole gas limit is consumed.
+        let r3 = executor
+            .execute_block(&dummy_header(2_392_699), &[(call(1), sender)], &root2, store.clone())
+            .expect("pre-papyrus call block");
+        assert!(!r3.tx_results[0].success, "CHAINID invalid before papyrus200");
+        assert_eq!(r3.tx_results[0].gas_used, 1_000_000, "invalid opcode consumes all gas");
     }
 
     /// Regression for mainnet #1,661,324: rskj's VM.doCODESIZE (RSKIP90, orchid)

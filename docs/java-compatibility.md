@@ -1032,6 +1032,33 @@ Solidity on RSKIP146; `p2sh_base58_address`).
 
 ---
 
+## 24. RSKIP151/152: SELFBALANCE and CHAINID at papyrus200 (no Istanbul repricing)
+
+RSK activates the two Istanbul opcodes individually at papyrus200 —
+RSKIP152 CHAINID (0x46, BASE tier = 2 gas) and RSKIP151 SELFBALANCE
+(0x47, LOW tier = 5 gas) — WITHOUT adopting the rest of Istanbul (no
+EIP-1884 repricing, no EIP-2200 SSTORE metering). rustock keeps the revm
+SpecId at PETERSBURG for papyrus, so revm's spec-checked `chainid`/
+`selfbalance` impls halted `NotActivated`; rskj executed them fine.
+Before papyrus200 both opcodes are invalid in rskj (`invalidOpCode`,
+consuming all frame gas), whereas revm's NotActivated halt returns the
+frame's remaining gas — both directions needed custom instructions.
+
+**Trigger**: mainnet #2,430,894 — a CREATE2-deployed contract using
+CHAINID/SELFBALANCE; rustock failed the tx consuming the full 353,934 gas
+limit (rskj: success, 235,956).
+
+**rskj source**: `org.ethereum.vm.VM` (OP_CHAINID gated on RSKIP152,
+OP_SELFBALANCE on RSKIP151), `OpCode.java` (CHAINID BASE_TIER,
+SELFBALANCE LOW_TIER), `reference.conf` (rskip151/152 = papyrus200).
+
+**rustock**: `rsk_instructions.rs` (`rsk_chainid`/`rsk_selfbalance`
+uncheck-ed impls installed when `has_chainid`; `invalid_opcode` installed
+before papyrus), `executor.rs` install sites + regression test
+`test_chainid_selfbalance_activate_at_papyrus`.
+
+---
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`
