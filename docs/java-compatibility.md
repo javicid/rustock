@@ -1133,6 +1133,34 @@ the caller's return buffer is snapshotted and restored after
 
 ---
 
+## 27. RSKIP150: EVM call-stack limit is 400 (not 1024)
+
+From RSKIP150 (twoToThree, mainnet #2,018,000) rskj's
+`Program.getMaxDepth()` returns 400 (1024 before). The deep checks in
+`callToAddress`, `callToPrecompiledAddress` and `createContract` push 0,
+refund the requested child gas, and return — before any
+returnDataBuffer reset, so the buffer is preserved (§26).
+
+revm hard-codes `CALL_STACK_LIMIT = 1024`, so unbounded recursion runs
+~2.5× deeper and burns correspondingly more gas before hitting the
+ceiling.
+
+**Trigger**: mainnet #2,814,761 — a factory tx recursing ~1,046
+gas/frame. rskj cut it off at depth 400 (tx FAILED at 550,834 gas);
+rustock recursed past 700 frames and consumed the full 826,251 limit.
+
+**rskj source**: `org.ethereum.vm.program.Program.getMaxDepth/
+callToAddress/createContract` (gated on RSKIP150).
+
+**rustock**: `rsk_handler.rs` `run_exec_loop` — a FrameInit with depth >
+400 (when RSKIP150 is active) is answered with a synthesized CallTooDeep
+outcome (full child-gas refund, return buffer preserved) instead of
+being initialized. Regression test
+`test_rskip150_call_depth_capped_at_400` (recursion counter stops at
+401 frames). Pre-RSKIP150 blocks keep revm's 1024.
+
+---
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`

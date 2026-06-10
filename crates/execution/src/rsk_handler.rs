@@ -242,6 +242,42 @@ where
                         }
                         _ => None,
                     };
+                    // RSKIP150 lowers the call-stack limit from 1024 to 400
+                    // (rskj Program.getMaxDepth); revm hard-codes 1024, so
+                    // the cap is enforced here. rskj's deep checks push 0,
+                    // refund the child gas, and return BEFORE any
+                    // returnDataBuffer reset.
+                    let rskip150_active = self.pre_rskip150_precompiles.is_none();
+                    if rskip150_active && init.depth > 400 {
+                        if let Some(synth) = call_too_deep_result(&init.frame_input) {
+                            use revm::interpreter::interpreter_types::ReturnData;
+                            preserved_return_buffer = Some(
+                                evm.frame_stack()
+                                    .get()
+                                    .interpreter
+                                    .return_data
+                                    .buffer()
+                                    .clone(),
+                            );
+                            if *TRACE_FRAMES {
+                                tracing::debug!(
+                                    "FRAME REJECTED CallTooDeep depth={} (RSKIP150 limit 400)",
+                                    init.depth
+                                );
+                            }
+                            if let Some(result) = evm.frame_return_result(synth)? {
+                                return Ok(result);
+                            }
+                            if let Some(buffer) = preserved_return_buffer {
+                                evm.frame_stack()
+                                    .get()
+                                    .interpreter
+                                    .return_data
+                                    .set_buffer(buffer);
+                            }
+                            continue;
+                        }
+                    }
                     match evm.frame_init(init)? {
                         ItemOrResult::Item(_) => {
                             // Internal CREATE/CREATE2 opcode: post-RSKIP125
@@ -463,6 +499,32 @@ fn trace_frame_init(init: &FrameInit) {
             c.gas_limit(),
         ),
         FrameInput::Empty => {}
+    }
+}
+
+/// Synthesize the CallTooDeep rejection revm would produce at its own
+/// depth limit: the child's full gas refunded, empty output (rskj
+/// stackPushZero + refundGas at the Program deep checks).
+fn call_too_deep_result(
+    frame_input: &revm::interpreter::interpreter_action::FrameInput,
+) -> Option<FrameResult> {
+    use revm::interpreter::interpreter_action::FrameInput;
+    use revm::interpreter::{Gas, InterpreterResult};
+    let interp_result = |gas_limit: u64| InterpreterResult {
+        result: InstructionResult::CallTooDeep,
+        gas: Gas::new(gas_limit),
+        output: Bytes::new(),
+    };
+    match frame_input {
+        FrameInput::Call(c) => Some(FrameResult::Call(CallOutcome::new(
+            interp_result(c.gas_limit),
+            c.return_memory_offset.clone(),
+        ))),
+        FrameInput::Create(c) => Some(FrameResult::Create(CreateOutcome::new(
+            interp_result(c.gas_limit()),
+            None,
+        ))),
+        FrameInput::Empty => None,
     }
 }
 

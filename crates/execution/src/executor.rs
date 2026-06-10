@@ -1229,6 +1229,78 @@ mod tests {
         assert_eq!(r3.tx_results[0].gas_used, 1_000_000, "invalid opcode consumes all gas");
     }
 
+    /// Regression for mainnet #2,814,761: RSKIP150 lowers the EVM call-stack
+    /// limit to 400 (rskj Program.getMaxDepth); revm hard-codes 1024. A
+    /// self-recursive contract must be cut off at depth 400 — frames at
+    /// depths 0..=400 run, the CALL at depth 400 is refused with the child
+    /// gas refunded.
+    #[test]
+    fn test_rskip150_call_depth_capped_at_400() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+        let sender = Address::repeat_byte(0xAD);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+        let block_store =
+            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+
+        // Runtime: SSTORE(0, SLOAD(0)+1); CALL(self, all gas); STOP.
+        let runtime: Vec<u8> = vec![
+            0x60, 0x00, 0x54, 0x60, 0x01, 0x01, 0x60, 0x00, 0x55, // counter += 1
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, // ret/arg/value
+            0x30, 0x5a, 0xf1, 0x50, // ADDRESS GAS CALL POP
+            0x00,
+        ];
+        let mut init = vec![
+            0x60, runtime.len() as u8, 0x60, 0x0c, 0x60, 0x00, 0x39,
+            0x60, runtime.len() as u8, 0x60, 0x00, 0xf3,
+        ];
+        init.extend_from_slice(&runtime);
+        let deploy = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(1_000_000),
+            to: Bytes::new(),
+            value: U256::ZERO,
+            input: Bytes::from(init),
+            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+        };
+        let r1 = executor
+            .execute_block(&dummy_header(2_500_000), &[(deploy, sender)], &root, store.clone())
+            .expect("deploy block");
+        assert!(r1.tx_results[0].success);
+        let contract = sender.create(0);
+        let root2 =
+            crate::state::apply_state_changes(&root, store.as_ref(), &r1.state_changes, &r1.markers);
+
+        let call = rustock_core::Transaction {
+            nonce: 1,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(6_000_000),
+            to: Bytes::copy_from_slice(contract.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::new(),
+            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+        };
+        let r2 = executor
+            .execute_block(&dummy_header(2_500_001), &[(call, sender)], &root2, store.clone())
+            .expect("call block");
+        assert!(r2.tx_results[0].success, "recursion must end cleanly at the cap");
+        let slot0 = r2
+            .state_changes
+            .get(&contract)
+            .expect("contract")
+            .storage
+            .get(&U256::ZERO)
+            .expect("slot 0");
+        assert_eq!(
+            slot0.present_value,
+            U256::from(401),
+            "frames at depths 0..=400 run; the call at depth 400 is refused"
+        );
+    }
+
     /// Regression for mainnet #2,669,886: rskj resets the caller's
     /// returnDataBuffer only when callee code actually runs (executeCode) or
     /// on precompile calls; a CALL to an empty-code account (plain value
