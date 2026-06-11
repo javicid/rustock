@@ -1668,15 +1668,23 @@ fn pubkey_hash160(key: &[u8]) -> [u8; 20] {
 // Matches rskj BridgeSerializationUtils.serializeRskTxsWaitingForSignatures:
 //   RLP_list [ rlp_bytes(rsk_hash_0), rlp_bytes(btc_tx_raw_0), ... ]
 //
-// The map is sorted by RSK tx hash (lexicographic, matching Java's TreeMap).
+// The map is a Java TreeMap<Keccak256, BtcTransaction>, so entries serialize in
+// Keccak256 natural order — and rskj's `Keccak256.compareTo` compares bytes
+// UNSIGNED from the LAST byte (index 31) down to the first, i.e. reverse-byte
+// (little-endian) order. A plain BTreeMap<[u8;32]> orders forward (big-endian),
+// which diverges whenever the two orderings disagree, so we re-sort at
+// serialization time rather than rely on the in-memory map's iteration order.
 // ---------------------------------------------------------------------------
 
 /// Serialize the pegouts-waiting-for-signatures map.
 pub fn serialize_rsk_txs_waiting_for_signatures(
     map: &BTreeMap<[u8; 32], Vec<u8>>,
 ) -> Vec<u8> {
-    let mut items = Vec::with_capacity(map.len() * 2);
-    for (rsk_hash, btc_tx_raw) in map.iter() {
+    // rskj Keccak256.compareTo: unsigned, from byte[31] down to byte[0].
+    let mut entries: Vec<(&[u8; 32], &Vec<u8>)> = map.iter().collect();
+    entries.sort_by(|(a, _), (b, _)| a.iter().rev().cmp(b.iter().rev()));
+    let mut items = Vec::with_capacity(entries.len() * 2);
+    for (rsk_hash, btc_tx_raw) in entries {
         items.push(rlp_encode_element(rsk_hash));
         items.push(rlp_encode_element(btc_tx_raw));
     }
@@ -2766,5 +2774,33 @@ mod tests {
         assert!(should_mark_rejected_pegin_as_processed(&cfg, 8_804_199));
         // From vetiver900 (RSKIP551): disabled again.
         assert!(!should_mark_rejected_pegin_as_processed(&cfg, 8_804_200));
+    }
+
+    /// rskTxsWaitingFS is a Java TreeMap<Keccak256, BtcTransaction>; rskj's
+    /// `Keccak256.compareTo` compares bytes UNSIGNED from the LAST byte down to
+    /// the first (reverse/little-endian order). Ground truth from RSK Mainnet
+    /// block #3,340,065: the two waiting-for-signatures RSK tx hashes must
+    /// serialize with `285b…0c` BEFORE `12b7…f0` (last bytes 0x0c < 0xf0),
+    /// the opposite of forward (big-endian) BTreeMap order (0x12 < 0x28).
+    #[test]
+    fn rsk_txs_waiting_fs_keccak_reverse_byte_order() {
+        let k_12b7: [u8; 32] =
+            hex::decode("12b7dd806871857a4d949c2bbd25ab95bce3c4a38ef5c7fcee7bc43ea3a6baf0")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let k_285b: [u8; 32] =
+            hex::decode("285b09d3973cbe2a324cb7d3248b36ee668b66093f2976f1e5a5a4b5d9a7d10c")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let mut map = BTreeMap::new();
+        map.insert(k_12b7, vec![0xaa]);
+        map.insert(k_285b, vec![0xbb]);
+        let out = serialize_rsk_txs_waiting_for_signatures(&map);
+        let items = rlp_decode_list(&out).unwrap();
+        // First serialized key must be 285b… (smaller under reverse-byte order).
+        assert_eq!(items[0], k_285b);
+        assert_eq!(items[2], k_12b7);
     }
 }

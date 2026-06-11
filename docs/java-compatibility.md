@@ -1428,6 +1428,57 @@ fallback reverses both the block-hash lookup key and the stored witness root
 
 ---
 
+## 33. `rskTxsWaitingFS` order: Keccak256 compares bytes from the LAST byte (reverse)
+
+The pegouts-waiting-for-signatures map (`rskTxsWaitingFS`,
+`pegoutsWaitingForSignatures`) is a Java `SortedMap<Keccak256, BtcTransaction>`
+(a `TreeMap`), and rskj serializes it in iteration order — i.e. sorted by the
+`Keccak256` key's natural ordering. The trap is `Keccak256.compareTo`
+(`co.rsk.crypto.Keccak256`): it compares the 32 bytes **unsigned, from index 31
+down to index 0** — reverse (little-endian) byte order, not the forward
+big-endian order you get from comparing a `[u8; 32]` or a `BTreeMap<[u8;32]>`
+key directly.
+
+```java
+public int compareTo(Keccak256 o) {
+    for (int i = HASH_LEN - 1; i >= 0; i--) {
+        final int thisByte = this.bytes[i] & 0xff;
+        final int otherByte = o.bytes[i] & 0xff;
+        if (thisByte > otherByte) return 1;
+        if (thisByte < otherByte) return -1;
+    }
+    return 0;
+}
+```
+
+So two entries whose hashes order one way big-endian can order the *other* way
+under rskj's comparator, producing a different `RLP.encodeList` and a different
+storage cell — identical entries, identical bytes, swapped positions.
+
+**Consensus-load-bearing:** a from-scratch client that holds this map in any
+forward-ordered structure (sorted set/map over the raw hash, or "I'll just sort
+the keys") serializes the entries in the wrong order the moment two waiting
+pegouts' request-tx hashes disagree between big- and little-endian ordering, and
+forks — gas and receipts are unaffected (the map is internal Bridge state).
+
+**Trigger**: mainnet #3,340,065 (migration window — two pegouts waiting for
+signatures). Hashes `285b09…d10c` (last byte `0x0c`) and `12b7dd…baf0` (last
+byte `0xf0`): rskj orders `285b09…` first (`0x0c < 0xf0`), rustock's
+`BTreeMap<[u8;32]>` ordered `12b7dd…` first (`0x12 < 0x28`). One-leaf state diff,
+gas + receipts identical.
+
+**rskj source**: `co.rsk.crypto.Keccak256.compareTo`,
+`BridgeSerializationUtils.serializeRskTxsWaitingForSignatures` (iterates the
+`SortedMap`), `BridgeStorageProvider` `PEGOUTS_WAITING_FOR_SIGNATURES`.
+
+**rustock**: `crates/execution/src/bridge/peg.rs`
+`serialize_rsk_txs_waiting_for_signatures` re-sorts entries by reversed key
+bytes (`a.iter().rev().cmp(b.iter().rev())`) before encoding, rather than
+trusting the in-memory `BTreeMap`'s forward iteration order. Test:
+`rsk_txs_waiting_fs_keccak_reverse_byte_order` (block #3,340,065 ground truth).
+
+---
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`
