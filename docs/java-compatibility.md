@@ -1199,6 +1199,45 @@ registerBtcTransaction`.
 
 ---
 
+## 29. Pegout dusty-change surplus is burned to 0xff…ff
+
+When bitcoinj's `completeTx` (recipientsPayFees) finds the pegout's
+change output below the non-dust minimum (`3 × 5000 × (outputLen+148) /
+1000`, 2,700 sat for the federation P2SH), it raises the change to that
+minimum and deducts the difference from the recipient output. The
+federation then spends LESS BTC than the user pegged out, so rskj's
+`adjustBalancesIfChangeOutputWasDust` — unconditional since the genesis
+bridge — burns the surplus: `transferTo(BURN_ADDRESS, …)` moves
+`sentByUser − (sumInputs − change)` (satoshis × 10^10 wei) from the
+Bridge account to `0xffffffffffffffffffffffffffffffffffffffff`
+(`BridgeSupport.BURN_ADDRESS`), creating that account on first use.
+
+The change amount is read as `getOutput(1)` in the papyrus-era code and
+as `getValueSentToMe(wallet)` from the HOP batching refactor; both equal
+the value paid back to the federation P2SH script for every reachable
+case (individual pegouts have exactly one P2PKH recipient + the change
+at index 1).
+
+**Trigger**: mainnet #3,103,055 tx 1 (updateCollections) — a 9,999,400
+sat pegout against UTXOs leaving 600 sat of change, raised to 2,700.
+rskj burned 2,100 sat (21,000,000,000,000 wei); rustock built the
+byte-identical BTC tx (receipts root matched) but skipped the burn:
+two-leaf state diff (missing 0xff…ff account + Bridge balance high by
+the same amount).
+
+**rskj source**: `co.rsk.peg.BridgeSupport.adjustBalancesIfChangeOutputWasDust`
+(called from `processPegoutsIndividually` and, post-RSKIP271,
+`processPegoutsInBatch` with the batch's total value).
+
+**rustock**: `bridge/peg.rs` `update_collections` — the `settle` closure
+(shared by the individual and batch paths, mirroring rskj's two call
+sites) computes the surplus and transfers it from `BRIDGE_ADDR` to
+`BURN_ADDR`. Test `update_collections_burns_dusty_change_surplus`
+(executor.rs) ports rskj `BridgeSupportIT.callUpdateCollectionsChangeGetsOutOfDust`
+(1 BTC request vs 1 BTC + 100 sat UTXO → 2,600 sat burned).
+
+---
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`

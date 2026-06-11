@@ -47,6 +47,10 @@ use super::tx::*;
 use crate::hardfork::RskHardforkConfig;
 use crate::precompiles::{BRIDGE_ADDR, BridgeTxContext};
 
+/// rskj `BridgeSupport.BURN_ADDRESS`: receiver of the sBTC burned when a
+/// pegout's dusty change output is raised to the non-dust minimum.
+const BURN_ADDR: RskAddress = RskAddress::new([0xff; 20]);
+
 /// A pending peg-out release request, matching rskj's ReleaseRequestQueue.Entry.
 ///
 /// The BTC destination address is the P2PKH hash160 derived from the RSK
@@ -978,8 +982,9 @@ pub fn update_collections<CTX: crate::RskContextTr>(
                 let mut created_any = false;
 
                 // Settle one successfully built peg-out: remove the spent
-                // UTXOs, queue it for confirmations, and (RSKIP146+) log
-                // release_requested with the creation RSK tx hash.
+                // UTXOs, queue it for confirmations, (RSKIP146+) log
+                // release_requested with the creation RSK tx hash, and burn
+                // the dusty-change surplus (adjustBalancesIfChangeOutputWasDust).
                 let settle = |ctx: &mut CTX,
                                   built: super::release_tx::BuiltPegout,
                                   rsk_tx_hash: Option<[u8; 32]>,
@@ -1004,6 +1009,35 @@ pub fn update_collections<CTX: crate::RskContextTr>(
                                 &hash,
                                 &btc_txid_event_bytes(&built.tx),
                                 amount,
+                            );
+                        }
+                    }
+                    // rskj BridgeSupport.adjustBalancesIfChangeOutputWasDust
+                    // (unconditional since genesis): when a dusty change
+                    // output was raised to the non-dust minimum (paid by the
+                    // recipient), the federation spent less BTC than the user
+                    // sent, so the difference is burned — transferred from
+                    // the Bridge to 0xffff...ff (BridgeSupport.BURN_ADDRESS).
+                    if built.tx.output.len() > 1 {
+                        let sum_inputs: u64 =
+                            built.used_utxos.iter().map(|u| u.value_satoshis).sum();
+                        // Papyrus-era rskj reads getOutput(1); HOP+ reads
+                        // getValueSentToMe(wallet). Both equal the change
+                        // paid back to the federation P2SH script.
+                        let change: u64 = built
+                            .tx
+                            .output
+                            .iter()
+                            .filter(|o| o.script_pubkey == *change_script)
+                            .map(|o| o.value.to_sat())
+                            .sum();
+                        let spent_by_federation = sum_inputs.saturating_sub(change);
+                        if spent_by_federation < amount {
+                            let to_burn = amount - spent_by_federation;
+                            let _ = ctx.journal_mut().transfer(
+                                BRIDGE_ADDR,
+                                BURN_ADDR,
+                                btc_satoshi_to_rbtc_wei(to_burn),
                             );
                         }
                     }

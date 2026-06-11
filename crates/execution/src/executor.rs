@@ -5647,4 +5647,102 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
         assert!(acct.is_touched(), "recipient must be touched");
         assert!(acct.is_created(), "frontier materialises the empty account");
     }
+
+    /// Port of rskj `BridgeSupportIT.callUpdateCollectionsChangeGetsOutOfDust`
+    /// (regression for mainnet #3,103,055): when a pegout's change output is
+    /// dusty, bitcoinj raises it to the non-dust minimum at the recipient's
+    /// expense, so the federation spends less BTC than the user sent. rskj's
+    /// `adjustBalancesIfChangeOutputWasDust` burns the difference: an sBTC
+    /// transfer from the Bridge to 0xffff…ff (`BridgeSupport.BURN_ADDRESS`).
+    /// Request 1 BTC against a single 1 BTC + 100 sat UTXO: raw change 100 <
+    /// 2,700 (P2SH non-dust minimum) → burn 2,600 sat = 26,000,000,000,000 wei.
+    #[test]
+    fn update_collections_burns_dusty_change_surplus() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+        let root = put_account(
+            &root,
+            store.as_ref(),
+            &crate::precompiles::BRIDGE_ADDR,
+            0,
+            one_rbtc,
+        );
+
+        // Seed bridge storage: a 1 BTC release request (papyrus-era
+        // with-txhash queue) and one federation UTXO worth 1 BTC + 100 sat.
+        let put_cell = |root: &TrieNode, name: &str, value: &[u8]| {
+            let slot = B256::from(crate::bridge::storage::bridge_storage_key(name));
+            let key = rustock_trie::storage_key(&crate::precompiles::BRIDGE_ADDR, &slot);
+            root.put(&rustock_trie::TrieKeySlice::from_key(&key), value, store.as_ref())
+        };
+        let request = crate::bridge::peg::ReleaseRequest {
+            btc_dest_hash160: [0x11; 20],
+            amount_satoshis: 100_000_000,
+            rsk_tx_hash: Some([0xab; 32]),
+        };
+        let root = put_cell(
+            &root,
+            crate::bridge::storage::RELEASE_REQUEST_QUEUE_WITH_TXHASH_KEY,
+            &crate::bridge::peg::serialize_release_queue_with_hash(&[request]),
+        );
+        let utxo = crate::bridge::storage::BridgeUtxo {
+            tx_hash: [0x07; 32],
+            vout: 0,
+            value_satoshis: 100_000_100,
+            height: 0,
+            script: vec![],
+            coinbase: false,
+        };
+        let root = put_cell(
+            &root,
+            crate::bridge::storage::NEW_FEDERATION_BTC_UTXOS_KEY,
+            &crate::bridge::storage::serialize_utxo_list(&[utxo]),
+        );
+
+        let block_store =
+            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(1_000_000),
+            to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::copy_from_slice(
+                &alloy_primitives::keccak256(b"updateCollections()")[..4],
+            ),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+
+        let header = dummy_header(3_103_055);
+        let result = executor
+            .execute_block(&header, &[(tx, sender)], &root, store.clone())
+            .expect("block executes");
+        assert!(result.tx_results[0].success, "updateCollections succeeds");
+
+        // 2,600 sat = 26,000,000,000,000 wei moved from the Bridge to the
+        // burn address (rskj IT asserts the same pair of balances).
+        let burned = U256::from(26_000_000_000_000u64);
+        let burn_addr = Address::repeat_byte(0xff);
+        let burn_balance = result
+            .state_changes
+            .get(&burn_addr)
+            .map(|a| a.info.balance)
+            .unwrap_or_default();
+        assert_eq!(burn_balance, burned, "dusty-change surplus burned to 0xff…ff");
+        let bridge_balance = result
+            .state_changes
+            .get(&crate::precompiles::BRIDGE_ADDR)
+            .map(|a| a.info.balance)
+            .unwrap_or_default();
+        assert_eq!(bridge_balance, one_rbtc - burned, "burn debits the Bridge");
+    }
 }
