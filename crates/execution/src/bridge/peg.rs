@@ -845,19 +845,53 @@ pub fn release_btc<CTX: crate::RskContextTr>(
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     }
 
-    // rskj requestRelease: post-RSKIP219 the minimum is inclusive (and also
-    // bounded by a fee-based estimate — TODO before iris300); the legacy rule
-    // is EXCLUSIVE: value must be strictly greater than the legacy minimum.
-    let rejected = if hardfork_cfg.has_rskip219(block_number) {
-        amount_satoshis_u256 < U256::from(config.minimum_pegout_tx_value)
+    let amount_satoshis = amount_satoshis_u256.to::<u64>();
+
+    // rskj BridgeSupport.requestRelease: post-RSKIP219 the minimum is INCLUSIVE
+    // and is the max of `minimumPegoutTxValue` and a fee-based estimate; the
+    // legacy rule is EXCLUSIVE (value must be strictly greater than the legacy
+    // minimum). On rejection the reason distinguishes LOW_AMOUNT from
+    // FEE_ABOVE_VALUE (the latter when the fee estimate is the binding bound).
+    let reject_reason: Option<u64> = if hardfork_cfg.has_rskip219(block_number) {
+        let fee_per_kb = get_effective_fee_per_kb(ctx, config);
+        let federation_keys =
+            federation_keys_or_genesis(ctx, config, hardfork_cfg, block_number);
+        let require_funds_for_fee =
+            require_funds_for_fee(&federation_keys, fee_per_kb, config);
+        let min_value = config.minimum_pegout_tx_value.max(require_funds_for_fee);
+        if amount_satoshis < min_value {
+            // rskj: FEE_ABOVE_VALUE when minValue == requireFundsForFee, else
+            // LOW_AMOUNT. RejectedPegoutReason: LOW_AMOUNT=1, FEE_ABOVE_VALUE=3.
+            Some(if min_value == require_funds_for_fee { 3 } else { 1 })
+        } else {
+            None
+        }
+    } else if amount_satoshis_u256 <= U256::from(config.legacy_minimum_pegout_tx_value) {
+        Some(1) // legacy: always LOW_AMOUNT
     } else {
-        amount_satoshis_u256 <= U256::from(config.legacy_minimum_pegout_tx_value)
+        None
     };
-    if rejected {
+
+    if let Some(reason) = reject_reason {
+        // RSKIP185 (Iris300): refund the value to the sender and emit the
+        // release_request_rejected event. Before RSKIP185 the request was
+        // silently dropped (value retained by the Bridge).
+        if hardfork_cfg.has_rskip185(block_number) {
+            // Pre-RSKIP427 refund value = Coin.fromBitcoin(weis.toBitcoin()),
+            // i.e. the wei amount truncated to satoshi granularity.
+            let refund_wei = amount_satoshis_u256 * U256::from(10_000_000_000u64);
+            let _ = ctx
+                .journal_mut()
+                .transfer(BRIDGE_ADDR, tx_ctx.rsk_sender, refund_wei);
+            super::events::log_release_request_rejected(
+                ctx,
+                tx_ctx.rsk_sender,
+                amount_satoshis,
+                reason,
+            );
+        }
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     }
-
-    let amount_satoshis = amount_satoshis_u256.to::<u64>();
 
     // BTC destination: RIPEMD160(SHA256(compressed_pubkey)) derived from tx sender.
     // tx_ctx.btc_sender_hash160 was computed by the executor from the RSK tx signature,
@@ -2100,6 +2134,40 @@ pub(crate) fn load_federation_member_keys<CTX: crate::RskContextTr>(ctx: &mut CT
     Vec::new()
 }
 
+/// rskj `BridgeUtilsLegacy.calculatePegoutTxSize` for a regular peg-out (two
+/// inputs, two outputs). Pre-RSKIP271 only; the active federation is a
+/// standard multisig whose redeem script length and signature count drive the
+/// size estimate. Matches rskj `BridgeUtils.getRegularPegoutTxSize`.
+fn regular_pegout_tx_size(federation_keys: &[[u8; 33]]) -> u64 {
+    const SIGNATURE_MULTIPLIER: u64 = 71;
+    const OUTPUT_SIZE: u64 = 25;
+    const INPUT_ADDITIONAL_DATA_SIZE: u64 = 40;
+    const OUTPUT_ADDITIONAL_DATA_SIZE: u64 = 9;
+    const TX_ADDITIONAL_DATA_SIZE: u64 = 4;
+    const INPUTS: u64 = 2;
+    const OUTPUTS: u64 = 2;
+
+    let threshold = (federation_keys.len() / 2) + 1;
+    let redeem = build_federation_redeem_script(federation_keys, threshold);
+    let script_sig_chunk =
+        threshold as u64 * (SIGNATURE_MULTIPLIER + 1) + redeem.len() as u64 + 1;
+    TX_ADDITIONAL_DATA_SIZE
+        + (script_sig_chunk + INPUT_ADDITIONAL_DATA_SIZE) * INPUTS
+        + (OUTPUT_SIZE + 1 + OUTPUT_ADDITIONAL_DATA_SIZE) * OUTPUTS
+}
+
+/// rskj `BridgeSupport.requestRelease` minimum-fee estimate (post-RSKIP219):
+/// `feePerKb * pegoutSize / 1000`, plus a configured percentage gap.
+fn require_funds_for_fee(
+    federation_keys: &[[u8; 33]],
+    fee_per_kb: u64,
+    config: &BridgeConstants,
+) -> u64 {
+    let pegout_size = regular_pegout_tx_size(federation_keys);
+    let base = fee_per_kb * pegout_size / 1000;
+    base + base * config.minimum_pegout_value_percentage_to_receive_after_fee / 100
+}
+
 /// Read the effective fee per KB from storage, falling back to genesis value.
 fn get_effective_fee_per_kb<CTX: crate::RskContextTr>(ctx: &mut CTX, config: &BridgeConstants) -> u64 {
     let stored = super::storage::bridge_load_u256(ctx, super::storage::FEE_PER_KB_KEY);
@@ -2920,5 +2988,44 @@ mod tests {
         // First serialized key must be 285b… (smaller under reverse-byte order).
         assert_eq!(items[0], k_285b);
         assert_eq!(items[2], k_12b7);
+    }
+
+    /// Port of rskj BridgeUtilsLegacyTest.calculatePegoutTxSize_before_rskip_271:
+    /// a 13-of-13 standard multisig federation's regular peg-out (2 inputs,
+    /// 2 outputs) must size to within 2% of the real-world 2076 bytes.
+    #[test]
+    fn regular_pegout_tx_size_within_2pct_of_real_tx() {
+        use k256::ecdsa::SigningKey;
+        let keys: Vec<[u8; 33]> = (1u8..=13)
+            .map(|seed| {
+                SigningKey::from_slice(&[seed; 32])
+                    .unwrap()
+                    .verifying_key()
+                    .to_encoded_point(true)
+                    .as_bytes()
+                    .try_into()
+                    .unwrap()
+            })
+            .collect();
+        let size = regular_pegout_tx_size(&keys);
+        let orig = 2076i64;
+        let diff = (orig - size as i64).abs();
+        assert!(diff as f64 <= orig as f64 * 0.02, "size {size} too far from {orig}");
+    }
+
+    /// At mainnet #3,615,279 (feePerKb 30000 sat/kB, mainnet federation) the
+    /// fee-based minimum is far below the 400000-sat minimumPegoutTxValue, so a
+    /// 10000-sat direct transfer is rejected with reason LOW_AMOUNT (not
+    /// FEE_ABOVE_VALUE). This pins the reason-selection branch.
+    #[test]
+    fn require_funds_for_fee_below_minimum_pegout_value() {
+        let config = BridgeConstants::mainnet();
+        let keys = genesis_federation_keys(&config);
+        let fee = require_funds_for_fee(&keys, 30_000, &config);
+        assert!(
+            fee < config.minimum_pegout_tx_value,
+            "require_funds_for_fee {fee} should be below {} so reason is LOW_AMOUNT",
+            config.minimum_pegout_tx_value
+        );
     }
 }

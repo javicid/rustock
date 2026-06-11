@@ -1599,6 +1599,71 @@ now format the height with `height.to_string()` (decimal). Tests:
 
 ---
 
+## 36. RSKIP185: a rejected direct peg-out refunds the sender and logs `release_request_rejected`
+
+A direct RBTC transfer to the Bridge address (empty calldata, non-zero value)
+invokes `BridgeSupport.releaseBtc()` → `requestRelease()`. Post-RSKIP219 the
+peg-out value must be **≥ `minValue`**, where
+
+```java
+Coin requireFundsForFee = feePerKB.multiply(pegoutSize).divide(1000);
+requireFundsForFee = requireFundsForFee.add(
+    requireFundsForFee.times(minimumPegoutValuePercentageToReceiveAfterFee).divide(100));
+Coin minValue = Coin.valueOf(Math.max(minimumPegoutTxValue.value, requireFundsForFee.value));
+if (valueToReleaseInSatoshis.isLessThan(minValue)) { /* reject */ }
+```
+
+When the value is below `minValue` and **RSKIP185** (Iris300, mainnet
+3,614,800) is active, `requestRelease` calls `refundAndEmitRejectEvent`, which:
+
+1. **Refunds** the value back to the sender:
+   `rskRepository.transfer(BRIDGE_ADDR, sender, refundValue)`. Pre-RSKIP427 the
+   refund is `Coin.fromBitcoin(weis.toBitcoin())` — i.e. the wei amount
+   **truncated to satoshi granularity** (`floor(wei/1e10) * 1e10`).
+2. **Logs** `release_request_rejected(address indexed sender, uint256 amount,
+   int256 reason)`. Pre-RSKIP427 `amount` is in **satoshis**
+   (`amountInWeis.toBitcoin().getValue()`); `reason` is the
+   `RejectedPegoutReason` enum value: **`LOW_AMOUNT=1`**, `CALLER_CONTRACT=2`,
+   **`FEE_ABOVE_VALUE=3`**. The reason is `FEE_ABOVE_VALUE` iff
+   `minValue == requireFundsForFee` (the fee estimate is the binding bound),
+   else `LOW_AMOUNT`.
+
+Before RSKIP185 the request was silently dropped (no refund, no log; the value
+stayed at the Bridge). rustock previously took that silent-drop path
+unconditionally, and never computed the fee-based `minValue`/reason.
+
+**Consensus-load-bearing:** gasUsed and tx status are unaffected (the rejection
+charges no extra gas, and the net balance change is the same once refunded), so
+a from-scratch client that forgets to emit the event forks **only on the
+receipts root** (missing log → missing bloom + log entry), while a client that
+forgets the refund forks only on the state root. The `pegoutSize`/`feePerKb`
+inputs to `minValue` also alter the *reason* value embedded in the log data.
+
+**Trigger**: mainnet #3,615,279 tx 9 — a 10,000-sat (1e14-wei) direct transfer
+to the Bridge. 10,000 < 400,000 (`minimumPegoutTxValue`) and the fee-based
+estimate at `feePerKb=30,000` is ≈ 1e5 sat (≪ 400,000), so `minValue =
+minimumPegoutTxValue` → reason `LOW_AMOUNT`. rustock emitted no log; the
+receipts root forked (`0x767c…` vs `0x499b…`) and, downstream of the missing
+refund, the state root (`0x9bff…` vs `0xaa20…`).
+
+**rskj source**: `co.rsk.peg.BridgeSupport.releaseBtc` / `requestRelease` /
+`refundAndEmitRejectEvent`; `co.rsk.peg.utils.BridgeEventLoggerImpl.logReleaseBtcRequestRejected`;
+`co.rsk.peg.utils.RejectedPegoutReason`; `co.rsk.peg.BridgeUtils.getRegularPegoutTxSize`
+→ `BridgeUtilsLegacy.calculatePegoutTxSize` (pre-RSKIP271).
+
+**rustock**: `crates/execution/src/bridge/peg.rs` — `release_btc` now computes
+`require_funds_for_fee` (via `regular_pegout_tx_size`) and the `minValue`/reason,
+and on rejection (RSKIP185+) refunds `amount_satoshis * 1e10` wei and calls
+`super::events::log_release_request_rejected`
+(`crates/execution/src/bridge/events.rs`). The percentage gap constant
+`minimum_pegout_value_percentage_to_receive_after_fee` (mainnet/testnet 80,
+regtest 20) was added to `BridgeConstants`. Tests:
+`solidity_release_request_rejected_matches_mainnet_3615279` (event topic + data
+ground truth), `regular_pegout_tx_size_within_2pct_of_real_tx` (ported from rskj
+`BridgeUtilsLegacyTest`), `require_funds_for_fee_below_minimum_pegout_value`.
+
+---
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`

@@ -35,6 +35,10 @@ pub struct BridgeConstants {
     pub legacy_minimum_pegout_tx_value: u64,
     /// Minimum peg-out value in BTC satoshis (post-RSKIP271).
     pub minimum_pegout_tx_value: u64,
+    /// Extra-gap percentage added on top of the fee estimate when computing
+    /// the post-RSKIP219 minimum peg-out value (rskj
+    /// BridgeConstants.minimumPegoutValuePercentageToReceiveAfterFee).
+    pub minimum_pegout_value_percentage_to_receive_after_fee: u64,
 
     // -- Peg-out batching --
 
@@ -145,6 +149,7 @@ impl BridgeConstants {
             minimum_pegin_tx_value: 500_000,           // 0.005 BTC
             legacy_minimum_pegout_tx_value: 800_000,   // 0.008 BTC
             minimum_pegout_tx_value: 400_000,          // 0.004 BTC
+            minimum_pegout_value_percentage_to_receive_after_fee: 80,
             max_inputs_per_pegout_transaction: 20,
             number_of_blocks_between_pegouts: 360,
             update_bridge_execution_period: 1,
@@ -236,6 +241,7 @@ impl BridgeConstants {
             minimum_pegin_tx_value: 500_000,
             legacy_minimum_pegout_tx_value: 500_000,
             minimum_pegout_tx_value: 250_000,
+            minimum_pegout_value_percentage_to_receive_after_fee: 80,
             max_inputs_per_pegout_transaction: 20,
             number_of_blocks_between_pegouts: 360,
             update_bridge_execution_period: 1,
@@ -316,6 +322,7 @@ impl BridgeConstants {
             minimum_pegin_tx_value: 500_000,
             legacy_minimum_pegout_tx_value: 500_000,
             minimum_pegout_tx_value: 250_000,
+            minimum_pegout_value_percentage_to_receive_after_fee: 20,
             max_inputs_per_pegout_transaction: 20,
             number_of_blocks_between_pegouts: 1,
             update_bridge_execution_period: 1,

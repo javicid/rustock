@@ -300,6 +300,30 @@ pub fn log_release_requested<CTX: crate::RskContextTr>(
     );
 }
 
+/// `release_request_rejected(address indexed sender, uint256 amount, int256
+/// reason)` — rskj `logReleaseBtcRequestRejected`. Pre-RSKIP427 the amount is
+/// in satoshis (`amountInWeis.toBitcoin().getValue()`); the reason is the
+/// `RejectedPegoutReason` enum value (LOW_AMOUNT=1, CALLER_CONTRACT=2,
+/// FEE_ABOVE_VALUE=3).
+pub fn log_release_request_rejected<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    sender: Address,
+    amount_satoshis: u64,
+    reason: u64,
+) {
+    let mut data = Vec::with_capacity(64);
+    data.extend_from_slice(&u256_word(alloy_primitives::U256::from(amount_satoshis)));
+    data.extend_from_slice(&u256_word(alloy_primitives::U256::from(reason)));
+    emit_topics(
+        ctx,
+        vec![
+            solidity_topic("release_request_rejected(address,uint256,int256)"),
+            address_word(sender),
+        ],
+        data,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,6 +433,35 @@ mod tests {
         assert_eq!(
             hex::encode(&data),
             "9432c865f2dbf36ce6f4cfcb624b559ef98b33a2d1"
+        );
+    }
+
+    /// Groundtruth from mainnet #3,615,279 tx 9 receipt (public-node.rsk.co):
+    /// a direct RBTC transfer to the Bridge below the minimum peg-out value is
+    /// rejected with LOW_AMOUNT(1), refunded, and logged. The receipt log:
+    ///   topic0 0xb607c3e1fbe6b38cd145b15b837f7b722b199caa60e3057b36c141adee3b75e7
+    ///   topic1 0x000000000000000000000000a231da16f77aaefa07427f13c6e03141eb15733a
+    ///   data   0x...2710 (10000 sat) ...0001 (reason LOW_AMOUNT)
+    #[test]
+    fn solidity_release_request_rejected_matches_mainnet_3615279() {
+        use alloy_primitives::hex;
+        assert_eq!(
+            hex::encode(solidity_topic("release_request_rejected(address,uint256,int256)")),
+            "b607c3e1fbe6b38cd145b15b837f7b722b199caa60e3057b36c141adee3b75e7"
+        );
+        let sender: Address = "0xa231da16f77aaefa07427f13c6e03141eb15733a".parse().unwrap();
+        assert_eq!(
+            hex::encode(address_word(sender)),
+            "000000000000000000000000a231da16f77aaefa07427f13c6e03141eb15733a"
+        );
+        // data = uint256(amountSatoshis) || int256(reason)
+        let mut data = Vec::new();
+        data.extend_from_slice(&u256_word(alloy_primitives::U256::from(10_000u64)));
+        data.extend_from_slice(&u256_word(alloy_primitives::U256::from(1u64)));
+        assert_eq!(
+            hex::encode(&data),
+            "0000000000000000000000000000000000000000000000000000000000002710\
+             0000000000000000000000000000000000000000000000000000000000000001"
         );
     }
 
