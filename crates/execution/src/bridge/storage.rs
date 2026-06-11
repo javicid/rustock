@@ -32,14 +32,12 @@ pub fn bridge_storage_key_long(name: &str) -> U256 {
 }
 
 /// Build a compound key: `base_key + delimiter + identifier`, then hash.
-/// Matches rskj's `BridgeStorageIndexKey.getCompoundKey(delimiter, identifier)`.
+/// Matches rskj's `BridgeStorageIndexKey.getCompoundKey(delimiter, identifier)`,
+/// which is `DataWord.fromLongString(...)` — i.e. **always** Keccak256 of the
+/// concatenated string, regardless of length (it does NOT fall back to the
+/// `fromString` right-aligned encoding for short strings).
 pub fn compound_key(base: &str, delimiter: &str, identifier: &str) -> U256 {
-    let combined = format!("{}{}{}", base, delimiter, identifier);
-    if combined.len() <= 32 {
-        bridge_storage_key(&combined)
-    } else {
-        bridge_storage_key_long(&combined)
-    }
+    bridge_storage_key_long(&format!("{}{}{}", base, delimiter, identifier))
 }
 
 // ---------------------------------------------------------------------------
@@ -182,7 +180,7 @@ pub fn bridge_store_timestamp<CTX: crate::RskContextTr>(ctx: &mut CTX, key_name:
 /// Read a BTC main-chain block hash by height (RSKIP199 index; rskj
 /// `getBtcBestBlockHashByHeight` -- value is `RLP.encodeElement(hash)`).
 pub fn bridge_load_btc_block_hash_by_height<CTX: crate::RskContextTr>(ctx: &mut CTX, height: u32) -> Option<B256> {
-    let key = compound_key(BTC_BLOCK_HEIGHT_KEY, "-", &format!("{:x}", height));
+    let key = compound_key(BTC_BLOCK_HEIGHT_KEY, "-", &height.to_string());
     let data = bridge_load_raw(ctx, key)?;
     // RLP element: 0xa0 || 32-byte hash
     if data.len() == 33 && data[0] == 0xa0 {
@@ -195,7 +193,7 @@ pub fn bridge_load_btc_block_hash_by_height<CTX: crate::RskContextTr>(ctx: &mut 
 /// Store a BTC main-chain block hash by height (RSKIP199 index; rskj
 /// `setBtcBestBlockHashByHeight` -- serializeSha256Hash = RLP element).
 pub fn bridge_store_btc_block_hash_by_height<CTX: crate::RskContextTr>(ctx: &mut CTX, height: u32, hash: B256) {
-    let key = compound_key(BTC_BLOCK_HEIGHT_KEY, "-", &format!("{:x}", height));
+    let key = compound_key(BTC_BLOCK_HEIGHT_KEY, "-", &height.to_string());
     let value = super::serialization::rlp_encode_element(hash.as_slice());
     bridge_store_raw(ctx, key, Some(value));
 }
@@ -652,10 +650,18 @@ mod tests {
 
     #[test]
     fn compound_key_btc_height() {
-        let key = compound_key(BTC_BLOCK_HEIGHT_KEY, "-", "ff");
-        // "btcBlockHeight-ff" is 17 bytes, fits in 32, so uses fromString
-        let bytes = key.to_be_bytes::<32>();
-        assert_eq!(&bytes[32 - 17..], b"btcBlockHeight-ff");
+        // rskj BridgeStorageProvider.getStorageKeyForBtcBlockIndex passes
+        // `height.toString()` (DECIMAL) and getCompoundKey always uses
+        // DataWord.fromLongString (Keccak256), even for short strings.
+        // Groundtruth: block #3,614,822 stored the BTC-best-block-hash index for
+        // height 696552; its unitrie storage slot (the DataWord) was
+        // 0x16237937c05c75734c886e3a18c663be516f8140f821c7e6c277dc78d76e78fd.
+        let key = compound_key(BTC_BLOCK_HEIGHT_KEY, "-", "696552");
+        assert_eq!(key, bridge_storage_key_long("btcBlockHeight-696552"));
+        assert_eq!(
+            alloy_primitives::hex::encode(key.to_be_bytes::<32>()),
+            "16237937c05c75734c886e3a18c663be516f8140f821c7e6c277dc78d76e78fd"
+        );
     }
 
     #[test]
@@ -741,22 +747,23 @@ mod tests {
         assert_eq!(key, expected);
     }
 
-    /// Verify compound_key switches from fromString to fromLongString at
-    /// the 32-byte boundary (matching rskj's BridgeStorageIndexKey behavior).
+    /// rskj's `BridgeStorageIndexKey.getCompoundKey` always uses
+    /// `DataWord.fromLongString` (Keccak256), regardless of the concatenated
+    /// string's length — there is NO fromString fallback for short strings.
     #[test]
-    fn rskj_compound_key_boundary() {
-        // Short compound: "btcBlockHeight-ff" = 17 bytes → fromString
+    fn rskj_compound_key_always_keccak() {
+        // Short compound (17 bytes): still Keccak256, NOT right-aligned ASCII.
         let short = compound_key("btcBlockHeight", "-", "ff");
-        let short_bytes = short.to_be_bytes::<32>();
-        assert_eq!(&short_bytes[32 - 17..], b"btcBlockHeight-ff");
+        assert_eq!(short, bridge_storage_key_long("btcBlockHeight-ff"));
+        // It must NOT equal the fromString (right-aligned) encoding.
+        assert_ne!(short, bridge_storage_key("btcBlockHeight-ff"));
 
-        // Long compound: key + delimiter + 64-char hash → >32 bytes → keccak256
+        // Long compound: same rule.
         let long_id = "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344";
         let long_key = compound_key("btcTxHashAP", "-", long_id);
         let combined = format!("btcTxHashAP-{}", long_id);
         assert!(combined.len() > 32);
-        let expected = bridge_storage_key_long(&combined);
-        assert_eq!(long_key, expected);
+        assert_eq!(long_key, bridge_storage_key_long(&combined));
     }
 
     /// Verify that the chain head key "blockStoreChainHead" produces the

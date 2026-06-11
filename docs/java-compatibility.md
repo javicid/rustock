@@ -1546,6 +1546,59 @@ truth).
 
 ---
 
+## 35. `getCompoundKey` ALWAYS Keccak256-hashes, and `btcBlockHeight` uses the DECIMAL height
+
+The RSKIP199 BTC-best-block-hash-by-height index (`getBtcBestBlockHashByHeight` /
+`setBtcBestBlockHashByHeight`) keys its storage cell with
+
+```java
+private DataWord getStorageKeyForBtcBlockIndex(Integer height) {
+    return BTC_BLOCK_HEIGHT.getCompoundKey("-", height.toString());
+}
+```
+
+Two implementation details are consensus-load-bearing here:
+
+1. **`getCompoundKey` is unconditionally `fromLongString` (Keccak256).**
+   `BridgeStorageIndexKey.getCompoundKey` is
+   `DataWord.fromLongString(key + delimiter + identifier)`, and
+   `DataWord.fromLongString(s) = valueOf(HashUtil.keccak256(s.getBytes(UTF_8)))`.
+   It hashes the concatenated string **regardless of length** — there is no
+   `fromString` (right-aligned ASCII) fallback for strings ≤ 32 bytes. The other
+   compound keys (`coinbaseInformation-<txhash>`, `btcTxHashAP-<txhash>`,
+   `fastBridgeHashUsedInBtcTx-<…>`) all exceed 32 bytes, so a length-conditional
+   implementation happened to match them — but `btcBlockHeight-<height>` is short
+   (e.g. `"btcBlockHeight-696552"` = 21 bytes), exposing the bug.
+
+2. **The identifier is the DECIMAL height** (`Integer.toString()`), not hex.
+
+So the slot for height 696552 is `keccak256("btcBlockHeight-696552")` =
+`0x16237937c05c75734c886e3a18c663be516f8140f821c7e6c277dc78d76e78fd`, NOT the
+right-aligned ASCII of `"btcBlockHeight-aa0e8"` (the hex form rustock used).
+
+**Consensus-load-bearing:** the stored value (the BTC block hash) is identical;
+only the storage *key* differs, so gas and receipts match while the unitrie
+forks. A from-scratch client that (a) right-aligns short compound key strings
+like every other Bridge `fromString` key, or (b) formats the height as hex,
+diverges the first time this index is written.
+
+**Trigger**: mainnet #3,614,822. The block writes the RSKIP199 index for BTC
+height 696552; rustock stored the value under `fromString("btcBlockHeight-aa0e8")`
+(hex, ASCII-padded) instead of `fromLongString("btcBlockHeight-696552")`,
+producing a two-leaf diff (one absent leaf each side) on the Bridge contract.
+
+**rskj source**: `co.rsk.peg.BridgeStorageProvider.getStorageKeyForBtcBlockIndex`
+(`height.toString()`); `co.rsk.peg.BridgeStorageIndexKey.getCompoundKey`
+(`DataWord.fromLongString`); `org.ethereum.vm.DataWord.fromLongString`.
+
+**rustock**: `crates/execution/src/bridge/storage.rs` — `compound_key` now always
+calls `bridge_storage_key_long` (Keccak256); `bridge_{load,store}_btc_block_hash_by_height`
+now format the height with `height.to_string()` (decimal). Tests:
+`compound_key_btc_height` (block #3,614,822 slot ground truth) and
+`rskj_compound_key_always_keccak`.
+
+---
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`
