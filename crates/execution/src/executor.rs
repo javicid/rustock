@@ -150,6 +150,7 @@ impl RskExecutor {
                 invisible_flag,
                 pre_rskip150_precompiles,
                 active_precompiles,
+                self.hardfork_cfg.has_rskip171(header.number),
             );
             let out = handler
                 .run(&mut evm)
@@ -517,6 +518,7 @@ impl RskExecutor {
                 invisible_flag.clone(),
                 pre_rskip150_precompiles.clone(),
                 active_precompiles.clone(),
+                self.hardfork_cfg.has_rskip171(header.number),
             );
                 handler
                     .run(&mut evm)
@@ -1417,6 +1419,101 @@ mod tests {
             U256::from(32),
             "RETURNDATASIZE after a call to an empty-code account must keep \
              the previous call's 32-byte size (rskj returnDataBuffer)"
+        );
+    }
+
+    /// Regression for mainnet #3,616,094: RSKIP171 (iris300) makes
+    /// `Program.cleanReturnDataBuffer` reset the caller's returnDataBuffer on
+    /// every call that runs no new frame, so a CALL to an empty-code account
+    /// CLEARS the buffer (canonical EIP-211) instead of preserving the prior
+    /// call's output. RETURNDATASIZE after such a call must report 0.
+    /// Ground truth: rskj VMTest.returnDataSizeAfterCallToNonExistentContract
+    /// (active = true → 0); the pre-iris twin asserts 32 above.
+    #[test]
+    fn test_empty_code_call_clears_return_data_buffer_post_rskip171() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+        let sender = Address::repeat_byte(0xAC);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+        let block_store =
+            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+
+        let deploy_tx = |nonce: u64, runtime: &[u8]| {
+            let mut init = vec![
+                0x60, runtime.len() as u8, 0x60, 0x0c, 0x60, 0x00, 0x39,
+                0x60, runtime.len() as u8, 0x60, 0x00, 0xf3,
+            ];
+            init.extend_from_slice(runtime);
+            rustock_core::Transaction {
+                nonce,
+                gas_price: U256::from(0),
+                gas_limit: U256::from(1_000_000),
+                to: Bytes::new(),
+                value: U256::ZERO,
+                input: Bytes::from(init),
+                v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+            }
+        };
+
+        // Returner: RETURN 32 zero bytes.
+        let returner_runtime = vec![0x60, 0x20, 0x60, 0x00, 0xf3];
+        let returner = sender.create(0);
+        let eoa = Address::repeat_byte(0xEE);
+
+        // Main: CALL returner; CALL the EOA; SSTORE(0, RETURNDATASIZE); STOP.
+        let mut main_runtime = Vec::new();
+        let call_to = |code: &mut Vec<u8>, addr: Address| {
+            code.extend_from_slice(&[0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x73]);
+            code.extend_from_slice(addr.as_slice());
+            code.extend_from_slice(&[0x62, 0x0f, 0x42, 0x40, 0xf1, 0x50]); // PUSH3 1M gas; CALL; POP
+        };
+        call_to(&mut main_runtime, returner);
+        call_to(&mut main_runtime, eoa);
+        main_runtime.extend_from_slice(&[0x3d, 0x60, 0x00, 0x55, 0x00]);
+        let main = sender.create(1);
+
+        // Iris300 activates at mainnet #3,614,800 — pick a block past it.
+        let header1 = dummy_header(3_616_094);
+        let r1 = executor
+            .execute_block(
+                &header1,
+                &[(deploy_tx(0, &returner_runtime), sender), (deploy_tx(1, &main_runtime), sender)],
+                &root,
+                store.clone(),
+            )
+            .expect("deploy block");
+        assert!(r1.tx_results.iter().all(|r| r.success));
+        let root2 =
+            crate::state::apply_state_changes(&root, store.as_ref(), &r1.state_changes, &r1.markers);
+
+        let call = rustock_core::Transaction {
+            nonce: 2,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(1_000_000),
+            to: Bytes::copy_from_slice(main.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::new(),
+            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+        };
+        let r2 = executor
+            .execute_block(&dummy_header(3_616_095), &[(call, sender)], &root2, store.clone())
+            .expect("call block");
+        assert!(r2.tx_results[0].success);
+        let slot0 = r2
+            .state_changes
+            .get(&main)
+            .expect("main contract")
+            .storage
+            .get(&U256::ZERO)
+            .map(|s| s.present_value)
+            .unwrap_or(U256::ZERO);
+        assert_eq!(
+            slot0,
+            U256::ZERO,
+            "RSKIP171: RETURNDATASIZE after a call to an empty-code account \
+             must be 0 (the buffer is cleared, not preserved)"
         );
     }
 

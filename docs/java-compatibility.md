@@ -1664,6 +1664,66 @@ ground truth), `regular_pegout_tx_size_within_2pct_of_real_tx` (ported from rskj
 
 ---
 
+## 37. RSKIP171: a CALL that runs no new frame CLEARS the caller's returnDataBuffer (iris300)
+
+The mirror image of §26. rskj's `Program.cleanReturnDataBuffer` is era-gated:
+
+```java
+private void cleanReturnDataBuffer() {
+    if (getActivations().isActive(ConsensusRule.RSKIP171)) {
+        returnDataBuffer = null; // reset when the call created no new call frame
+    }
+}
+```
+
+It is invoked from every CALL/CREATE path that runs **no new frame** —
+`callToAddress` empty-code branch (plain value transfer / call to an EOA) and
+insufficient-endowment branch, `createContract` insufficient-funds branch,
+`callToPrecompiledAddress` out-of-gas branch:
+
+- **Pre-RSKIP171** (no-op): the *previous* call's return data survives — this
+  is the §26 behavior (mainnet #2,669,886): `RETURNDATASIZE` after a no-frame
+  call still reports the prior call's size.
+- **Post-RSKIP171** (iris300, mainnet **#3,614,800**): the buffer is reset to
+  empty, exactly like canonical EVM / EIP-211 — `RETURNDATASIZE` reports 0.
+
+**Consensus-load-bearing.** The call's own gasUsed and status are unaffected,
+but the post-call `RETURNDATASIZE`/`RETURNDATACOPY` value steers a contract
+down a different branch. A from-scratch client that keeps the §26 preservation
+past iris300 forks on the **state and receipts roots** wherever a contract
+reads return data after a no-frame call — and may spend a different amount of
+gas on the divergent path, even running out of gas where the canonical client
+succeeds.
+
+**Trigger.** mainnet **#3,616,094** tx 8 — a DEX router (`0x5a0d867e…`) sends
+RBTC change to an EOA (`0x60f096e5…`, empty code) via a value-bearing CALL,
+then executes `RETURNDATASIZE` to validate the *prior* WRBTC `transfer()`'s
+32-byte output. rustock (still using the §26 preservation) reported size 32
+where rskj reported 0, took the wrong branch, overspent ~77 gas and ran the
+top-level call **out of gas**, reverting the whole swap. gasUsed and receipts
+matched at the originally-reported halt #3,616,195 because the corruption was a
+clean revert of all of tx 8's state, surfacing only as a state-root divergence;
+the real origin was #3,616,094.
+
+**rskj source.** `org.ethereum.vm.program.Program.cleanReturnDataBuffer`
+(called from `callToAddress` / `createContract` / `callToPrecompiledAddress`);
+`ConsensusRule.RSKIP171` (reference.conf `rskip171 = iris300`). Ground truth:
+`org.ethereum.vm.VMTest.returnDataSizeAfterCallToNonExistentContract`
+(active → 0) and `beforeIrisReturnDataSizeAfterCallToNonExistentContract`
+(inactive → 32).
+
+**rustock.** `RskHandler` gained an `rskip171_active` flag
+(`crates/execution/src/rsk_handler.rs`); when set, the §26
+returnDataBuffer-preservation (`rskj_preserves`) is disabled so revm's default
+EIP-211 clearing stands. Wired from `RskHardforkConfig::has_rskip171` (iris300,
+`crates/execution/src/hardfork.rs`) at both `RskExecutor` call sites
+(`crates/execution/src/executor.rs`). Tests, the two halves of rskj's VMTest
+pair: `test_empty_code_call_preserves_return_data_buffer` (pre-iris #2,500,000
+→ 32) and `test_empty_code_call_clears_return_data_buffer_post_rskip171`
+(#3,616,094 → 0).
+
+---
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`

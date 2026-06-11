@@ -83,7 +83,17 @@ pub struct RskHandler<CTX, ERROR, FRAME> {
     /// `callToPrecompiledAddress`; a call that executes nothing — empty-code
     /// callee, depth limit, insufficient endowment — leaves the PREVIOUS
     /// call's return data in place, where canonical EVM (EIP-211) clears it.
+    /// This pre-iris quirk is disabled once RSKIP171 activates.
     active_precompiles: Vec<Address>,
+    /// Post-RSKIP171 (iris300): `Program.cleanReturnDataBuffer` now resets
+    /// the buffer on EVERY call that runs no new frame (empty-code callee,
+    /// insufficient endowment, depth limit, precompile-out-of-gas), matching
+    /// canonical EVM / revm's default EIP-211 clearing. When `true`, the
+    /// buffer-preservation above is disabled (mainnet #3,616,094: a DEX
+    /// router does RETURNDATASIZE right after a value transfer to an empty
+    /// account — preserving the prior call's 32-byte output sent it down a
+    /// different branch and out of gas).
+    rskip171_active: bool,
     _phantom: core::marker::PhantomData<(CTX, ERROR, FRAME)>,
 }
 
@@ -98,15 +108,18 @@ impl<CTX, ERROR, FRAME> RskHandler<CTX, ERROR, FRAME> {
             invisible_exception,
             None,
             Vec::new(),
+            false,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn with_rskip125(
         empty_create_on_unpayable_deposit: bool,
         rskip125_active: bool,
         invisible_exception: Arc<AtomicBool>,
         pre_rskip150_precompiles: Option<Vec<Address>>,
         active_precompiles: Vec<Address>,
+        rskip171_active: bool,
     ) -> Self {
         Self {
             empty_create_on_unpayable_deposit,
@@ -114,6 +127,7 @@ impl<CTX, ERROR, FRAME> RskHandler<CTX, ERROR, FRAME> {
             invisible_exception,
             pre_rskip150_precompiles,
             active_precompiles,
+            rskip171_active,
             _phantom: core::marker::PhantomData,
         }
     }
@@ -313,15 +327,20 @@ where
                             // reports the prior call's 32-byte output).
                             // For CREATE only the pre-checks (depth/endowment)
                             // return before rskj's reset.
-                            let rskj_preserves = match &result {
-                                FrameResult::Call(_) => callee
-                                    .is_some_and(|c| !self.active_precompiles.contains(&c)),
-                                FrameResult::Create(outcome) => matches!(
-                                    outcome.instruction_result(),
-                                    InstructionResult::CallTooDeep
-                                        | InstructionResult::OutOfFunds
-                                ),
-                            };
+                            // RSKIP171 (iris300): cleanReturnDataBuffer now
+                            // fires on every no-frame call, so the pre-iris
+                            // preservation is disabled and revm's EIP-211
+                            // clearing stands.
+                            let rskj_preserves = !self.rskip171_active
+                                && match &result {
+                                    FrameResult::Call(_) => callee
+                                        .is_some_and(|c| !self.active_precompiles.contains(&c)),
+                                    FrameResult::Create(outcome) => matches!(
+                                        outcome.instruction_result(),
+                                        InstructionResult::CallTooDeep
+                                            | InstructionResult::OutOfFunds
+                                    ),
+                                };
                             if rskj_preserves {
                                 use revm::interpreter::interpreter_types::ReturnData;
                                 preserved_return_buffer = Some(
