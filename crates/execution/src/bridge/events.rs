@@ -324,6 +324,38 @@ pub fn log_release_request_rejected<CTX: crate::RskContextTr>(
     );
 }
 
+/// `release_request_received(address indexed sender, bytes
+/// btcDestinationAddress, uint256 amount)` — rskj `logReleaseBtcRequestReceived`
+/// (RELEASE_REQUEST_RECEIVED_LEGACY). Emitted when a peg-out is accepted and
+/// enqueued (RSKIP185). Pre-RSKIP326 the destination is the 20-byte hash160 as
+/// dynamic `bytes`; pre-RSKIP427 the amount is in satoshis
+/// (`amountInWeis.toBitcoin().getValue()`).
+pub fn log_release_request_received<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    sender: Address,
+    btc_dest_hash160: &[u8; 20],
+    amount_satoshis: u64,
+) {
+    // ABI data for `(bytes btcDestinationAddress, uint256 amount)`: head holds
+    // the dynamic-bytes offset (0x40) and the amount word, then the bytes tail.
+    let mut data = Vec::with_capacity(128);
+    data.extend_from_slice(&u256_word(alloy_primitives::U256::from(64u64)));
+    data.extend_from_slice(&u256_word(alloy_primitives::U256::from(amount_satoshis)));
+    data.extend_from_slice(&u256_word(alloy_primitives::U256::from(
+        btc_dest_hash160.len() as u64,
+    )));
+    data.extend_from_slice(btc_dest_hash160);
+    data.resize(data.len().next_multiple_of(32), 0);
+    emit_topics(
+        ctx,
+        vec![
+            solidity_topic("release_request_received(address,bytes,uint256)"),
+            address_word(sender),
+        ],
+        data,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,6 +494,44 @@ mod tests {
             hex::encode(&data),
             "0000000000000000000000000000000000000000000000000000000000002710\
              0000000000000000000000000000000000000000000000000000000000000001"
+        );
+    }
+
+    /// Groundtruth from mainnet #3,615,289 tx 0 receipt (public-node.rsk.co):
+    /// a 400,000-sat direct RBTC transfer to the Bridge is ACCEPTED, enqueued,
+    /// and logged with release_request_received (legacy variant; pre-RSKIP326
+    /// destination = 20-byte hash160, pre-RSKIP427 amount in satoshis). Receipt:
+    ///   topic0 0x8e04e2f2c246a91202761c435d6a4971bdc7af0617f0c739d900ecd12a6d7266
+    ///   topic1 0x000000000000000000000000a231da16f77aaefa07427f13c6e03141eb15733a
+    ///   data   offset(0x40) || 0x061a80 (400000 sat) || len(0x14) || hash160
+    #[test]
+    fn release_request_received_matches_mainnet_3615289() {
+        use alloy_primitives::hex;
+        assert_eq!(
+            hex::encode(solidity_topic("release_request_received(address,bytes,uint256)")),
+            "8e04e2f2c246a91202761c435d6a4971bdc7af0617f0c739d900ecd12a6d7266"
+        );
+        let sender: Address = "0xa231da16f77aaefa07427f13c6e03141eb15733a".parse().unwrap();
+        assert_eq!(
+            hex::encode(address_word(sender)),
+            "000000000000000000000000a231da16f77aaefa07427f13c6e03141eb15733a"
+        );
+        let hash160: [u8; 20] =
+            hex::decode("79d6308c3be90264f36cfd1457dbea5f4a6a2cce").unwrap().try_into().unwrap();
+        // Reproduce the data block built by log_release_request_received and
+        // compare to the exact bytes from the receipt.
+        let mut data = Vec::new();
+        data.extend_from_slice(&u256_word(alloy_primitives::U256::from(64u64)));
+        data.extend_from_slice(&u256_word(alloy_primitives::U256::from(400_000u64)));
+        data.extend_from_slice(&u256_word(alloy_primitives::U256::from(20u64)));
+        data.extend_from_slice(&hash160);
+        data.resize(data.len().next_multiple_of(32), 0);
+        assert_eq!(
+            hex::encode(&data),
+            "0000000000000000000000000000000000000000000000000000000000000040\
+             0000000000000000000000000000000000000000000000000000000000061a80\
+             0000000000000000000000000000000000000000000000000000000000000014\
+             79d6308c3be90264f36cfd1457dbea5f4a6a2cce000000000000000000000000"
         );
     }
 

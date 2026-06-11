@@ -1790,6 +1790,54 @@ suicide to an absent beneficiary still pays 25,000).
 
 ---
 
+## 39. RSKIP185: an ACCEPTED direct peg-out logs `release_request_received`
+
+§36 covered the *rejected* direct peg-out (refund + `release_request_rejected`).
+RSKIP185 (iris300) also adds an event on the **accepted** path: after enqueuing
+the release request, `BridgeSupport.requestRelease` (rskj `BridgeSupport.java`
+l.1006-1020) calls
+`eventLogger.logReleaseBtcRequestReceived(sender, destinationAddress, releaseRequestedValueInWeis)`.
+rustock's `release_btc` enqueued the request but emitted nothing on success, so
+the receipt was missing one log — the **receipts root** forked while gasUsed,
+tx status and the **state root** all matched (the enqueue is identical, and a
+peg-out moves no balance in this tx).
+
+**Event encoding (`BridgeEventLoggerImpl.logReleaseBtcRequestReceived`).** The
+variant is era-gated: pre-RSKIP326 → `RELEASE_REQUEST_RECEIVED_LEGACY`, after →
+`RELEASE_REQUEST_RECEIVED`. At iris300 (RSKIP326/RSKIP427 not yet active) the
+**legacy** variant applies:
+
+- signature `release_request_received(address,bytes,uint256)`, topic0 =
+  `0x8e04e2f2c246a91202761c435d6a4971bdc7af0617f0c739d900ecd12a6d7266`.
+- topic1 (indexed `sender`) = the RSK tx sender.
+- data = ABI `(bytes btcDestinationAddress, uint256 amount)`: the destination is
+  the **20-byte hash160** (`btcDestinationAddress.getHash160()`), and the amount
+  is in **satoshis** (`amountInWeis.toBitcoin()`), not wei. Head = [offset 0x40,
+  amount]; tail = [len 20, hash160 right-padded].
+
+(Post-RSKIP326 the destination becomes the Base58 address `string`; post-RSKIP427
+the amount becomes wei. Neither is active in the iris-era window — gate added
+when those forks are reached.)
+
+**Consensus-load-bearing:** the extra log changes the receipts root, so a
+from-scratch client that only emits the *rejected* event (or no event) forks the
+receipts root on the first accepted post-iris peg-out. Trigger: mainnet
+**#3,615,289** tx 0 — a 400,000-sat (0.004 RBTC) direct transfer to the Bridge,
+accepted and logged (header receipts root
+`0xd213036b9ceffe97185518d3aa15f5d8dcfdaa8cd35d3b2ea146f2ca1689a94d`).
+
+**rskj source**: `co.rsk.peg.BridgeSupport.requestRelease`;
+`co.rsk.peg.utils.BridgeEventLoggerImpl.logReleaseBtcRequestReceived`;
+`co.rsk.peg.BridgeEvents.RELEASE_REQUEST_RECEIVED_LEGACY`.
+
+**rustock**: `crates/execution/src/bridge/events.rs`
+(`log_release_request_received`), wired into `release_btc`'s accepted path
+(`crates/execution/src/bridge/peg.rs`) under `has_rskip185`. Groundtruth test
+`release_request_received_matches_mainnet_3615289` (events.rs) reproduces the
+#3,615,289 receipt log byte-for-byte.
+
+---
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`

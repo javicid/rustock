@@ -50,8 +50,14 @@ fn main() -> anyhow::Result<()> {
         if n < number {
             if processed.state_root_hash.as_slice() != block.header.state_root.as_slice() {
                 eprintln!(
-                    "intermediate block #{n} already diverges: computed={:?} header={:?}",
+                    "intermediate block #{n} state diverges: computed={:?} header={:?}",
                     processed.state_root_hash, block.header.state_root
+                );
+            }
+            if processed.receipts_root != block.header.receipts_root {
+                eprintln!(
+                    "intermediate block #{n} receipts diverges: computed={:?} header={:?}",
+                    processed.receipts_root, block.header.receipts_root
                 );
             }
             root = processed.new_state_root;

@@ -926,6 +926,18 @@ pub fn release_btc<CTX: crate::RskContextTr>(
         bridge_store_bytes(ctx, key, &updated);
     }
 
+    // RSKIP185 (Iris300): an accepted peg-out emits release_request_received
+    // (rskj BridgeSupport.requestRelease). Pre-RSKIP326 the destination is the
+    // 20-byte hash160; pre-RSKIP427 the amount is in satoshis.
+    if hardfork_cfg.has_rskip185(block_number) {
+        super::events::log_release_request_received(
+            ctx,
+            tx_ctx.rsk_sender,
+            &btc_dest,
+            amount_satoshis,
+        );
+    }
+
     Ok(PrecompileOutput::new(gas_cost, Bytes::new()))
 }
 
