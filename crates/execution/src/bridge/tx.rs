@@ -129,7 +129,11 @@ pub fn set_coinbase_information<CTX: crate::RskContextTr>(
     block_hash: &[u8; 32],
     witness_merkle_root: &[u8; 32],
 ) {
-    let hash_hex = btc_hash_hex_display(block_hash);
+    // rskj keys by `Sha256Hash.wrap(blockHashArg).toString()`. bitcoinj's
+    // `toString()` hex-encodes the wrapped bytes WITHOUT reversing (only
+    // `wrapReversed`/`getHash` reverse), and the ABI `blockHash` arg is already
+    // in display order — so the preimage uses the arg bytes as-is, not reversed.
+    let hash_hex = to_hex(block_hash);
     let key = compound_key(COINBASE_INFORMATION_KEY, "-", &hash_hex);
     // rskj serializeCoinbaseInformation: RLP list of one element.
     let value = rlp_encode_list(&[rlp_encode_element(witness_merkle_root)]);
@@ -141,7 +145,9 @@ pub fn get_coinbase_information<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     block_hash: &[u8; 32],
 ) -> Option<[u8; 32]> {
-    let hash_hex = btc_hash_hex_display(block_hash);
+    // See `set_coinbase_information`: the ABI block-hash arg is used as-is
+    // (no reversal) to match rskj's `Sha256Hash.toString()` of the wrapped arg.
+    let hash_hex = to_hex(block_hash);
     let key = compound_key(COINBASE_INFORMATION_KEY, "-", &hash_hex);
     let data = bridge_load_raw(ctx, key)?;
     let items = rlp_decode_list(&data)?;
@@ -397,5 +403,28 @@ mod tests {
         let h1 = calculate_btc_tx_hash(&data);
         let h2 = calculate_btc_tx_hash(&data);
         assert_eq!(h1, h2);
+    }
+
+    /// Ground truth from RSK Mainnet block #3,229,522 (registerBtcCoinbaseTransaction):
+    /// rskj keys coinbase information by `DataWord.fromLongString("coinbaseInformation-"
+    /// + Sha256Hash.wrap(blockHashArg).toString())`, and bitcoinj's `toString()` hex-encodes
+    /// the wrapped bytes WITHOUT reversing. The block-hash ABI arg below is the exact one
+    /// from that block; the expected DataWord is the storage slot read from rskj's own unitrie.
+    #[test]
+    fn coinbase_information_storage_key_mainnet() {
+        let block_hash: [u8; 32] =
+            hex::decode("0000000000000000000b718fb9d9d0c032cbfbebae6e3f99da00a131a7433fe4")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let key = compound_key(COINBASE_INFORMATION_KEY, "-", &to_hex(&block_hash));
+        let expected = U256::from_be_bytes(
+            <[u8; 32]>::try_from(
+                hex::decode("4e92fd4d2d1f5769b361ef086f963fea4d74d700b5544f67b5a9a2c587fd3f2f")
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(key, expected, "coinbase storage key must match rskj (no hash reversal)");
     }
 }

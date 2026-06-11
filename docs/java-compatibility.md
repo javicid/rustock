@@ -1304,6 +1304,59 @@ neutralization), `crates/execution/src/state.rs`
 
 ---
 
+## 31. Coinbase-information storage key: `Sha256Hash.toString()` does NOT reverse
+
+`registerBtcCoinbaseTransaction` (RSKIP143) stores the witness merkle root
+for a BTC block, keyed by that block's hash. rskj derives the storage slot
+in `BridgeStorageProvider.getStorageKeyForCoinbaseInformation`:
+
+```java
+COINBASE_INFORMATION.getCompoundKey("-", btcTxHash.toString());
+// = DataWord.fromLongString("coinbaseInformation-" + blockHash.toString())
+```
+
+where `blockHash = Sha256Hash.wrap(args[1])` is built from the raw ABI
+`bytes32` argument (`Bridge.registerBtcCoinbaseTransaction`). The consensus
+trap is bitcoinj's `Sha256Hash.toString()`: it hex-encodes the wrapped bytes
+**verbatim, without reversing** (only `wrapReversed()` and the
+double-SHA256 `getHash()` paths reverse). So the storage-key preimage uses
+the block-hash arg bytes exactly as passed — which on mainnet are already in
+big-endian display order (leading zeros).
+
+This is the opposite of the *processed-BTC-tx-hash* map
+(`getStorageKeyForBtcTxHashAlreadyProcessed`), whose `Sha256Hash` is computed
+internally (little-endian raw double-SHA256) and whose `toString()` therefore
+*does* differ from the raw bytes. rustock models that case with
+`btc_hash_hex_display` (reverse-then-hex) — correct there, **wrong** for the
+coinbase key, which must hex the arg bytes as-is.
+
+**Consensus-load-bearing:** a from-scratch client that "naturally" reverses
+BTC hashes to display order before formatting the key (as one would for a
+`Sha256Hash`) computes a *different* storage slot, stores the identical
+`CoinbaseInformation` value under the wrong key, and forks — receipts and gas
+are unaffected (the Bridge emits no log here pre-RSKIP146), so only the state
+root catches it.
+
+**Trigger**: mainnet #3,229,522 — tx 1 `registerBtcCoinbaseTransaction` for
+BTC block `0000…0b718fb9…7433fe4`. rustock stored the witness merkle root at
+`keccak("coinbaseInformation-" + reverse(arg))`, rskj at
+`keccak("coinbaseInformation-" + arg)` — a two-leaf state diff (same value,
+wrong slot), gas and receipts identical.
+
+**rskj source**: `co.rsk.peg.Bridge.registerBtcCoinbaseTransaction`
+(`Sha256Hash.wrap(args[1])`), `BridgeStorageProvider`
+`getStorageKeyForCoinbaseInformation`, `BridgeStorageIndexKey.getCompoundKey`,
+bitcoinj `Sha256Hash.toString()`.
+
+**rustock**: `crates/execution/src/bridge/tx.rs` — `set_coinbase_information`
+/ `get_coinbase_information` now key with `to_hex(block_hash)` (no reversal).
+Test: `coinbase_information_storage_key_mainnet` (byte-exact slot from rskj's
+unitrie). The divergence was localized with the new `diff_state` example
+(`crates/cli/examples/diff_state.rs`), a hash-pruned dual walk of rustock's
+computed trie vs rskj's LevelDB unitrie at the header root.
+
+---
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`
