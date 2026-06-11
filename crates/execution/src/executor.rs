@@ -574,6 +574,32 @@ impl RskExecutor {
                 created_address,
             });
 
+            // rskj TransactionExecutor.finalization deletes suicided accounts
+            // at the END of each transaction (track.delete), so a LATER tx in
+            // the same block sees the address as nonexistent and re-creates a
+            // fresh (0, 0) account node by merely calling it (frontier
+            // `transfer`/`addBalance(0)`). revm keeps one journal for the
+            // whole block and only wipes a destroyed account lazily on the
+            // next cold load, leaving the sticky global SelfDestructed and
+            // Touched flags — so the block-end state could not distinguish
+            // "destroyed" from "destroyed, then re-created by a later tx".
+            // Neutralize the entry as soon as the destroying tx commits: wipe
+            // info/storage (what revm's next cold load would do) and clear
+            // the touched flag. A later tx that touches the address re-marks
+            // Touched, which apply_state_changes reads as "alive again at
+            // block end" (mainnet #3173807).
+            {
+                use revm::context_interface::ContextTr;
+                for account in evm.ctx.journal_mut().inner.state.values_mut() {
+                    if account.is_selfdestructed_locally() {
+                        account.selfdestruct();
+                        account.unmark_selfdestructed_locally();
+                        account.unmark_created_locally();
+                        account.unmark_touch();
+                    }
+                }
+            }
+
             debug!(tx_index = i, gas_used, success, "executed transaction");
         }
 
@@ -5744,5 +5770,281 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
             .map(|a| a.info.balance)
             .unwrap_or_default();
         assert_eq!(bridge_balance, one_rbtc - burned, "burn debits the Bridge");
+    }
+
+    /// Seed a contract account in the trie with code, the rskj setupContract
+    /// storage-prefix marker, and one storage slot (slot 7 = 0xAA).
+    fn seed_contract(
+        root: &TrieNode,
+        store: &dyn TrieStore,
+        addr: &Address,
+        balance: U256,
+        code: &[u8],
+    ) -> TrieNode {
+        let root = put_account(root, store, addr, 1, balance);
+        let root = root.put(
+            &TrieKeySlice::from_key(&rustock_trie::code_key(addr)),
+            code,
+            store,
+        );
+        let root = root.put(
+            &TrieKeySlice::from_key(&rustock_trie::storage_prefix_key(addr)),
+            &[1],
+            store,
+        );
+        root.put(
+            &TrieKeySlice::from_key(&rustock_trie::storage_key(
+                addr,
+                &B256::from(U256::from(7)),
+            )),
+            &[0xAA],
+            store,
+        )
+    }
+
+    fn trie_account(root: &TrieNode, store: &dyn TrieStore, addr: &Address) -> Option<AccountState> {
+        root.get(&TrieKeySlice::from_key(&account_key(addr)), store)
+            .and_then(|d| AccountState::decode(&d).ok())
+    }
+
+    /// Assert the whole account subtree (code, marker, old storage) is gone.
+    fn assert_subtree_deleted(root: &TrieNode, store: &dyn TrieStore, addr: &Address) {
+        assert!(
+            root.get(&TrieKeySlice::from_key(&rustock_trie::code_key(addr)), store).is_none(),
+            "code must be deleted"
+        );
+        assert!(
+            root.get(&TrieKeySlice::from_key(&rustock_trie::storage_prefix_key(addr)), store)
+                .is_none(),
+            "storage-prefix marker must be deleted"
+        );
+        assert!(
+            root.get(
+                &TrieKeySlice::from_key(&rustock_trie::storage_key(
+                    addr,
+                    &B256::from(U256::from(7)),
+                )),
+                store,
+            )
+            .is_none(),
+            "old storage must be deleted"
+        );
+    }
+
+    fn plain_tx(nonce: u64, to: &Address, value: U256) -> rustock_core::Transaction {
+        rustock_core::Transaction {
+            nonce,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(1_000_000),
+            to: Bytes::copy_from_slice(to.as_slice()),
+            value,
+            input: Bytes::new(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        }
+    }
+
+    /// Regression for mainnet #3173807: rskj TransactionExecutor.finalization
+    /// deletes suicided accounts at the END of each transaction
+    /// (`track.delete`), so a LATER tx in the same block sees the address as
+    /// nonexistent and re-creates a fresh (0, 0) node by merely calling it
+    /// (frontier `transfer`/`addBalance(0)`). Block-end state must be: old
+    /// subtree (code, marker, storage) deleted, fresh account present.
+    #[test]
+    fn selfdestruct_then_recreate_in_same_block() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let sender = Address::repeat_byte(0xAA);
+        let bene = Address::repeat_byte(0xBB);
+        let victim = Address::repeat_byte(0xCC);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        let root = put_account(&root, store.as_ref(), &bene, 1, U256::from(5));
+        // PUSH20 bene; SELFDESTRUCT
+        let mut code = vec![0x73];
+        code.extend_from_slice(bene.as_slice());
+        code.push(0xFF);
+        let root = seed_contract(&root, store.as_ref(), &victim, U256::from(1_000), &code);
+
+        let block_store =
+            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        let txs = vec![
+            (plain_tx(0, &victim, U256::ZERO), sender), // selfdestructs to bene
+            (plain_tx(1, &victim, U256::ZERO), sender), // re-creates (0,0) node
+            (plain_tx(2, &victim, U256::from(123)), sender), // tops it up
+        ];
+        let r = executor
+            .execute_block(&dummy_header(3_173_807), &txs, &root, store.clone())
+            .expect("block");
+        assert!(r.tx_results.iter().all(|t| t.success));
+
+        let new_root =
+            crate::state::apply_state_changes(&root, store.as_ref(), &r.state_changes, &r.markers);
+        assert_subtree_deleted(&new_root, store.as_ref(), &victim);
+        let acct = trie_account(&new_root, store.as_ref(), &victim)
+            .expect("re-created account node must exist");
+        assert_eq!(acct.nonce, U256::ZERO, "fresh account: nonce reset");
+        assert_eq!(acct.balance, U256::from(123), "fresh account: later balance only");
+        let bene_acct = trie_account(&new_root, store.as_ref(), &bene).unwrap();
+        assert_eq!(bene_acct.balance, U256::from(1_005), "suicide proceeds paid out");
+    }
+
+    /// Selfdestruct in the LAST tx of the block: no later re-creation, the
+    /// whole subtree is gone and no account node remains (rskj
+    /// MutableRepository.delete → deleteRecursive).
+    #[test]
+    fn selfdestruct_in_last_tx_deletes_account_entirely() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let sender = Address::repeat_byte(0xAA);
+        let bene = Address::repeat_byte(0xBB);
+        let victim = Address::repeat_byte(0xCC);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        let mut code = vec![0x73];
+        code.extend_from_slice(bene.as_slice());
+        code.push(0xFF);
+        let root = seed_contract(&root, store.as_ref(), &victim, U256::from(1_000), &code);
+
+        let block_store =
+            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        let r = executor
+            .execute_block(
+                &dummy_header(3_173_807),
+                &[(plain_tx(0, &victim, U256::ZERO), sender)],
+                &root,
+                store.clone(),
+            )
+            .expect("block");
+        assert!(r.tx_results[0].success);
+
+        let new_root =
+            crate::state::apply_state_changes(&root, store.as_ref(), &r.state_changes, &r.markers);
+        assert_subtree_deleted(&new_root, store.as_ref(), &victim);
+        assert!(
+            trie_account(&new_root, store.as_ref(), &victim).is_none(),
+            "no account node may survive"
+        );
+    }
+
+    /// Selfdestruct to self: rskj transfers the balance to the account itself
+    /// and then deletes it — the balance is burned, the subtree is gone.
+    #[test]
+    fn selfdestruct_to_self_burns_balance() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let sender = Address::repeat_byte(0xAA);
+        let victim = Address::repeat_byte(0xCC);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        // ADDRESS; SELFDESTRUCT
+        let root =
+            seed_contract(&root, store.as_ref(), &victim, U256::from(1_000), &[0x30, 0xFF]);
+
+        let block_store =
+            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        let r = executor
+            .execute_block(
+                &dummy_header(3_173_807),
+                &[(plain_tx(0, &victim, U256::ZERO), sender)],
+                &root,
+                store.clone(),
+            )
+            .expect("block");
+        assert!(r.tx_results[0].success);
+
+        let new_root =
+            crate::state::apply_state_changes(&root, store.as_ref(), &r.state_changes, &r.markers);
+        assert!(
+            trie_account(&new_root, store.as_ref(), &victim).is_none(),
+            "self-beneficiary account deleted, balance burned"
+        );
+        assert_subtree_deleted(&new_root, store.as_ref(), &victim);
+        let sender_acct = trie_account(&new_root, store.as_ref(), &sender).unwrap();
+        assert_eq!(sender_acct.balance, one_rbtc, "burned balance goes nowhere");
+    }
+
+    /// Destroy → CREATE2 re-deploy at the same address → destroy again, all
+    /// in one block (the rskj TransactionExecutor comment: "the remote case
+    /// there is a CREATE2 creating a deleted account"). The final destruction
+    /// must win: nothing of the address survives at block end.
+    #[test]
+    fn selfdestruct_recreate_via_create2_then_selfdestruct_again() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let sender = Address::repeat_byte(0xAA);
+        let factory = Address::repeat_byte(0xFA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+
+        // Victim runtime: CALLER; SELFDESTRUCT (suicides to its caller).
+        // Init code returns it: PUSH2 0x33FF; PUSH1 0; MSTORE;
+        //                       PUSH1 2; PUSH1 30; RETURN
+        let init: [u8; 11] = [0x61, 0x33, 0xFF, 0x60, 0x00, 0x52, 0x60, 0x02, 0x60, 0x1E, 0xF3];
+        // Factory runtime: PUSH11 init; PUSH1 0; MSTORE   (init at mem[21..32])
+        //                  PUSH1 0 (salt); PUSH1 11 (size); PUSH1 21 (offset);
+        //                  PUSH1 0 (value); CREATE2; POP; STOP
+        let mut factory_code = vec![0x6A];
+        factory_code.extend_from_slice(&init);
+        factory_code.extend_from_slice(&[
+            0x60, 0x00, 0x52, 0x60, 0x00, 0x60, 0x0B, 0x60, 0x15, 0x60, 0x00, 0xF5, 0x50, 0x00,
+        ]);
+        let victim = factory.create2(B256::ZERO, alloy_primitives::keccak256(init));
+
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        let root = put_account(&root, store.as_ref(), &factory, 1, U256::ZERO);
+        let root = root.put(
+            &TrieKeySlice::from_key(&rustock_trie::code_key(&factory)),
+            &factory_code,
+            store.as_ref(),
+        );
+
+        let block_store =
+            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        let txs = vec![
+            (plain_tx(0, &factory, U256::ZERO), sender), // deploy victim
+            (plain_tx(1, &victim, U256::ZERO), sender),  // destroy it
+            (plain_tx(2, &factory, U256::ZERO), sender), // re-deploy at same addr
+            (plain_tx(3, &victim, U256::from(7)), sender), // destroy again
+        ];
+        let r = executor
+            .execute_block(&dummy_header(3_173_807), &txs, &root, store.clone())
+            .expect("block");
+        assert!(r.tx_results.iter().all(|t| t.success));
+
+        let new_root =
+            crate::state::apply_state_changes(&root, store.as_ref(), &r.state_changes, &r.markers);
+        // If the second CREATE2 had failed (collision against the stale
+        // destroyed entry), tx 3 would have been a plain transfer and the
+        // victim would survive with balance 7.
+        assert!(
+            trie_account(&new_root, store.as_ref(), &victim).is_none(),
+            "victim fully deleted after destroy → CREATE2 re-deploy → destroy"
+        );
+        assert!(
+            new_root
+                .get(
+                    &TrieKeySlice::from_key(&rustock_trie::code_key(&victim)),
+                    store.as_ref(),
+                )
+                .is_none(),
+            "victim code deleted"
+        );
+        assert!(
+            new_root
+                .get(
+                    &TrieKeySlice::from_key(&rustock_trie::storage_prefix_key(&victim)),
+                    store.as_ref(),
+                )
+                .is_none(),
+            "victim marker deleted"
+        );
+        // The selfdestruct in tx 3 pays the 7 wei back to the caller.
+        let sender_acct = trie_account(&new_root, store.as_ref(), &sender).unwrap();
+        assert_eq!(sender_acct.balance, one_rbtc, "value round-trips via suicide");
     }
 }

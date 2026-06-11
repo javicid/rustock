@@ -46,16 +46,24 @@ pub fn apply_state_changes(
     let mut new_root = root.clone();
 
     for (addr, account) in state {
-        if !account.is_touched() {
-            continue;
-        }
-
         if account.status.contains(AccountStatus::SelfDestructed) {
             // rskj `MutableRepository.delete`: the whole account subtree
             // (storage, code, marker) goes away in one recursive delete.
+            // rskj deletes at the END of the destroying transaction
+            // (TransactionExecutor.finalization), so a LATER tx in the same
+            // block can re-create the address as a fresh account (frontier
+            // `transfer`/`addBalance(0)`). The executor neutralizes the
+            // journal entry once the destroying tx commits (wiping it and
+            // clearing the touched flag), so `is_touched()` here means
+            // "alive again at block end": fall through and write the fresh
+            // account state (mainnet #3173807). Untouched means the
+            // destruction was the last word: the delete is everything.
             let key = TrieKeySlice::from_key(&account_key(addr));
             new_root = new_root.delete_recursive(&key, store);
             debug!(%addr, "self-destructed account subtree removed from trie");
+        }
+
+        if !account.is_touched() {
             continue;
         }
 
@@ -446,16 +454,15 @@ mod tests {
 
         assert!(read_account(&root, &store, &addr).is_some());
 
-        let info = make_account_info(5, U256::ZERO);
-        let mut storage_map = revm::state::EvmStorage::default();
-        storage_map.insert(U256::from(0), EvmStorageSlot::new_changed(U256::from(7), U256::ZERO, 0));
-
+        // The executor neutralizes a destroyed account when its tx commits:
+        // info/storage wiped, Touched cleared. SelfDestructed without Touched
+        // means the destruction was the last word in the block.
         let account = Account {
-            info: info.clone(),
-            original_info: Box::new(info),
+            info: AccountInfo::default(),
+            original_info: Box::new(AccountInfo::default()),
             transaction_id: 0,
-            storage: storage_map,
-            status: AccountStatus::SelfDestructed | AccountStatus::Touched,
+            storage: Default::default(),
+            status: AccountStatus::SelfDestructed,
         };
 
         let mut state = EvmState::default();
@@ -474,6 +481,49 @@ mod tests {
             "storage from earlier blocks removed by the recursive delete"
         );
         assert!(new_root.is_empty_trie(), "nothing else was in the trie");
+    }
+
+    /// Mainnet #3173807: an account selfdestructed by one tx and re-created
+    /// by a later tx in the same block arrives here as SelfDestructed AND
+    /// Touched (the executor clears Touched when the destroying tx commits;
+    /// only a later re-creation re-marks it). The old subtree must be deleted
+    /// and the fresh account written.
+    #[test]
+    fn test_selfdestructed_then_recreated_account_rewritten_fresh() {
+        let (store, root) = empty_trie();
+        let addr = Address::repeat_byte(0xFF);
+
+        // Old incarnation: account, code, marker, storage slot.
+        let key_a = TrieKeySlice::from_key(&account_key(&addr));
+        let root = root.put(&key_a, &AccountState::new(U256::from(5), U256::from(1000)).encode(), &store);
+        let code_trie_key = TrieKeySlice::from_key(&code_key(&addr));
+        let root = root.put(&code_trie_key, &[0x60, 0x00], &store);
+        let marker_key = TrieKeySlice::from_key(&storage_prefix_key(&addr));
+        let root = root.put(&marker_key, &[1u8], &store);
+        let slot_b256 = B256::from(U256::from(7));
+        let slot_key = TrieKeySlice::from_key(&storage_key(&addr, &slot_b256));
+        let root = root.put(&slot_key, &[0xAAu8], &store);
+
+        // Re-created incarnation: fresh (0, 42) info, wiped storage/code.
+        let info = make_account_info(0, U256::from(42));
+        let account = Account {
+            info: info.clone(),
+            original_info: Box::new(info),
+            transaction_id: 0,
+            storage: Default::default(),
+            status: AccountStatus::SelfDestructed | AccountStatus::Touched,
+        };
+        let mut state = EvmState::default();
+        state.insert(addr, account);
+
+        let new_root = apply_state_changes(&root, &store, &state, &ContractMarkers::default());
+
+        let acct = read_account(&new_root, &store, &addr).expect("fresh account node");
+        assert_eq!(acct.nonce, U256::ZERO, "old nonce gone");
+        assert_eq!(acct.balance, U256::from(42), "fresh balance");
+        assert!(new_root.get(&code_trie_key, &store).is_none(), "old code deleted");
+        assert!(new_root.get(&marker_key, &store).is_none(), "old marker deleted");
+        assert!(new_root.get(&slot_key, &store).is_none(), "old storage deleted");
     }
 
     #[test]

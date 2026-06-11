@@ -1238,6 +1238,72 @@ sites) computes the surplus and transfers it from `BRIDGE_ADDR` to
 
 ---
 
+## 30. Suicided accounts are deleted per-TRANSACTION, not per-block
+
+rskj deletes a selfdestructed account from the repository at the END of
+the destroying transaction: `TransactionExecutor.finalization()` runs
+`result.getDeleteAccounts().forEach(address -> track.delete(...))`
+against the per-block repository (after the per-tx `cacheTrack` has
+committed). A LATER transaction in the same block therefore sees the
+address as nonexistent, and under RSK's frontier-forever account rules
+(no EIP-158/161, see §"eternal frontier") merely calling or sending 0
+value to it re-creates a fresh `(nonce 0, balance 0)` account node via
+`addBalance(0)`. Block-end state can thus contain a BRAND-NEW account
+at an address destroyed earlier in the same block — with the old code,
+storage and storage-prefix marker gone (the delete is recursive over
+the whole subtree) but a fresh account leaf present.
+
+revm keeps ONE journal for the whole block: the `SelfDestructed` and
+`Touched` status flags are sticky across transactions, and a destroyed
+account's info/storage are only wiped lazily on the next cold load
+(`JournalInner::load_account_mut_optional`, which clears the *local*
+selfdestruct flag but not the global ones). So at block end rustock
+could not distinguish "destroyed" from "destroyed, then re-created by a
+later tx" — both looked like `SelfDestructed | Touched` and the
+re-created account vanished with the delete.
+
+**rustock**: two-part fix.
+- `executor.rs` `execute_block`: when a tx commits, every journal entry
+  with `is_selfdestructed_locally()` is neutralized eagerly — info and
+  storage wiped (exactly what revm's next cold load would do) and the
+  `Touched`/local flags cleared. A later tx that touches the address
+  re-marks `Touched`.
+- `state.rs` `apply_state_changes`: a `SelfDestructed` account always
+  gets its subtree recursively deleted first; if it is ALSO `Touched`
+  (re-created later in the block) the fresh account state is then
+  written on top instead of being skipped.
+
+Edge cases verified: re-creation by zero-value and value-carrying
+transfers; selfdestruct in the last tx (plain delete); selfdestruct to
+self (balance burned, rskj transfers to itself then deletes); destroy →
+CREATE2 re-deploy at the same address → destroy again (the rskj comment
+in `TransactionExecutor`: "the remote case there is a CREATE2 creating
+a deleted account" — the wiped journal entry must also pass revm's
+CREATE2 collision check). The per-tx suicide refund also matches: rskj
+grants 24,000 per address in the TX's `deleteAccounts` set
+(`TransactionExecutor` `addFutureRefund`), revm keys
+`previously_destroyed` off the per-tx local flag, so destroying a
+re-created account in a later tx refunds again in both.
+
+**Trigger**: mainnet #3,173,807 — tx 0 selfdestructs
+`0xceb1…f1a`, tx 1 calls the same address and re-creates it as a fresh
+empty account. rskj's block-end trie has the new `(0,0)` leaf; rustock
+deleted it (one-leaf state diff).
+
+**rskj source**: `org.ethereum.core.TransactionExecutor.finalization`
+(`track.delete`), `MutableRepository.delete` → `deleteRecursive`.
+
+**rustock**: `crates/execution/src/executor.rs` (post-tx
+neutralization), `crates/execution/src/state.rs`
+(`apply_state_changes`). Tests: `selfdestruct_then_recreate_in_same_block`,
+`selfdestruct_in_last_tx_deletes_account_entirely`,
+`selfdestruct_to_self_burns_balance`,
+`selfdestruct_recreate_via_create2_then_selfdestruct_again`
+(executor.rs), `test_selfdestructed_then_recreated_account_rewritten_fresh`
+(state.rs).
+
+---
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`
