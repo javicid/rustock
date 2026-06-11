@@ -1479,6 +1479,73 @@ trusting the in-memory `BTreeMap`'s forward iteration order. Test:
 
 ---
 
+## 34. Confirmed-pegout selection follows Java `HashSet` iteration order
+
+`updateCollections` → `processConfirmedPegouts` moves *one* confirmed pegout per
+call from `pegoutsWaitingForConfirmations` into `pegoutsWaitingForSignatures`.
+It picks that entry with
+`PegoutsWaitingForConfirmations.getNextPegoutWithEnoughConfirmations`:
+
+```java
+return entries.stream()
+    .filter(entry -> hasEnoughConfirmations(entry, currentBlockNumber, minimumConfirmations))
+    .findFirst();
+```
+
+`entries` is a Java `HashSet<Entry>`, so `findFirst()` returns the first
+confirmed entry in **`HashSet` iteration order**, not the storage order. The
+storage cell is sorted by serialized BTC-tx bytes (`Entry.BTC_TX_COMPARATOR`,
+java-compat §21), so a client that selects the first confirmed entry in the
+sorted/stored order picks the wrong pegout whenever two confirmed entries share
+a creation height (both cross the confirmation threshold on the same block).
+
+`HashSet` iteration walks the backing table's buckets `0 .. table.length`
+ascending, and within a bucket in insertion order. The bucket is
+`(table.length - 1) & spread(hash)` with `spread(h) = h ^ (h >>> 16)` and
+
+```
+hash = Objects.hash(btcTransaction, Long(pegoutCreationRskBlockNumber))
+     = 31 * (31 + btcTransaction.hashCode()) + Long.hashCode(height)
+```
+
+`btcTransaction.hashCode()` is bitcoinj `Sha256Hash.hashCode()` of the txid: the
+last four bytes of the **display-order** hash read big-endian
+(`Ints.fromBytes(bytes[28], bytes[29], bytes[30], bytes[31])`). The provider
+rebuilds the set with `new HashSet<>(entries)`, so the table length is
+`tableSizeFor(max((int)(n / 0.75f) + 1, 16))` for `n` entries (the constructor
+pre-sizes to fit, no resize). `Long.hashCode(v) = (int)(v ^ (v >>> 32))`; all of
+it is signed 32-bit `int` arithmetic, but the bucket index is a bitwise AND so
+unsigned `u32` with wrapping arithmetic reproduces the exact bit pattern.
+
+**Consensus-load-bearing:** which BTC pegout transaction is promoted to be
+signed (and which is left in the confirmation set) is pure Bridge state — gas
+and receipts are unaffected — yet it forks the unitrie. A from-scratch client
+that iterates the confirmation set in any natural/sorted order diverges as soon
+as two confirmed entries share a creation height.
+
+**Trigger**: mainnet #3,345,557 (migration window). Two entries created at height
+3,341,556 both reach 4000 confirmations at this block; their entry hashes land in
+`HashSet` buckets 9 (`a7c69a46…:1` input, pegoutCreationRskTxHash `26dc74c8…`)
+and 20 (`0260d432…:1` input, `3c218098…`) of the 32-bucket table. rskj promotes
+the bucket-9 tx; rustock previously promoted the lexicographically-smaller
+bucket-20 tx, producing a one-leaf diff in both `releaseTransactionSetWithTxHash`
+and `rskTxsWaitingFS`.
+
+**rskj source**:
+`co.rsk.peg.PegoutsWaitingForConfirmations.getNextPegoutWithEnoughConfirmations`
+and `Entry.hashCode`; `co.rsk.bitcoinj.core.BtcTransaction.hashCode` /
+`Sha256Hash.hashCode`; `co.rsk.peg.BridgeSupport.processConfirmedPegouts`;
+`BridgeStorageProvider.getPegoutsWaitingForConfirmations` (`new HashSet<>(…)`).
+
+**rustock**: `crates/execution/src/bridge/peg.rs`
+`next_pegout_with_enough_confirmations` / `pegout_entry_hash` (replicate the
+bucket order), called from `process_confirmed_pegouts` (Step 2 of
+`update_collections`). Test:
+`rskj_next_pegout_hashset_iteration_order_groundtruth` (block #3,345,557 ground
+truth).
+
+---
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`

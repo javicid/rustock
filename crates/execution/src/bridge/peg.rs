@@ -1180,11 +1180,11 @@ pub fn update_collections<CTX: crate::RskContextTr>(
     {
         let mut waiting = load_pegout_confirmation_set(ctx, use_tx_hash);
         let min_confirmations = config.rsk2btc_minimum_acceptable_confirmations as u64;
-        let confirmed_pos = waiting.iter().position(|e| {
-            block_number
-                .checked_sub(e.rsk_block_height)
-                .is_some_and(|d| d >= min_confirmations)
-        });
+        let confirmed_pos = next_pegout_with_enough_confirmations(
+            &waiting,
+            block_number,
+            min_confirmations,
+        );
 
         if let Some(pos) = confirmed_pos {
             let entry = waiting.remove(pos);
@@ -1217,6 +1217,77 @@ pub fn update_collections<CTX: crate::RskContextTr>(
     }
 
     Ok(PrecompileOutput::new(gas_cost, Bytes::new()))
+}
+
+/// rskj `PegoutsWaitingForConfirmations.getNextPegoutWithEnoughConfirmations`:
+/// `entries.stream().filter(hasEnoughConfirmations).findFirst()` over a Java
+/// `HashSet<Entry>`. The selected entry is therefore the first confirmed one in
+/// Java `HashSet` iteration order — NOT the storage (btc-tx-sorted) order. When
+/// two entries share the same creation height (so both confirm on the same
+/// block) the choice between them depends on this iteration order, which is
+/// consensus-critical (block #3,345,557 mainnet).
+///
+/// `HashSet` iteration walks buckets `0..table.length` ascending, and within a
+/// bucket in insertion order. The bucket is `(table.length-1) & spread(hash)`
+/// with `spread(h) = h ^ (h >>> 16)` and
+/// `hash = Objects.hash(btcTx, Long(height))`
+/// (`= 31*(31 + btcTx.hashCode()) + Long.hashCode(height)`), where
+/// `btcTx.hashCode()` is the last 4 bytes of the display-order txid read
+/// big-endian (bitcoinj `Sha256Hash.hashCode`). The provider rebuilds the set
+/// with `new HashSet<>(entries)`, so the table capacity is
+/// `tableSizeFor(max((int)(n / 0.75) + 1, 16))` for `n` entries (no resize, the
+/// constructor pre-sizes to fit). Returns the index into `entries`.
+fn next_pegout_with_enough_confirmations(
+    entries: &[PegoutWaitingForConfirmations],
+    current_block: u64,
+    min_confirmations: u64,
+) -> Option<usize> {
+    if entries.is_empty() {
+        return None;
+    }
+
+    // new HashSet<>(coll): initialCapacity = max((int)(size/0.75)+1, 16),
+    // table length = tableSizeFor(initialCapacity) (next power of two).
+    let init_cap = std::cmp::max((entries.len() as f32 / 0.75) as u32 + 1, 16);
+    let cap = init_cap.next_power_of_two();
+
+    // Bucket each entry; within a bucket preserve insertion (storage) order.
+    let mut buckets: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+    for (i, entry) in entries.iter().enumerate() {
+        let h = pegout_entry_hash(entry);
+        let spread = h ^ (h >> 16);
+        let bucket = (cap - 1) & spread;
+        buckets.entry(bucket).or_default().push(i);
+    }
+
+    // findFirst over the confirmation-filtered stream in iteration order.
+    buckets.into_values().flatten().find(|&i| {
+        current_block
+            .checked_sub(entries[i].rsk_block_height)
+            .is_some_and(|d| d >= min_confirmations)
+    })
+}
+
+/// rskj `PegoutsWaitingForConfirmations.Entry.hashCode()`:
+/// `Objects.hash(btcTransaction, pegoutCreationRskBlockNumber)`
+/// `= 31 * (31 * 1 + btcTransaction.hashCode()) + Long.hashCode(height)`.
+/// `btcTransaction.hashCode()` (bitcoinj) is `Sha256Hash.hashCode()` of the
+/// txid: the last 4 bytes of the display-order hash read big-endian.
+fn pegout_entry_hash(entry: &PegoutWaitingForConfirmations) -> u32 {
+    // Display-order txid = reverse of rust-bitcoin's internal SHA256d.
+    let btc_hash_code = match deserialize::<BtcTransaction>(&entry.btc_tx_raw) {
+        Ok(tx) => {
+            let mut disp = *tx.compute_txid().to_raw_hash().as_byte_array();
+            disp.reverse();
+            u32::from_be_bytes([disp[28], disp[29], disp[30], disp[31]])
+        }
+        Err(_) => 0,
+    };
+    let long_hash_code =
+        (entry.rsk_block_height ^ (entry.rsk_block_height >> 32)) as u32;
+    // Objects.hash(btcTx, height) = 31 * (31 + btcTx.hashCode()) + Long.hashCode.
+    let r = 31u32.wrapping_add(btc_hash_code);
+    31u32.wrapping_mul(r).wrapping_add(long_hash_code)
 }
 
 /// rskj `BridgeSupport.processFundsMigration` (pre-RSKIP294/376 era).
@@ -2616,6 +2687,53 @@ mod tests {
         assert_eq!(items[0].len(), 32);
         assert_eq!(items[0][0], 0x01, "first item should be hash1");
         assert_eq!(items[2][0], 0x02, "third item should be hash2");
+    }
+
+    /// rskj `getNextPegoutWithEnoughConfirmations` selects the first confirmed
+    /// entry in Java `HashSet` iteration order — not storage (btc-tx-sorted)
+    /// order. Groundtruth from RSK Mainnet block #3,345,557 (migration window):
+    /// two pegout entries share creation height 3,341,556 and both confirm at
+    /// this block (min 4000 confirmations), so the tie is broken purely by
+    /// HashSet bucket order. rskj moved the `a7c69a46…` input tx
+    /// (pegoutCreationRskTxHash `26dc74c8…`) into pegoutsWaitingForSignatures,
+    /// leaving the lexicographically-smaller `0260d432…` tx in the set. A naive
+    /// btc-tx-sorted selection would pick the wrong one and fork the chain.
+    #[test]
+    fn rskj_next_pegout_hashset_iteration_order_groundtruth() {
+        // The two real h=3,341,556 entries from the diverging cell at #3,345,557.
+        // rskj-selected (moved to WFS): btc spends input a7c69a46…:1.
+        let selected_btc = hex::decode(
+            "010000000122fab61f4bdfe74f41dfecbe2a52d0cb5aa42c898687c6142d3f8497469ac6a701000000fdc80100000000000000004dbd0157210231a395e332dde8688800a0025cccc5771ea1aa874a633b8ab6e5c89d300c7c3621026b472f7d59d201ff1f540f111b6eb329e071c30a9d23e3d2bcd128fe73dc254c21027319afb15481dbeb3c426bcc37f9a30e7f51ceff586936d85548d9395bcc2344210294c817150f78607566e961b3c71df53a22022a80acbb982f83c0c8baac040adc2103250c11be0561b1d7ae168b1f59e39cbc1fd1ba3cf4d2140c1a365b2723a2bf9321033ada6ef3b1d93a1978b595c7a9e2aa613860b26d4f5a7abb88576aa42b3432ad210357f7ed4c118e581f49cd3b4d9dd1edb4295f4def49d6dcf2faaaaac87a1a0a42210372cd46831f3b6afd4c044d160b7667e8ebf659d6cb51a825a3104df6ee0638c62103ae72827d25030818c4947a800187b1fbcc33ae751e248ae60094cc989fb880f62103b3a7aa25702000c5c1faa300600e8e2bd89cde2be7fb1ec898a39c50d9de90d12103b53899c390573471ba30e5054f78376c5f797fda26dde7a760789f02908cbad22103e05bf6002b62651378b1954820539c36ca405cbb778c225395dd9ebff67802992103ecd8af1e93c57a1b8c7f917bd9980af798adeb0205e9687865673353eb041e8d5daeffffffff029a686c09000000001976a914fb53759d716de10362f5b57d28151a6481fd30e188ace354f1f00c00000017a914596cff92a275960df9cb2ab9df0ff69faa2b1d8a8700000000",
+        )
+        .unwrap();
+        // rskj-kept (NOT selected): btc spends input 0260d432…:1, smaller bytes.
+        let kept_btc = hex::decode(
+            "01000000010260d43256d4072e46f87acec7e3225752beff0fcb60288baf5088f5d5e9949401000000fdc80100000000000000004dbd0157210231a395e332dde8688800a0025cccc5771ea1aa874a633b8ab6e5c89d300c7c3621026b472f7d59d201ff1f540f111b6eb329e071c30a9d23e3d2bcd128fe73dc254c21027319afb15481dbeb3c426bcc37f9a30e7f51ceff586936d85548d9395bcc2344210294c817150f78607566e961b3c71df53a22022a80acbb982f83c0c8baac040adc2103250c11be0561b1d7ae168b1f59e39cbc1fd1ba3cf4d2140c1a365b2723a2bf9321033ada6ef3b1d93a1978b595c7a9e2aa613860b26d4f5a7abb88576aa42b3432ad210357f7ed4c118e581f49cd3b4d9dd1edb4295f4def49d6dcf2faaaaac87a1a0a42210372cd46831f3b6afd4c044d160b7667e8ebf659d6cb51a825a3104df6ee0638c62103ae72827d25030818c4947a800187b1fbcc33ae751e248ae60094cc989fb880f62103b3a7aa25702000c5c1faa300600e8e2bd89cde2be7fb1ec898a39c50d9de90d12103b53899c390573471ba30e5054f78376c5f797fda26dde7a760789f02908cbad22103e05bf6002b62651378b1954820539c36ca405cbb778c225395dd9ebff67802992103ecd8af1e93c57a1b8c7f917bd9980af798adeb0205e9687865673353eb041e8d5daeffffffff02a69bbc06000000001976a9140b9c738761bb47eba3802df6ac169717aa85b6f088ac104bd32d0100000017a914596cff92a275960df9cb2ab9df0ff69faa2b1d8a8700000000",
+        )
+        .unwrap();
+
+        let mk = |btc: &[u8], h: u64| PegoutWaitingForConfirmations {
+            btc_tx_raw: btc.to_vec(),
+            rsk_block_height: h,
+            rsk_tx_hash: Some([0u8; 32]),
+        };
+
+        // 13 entries (the real cell size at #3,345,557) so the HashSet capacity
+        // is 32. The 11 fillers carry height 3,345,000 (only 557 confirmations
+        // at block 3,345,557) so they never confirm and the tie is decided by
+        // the two real entries' buckets: a7c69a46→9, 0260d432→20.
+        let mut entries = vec![mk(&kept_btc, 3_341_556), mk(&selected_btc, 3_341_556)];
+        for i in 0..11u8 {
+            entries.push(mk(&[1, 0, 0, 0, i], 3_345_000));
+        }
+
+        let pos = next_pegout_with_enough_confirmations(&entries, 3_345_557, 4000)
+            .expect("one confirmed entry");
+        assert_eq!(
+            entries[pos].btc_tx_raw, selected_btc,
+            "must promote the a7c69a46… tx (HashSet bucket 9) like rskj, not the \
+             lexicographically-smaller 0260d432… tx (bucket 20)"
+        );
     }
 
     /// Empty rskTxsWaitingFS: empty data → empty map (matches rskj behavior).
