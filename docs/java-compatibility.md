@@ -1357,6 +1357,77 @@ computed trie vs rskj's LevelDB unitrie at the header root.
 
 ---
 
+## 32. SegWit peg-ins: wtxid for PMT/merkle, txid (no witness) for the processed map; witness-root read byte order
+
+A SegWit-serialized peg-in carries the BTC marker/flag and a witness stack,
+so its raw double-SHA256 (the wtxid) differs from its witness-stripped txid.
+rskj uses BOTH hashes, for different purposes, inside one
+`registerBtcTransaction`:
+
+```java
+// BridgeSupport.registerBtcTransaction
+Sha256Hash btcTxHash = BtcTransactionFormatUtils.calculateBtcTxHash(btcTxSerialized);
+//   = hashTwice(btcTxSerialized)  -> over the RAW bytes  -> WTXID
+...
+if (isAlreadyBtcTxHashProcessed(btcTx.getHash(false))) { ... }   // l.404
+...
+provider.setHeightBtcTxhashAlreadyProcessed(btcTx.getHash(false), rskHeight); // markTxAsProcessed l.763
+//   getHash(false)  -> WITNESS-STRIPPED txid
+```
+
+- **PMT matching / merkle-root validation** (`validationsForRegisterBtcTransaction`)
+  use `calculateBtcTxHash` = the **wtxid**. For a SegWit peg-in the supplied
+  PMT proves inclusion in the BTC block's **witness** merkle tree, so the
+  matched hash IS the wtxid and the PMT root is the witness merkle root.
+- **`btcTxHashesAlreadyProcessed`** is keyed by `getHash(false)` = the
+  **legacy txid**. The same legacy txid is what `registerNewUtxos` records as
+  the UTXO outpoint.
+
+A from-scratch client that uses a single "the BTC tx hash" everywhere either
+never finds the wtxid in the PMT (if it strips the witness for hashing) or
+marks/looks up the processed map under the wrong key (if it hashes raw bytes).
+Both fork: the first SILENTLY rejects a valid peg-in (no credit, no UTXO, tx
+not even marked processed), the state root being the only witness.
+
+A second, coupled trap is the **witness-root fallback byte order** in
+`isBlockMerkleRootValid` (RSKIP143): when the PMT root != the block's legacy
+merkle root, rskj reads `provider.getCoinbaseInformation(blockHeader.getHash())`
+and compares its stored witness merkle root to the PMT root. The coinbase info
+is keyed by the block hash in **display** order (§31) and its stored witness
+root is also **display** order (`registerBtcCoinbaseTransaction` reverses it
+for the commitment, `Sha256Hash.twiceOf(witnessMerkleRoot.getReversedBytes(),
+…)`), whereas the PMT root is in **internal** (little-endian) order. The
+lookup key and the compared value must therefore both be reversed.
+
+**Trigger**: mainnet #3,231,219 — tx 2 `registerBtcTransaction`, a 2-input
+SegWit peg-in of 1,000,001 sat to the active federation
+(`a914596cff92…87`). wtxid `cfe2…0897`, txid `124f…9b7e`. rskj locks it
+(credits `0xded5…24e6` with `0x2386f4c3cce400` wei, appends UTXO `124f…9b7e`,
+writes `btcTxHashesAlreadyProcessed[124f…9b7e] = 0x314df3`); rustock bailed at
+"merkle root mismatch" (wrong byte order on the witness-root read) and then,
+once that was fixed, would have keyed the processed map by the wtxid. Gas and
+receipts are identical (all status=true, total 370427).
+
+**rskj source**: `co.rsk.peg.BridgeSupport.registerBtcTransaction` (l.385,
+404, 763), `markTxAsProcessed`, `validationsForRegisterBtcTransaction`,
+`isBlockMerkleRootValid` (l.3336), `BtcTransactionFormatUtils.calculateBtcTxHash`,
+`co.rsk.peg.Bridge.registerBtcCoinbaseTransaction` (`Sha256Hash.wrap(args[3])`),
+`BridgeSupport.validateWitnessInformation` (`getReversedBytes()`).
+
+**rustock**: `crates/execution/src/bridge/tx.rs` — `calculate_btc_tx_hash`
+hashes raw bytes (wtxid, for PMT) and the new `legacy_btc_txid` returns the
+witness-stripped txid via `compute_txid`. `crates/execution/src/bridge/peg.rs`
+— `register_btc_transaction` re-checks the processed map with `legacy_txid`
+after parsing and marks all processed entries with it; the witness-root
+fallback reverses both the block-hash lookup key and the stored witness root
+(same fix mirrored in `register_fast_bridge_btc_transaction`). Tests:
+`calculate_btc_tx_hash_legacy_vector` (ported from rskj
+`BtcTransactionFormatUtilsTest`) and `segwit_pegin_wtxid_vs_legacy_txid`
+(block #3,231,219 ground truth). Verified end-to-end with `diff_state`
+(0 diverging leaves, root `0x3a66…f3d8`).
+
+---
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`

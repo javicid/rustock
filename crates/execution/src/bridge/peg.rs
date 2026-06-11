@@ -163,13 +163,24 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
         let root_valid = if pmt_result.merkle_root == block_merkle_root {
             true
         } else {
-            // Post-RSKIP143: also accept witness merkle root
+            // Post-RSKIP143: also accept witness merkle root. The coinbase
+            // information is keyed by the block hash in DISPLAY byte order
+            // (rskj `Sha256Hash.toString()`; see set_coinbase_information),
+            // the reverse of rust-bitcoin's internal order.
             let block_hash_bytes = {
-                let raw = block_hash.to_raw_hash();
-                *raw.as_byte_array()
+                let mut raw = *block_hash.to_raw_hash().as_byte_array();
+                raw.reverse();
+                raw
             };
             match get_coinbase_information(ctx, &block_hash_bytes) {
-                Some(witness_root) => pmt_result.merkle_root == witness_root,
+                // The stored witness merkle root is in DISPLAY byte order
+                // (rskj registerBtcCoinbaseTransaction wraps the ABI arg and
+                // reverses it for the commitment, BridgeSupport l.2574), while
+                // the PMT merkle root is internal order — compare reversed.
+                Some(mut witness_root) => {
+                    witness_root.reverse();
+                    pmt_result.merkle_root == witness_root
+                }
                 None => false,
             }
         };
@@ -196,6 +207,18 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     let btc_tx: BtcTransaction = deserialize(&btc_tx_data).map_err(|_| {
         PrecompileError::other("registerBtcTransaction: invalid BTC transaction")
     })?;
+
+    // rskj re-checks "already processed" using the witness-stripped txid
+    // (BridgeSupport.registerBtcTransaction l.404, `btcTx.getHash(false)`):
+    // the pre-parse check above used the wtxid (`calculateBtcTxHash` over the
+    // raw bytes), so for a SegWit tx the two keys differ and this second check
+    // is what actually guards the legacy-txid-keyed map. Every mark below uses
+    // this same legacy txid (rskj markTxAsProcessed l.763).
+    let legacy_txid = legacy_btc_txid(&btc_tx);
+    if is_btc_tx_processed(ctx, &legacy_txid) {
+        tracing::debug!("registerBtcTransaction: transaction already processed (txid); returning success");
+        return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
+    }
 
     // Live federations (active + retiring during migration): their P2SH
     // scripts identify which outputs are peg-ins and which inputs make the
@@ -234,7 +257,7 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
                 super::storage::OLD_FEDERATION_BTC_UTXOS_KEY,
             );
         }
-        set_btc_tx_processed(ctx, &btc_tx_hash, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
+        set_btc_tx_processed(ctx, &legacy_txid, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     }
 
@@ -264,7 +287,7 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     };
     if total_value < min_pegin {
         if should_mark_rejected_pegin_as_processed(hardfork_cfg, rsk_height) {
-            set_btc_tx_processed(ctx, &btc_tx_hash, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
+            set_btc_tx_processed(ctx, &legacy_txid, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
         }
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     }
@@ -379,7 +402,7 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
             }
             store_pegout_confirmation_set(ctx, &waiting, use_tx_hash);
         }
-        set_btc_tx_processed(ctx, &btc_tx_hash, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
+        set_btc_tx_processed(ctx, &legacy_txid, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     }
 
@@ -429,7 +452,7 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     }
 
     // Mark as processed
-    set_btc_tx_processed(ctx, &btc_tx_hash, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
+    set_btc_tx_processed(ctx, &legacy_txid, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
 
     Ok(PrecompileOutput::new(gas_cost, Bytes::new()))
 }
@@ -740,13 +763,25 @@ pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
     };
 
     if pmt_result.merkle_root != block_merkle_root {
+        // Witness-root fallback (rskj isBlockMerkleRootValid, RSKIP143): the
+        // coinbase info is keyed by the block hash in DISPLAY order and the
+        // stored witness root is also display order, vs the internal-order PMT
+        // root — both must be reversed (see register_btc_transaction).
         let block_hash_bytes = {
-            let raw = block_hash.to_raw_hash();
-            *raw.as_byte_array()
+            let mut raw = *block_hash.to_raw_hash().as_byte_array();
+            raw.reverse();
+            raw
         };
         match get_coinbase_information(ctx, &block_hash_bytes) {
-            Some(witness_root) if pmt_result.merkle_root == witness_root => {}
-            _ => {
+            Some(mut witness_root) => {
+                witness_root.reverse();
+                if pmt_result.merkle_root != witness_root {
+                    return Err(PrecompileError::other(
+                        "registerFastBridgeBtcTransaction: merkle root mismatch",
+                    ));
+                }
+            }
+            None => {
                 return Err(PrecompileError::other(
                     "registerFastBridgeBtcTransaction: merkle root mismatch",
                 ))

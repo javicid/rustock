@@ -353,9 +353,27 @@ pub fn get_btc_transaction_confirmations<CTX: crate::RskContextTr>(
 
 /// Compute the BTC transaction hash (double-SHA256 of raw tx bytes).
 /// Returns the hash in internal byte order (same as bitcoinj's Sha256Hash).
+///
+/// This is rskj `BtcTransactionFormatUtils.calculateBtcTxHash`
+/// (`hashTwice(btcTxSerialized)`): it hashes the bytes AS SUPPLIED, so for a
+/// SegWit-serialized tx it yields the wtxid. rskj uses this hash for PMT
+/// matching and merkle-root validation (BridgeSupport.registerBtcTransaction
+/// l.385, validationsForRegisterBtcTransaction). The btcTxHashesAlreadyProcessed
+/// map instead keys by the witness-stripped txid `btcTx.getHash(false)` — see
+/// `legacy_btc_txid`.
 pub fn calculate_btc_tx_hash(tx_bytes: &[u8]) -> [u8; 32] {
     let hash = sha256d::Hash::hash(tx_bytes);
     *hash.as_byte_array()
+}
+
+/// The witness-stripped BTC txid (bitcoinj `BtcTransaction.getHash(false)`),
+/// in internal byte order. For non-SegWit txs this equals
+/// `calculate_btc_tx_hash`; for SegWit txs the raw bytes carry the
+/// marker/flag and witness stack, so the two differ. rskj marks/looks up
+/// peg-ins in btcTxHashesAlreadyProcessed by THIS hash
+/// (BridgeSupport.registerBtcTransaction l.404, l.763).
+pub fn legacy_btc_txid(tx: &bitcoin::Transaction) -> [u8; 32] {
+    *tx.compute_txid().to_raw_hash().as_byte_array()
 }
 
 fn read_abi_dynamic_bytes(args: &[u8], offset: usize) -> Result<Vec<u8>, PrecompileError> {
@@ -403,6 +421,58 @@ mod tests {
         let h1 = calculate_btc_tx_hash(&data);
         let h2 = calculate_btc_tx_hash(&data);
         assert_eq!(h1, h2);
+    }
+
+    /// Ground truth ported from rskj BtcTransactionFormatUtilsTest.calculateBtcTxHash:
+    /// `calculate_btc_tx_hash` hashes the raw bytes as supplied (rskj
+    /// `BtcTransactionFormatUtils.calculateBtcTxHash = hashTwice(serialized)`).
+    /// rskj asserts the DISPLAY-order hash 4d63ac30…151576; our internal-order
+    /// result is its reverse.
+    #[test]
+    fn calculate_btc_tx_hash_legacy_vector() {
+        let hex_str = "020000000418bc858998739dbb7e7676435178dba5e71157b1537d415518d5c1fce6349018000000006a47304402204317903e40f8736858f87758e68bf18372bc075bc928fd82aa8e6c03ae8ce9fb022074a59d7449cc753c5a6b10e70db20469076e2a8b950aa44624ee7ff70633f732012103161014902a3984b695c41627f1403f56b0e631152ff265ddb42e36ba0d57b796feffffff6b853f36edb3a55c419792d3923790147b3c429bb6082d11846ff563edcdae05010000006b483045022100e202a463722821875bcecea315041623b4f4b7c615bc63c85ddcb4185035cc0502201beb9c556c1a672d326e66c4d4b44ac189b7f3296c5ce6128bf9e52f96cfcabc012103a6ba50eaba8d2fc9a638123cf3fe155610cf162253e8cf672f70945fe00fd317feffffffac932fbdbb882a3947652710b6c9117729962efb30f77779265436f804a5f4bc010000006b483045022100ddc4be4b2d61eb6bdecbb76002cc85c304630465807039f7c9eaf5583d5c6cce02203bc3dc7429a17a92c63b6ec517d82f3964beda7f3c375a388c0326e3db3a455101210366d0e8c0c72ea7e8a48ae9fe525fb51bcea39702b9ba2903758a582e26a7d0b9feffffffe89b208401d4eb6fc01deef1393fe00c1f56e2b86b77268629491894f560adb6010000006b483045022100ac01733d947bf43ad97a5792864766c6c6d9963e359a6e0ab470b68565d679b6022003d4afeb917e7711e797b665f5a95893dea2f53d07e2840b6441a72702f88412012102b005a7d4368c02dc8e5f171765db281f546b99b921eac18b2910c82d38f820f7feffffff02441427010000000017a914056bce3306ec98a0247cebb654809943045d6b51877ff21500000000001976a914f7da7f0f7669bce303cfc48921bb7303e3918b1288acdfdc0700";
+        let raw = hex::decode(hex_str).unwrap();
+        let mut expected_display =
+            hex::decode("4d63ac307e0daba3597a0d8075facb4e6cba3908a60920259b7447e28a151576").unwrap();
+        expected_display.reverse(); // display -> internal
+        assert_eq!(calculate_btc_tx_hash(&raw).to_vec(), expected_display);
+    }
+
+    /// RSK Mainnet block #3,231,219 tx[2]: a SegWit-serialized peg-in. rskj
+    /// `BtcTransactionFormatUtils.calculateBtcTxHash` hashes the raw bytes
+    /// (wtxid) for PMT matching, while `btcTx.getHash(false)` (= our
+    /// `legacy_btc_txid`) strips the witness for the
+    /// btcTxHashesAlreadyProcessed map. The two MUST differ for a SegWit tx.
+    /// Ground truth: the legacy txid (display order 124f95f3…f09b7e) is the
+    /// UTXO hash rskj appended to newFederationBtcUTXOs in that block.
+    #[test]
+    fn segwit_pegin_wtxid_vs_legacy_txid() {
+        let raw = hex::decode(
+            "01000000000102ad5193f8f5af5fa13b9555811ae1de6e08e7c65801cb731a79ff445abd1b5061000000006a473044\
+             02206dd90517b2b462b1edf9592cdc75d5b10196c275e39cb22fc63c053c57f001dd02203594e7c41258948f40f4bf3\
+             f5628cfefac04adb639da5a227fca772f33ab83a30121037975b80b0275420aa52cad67dff83a26c9fc398f5e7698c5\
+             014bb5a6937c17c0ffffffff706fce5df32d6c0f1c3a770282d80a2f3d96809cacb488476d70a0a41e8f12580000000\
+             000ffffffff0241420f000000000017a914596cff92a275960df9cb2ab9df0ff69faa2b1d8a873b6a1700000000001\
+             976a914935fe65e138f8cc6d5aa72801aebe59f78d7289f88ac00024730440220660b129d3f75041c30b5a8d51b41b4\
+             d13b07818cfe5e3274ddad39bdea3b2d2e02205ab94a07c9a13a4419d8f07edcca45ab7006c1fdd8d35d903d2a1a2a7\
+             9799f40012102240177f45453feca344644d99a285ab33674d3eaa5fb0ae3e17d10b08f85d6e200000000",
+        )
+        .unwrap();
+        // wtxid (raw double-SHA256, internal order).
+        let mut expected_wtxid =
+            hex::decode("cfe20fb72fd2d39bb59f6b89da3dea74733f4f9710192cd19431dfdb95620897").unwrap();
+        expected_wtxid.reverse();
+        assert_eq!(calculate_btc_tx_hash(&raw).to_vec(), expected_wtxid);
+
+        // legacy txid (witness stripped, internal order).
+        let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&raw).unwrap();
+        let mut expected_txid =
+            hex::decode("124f95f3c6f1a52918077550997fd68df3402ad51e97414fac9e23a029f09b7e").unwrap();
+        expected_txid.reverse();
+        assert_eq!(legacy_btc_txid(&tx).to_vec(), expected_txid);
+
+        // The whole point: for a SegWit tx the two hashes differ.
+        assert_ne!(calculate_btc_tx_hash(&raw), legacy_btc_txid(&tx));
     }
 
     /// Ground truth from RSK Mainnet block #3,229,522 (registerBtcCoinbaseTransaction):
