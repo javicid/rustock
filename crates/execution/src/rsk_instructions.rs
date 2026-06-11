@@ -27,6 +27,7 @@ use revm::interpreter::{
     CallInput, CallInputs, CallScheme, CallValue, FrameInput, Host, Instruction,
     InstructionContext, InstructionResult, InterpreterAction,
 };
+use revm::context_interface::host::LoadError;
 use revm::primitives::{Address, B256, U256};
 
 /// rskj `GasCost.CALL`: static cost of every CALL-family opcode.
@@ -34,6 +35,10 @@ const CALL_STATIC_GAS: u64 = 700;
 
 /// rskj `GasCost.EXT_CODE_SIZE` (== revm's pre-Berlin EXTCODESIZE), EIP-150.
 const EXT_CODE_SIZE_GAS: u64 = 700;
+
+/// rskj `GasCost.SUICIDE`: static cost of SELFDESTRUCT (EIP-150 onward, which
+/// is always active for RSK eras). Mirrors revm's TANGERINE+ static gas.
+const SUICIDE_STATIC_GAS: u64 = 5000;
 
 thread_local! {
     /// Addresses for which EXTCODESIZE must report `2^256-1` (rskj RSKIP90:
@@ -112,6 +117,10 @@ pub fn install<WIRE, HOST>(
     instructions.insert_instruction(
         opcode::STATICCALL,
         Instruction::new(rsk_static_call::<WIRE, HOST>, CALL_STATIC_GAS),
+    );
+    instructions.insert_instruction(
+        opcode::SELFDESTRUCT,
+        Instruction::new(rsk_selfdestruct::<WIRE, HOST>, SUICIDE_STATIC_GAS),
     );
 
     // Divergence-hunt diagnostic (env-gated, temporary): log pc/op/gas for
@@ -278,6 +287,7 @@ fn traced_all<WIRE: InterpreterTypes, HOST: Host>(
         opcode::CALLCODE => rsk_call_code(context),
         opcode::DELEGATECALL => rsk_delegate_call(context),
         opcode::STATICCALL => rsk_static_call(context),
+        opcode::SELFDESTRUCT => rsk_selfdestruct(context),
         opcode::EXTCODEHASH if !EXTCODEHASH_ENABLED.with(|f| f.get()) => {
             invalid_opcode(context)
         }
@@ -483,6 +493,67 @@ pub fn rsk_call<WIRE: InterpreterTypes, H: Host + ?Sized>(
                 return_memory_offset,
             },
         ))));
+}
+
+/// SELFDESTRUCT with rskj gas semantics.
+///
+/// rskj `VM.doSUICIDE` adds `NEW_ACCT_SUICIDE` (25,000) whenever the
+/// beneficiary does not exist (`!track.isExist`), with NO condition on the
+/// suiciding contract's balance. revm's stock `selfdestruct` instead gates the
+/// top-up on `had_value && !target_exists` once Spurious Dragon is active
+/// (EIP-161), which is always the case for RSK eras (spec >= Byzantium) — so a
+/// zero-balance contract self-destructing to an absent beneficiary would skip
+/// the 25,000 charge and diverge. This override drops the value condition,
+/// matching rskj frontier-style suicide gas. Everything else (base 5,000 via
+/// static gas, cold cost, refund) mirrors revm's instruction.
+pub fn rsk_selfdestruct<WIRE: InterpreterTypes, H: Host + ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+) {
+    if context.interpreter.runtime_flag.is_static() {
+        context
+            .interpreter
+            .halt(InstructionResult::StateChangeDuringStaticCall);
+        return;
+    }
+    let Some([target]) = context.interpreter.stack.popn() else {
+        context.interpreter.halt_underflow();
+        return;
+    };
+    let target = Address::from_word(B256::from(target));
+
+    let cold_load_gas = context.host.gas_params().selfdestruct_cold_cost();
+    let skip_cold_load = context.interpreter.gas.remaining() < cold_load_gas;
+    let res = match context.host.selfdestruct(
+        context.interpreter.input.target_address(),
+        target,
+        skip_cold_load,
+    ) {
+        Ok(res) => res,
+        Err(LoadError::ColdLoadSkipped) => return context.interpreter.halt_oog(),
+        Err(LoadError::DBError) => return context.interpreter.halt_fatal(),
+    };
+
+    // rskj charges NEW_ACCT_SUICIDE on beneficiary non-existence regardless of
+    // value (no `had_value &&` gate, unlike revm's EIP-161 path).
+    let should_charge_topup = !res.target_exists;
+
+    let cost = context
+        .host
+        .gas_params()
+        .selfdestruct_cost(should_charge_topup, res.is_cold);
+    if !context.interpreter.gas.record_cost(cost) {
+        context.interpreter.halt_oog();
+        return;
+    }
+
+    if !res.previously_destroyed {
+        context
+            .interpreter
+            .gas
+            .record_refund(context.host.gas_params().selfdestruct_refund());
+    }
+
+    context.interpreter.halt(InstructionResult::SelfDestruct);
 }
 
 /// CALLCODE with rskj gas semantics (no new-account charge).

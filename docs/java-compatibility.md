@@ -1724,6 +1724,72 @@ pair: `test_empty_code_call_preserves_return_data_buffer` (pre-iris #2,500,000
 
 ---
 
+## 38. `NEW_ACCT_CALL` / `NEW_ACCT_SUICIDE` charge on trie EXISTENCE, not EIP-161 emptiness
+
+rskj's VM charges the 25,000-gas new-account surcharge on **trie existence**
+(`track.isExist(addr)`), with no value condition (frontier style; EIP-161's
+`value>0` gate never applied):
+
+- `Program.getCallGas` / CALL: charges `NEW_ACCT_CALL` whenever the callee does
+  not exist.
+- `VM.doSUICIDE` (`VM.java`): `if (!program.getStorage().isExist(beneficiary))
+  gasCost += GasCost.NEW_ACCT_SUICIDE;` — **unconditional on the suiciding
+  contract's balance.**
+
+The distinction matters for accounts that *exist in the unitrie but are empty*
+(`nonce=0, balance=0, no code`) — these genuinely occur on RSK (zero-paid
+miners; an account re-created after a same-block selfdestruct, see §30). rskj
+does NOT charge for a CALL/suicide targeting such an account (it exists);
+EIP-161 emptiness would charge.
+
+**CALL path — already correct via the HOMESTEAD journal pin.** revm's CALL gas
+(`load_account_delegated`) keys the new-account cost on `account.is_empty`,
+where `is_empty` is computed by the journal as `state_clear_aware_is_empty(spec)`
+with `spec = journal.cfg.spec`. rustock pins that journal spec to
+**`SpecId::HOMESTEAD`** (`rsk_handler.rs`, the "frontier-forever" pin), and under
+a pre-Spurious-Dragon spec `state_clear_aware_is_empty` collapses to
+`is_loaded_as_not_existing_not_touched()`. revm sets `LoadedAsNotExisting` only
+when `Database::basic` returns `None` (the trie has no node — see
+`journal/inner.rs` `load_account_mut_optional`); a DB-returned empty `(0,0,no
+code)` account gets status `Loaded`. rustock's `basic_ref`
+(`database.rs`) returns `None` exactly when the trie has no account node. So
+revm's `is_empty` == rskj's `!isExist`, and the CALL surcharge is already keyed
+on existence. (This also explains why a precompile is charged `NEW_ACCT_CALL`
+only once over the chain's lifetime — §ref `test_precompile_new_account_charged_only_once_across_blocks`.)
+
+**SUICIDE path — fixed.** revm's stock `selfdestruct` instruction gates the
+beneficiary top-up on `should_charge_topup = had_value && !target_exists` once
+Spurious Dragon is active (the *interpreter* spec, always ≥ Byzantium for RSK).
+So a **zero-balance** contract self-destructing to an absent beneficiary skipped
+the 25,000 charge — a latent divergence from rskj's value-independent
+`!isExist`. rustock now installs a `rsk_selfdestruct` override
+(`crates/execution/src/rsk_instructions.rs`) that mirrors revm's instruction but
+drops the `had_value &&` gate (`should_charge_topup = !res.target_exists`). Base
+cost (5,000, rskj `GasCost.SUICIDE`) is the opcode's static gas; cold cost and
+refund are unchanged. (`target_exists` itself is `!is_empty` computed under the
+pinned HOMESTEAD journal spec, so it is true trie existence — matching rskj.)
+
+**Consensus-load-bearing:** the surcharge changes gasUsed → receipts root, so a
+from-scratch client that uses EIP-161 emptiness (or revm's `had_value` suicide
+gate) forks on the receipts root the first time a CALL/suicide targets an
+existing-but-empty account, or a zero-value contract suicides to an absent
+beneficiary. A from-scratch client must charge the 25,000 on `!isExist`
+regardless of value.
+
+**rskj source**: `org.ethereum.vm.VM.doSUICIDE` (NEW_ACCT_SUICIDE on `!isExist`);
+`org.ethereum.vm.program.Program.getCallGas`; `org.ethereum.vm.GasCost`
+(`SUICIDE=5000`, `NEW_ACCT_SUICIDE=25000`).
+
+**rustock**: `crates/execution/src/rsk_instructions.rs` — `rsk_selfdestruct`
+(SELFDESTRUCT override) and the existing CALL path's reliance on the HOMESTEAD
+journal pin. Tests (`crates/execution/src/executor.rs`):
+`test_new_acct_call_charged_on_existence_not_emptiness` (CALL: existing-but-empty
+target not charged, absent target charged) and
+`test_new_acct_suicide_charged_on_existence_regardless_of_value` (zero-balance
+suicide to an absent beneficiary still pays 25,000).
+
+---
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`

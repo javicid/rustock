@@ -1957,6 +1957,157 @@ mod tests {
         );
     }
 
+    /// rskj charges NEW_ACCT_CALL (25,000) on trie EXISTENCE
+    /// (`track.isExist(addr)`), NOT on EIP-161 emptiness. An account that
+    /// exists in the unitrie with `(nonce=0, balance=0, no code)` — e.g. a
+    /// zero-paid miner, or an account re-created after a same-block
+    /// selfdestruct — is NOT charged, because rustock pins the journal spec to
+    /// HOMESTEAD (`rsk_handler`), making revm's `is_empty` collapse to
+    /// `is_loaded_as_not_existing` (DB returned `None`) rather than raw EIP-161
+    /// emptiness. A CALL to a truly-absent address IS charged. The 25,000 delta
+    /// between the two cases proves the charge keys on existence, not emptiness.
+    #[test]
+    fn test_new_acct_call_charged_on_existence_not_emptiness() {
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let sender = Address::repeat_byte(0xAA);
+        let contract = Address::repeat_byte(0xCC);
+        let target = Address::repeat_byte(0xDD); // not a precompile
+
+        // Contract: CALL(gas=3000, target, value=0) ; STOP.
+        // PUSH1 0 x4 (ret/args) PUSH1 0 (value) PUSH20 target PUSH2 3000 CALL STOP
+        let mut code = vec![0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x73];
+        code.extend_from_slice(target.as_slice());
+        code.extend_from_slice(&[0x61, 0x0b, 0xb8, 0xf1, 0x00]); // PUSH2 3000, CALL, STOP
+
+        let call_tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(200_000),
+            to: Bytes::copy_from_slice(contract.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::new(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+
+        // Run the identical CALL with the target either absent or present-but-empty.
+        let run = |target_exists: bool| {
+            let store = Arc::new(MemoryTrieStore::new());
+            let root = TrieNode::empty();
+            let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+            let root = put_account(&root, store.as_ref(), &contract, 1, U256::ZERO);
+            let root = if target_exists {
+                // Existing-but-empty (0,0,no-code) account node in the trie.
+                put_account(&root, store.as_ref(), &target, 0, U256::ZERO)
+            } else {
+                root
+            };
+            let code_key_bytes = rustock_trie::code_key(&contract);
+            let root = root.put(
+                &TrieKeySlice::from_key(&code_key_bytes),
+                &code,
+                store.as_ref(),
+            );
+
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+            let header = dummy_header(466_503);
+            let r = executor
+                .execute_block(&header, &[(call_tx.clone(), sender)], &root, store.clone())
+                .expect("block");
+            assert!(r.tx_results[0].success);
+            r.tx_results[0].gas_used
+        };
+
+        let gas_absent = run(false);
+        let gas_exists = run(true);
+        assert_eq!(
+            gas_absent - gas_exists,
+            25_000,
+            "NEW_ACCT_CALL charged only when target absent \
+             (absent={gas_absent}, exists-empty={gas_exists})"
+        );
+    }
+
+    /// rskj `doSUICIDE` (VM.java) charges NEW_ACCT_SUICIDE (25,000) whenever the
+    /// beneficiary does not exist (`!track.isExist`), UNCONDITIONAL on the
+    /// suiciding contract's balance. revm's selfdestruct instead gates the
+    /// beneficiary top-up on `had_value && !target_exists` under Spurious Dragon
+    /// (always active for RSK eras), so a ZERO-balance contract self-destructing
+    /// to an absent beneficiary would skip the charge. This test pins the rskj
+    /// behavior: the absent-beneficiary case costs 25,000 more than the
+    /// existing-beneficiary case even with a zero contract balance.
+    #[test]
+    fn test_new_acct_suicide_charged_on_existence_regardless_of_value() {
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let sender = Address::repeat_byte(0xAA);
+        let contract = Address::repeat_byte(0xCC);
+        let bene = Address::repeat_byte(0xDD); // not a precompile
+
+        // Contract runtime: PUSH20 bene ; SELFDESTRUCT. Contract balance is 0.
+        let mut code = vec![0x73]; // PUSH20
+        code.extend_from_slice(bene.as_slice());
+        code.push(0xFF); // SELFDESTRUCT
+
+        // Pad the tx with non-zero calldata so the gross gas is large enough
+        // that the selfdestruct refund is NOT capped (refund = min(refund,
+        // gross/2)) in either case. Otherwise the cheaper existing-beneficiary
+        // case hits the refund cap and the net-gas delta no longer isolates the
+        // 25,000 top-up. The contract ignores the calldata.
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(500_000),
+            to: Bytes::copy_from_slice(contract.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::from(vec![1u8; 500]),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+
+        let run = |bene_exists: bool| {
+            let store = Arc::new(MemoryTrieStore::new());
+            let root = TrieNode::empty();
+            let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+            let root = put_account(&root, store.as_ref(), &contract, 1, U256::ZERO);
+            let root = if bene_exists {
+                put_account(&root, store.as_ref(), &bene, 0, U256::ZERO)
+            } else {
+                root
+            };
+            let code_key_bytes = rustock_trie::code_key(&contract);
+            let root = root.put(
+                &TrieKeySlice::from_key(&code_key_bytes),
+                &code,
+                store.as_ref(),
+            );
+
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+            let header = dummy_header(466_503);
+            let r = executor
+                .execute_block(&header, &[(tx.clone(), sender)], &root, store.clone())
+                .expect("block");
+            assert!(r.tx_results[0].success);
+            r.tx_results[0].gas_used
+        };
+
+        let gas_absent = run(false);
+        let gas_exists = run(true);
+        assert_eq!(
+            gas_absent - gas_exists,
+            25_000,
+            "NEW_ACCT_SUICIDE charged on absent beneficiary regardless of value \
+             (absent={gas_absent}, exists={gas_exists})"
+        );
+    }
+
     /// Multi-tx version of the #382,134 regression: a later transaction in
     /// the SAME block re-reads (and possibly same-value re-writes) the bridge
     /// slots written by an earlier one — the slots must still reach the trie.
