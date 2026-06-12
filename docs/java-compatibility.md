@@ -1974,6 +1974,77 @@ existing `PrecompileError`/`PrecompileOOG` path is preserved.
 final-block byte forwarding 900 000 gas; post-iris the tx settles far below the
 forwarded gas and the CALL pushes 0 (ported from rskj `ProgramTest`).
 
+## 41. RSKIP181: a rejected peg-in logs `rejected_pegin`
+
+RSKIP181 (iris300, mainnet #3,614,800) adds peg-in rejection events. In the
+iris-era legacy peg-in path (`BridgeSupport.processPegInVersionLegacy`, used
+until the arrowhead631 `registerPegIn` refactor), a peg-in that was classified as
+a valid PEGIN (so it passed the minimum-value gate in `PegUtils.getTransactionType`)
+but is then refused emits `rejected_pegin` before being refunded:
+
+```java
+if (shouldProcessPegInVersionLegacy(...)) {           // = lockable && whitelisted && capOk
+    executePegIn(...);
+} else {
+    if (activations.isActive(RSKIP181)) {
+        if (!isTxLockableForLegacyVersion(...)) {                       // not P2PKH / (post-143) P2SH-P2WPKH
+            eventLogger.logRejectedPegin(btcTx, LEGACY_PEGIN_MULTISIG_SENDER);   // reason 2
+        } else if (!verifyLockDoesNotSurpassLockingCap(btcTx, totalAmount)) {    // RSKIP134 cap
+            eventLogger.logRejectedPegin(btcTx, PEGIN_CAP_SURPASSED);            // reason 1
+        }
+    }
+    generateRejectionRelease(...);
+    markTxAsProcessed(btcTx);
+}
+```
+
+Two quirks a from-scratch client could get wrong:
+
+- **A whitelist-only rejection logs NOTHING.** `shouldProcess` short-circuits
+  `lockable && whitelisted && capOk`; the rejection branch re-checks only
+  lockable and cap, NOT the whitelist. So a lockable, cap-OK, but non-whitelisted
+  peg-in is refunded with no event.
+- **The cap re-check in the rejection branch lazily initializes the locking-cap
+  cell** (`getLockingCap` persists the network default on first read, §20). For a
+  lockable peg-in that failed the whitelist, the cap was NOT evaluated in
+  `shouldProcess` (short-circuit), so the `else if !verifyLockDoesNotSurpassLockingCap`
+  here is the first evaluation and writes the cell — a state side effect on the
+  rejection path.
+
+Event: `rejected_pegin(bytes32 indexed btcTxHash, int256 reason)`, topic0
+`0x708ce1ead20561c5894a93be3fee64b326b2ad6c198f8253e4bb56f1626053d6`, topic1 =
+`btcTx.getHash().getBytes()` (the witness-stripped legacy txid in **display**
+order), data = `int256(reason)` (`RejectedPeginReason`: PEGIN_CAP_SURPASSED=1,
+LEGACY_PEGIN_MULTISIG_SENDER=2, LEGACY_PEGIN_UNDETERMINED_SENDER=3,
+PEGIN_V1_INVALID_PAYLOAD=4, INVALID_AMOUNT=5).
+
+**Consensus-load-bearing:** the log changes the receipts root / logs bloom, so a
+client that omits it forks on the first post-iris peg-in refused for a
+multisig/P2SH-not-lockable sender or a locking-cap-surpassing amount. This is
+reachable in the CURRENT sync window (we are past iris300).
+
+**rskj source**: `co.rsk.peg.BridgeSupport.processPegInVersionLegacy`,
+`isTxLockableForLegacyVersion`, `shouldProcessPegInVersionLegacy`;
+`co.rsk.peg.utils.BridgeEventLoggerImpl.logRejectedPegin`;
+`co.rsk.peg.pegin.RejectedPeginReason`; `co.rsk.peg.BridgeEvents.REJECTED_PEGIN`.
+
+**rustock**: `crates/execution/src/bridge/events.rs::log_rejected_pegin`, wired
+into `register_btc_transaction`'s rejection branch
+(`crates/execution/src/bridge/peg.rs`) under `has_rskip181`, replicating the
+`!lockable → 2 / else !capOk → 1 / whitelist-only → none` selection (the cap
+re-check reuses `cap_ok`, preserving the lazy-init side effect).
+`has_rskip181` (iris300) added in `crates/execution/src/hardfork.rs`. Test:
+`rejected_pegin_topic_and_data` (events.rs).
+
+**Not implemented (logged in TODO):** `unrefundable_pegin` (rskj
+`logNonRefundablePegin`) — in the iris-era legacy path it is only reachable via
+the v1 `refundTxSender` no-refund-address case and the arrowhead+ `handleNonRefundablePegin`
+multisig-to-different-fed-types case; neither is reachable in the current window.
+Also the `LEGACY_PEGIN_UNDETERMINED_SENDER` (reason 3) `rejected_pegin` from
+`txIsProcessableInLegacyVersion` failing is not wired — a PEGIN-classified tx has
+a determinable sender, so it is effectively unreachable in the legacy era; revisit
+if a receipts mismatch points at an undetermined-sender peg-in.
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`

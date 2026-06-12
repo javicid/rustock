@@ -281,6 +281,28 @@ pub fn log_pegin_btc<CTX: crate::RskContextTr>(
     );
 }
 
+/// `rejected_pegin(bytes32 indexed btcTxHash, int256 reason)` — rskj
+/// `logRejectedPegin` (RSKIP181, iris300). Fired when a peg-in is rejected but
+/// the funds are refundable. `reason` is the `RejectedPeginReason` enum value:
+/// PEGIN_CAP_SURPASSED=1, LEGACY_PEGIN_MULTISIG_SENDER=2,
+/// LEGACY_PEGIN_UNDETERMINED_SENDER=3, PEGIN_V1_INVALID_PAYLOAD=4,
+/// INVALID_AMOUNT=5. The topic is `btcTx.getHash().getBytes()` = the legacy
+/// (witness-stripped) txid in display order.
+pub fn log_rejected_pegin<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    btc_tx_hash: &[u8; 32],
+    reason: u64,
+) {
+    emit_topics(
+        ctx,
+        vec![
+            solidity_topic("rejected_pegin(bytes32,int256)"),
+            B256::from_slice(btc_tx_hash),
+        ],
+        u256_word(alloy_primitives::U256::from(reason)).to_vec(),
+    );
+}
+
 /// `release_requested(bytes32 indexed rskTxHash, bytes32 indexed btcTxHash,
 /// uint256 amount)` — fired when a peg-out BTC transaction is created.
 pub fn log_release_requested<CTX: crate::RskContextTr>(
@@ -594,6 +616,25 @@ mod tests {
         assert_eq!(&data[64..96], &u256_word(alloy_primitives::U256::from(len as u64)));
         assert_eq!(&data[96..96 + len], base58.as_bytes());
         assert_eq!(data.len(), 96 + len.next_multiple_of(32));
+    }
+
+    /// rskj `BridgeEvents.REJECTED_PEGIN` topic0 = keccak256 of the canonical
+    /// signature `rejected_pegin(bytes32,int256)` (rskj `BridgeEventLoggerImplTest`
+    /// derives the topic the same way). Data = int256(reason). Topic1 (indexed
+    /// btcTxHash) = `btcTx.getHash().getBytes()` (display-order legacy txid).
+    #[test]
+    fn rejected_pegin_topic_and_data() {
+        use alloy_primitives::hex;
+        assert_eq!(
+            hex::encode(solidity_topic("rejected_pegin(bytes32,int256)")),
+            "708ce1ead20561c5894a93be3fee64b326b2ad6c198f8253e4bb56f1626053d6"
+        );
+        // Data is a single int256 word holding the reason enum value
+        // (PEGIN_CAP_SURPASSED=1, LEGACY_PEGIN_MULTISIG_SENDER=2, ...).
+        assert_eq!(
+            hex::encode(u256_word(alloy_primitives::U256::from(1u64))),
+            "0000000000000000000000000000000000000000000000000000000000000001"
+        );
     }
 
     /// Groundtruth from the mainnet #2,392,704 updateCollections receipt

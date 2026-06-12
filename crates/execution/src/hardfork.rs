@@ -306,6 +306,12 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Iris300
     }
 
+    /// RSKIP181: peg-in rejection events rejected_pegin / unrefundable_pegin
+    /// (Iris300).
+    pub fn has_rskip181(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Iris300
+    }
+
     /// RSKIP171: a CALL/CREATE that runs no new frame resets the caller's
     /// returnDataBuffer (canonical EIP-211), instead of preserving the prior
     /// call's output as pre-iris rskj did (Iris300).

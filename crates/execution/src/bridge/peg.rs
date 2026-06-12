@@ -324,10 +324,13 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     // evaluated only when the whitelist passed (rskj short-circuits the &&,
     // so a whitelist rejection never lazily initializes the cap). A cap
     // rejection produces the same refund release as a whitelist one.
+    let cap_ok = |ctx: &mut CTX| {
+        !hardfork_cfg.has_rskip134(rsk_height)
+            || verify_lock_does_not_surpass_locking_cap(ctx, config, total_value)
+    };
     let allowed = lockable
         && whitelist_allows_and_consume(ctx, &sender_hash160, total_value, btc_block_height)
-        && (!hardfork_cfg.has_rskip134(rsk_height)
-            || verify_lock_does_not_surpass_locking_cap(ctx, config, total_value));
+        && cap_ok(ctx);
     tracing::debug!(
         "pegin lock check: sender {} amount {} btc_height {} -> {}",
         to_hex(&sender_hash160),
@@ -336,6 +339,25 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
         allowed
     );
     if !allowed {
+        // RSKIP181 (iris300): log rejected_pegin. rskj processPegInVersionLegacy
+        // re-runs the lockable/cap checks in the rejection branch (NOT the
+        // whitelist): `!isTxLockableForLegacyVersion` -> LEGACY_PEGIN_MULTISIG_SENDER(2),
+        // else `!verifyLockDoesNotSurpassLockingCap` -> PEGIN_CAP_SURPASSED(1).
+        // A whitelist-only rejection (lockable, cap ok) logs nothing. The cap
+        // re-evaluation here also lazily initializes the locking-cap cell, like
+        // rskj's second verifyLockDoesNotSurpassLockingCap call.
+        if hardfork_cfg.has_rskip181(rsk_height) {
+            let reason = if !lockable {
+                Some(2u64) // LEGACY_PEGIN_MULTISIG_SENDER
+            } else if !cap_ok(ctx) {
+                Some(1u64) // PEGIN_CAP_SURPASSED
+            } else {
+                None // whitelist rejection: no event
+            };
+            if let Some(reason) = reason {
+                super::events::log_rejected_pegin(ctx, &btc_txid_event_bytes(&btc_tx), reason);
+            }
+        }
         // TODO(rustock): a rejected peg-in paying BOTH live federations would
         // need per-input redeem scripts in the refund; none exists on
         // mainnet pre-wasabi. Inputs paying the retiring federation use its
