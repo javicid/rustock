@@ -319,6 +319,12 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Fingerroot500
     }
 
+    /// RSKIP427: the RSKIP185 peg-out event amounts (release_request_received,
+    /// release_request_rejected) switch from satoshis to full wei (Lovell700).
+    pub fn has_rskip427(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Lovell700
+    }
+
     /// RSKIP459: mark rejected non-refundable peg-ins as processed (Lovell700).
     /// Disabled again by RSKIP551 at Vetiver900.
     pub fn has_rskip459(&self, block_number: u64) -> bool {

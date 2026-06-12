@@ -883,10 +883,17 @@ pub fn release_btc<CTX: crate::RskContextTr>(
             let _ = ctx
                 .journal_mut()
                 .transfer(BRIDGE_ADDR, tx_ctx.rsk_sender, refund_wei);
+            // Pre-RSKIP427 the event amount is in satoshis; post-427 it is the
+            // full wei call value (rskj logs `releaseRequestedValueInWeis`).
+            let event_amount = if hardfork_cfg.has_rskip427(block_number) {
+                call_value_wei
+            } else {
+                U256::from(amount_satoshis)
+            };
             super::events::log_release_request_rejected(
                 ctx,
                 tx_ctx.rsk_sender,
-                amount_satoshis,
+                event_amount,
                 reason,
             );
         }
@@ -927,14 +934,24 @@ pub fn release_btc<CTX: crate::RskContextTr>(
     }
 
     // RSKIP185 (Iris300): an accepted peg-out emits release_request_received
-    // (rskj BridgeSupport.requestRelease). Pre-RSKIP326 the destination is the
-    // 20-byte hash160; pre-RSKIP427 the amount is in satoshis.
+    // (rskj BridgeSupport.requestRelease). The destination is the sender's
+    // P2PKH BTC address. Pre-RSKIP326 the event carries the 20-byte hash160,
+    // post-326 the Base58 string; pre-RSKIP427 the amount is satoshis, post-427
+    // the full wei call value.
     if hardfork_cfg.has_rskip185(block_number) {
+        let dest_base58 = sender_base58_address(&btc_dest, false, config);
+        let event_amount = if hardfork_cfg.has_rskip427(block_number) {
+            call_value_wei
+        } else {
+            U256::from(amount_satoshis)
+        };
         super::events::log_release_request_received(
             ctx,
             tx_ctx.rsk_sender,
             &btc_dest,
-            amount_satoshis,
+            &dest_base58,
+            event_amount,
+            hardfork_cfg.has_rskip326(block_number),
         );
     }
 

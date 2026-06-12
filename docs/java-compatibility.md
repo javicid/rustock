@@ -1851,9 +1851,23 @@ variant is era-gated: pre-RSKIP326 → `RELEASE_REQUEST_RECEIVED_LEGACY`, after 
   is in **satoshis** (`amountInWeis.toBitcoin()`), not wei. Head = [offset 0x40,
   amount]; tail = [len 20, hash160 right-padded].
 
-(Post-RSKIP326 the destination becomes the Base58 address `string`; post-RSKIP427
-the amount becomes wei. Neither is active in the iris-era window — gate added
-when those forks are reached.)
+**Post-RSKIP326 (fingerroot500, mainnet #5,468,000)** the destination becomes the
+Base58 address `string` (`btcDestinationAddress.toString()`) and the signature's
+second arg switches `bytes`→`string`. **Post-RSKIP427 (lovell700, mainnet
+#7,338,024)** the amount of BOTH `release_request_received` and
+`release_request_rejected` becomes full wei (`amountInWeis.asBigInteger()`)
+instead of satoshis. Both gates are now implemented (`has_rskip326` /
+`has_rskip427` selecting the signature/encoding in
+`bridge/events.rs::log_release_request_received` / `log_release_request_rejected`,
+fed from `bridge/peg.rs::release_btc`); neither is active in the current sync
+window (post-iris, pre-fingerroot), so the legacy form still applies today. Tests
+`release_request_received_post_rskip326_427_string_and_wei` and
+`release_request_rejected_post_rskip427_amount_is_wei` cover the forward forms.
+
+rskj source for the forward forms:
+`co.rsk.peg.utils.BridgeEventLoggerImpl.logReleaseBtcRequestReceived` /
+`logReleaseBtcRequestRejected` (the `activations.isActive(RSKIP326)` /
+`RSKIP427` branches); `co.rsk.peg.BridgeEvents.RELEASE_REQUEST_RECEIVED`.
 
 **Consensus-load-bearing:** the extra log changes the receipts root, so a
 from-scratch client that only emits the *rejected* event (or no event) forks the

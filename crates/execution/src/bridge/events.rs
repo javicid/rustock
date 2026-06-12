@@ -301,59 +301,83 @@ pub fn log_release_requested<CTX: crate::RskContextTr>(
 }
 
 /// `release_request_rejected(address indexed sender, uint256 amount, int256
-/// reason)` — rskj `logReleaseBtcRequestRejected`. Pre-RSKIP427 the amount is
-/// in satoshis (`amountInWeis.toBitcoin().getValue()`); the reason is the
+/// reason)` — rskj `logReleaseBtcRequestRejected`. The signature is identical in
+/// every era; only the `amount` encoding changes: pre-RSKIP427 (lovell700) it is
+/// the value in satoshis (`amountInWeis.toBitcoin().getValue()`), post-RSKIP427
+/// it is the full value in wei (`amountInWeis.asBigInteger()`). The reason is the
 /// `RejectedPegoutReason` enum value (LOW_AMOUNT=1, CALLER_CONTRACT=2,
 /// FEE_ABOVE_VALUE=3).
 pub fn log_release_request_rejected<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     sender: Address,
-    amount_satoshis: u64,
+    amount: alloy_primitives::U256,
     reason: u64,
 ) {
-    let mut data = Vec::with_capacity(64);
-    data.extend_from_slice(&u256_word(alloy_primitives::U256::from(amount_satoshis)));
-    data.extend_from_slice(&u256_word(alloy_primitives::U256::from(reason)));
     emit_topics(
         ctx,
         vec![
             solidity_topic("release_request_rejected(address,uint256,int256)"),
             address_word(sender),
         ],
-        data,
+        release_request_rejected_data(amount, reason),
     );
 }
 
-/// `release_request_received(address indexed sender, bytes
-/// btcDestinationAddress, uint256 amount)` — rskj `logReleaseBtcRequestReceived`
-/// (RELEASE_REQUEST_RECEIVED_LEGACY). Emitted when a peg-out is accepted and
-/// enqueued (RSKIP185). Pre-RSKIP326 the destination is the 20-byte hash160 as
-/// dynamic `bytes`; pre-RSKIP427 the amount is in satoshis
-/// (`amountInWeis.toBitcoin().getValue()`).
+/// ABI `data` for `release_request_rejected`: `uint256(amount) || int256(reason)`.
+fn release_request_rejected_data(amount: alloy_primitives::U256, reason: u64) -> Vec<u8> {
+    let mut data = Vec::with_capacity(64);
+    data.extend_from_slice(&u256_word(amount));
+    data.extend_from_slice(&u256_word(alloy_primitives::U256::from(reason)));
+    data
+}
+
+/// `release_request_received` — rskj `logReleaseBtcRequestReceived`. Emitted when
+/// a peg-out is accepted and enqueued (RSKIP185, iris300). The event has TWO
+/// destination formats:
+///
+/// - **Pre-RSKIP326 (fingerroot500)** `RELEASE_REQUEST_RECEIVED_LEGACY`:
+///   `release_request_received(address indexed sender, bytes btcDestinationAddress, uint256 amount)`
+///   where `btcDestinationAddress` is the 20-byte hash160
+///   (`btcDestinationAddress.getHash160()`).
+/// - **Post-RSKIP326** `RELEASE_REQUEST_RECEIVED`:
+///   `release_request_received(address indexed sender, string btcDestinationAddress, uint256 amount)`
+///   where the destination is the Base58 address string
+///   (`btcDestinationAddress.toString()`).
+///
+/// Independently, the `amount` is in satoshis pre-RSKIP427 (lovell700) and in
+/// full wei post-RSKIP427.
 pub fn log_release_request_received<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     sender: Address,
     btc_dest_hash160: &[u8; 20],
-    amount_satoshis: u64,
+    btc_dest_base58: &str,
+    amount: alloy_primitives::U256,
+    rskip326: bool,
 ) {
-    // ABI data for `(bytes btcDestinationAddress, uint256 amount)`: head holds
-    // the dynamic-bytes offset (0x40) and the amount word, then the bytes tail.
-    let mut data = Vec::with_capacity(128);
-    data.extend_from_slice(&u256_word(alloy_primitives::U256::from(64u64)));
-    data.extend_from_slice(&u256_word(alloy_primitives::U256::from(amount_satoshis)));
-    data.extend_from_slice(&u256_word(alloy_primitives::U256::from(
-        btc_dest_hash160.len() as u64,
-    )));
-    data.extend_from_slice(btc_dest_hash160);
-    data.resize(data.len().next_multiple_of(32), 0);
+    let (signature, dynamic): (&str, &[u8]) = if rskip326 {
+        ("release_request_received(address,string,uint256)", btc_dest_base58.as_bytes())
+    } else {
+        ("release_request_received(address,bytes,uint256)", btc_dest_hash160)
+    };
     emit_topics(
         ctx,
-        vec![
-            solidity_topic("release_request_received(address,bytes,uint256)"),
-            address_word(sender),
-        ],
-        data,
+        vec![solidity_topic(signature), address_word(sender)],
+        release_request_received_data(dynamic, amount),
     );
+}
+
+/// ABI `data` for `release_request_received`: the dynamic destination field
+/// (bytes hash160 pre-326, string base58 post-326) occupies the same head slots
+/// — offset word (0x40) + amount word — then the tail (length word + content,
+/// right-zero-padded to 32 bytes).
+fn release_request_received_data(dynamic: &[u8], amount: alloy_primitives::U256) -> Vec<u8> {
+    let mut data = Vec::with_capacity(160);
+    data.extend_from_slice(&u256_word(alloy_primitives::U256::from(64u64)));
+    data.extend_from_slice(&u256_word(amount));
+    data.extend_from_slice(&u256_word(alloy_primitives::U256::from(dynamic.len() as u64)));
+    data.extend_from_slice(dynamic);
+    data.resize(data.len().next_multiple_of(32), 0);
+    data
 }
 
 #[cfg(test)]
@@ -486,13 +510,26 @@ mod tests {
             hex::encode(address_word(sender)),
             "000000000000000000000000a231da16f77aaefa07427f13c6e03141eb15733a"
         );
-        // data = uint256(amountSatoshis) || int256(reason)
-        let mut data = Vec::new();
-        data.extend_from_slice(&u256_word(alloy_primitives::U256::from(10_000u64)));
-        data.extend_from_slice(&u256_word(alloy_primitives::U256::from(1u64)));
+        // Pre-RSKIP427: data = uint256(amountSatoshis=10000) || int256(reason=1)
+        let data = release_request_rejected_data(alloy_primitives::U256::from(10_000u64), 1);
         assert_eq!(
             hex::encode(&data),
             "0000000000000000000000000000000000000000000000000000000000002710\
+             0000000000000000000000000000000000000000000000000000000000000001"
+        );
+    }
+
+    /// Post-RSKIP427 (lovell700) the `release_request_rejected` amount is the
+    /// full wei value, not satoshis. 10,000 sat * 1e10 = 1e14 wei =
+    /// 0x5af3107a4000. Signature is unchanged.
+    #[test]
+    fn release_request_rejected_post_rskip427_amount_is_wei() {
+        use alloy_primitives::hex;
+        let wei = alloy_primitives::U256::from(10_000u64) * alloy_primitives::U256::from(10_000_000_000u64);
+        let data = release_request_rejected_data(wei, 1);
+        assert_eq!(
+            hex::encode(&data),
+            "00000000000000000000000000000000000000000000000000005af3107a4000\
              0000000000000000000000000000000000000000000000000000000000000001"
         );
     }
@@ -518,14 +555,8 @@ mod tests {
         );
         let hash160: [u8; 20] =
             hex::decode("79d6308c3be90264f36cfd1457dbea5f4a6a2cce").unwrap().try_into().unwrap();
-        // Reproduce the data block built by log_release_request_received and
-        // compare to the exact bytes from the receipt.
-        let mut data = Vec::new();
-        data.extend_from_slice(&u256_word(alloy_primitives::U256::from(64u64)));
-        data.extend_from_slice(&u256_word(alloy_primitives::U256::from(400_000u64)));
-        data.extend_from_slice(&u256_word(alloy_primitives::U256::from(20u64)));
-        data.extend_from_slice(&hash160);
-        data.resize(data.len().next_multiple_of(32), 0);
+        // Pre-RSKIP326 dynamic field = the 20-byte hash160; amount = 400000 sat.
+        let data = release_request_received_data(&hash160, alloy_primitives::U256::from(400_000u64));
         assert_eq!(
             hex::encode(&data),
             "0000000000000000000000000000000000000000000000000000000000000040\
@@ -533,6 +564,36 @@ mod tests {
              0000000000000000000000000000000000000000000000000000000000000014\
              79d6308c3be90264f36cfd1457dbea5f4a6a2cce000000000000000000000000"
         );
+    }
+
+    /// Post-RSKIP326 (fingerroot500) the `release_request_received` destination
+    /// is the Base58 address STRING and the signature switches the second arg
+    /// from `bytes` to `string`. Post-RSKIP427 (lovell700) the amount becomes
+    /// full wei. This checks the new topic + the string-encoded data layout for
+    /// a mainnet P2PKH address (version 0) over hash160 79d6308c…2cce.
+    #[test]
+    fn release_request_received_post_rskip326_427_string_and_wei() {
+        use alloy_primitives::hex;
+        // New (post-326) topic differs from the legacy one.
+        let topic_326 = hex::encode(solidity_topic("release_request_received(address,string,uint256)"));
+        assert_ne!(topic_326, "8e04e2f2c246a91202761c435d6a4971bdc7af0617f0c739d900ecd12a6d7266");
+        // Base58 P2PKH of the hash160 (mainnet version 0).
+        let mut payload = [0u8; 21];
+        payload[1..].copy_from_slice(
+            &hex::decode("79d6308c3be90264f36cfd1457dbea5f4a6a2cce").unwrap(),
+        );
+        let base58 = bitcoin::base58::encode_check(&payload);
+        assert!(base58.starts_with('1'), "mainnet P2PKH addresses start with 1");
+        // Post-427 amount = 400000 sat * 1e10 wei.
+        let wei = alloy_primitives::U256::from(400_000u64) * alloy_primitives::U256::from(10_000_000_000u64);
+        let data = release_request_received_data(base58.as_bytes(), wei);
+        // Head: offset 0x40, amount, then length-prefixed string padded.
+        let len = base58.len();
+        assert_eq!(&data[0..32], &u256_word(alloy_primitives::U256::from(64u64)));
+        assert_eq!(&data[32..64], &u256_word(wei));
+        assert_eq!(&data[64..96], &u256_word(alloy_primitives::U256::from(len as u64)));
+        assert_eq!(&data[96..96 + len], base58.as_bytes());
+        assert_eq!(data.len(), 96 + len.next_multiple_of(32));
     }
 
     /// Groundtruth from the mainnet #2,392,704 updateCollections receipt
