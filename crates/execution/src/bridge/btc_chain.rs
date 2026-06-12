@@ -99,18 +99,10 @@ pub fn receive_header<CTX: crate::RskContextTr>(
 
     let stored = StoredBlock::new(btc_header, new_height, new_chain_work);
 
-    // Store the block
-    put_stored_block(ctx, &stored, use_v2);
-
-    // Update chain head if this extends the best chain
-    let is_new_best = match load_chain_head(ctx) {
-        Some(head) => new_chain_work > head.chain_work,
-        None => true,
-    };
-
-    if is_new_best {
-        set_chain_head(ctx, &stored, use_v2, rskip199);
-    }
+    // Store the block and, when it extends the best chain or wins a reorg,
+    // update the chain head and the height->hash main-chain index
+    // (bitcoinj `BtcAbstractBlockChain.connectBlock`).
+    connect_block(ctx, &stored, &parent, use_v2, rskip199);
 
     // Update timestamp (rskj serializeLong -> RLP)
     super::storage::bridge_store_timestamp(
@@ -120,6 +112,135 @@ pub fn receive_header<CTX: crate::RskContextTr>(
     );
 
     Ok(encode_int_result(gas_cost, SUCCESS))
+}
+
+/// Connect a freshly built `StoredBlock` to the BTC header chain, mirroring
+/// bitcoinj `BtcAbstractBlockChain.connectBlock` in header-only mode
+/// (`shouldVerifyTransactions() == false`, which is how the Bridge runs it).
+///
+/// `stored` is the new block (height/work already computed from `parent`); the
+/// caller has already verified PoW, rejected already-known blocks, and resolved
+/// `parent` (= bitcoinj `storedPrev`). `connectBlock` itself always persists the
+/// block via `addToBlockStore`, then:
+///
+/// - if the block extends the current best chain (`parent == chainHead`), it
+///   becomes the new head directly; or
+/// - if it forks the chain but has **strictly more work** than the head
+///   (`StoredBlock.moreWorkThan`, i.e. `chainWork >` — ties do NOT reorg), it
+///   triggers `handleNewBestChain`, which rewrites the height->hash main-chain
+///   index for **every** block on the new branch above the split point, then
+///   sets the head.
+///
+/// rustock previously only ever set the head's single index entry, so a BTC
+/// reorg deeper than one block left stale entries at the intermediate heights —
+/// the divergence localized to the `btcBlockHeight-<height>` cell.
+fn connect_block<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    stored: &StoredBlock,
+    parent: &StoredBlock,
+    use_v2: bool,
+    rskip199: bool,
+) {
+    // `addToBlockStore`: persist the block unconditionally.
+    put_stored_block(ctx, stored, use_v2);
+
+    let head = match load_chain_head(ctx) {
+        Some(h) => h,
+        // No head yet (chain not seeded): treat as a direct extension.
+        None => {
+            set_chain_head(ctx, stored, use_v2, rskip199);
+            return;
+        }
+    };
+
+    // Direct extension of the best chain (`storedPrev.equals(chainHead)`).
+    if parent.header.block_hash() == head.header.block_hash() {
+        set_chain_head(ctx, stored, use_v2, rskip199);
+        return;
+    }
+
+    // Fork. Only reorganize if the new block has strictly more work than the
+    // current head (bitcoinj `StoredBlock.moreWorkThan` uses `>` — a tie keeps
+    // the existing head). A fork with <= work is stored but does not move the
+    // head or touch the main-chain index.
+    if stored.chain_work > head.chain_work {
+        handle_new_best_chain(ctx, stored, &head, use_v2, rskip199);
+    }
+}
+
+/// bitcoinj `handleNewBestChain`: reindex the new branch and set the head.
+/// Rewrites `setMainChainBlock(height, hash)` for every block on the new branch
+/// from the split point (exclusive) up to the new head, then sets the head
+/// (which itself reindexes the head height).
+fn handle_new_best_chain<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    new_head: &StoredBlock,
+    old_head: &StoredBlock,
+    use_v2: bool,
+    rskip199: bool,
+) {
+    if rskip199 {
+        // Resolve a block's parent (bitcoinj `StoredBlock.getPrev`) from
+        // Bridge storage. Collected eagerly because the reindex below also
+        // mutates `ctx`, so we cannot hold a borrowing closure across it.
+        let split = find_split(new_head, old_head, |h| get_stored_block(ctx, h));
+        // bitcoinj getPartialChain(newChainHead, splitPoint): the new branch
+        // blocks above the split, walked from the head down via getPrev.
+        let new_branch = get_partial_chain(new_head, &split, |h| get_stored_block(ctx, h));
+        for block in new_branch {
+            super::storage::bridge_store_btc_block_hash_by_height(
+                ctx,
+                block.height,
+                bitcoin_hash_to_b256(&block.header.block_hash()),
+            );
+        }
+    }
+    set_chain_head(ctx, new_head, use_v2, rskip199);
+}
+
+/// bitcoinj `findSplit(newChainHead, oldChainHead, store)`: walk both branches
+/// back (by `getPrev`) until they meet at the common ancestor. `get_prev`
+/// resolves a block's parent stored block. Returns the split-point stored block.
+fn find_split(
+    new_head: &StoredBlock,
+    old_head: &StoredBlock,
+    mut get_prev: impl FnMut(&BlockHash) -> Option<StoredBlock>,
+) -> StoredBlock {
+    let mut current_chain_cursor = old_head.clone();
+    let mut new_chain_cursor = new_head.clone();
+    while current_chain_cursor.header.block_hash() != new_chain_cursor.header.block_hash() {
+        if current_chain_cursor.height > new_chain_cursor.height {
+            current_chain_cursor = get_prev(&current_chain_cursor.header.prev_blockhash)
+                .expect("findSplit: attempt to follow an orphan chain");
+        } else {
+            new_chain_cursor = get_prev(&new_chain_cursor.header.prev_blockhash)
+                .expect("findSplit: attempt to follow an orphan chain");
+        }
+    }
+    current_chain_cursor
+}
+
+/// bitcoinj `getPartialChain(higher, lower, store)`: blocks from `higher` down
+/// to (but excluding) `lower`, in head→split order. Walks from the in-memory
+/// `higher` and resolves ancestors via `get_prev` (the head's own parent is
+/// already persisted by the time we get here).
+fn get_partial_chain(
+    higher: &StoredBlock,
+    lower: &StoredBlock,
+    mut get_prev: impl FnMut(&BlockHash) -> Option<StoredBlock>,
+) -> Vec<StoredBlock> {
+    debug_assert!(higher.height > lower.height, "higher and lower are reversed");
+    let mut results = Vec::new();
+    let mut cursor = higher.clone();
+    loop {
+        results.push(cursor.clone());
+        cursor = get_prev(&cursor.header.prev_blockhash)
+            .expect("getPartialChain: ran off the end of the chain");
+        if cursor.header.block_hash() == lower.header.block_hash() {
+            break;
+        }
+    }
+    results
 }
 
 /// Update the chain head (rskj `RepositoryBtcBlockStoreWithCache.setChainHead`
@@ -295,16 +416,7 @@ pub fn receive_headers<CTX: crate::RskContextTr>(
         let new_height = parent.height + 1;
 
         let stored = StoredBlock::new(btc_header, new_height, new_chain_work);
-        put_stored_block(ctx, &stored, use_v2);
-
-        let is_new_best = match load_chain_head(ctx) {
-            Some(head) => new_chain_work > head.chain_work,
-            None => true,
-        };
-
-        if is_new_best {
-            set_chain_head(ctx, &stored, use_v2, rskip199);
-        }
+        connect_block(ctx, &stored, &parent, use_v2, rskip199);
 
         processed += 1;
     }
@@ -540,6 +652,100 @@ pub fn b256_to_bitcoin_hash(b: &alloy_primitives::B256) -> BlockHash {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin::block::Version;
+    use bitcoin::hashes::Hash;
+    use bitcoin::{CompactTarget, TxMerkleNode};
+    use std::collections::HashMap;
+
+    /// Build a `StoredBlock` whose header points at `prev` and carries a
+    /// distinguishing `nonce` (so sibling blocks at the same height get
+    /// distinct hashes). `chain_work` is the cumulative work.
+    fn link(prev: BlockHash, nonce: u32, height: u32, chain_work: u64) -> StoredBlock {
+        let header = BtcHeader {
+            version: Version::from_consensus(1),
+            prev_blockhash: prev,
+            merkle_root: TxMerkleNode::all_zeros(),
+            time: 1_700_000_000,
+            bits: CompactTarget::from_consensus(0x1d00ffff),
+            nonce,
+        };
+        StoredBlock::new(header, height, U256::from(chain_work))
+    }
+
+    /// A tiny in-memory block store: hash -> StoredBlock, mirroring what the
+    /// Bridge persists via `put_stored_block`.
+    fn store_of(blocks: &[StoredBlock]) -> HashMap<BlockHash, StoredBlock> {
+        blocks
+            .iter()
+            .map(|b| (b.header.block_hash(), b.clone()))
+            .collect()
+    }
+
+    /// bitcoinj `findSplit` + `getPartialChain`: a reorg of depth 3 must report
+    /// the common ancestor as the split point and list every new-branch block
+    /// above it, head-first. This is the core of the #3,622,582 fix (the BTC
+    /// main-chain index must be rewritten for ALL reorganized heights).
+    #[test]
+    fn reorg_find_split_and_partial_chain() {
+        // Common trunk: g(100) <- a(101). Then two branches fork at `a`:
+        //   old:  a <- o2(102) <- o3(103)            (head: o3)
+        //   new:  a <- n2(102) <- n3(103) <- n4(104) (head: n4, more work)
+        let g = link(BlockHash::all_zeros(), 0, 100, 100);
+        let a = link(g.header.block_hash(), 1, 101, 110);
+        let o2 = link(a.header.block_hash(), 2, 102, 120);
+        let o3 = link(o2.header.block_hash(), 3, 103, 130);
+        let n2 = link(a.header.block_hash(), 12, 102, 121);
+        let n3 = link(n2.header.block_hash(), 13, 103, 132);
+        let n4 = link(n3.header.block_hash(), 14, 104, 143);
+
+        let store = store_of(&[
+            g.clone(),
+            a.clone(),
+            o2.clone(),
+            o3.clone(),
+            n2.clone(),
+            n3.clone(),
+            n4.clone(),
+        ]);
+        let get_prev = |h: &BlockHash| store.get(h).cloned();
+
+        // Split point is the fork ancestor `a`.
+        let split = find_split(&n4, &o3, get_prev);
+        assert_eq!(split.header.block_hash(), a.header.block_hash());
+        assert_eq!(split.height, 101);
+
+        // New branch above the split, head-first: [n4, n3, n2].
+        let partial = get_partial_chain(&n4, &split, get_prev);
+        let hashes: Vec<_> = partial.iter().map(|b| b.header.block_hash()).collect();
+        assert_eq!(
+            hashes,
+            vec![
+                n4.header.block_hash(),
+                n3.header.block_hash(),
+                n2.header.block_hash(),
+            ],
+            "every reorganized height must be reindexed, not just the head"
+        );
+        // The split point itself is excluded.
+        assert!(!hashes.contains(&a.header.block_hash()));
+    }
+
+    /// When the new head is a direct child of the old head (no fork), the split
+    /// is the old head and the partial chain is just the new block.
+    #[test]
+    fn reorg_direct_extension_partial_chain_is_single_block() {
+        let a = link(BlockHash::all_zeros(), 1, 101, 110);
+        let b = link(a.header.block_hash(), 2, 102, 120);
+        let store = store_of(&[a.clone(), b.clone()]);
+        let get_prev = |h: &BlockHash| store.get(h).cloned();
+
+        let split = find_split(&b, &a, get_prev);
+        assert_eq!(split.header.block_hash(), a.header.block_hash());
+
+        let partial = get_partial_chain(&b, &a, get_prev);
+        assert_eq!(partial.len(), 1);
+        assert_eq!(partial[0].header.block_hash(), b.header.block_hash());
+    }
 
     /// The inlined mainnet checkpoint must decode to the bitcoinj checkpoint
     /// rskj seeds from: BTC #499,968,

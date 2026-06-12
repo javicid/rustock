@@ -2045,6 +2045,57 @@ Also the `LEGACY_PEGIN_UNDETERMINED_SENDER` (reason 3) `rejected_pegin` from
 a determinable sender, so it is effectively unreachable in the legacy era; revisit
 if a receipts mismatch points at an undetermined-sender peg-in.
 
+## 42. BTC header reorg: the `btcBlockHeight-<h>` main-chain index must be rewritten for EVERY reorganized height
+
+When a relayer submits BTC headers (`receiveHeader` / `receiveHeaders`), the
+Bridge feeds them to bitcoinj's `BtcBlockChain` via `btcBlockChain.add(header)`.
+bitcoinj's `BtcAbstractBlockChain.connectBlock` is not a simple "store + advance
+head if more work": it has full fork/reorg bookkeeping.
+
+For a header whose parent is the current chain head it extends the best chain
+directly: `addToBlockStore` (persist) then `setChainHead`, which writes the
+height→hash index entry (`setBtcBestBlockHashByHeight`, RSKIP199/iris300) for
+that one height. But for a header that **forks** the chain and has *strictly*
+more cumulative work than the current head (`StoredBlock.moreWorkThan` uses `>`,
+so a work tie does NOT reorg), it runs `handleNewBestChain`:
+
+1. `findSplit(newHead, oldHead)` — walk both branches back via `getPrev` to the
+   common ancestor.
+2. `getPartialChain(newHead, split)` — the new branch's blocks above the split,
+   head-first.
+3. **For every block in that partial chain: `setMainChainBlock(height, hash)`** —
+   i.e. rewrite the `btcBlockHeight-<height>` index entry for *each* reorganized
+   height, not just the new head's height.
+4. `setChainHead(newHead)`.
+
+**The consensus-critical quirk:** a from-scratch client that merely stored each
+block and pointed the height index at the new head would leave the *intermediate*
+reorganized heights pointing at the old (orphaned) branch's hashes — a state-root
+fork that only manifests on a BTC reorg deeper than one block. rustock previously
+did exactly that (it had no fork/reorg path at all), and it forked from the
+network at RSK mainnet block **#3,622,582** on the single leaf
+`btcBlockHeight-697008` (gas and receipts matched; one diverging unitrie leaf).
+
+**rskj source:** `co.rsk.bitcoinj.core.BtcAbstractBlockChain.connectBlock` /
+`handleNewBestChain` / `findSplit` / `getPartialChain` (bitcoinj-thin
+0.14.4-rsk-18); `co.rsk.peg.RepositoryBtcBlockStoreWithCache.setChainHead` →
+`setMainChainBlock` → `BridgeStorageProvider.setBtcBestBlockHashByHeight`
+(gated on RSKIP199); `co.rsk.peg.BridgeSupport.receiveHeaders` /
+`receiveHeader` calling `btcBlockChain.add`. The index value is
+`BridgeSerializationUtils.serializeSha256Hash` = `RLP.encodeElement(hash)`
+(`0xa0` + 32 bytes), keyed by `DataWord.fromLongString("btcBlockHeight-" + height)`
+with the height as a DECIMAL string (see §35).
+
+**rustock:** `crates/execution/src/bridge/btc_chain.rs` —
+`connect_block` (replaces the old inline "put + set head if more work" in both
+`receive_header` and `receive_headers`), `handle_new_best_chain`, `find_split`,
+`get_partial_chain`. The reorg reindex runs only under RSKIP199 (mirrors the
+gating in `setBtcBestBlockHashByHeight`). Tests:
+`reorg_find_split_and_partial_chain`, `reorg_direct_extension_partial_chain_is_single_block`
+(btc_chain.rs). Verified: replay of #3,622,582 reproduces the exact header state
+root `0x038ae437…` (0 diverging leaves) and 419 downstream blocks
+(→ #3,623,000) match state + receipts roots exactly.
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`
