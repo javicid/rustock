@@ -292,10 +292,88 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     }
 
-    // Sender classification (rskj BtcLockSenderProvider). No parser match,
-    // or a non-P2PKH type before RSKIP143 (txIsProcessable), aborts WITHOUT
-    // marking the tx as processed.
-    let Some(sender) = classify_pegin_sender(&btc_tx) else {
+    // Sender classification (rskj BtcLockSenderProvider). Used by the legacy
+    // (v0) path for the destination/refund, and as the v1 fallback refund.
+    let sender = classify_pegin_sender(&btc_tx);
+
+    // rskj `PeginInformation.parse`: the BtcLockSender sets the default
+    // (version-0) info; then, if RSKIP170 is active, an RSKT OP_RETURN
+    // overrides it (version 1). A malformed RSKT payload throws
+    // `PeginInstructionsException` and rejects the v1 peg-in. NoOpReturn
+    // (Ok(None)) leaves the legacy info in place.
+    let instructions = if hardfork_cfg.has_rskip170(rsk_height) {
+        match super::pegin_instructions::build_pegin_instructions(&btc_tx) {
+            Ok(opt) => opt,
+            Err(_) => {
+                // processPegIn: parse exception. RSKIP181 logs
+                // PEGIN_V1_INVALID_PAYLOAD(4); refund to the sender (the only
+                // refund address available — a malformed payload has no v1
+                // refund), then mark processed.
+                if hardfork_cfg.has_rskip181(rsk_height) {
+                    super::events::log_rejected_pegin(ctx, &btc_txid_event_bytes(&btc_tx), 4);
+                }
+                if let Some(sender) = &sender {
+                    let (refund_hash160, refund_is_p2sh) = sender_refund_target(sender);
+                    emit_pegin_rejection_release(
+                        ctx, &btc_tx, &refund_hash160, refund_is_p2sh, total_value, &fed_redeem,
+                        &retiring, &pays_live_federation, rsk_height, config, hardfork_cfg, tx_ctx,
+                    );
+                }
+                set_btc_tx_processed(ctx, &legacy_txid, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
+                return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
+            }
+        }
+    } else {
+        None
+    };
+
+    let cap_ok = |ctx: &mut CTX| {
+        !hardfork_cfg.has_rskip134(rsk_height)
+            || verify_lock_does_not_surpass_locking_cap(ctx, config, total_value)
+    };
+    let rbtc_amount = btc_satoshi_to_rbtc_wei(total_value);
+
+    // ---- Version 1 (RSKIP170 OP_RETURN) peg-in ----
+    if let Some(instr) = instructions {
+        // processPegInVersion1: NO whitelist, only the locking cap.
+        if !cap_ok(ctx) {
+            if hardfork_cfg.has_rskip181(rsk_height) {
+                super::events::log_rejected_pegin(ctx, &btc_txid_event_bytes(&btc_tx), 1); // PEGIN_CAP_SURPASSED
+            }
+            // refundTxSender: refund to the v1 refund address if present, else
+            // the BtcLockSender address; if neither, no refund (a non-refundable
+            // peg-in — unrefundable_pegin event not modeled, see TODO).
+            if let Some((refund_hash160, refund_is_p2sh)) = v1_refund_target(&instr, sender.as_ref()) {
+                emit_pegin_rejection_release(
+                    ctx, &btc_tx, &refund_hash160, refund_is_p2sh, total_value, &fed_redeem,
+                    &retiring, &pays_live_federation, rsk_height, config, hardfork_cfg, tx_ctx,
+                );
+            }
+            set_btc_tx_processed(ctx, &legacy_txid, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
+            return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
+        }
+
+        // executePegIn: credit the v1 destination from the OP_RETURN payload.
+        let dest = RskAddress::from(instr.rsk_destination);
+        if !rbtc_amount.is_zero() {
+            let _ = ctx.journal_mut().transfer(BRIDGE_ADDR, dest, rbtc_amount);
+        }
+        // RSKIP170 is required for v1, so pegin_btc (protocolVersion = 1).
+        super::events::log_pegin_btc(ctx, dest, &btc_txid_event_bytes(&btc_tx), total_value, 1);
+
+        let active_utxo_key = active_federation_utxo_key(ctx, config, hardfork_cfg, rsk_height);
+        register_federation_outputs(ctx, &btc_tx, &fed_script, active_utxo_key);
+        if let Some((_, retiring_script)) = &retiring {
+            register_federation_outputs(ctx, &btc_tx, retiring_script, super::storage::OLD_FEDERATION_BTC_UTXOS_KEY);
+        }
+        set_btc_tx_processed(ctx, &legacy_txid, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
+        return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
+    }
+
+    // ---- Version 0 (legacy) peg-in ----
+    // A non-P2PKH sender before RSKIP143 (txIsProcessable) aborts WITHOUT
+    // marking the tx as processed (no BtcLockSender or unsupported type).
+    let Some(sender) = sender else {
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     };
     let rskip143 = hardfork_cfg.has_rskip143(rsk_height);
@@ -324,10 +402,6 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     // evaluated only when the whitelist passed (rskj short-circuits the &&,
     // so a whitelist rejection never lazily initializes the cap). A cap
     // rejection produces the same refund release as a whitelist one.
-    let cap_ok = |ctx: &mut CTX| {
-        !hardfork_cfg.has_rskip134(rsk_height)
-            || verify_lock_does_not_surpass_locking_cap(ctx, config, total_value)
-    };
     let allowed = lockable
         && whitelist_allows_and_consume(ctx, &sender_hash160, total_value, btc_block_height)
         && cap_ok(ctx);
@@ -358,89 +432,18 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
                 super::events::log_rejected_pegin(ctx, &btc_txid_event_bytes(&btc_tx), reason);
             }
         }
-        // TODO(rustock): a rejected peg-in paying BOTH live federations would
-        // need per-input redeem scripts in the refund; none exists on
-        // mainnet pre-wasabi. Inputs paying the retiring federation use its
-        // redeem via the same builder when the active outputs are absent.
-        let pegin_utxos: Vec<BridgeUtxo> = btc_tx
-            .output
-            .iter()
-            .enumerate()
-            .filter(|(_, o)| pays_live_federation(&o.script_pubkey))
-            .map(|(index, o)| BridgeUtxo {
-                tx_hash: btc_txid_event_bytes(&btc_tx),
-                vout: index as u32,
-                value_satoshis: o.value.to_sat(),
-                height: 0,
-                script: o.script_pubkey.to_bytes(),
-                coinbase: btc_tx.is_coinbase(),
-            })
-            .collect();
-        let refund_redeem = if pegin_utxos
-            .iter()
-            .all(|u| retiring.as_ref().is_some_and(|(_, rs)| u.script == rs.to_bytes()))
-        {
-            &retiring.as_ref().expect("checked above").0
-        } else {
-            &fed_redeem
-        };
-        let fee_per_kb = get_effective_fee_per_kb(ctx, config);
-        let tx_version = if hardfork_cfg.has_rskip201(rsk_height) { 2 } else { 1 };
-        let refund_script = if sender_is_p2sh {
-            p2sh_output_script(&sender_hash160)
-        } else {
-            p2pkh_output_script(&sender_hash160)
-        };
-        let built = super::release_tx::build_empty_wallet_to(
-            &pegin_utxos,
-            &refund_script,
-            refund_redeem,
-            fee_per_kb,
-            tx_version,
+        emit_pegin_rejection_release(
+            ctx, &btc_tx, &sender_hash160, sender_is_p2sh, total_value, &fed_redeem,
+            &retiring, &pays_live_federation, rsk_height, config, hardfork_cfg, tx_ctx,
         );
-        tracing::debug!(
-            "pegin rejection release: utxos {} fee_per_kb {} built {:?}",
-            pegin_utxos.len(),
-            fee_per_kb,
-            built.as_ref().map(|b| b.tx.compute_txid().to_string())
-        );
-        if let Some(built) = built {
-            // rskj generateRejectionRelease: post-RSKIP146 the entry carries
-            // this registerBtcTransaction tx hash and logs release_requested.
-            let use_tx_hash = hardfork_cfg.has_rskip146(rsk_height);
-            let mut waiting = load_pegout_confirmation_set(ctx, use_tx_hash);
-            waiting.push(PegoutWaitingForConfirmations {
-                btc_tx_raw: btc_serialize(&built.tx),
-                rsk_block_height: rsk_height,
-                rsk_tx_hash: use_tx_hash.then_some(tx_ctx.rsk_tx_hash),
-            });
-            if use_tx_hash {
-                super::events::log_release_requested(
-                    ctx,
-                    &tx_ctx.rsk_tx_hash,
-                    &btc_txid_event_bytes(&built.tx),
-                    total_value,
-                );
-            }
-            store_pegout_confirmation_set(ctx, &waiting, use_tx_hash);
-        }
         set_btc_tx_processed(ctx, &legacy_txid, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     }
 
-    let rbtc_amount = btc_satoshi_to_rbtc_wei(total_value);
-
     // RSK destination: rskj's legacy peg-in credits the address derived from
     // the sender's public key (ethereumj ECKey.getAddress over the
     // UNCOMPRESSED point — mainnet #267,460 used a 65-byte pubkey).
-    // OP_RETURN-embedded destinations are pegin v1, RSKIP170+.
-    let sender_rsk_address =
-        sender_pubkey.and_then(super::federation::rsk_address_from_public_key);
-    let rsk_destination = if hardfork_cfg.has_rskip170(rsk_height) {
-        extract_rsk_destination(&btc_tx).or(sender_rsk_address)
-    } else {
-        sender_rsk_address
-    };
+    let rsk_destination = sender_pubkey.and_then(super::federation::rsk_address_from_public_key);
 
     // Credit the derived destination address (transfer from Bridge balance)
     if let Some(dest) = rsk_destination {
@@ -448,11 +451,11 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
             let _ = ctx.journal_mut().transfer(BRIDGE_ADDR, dest, rbtc_amount);
         }
 
-        // Peg-in events: lock_btc from RSKIP146, pegin_btc from RSKIP170.
+        // Peg-in events: lock_btc from RSKIP146, pegin_btc from RSKIP170
+        // (a legacy peg-in past RSKIP170 logs pegin_btc with protocolVersion 0).
         let txid_bytes = btc_txid_event_bytes(&btc_tx);
         if hardfork_cfg.has_rskip170(rsk_height) {
-            let protocol_version = if has_op_return_destination(&btc_tx) { 1 } else { 0 };
-            super::events::log_pegin_btc(ctx, dest, &txid_bytes, total_value, protocol_version);
+            super::events::log_pegin_btc(ctx, dest, &txid_bytes, total_value, 0);
         } else if hardfork_cfg.has_rskip146(rsk_height) {
             let sender_addr = sender_base58_address(&sender_hash160, sender_is_p2sh, config);
             super::events::log_lock_btc(ctx, dest, &txid_bytes, &sender_addr, total_value);
@@ -477,6 +480,117 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     set_btc_tx_processed(ctx, &legacy_txid, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
 
     Ok(PrecompileOutput::new(gas_cost, Bytes::new()))
+}
+
+/// rskj `BtcLockSender.getBTCAddress` target for a legacy refund: the sender's
+/// hash160 and whether it is a P2SH address.
+fn sender_refund_target(sender: &PeginSender) -> ([u8; 20], bool) {
+    match sender {
+        PeginSender::P2pkh { pubkey } => (pubkey_hash160(pubkey), false),
+        PeginSender::P2shP2wpkh { p2sh_hash, .. }
+        | PeginSender::P2shMultisig { p2sh_hash }
+        | PeginSender::P2shP2wsh { p2sh_hash } => (*p2sh_hash, true),
+    }
+}
+
+/// rskj `refundTxSender` for a v1 peg-in: the refund goes to the v1 OP_RETURN
+/// refund address if present, otherwise the BtcLockSender address. Returns
+/// `None` when neither is available (a non-refundable peg-in).
+fn v1_refund_target(
+    instr: &super::pegin_instructions::PeginInstructions,
+    sender: Option<&PeginSender>,
+) -> Option<([u8; 20], bool)> {
+    if let Some(refund) = &instr.btc_refund_address {
+        return Some((refund.hash160, refund.is_p2sh));
+    }
+    sender.map(sender_refund_target)
+}
+
+/// rskj `generateRejectionRelease`: build an empty-wallet refund of all the
+/// outputs paying the live federation(s) back to `refund_hash160`, enqueue it
+/// in the pegouts-waiting-for-confirmations set, and (post-RSKIP146) log
+/// release_requested with the registering RSK tx hash.
+#[allow(clippy::too_many_arguments)]
+fn emit_pegin_rejection_release<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    btc_tx: &BtcTransaction,
+    refund_hash160: &[u8; 20],
+    refund_is_p2sh: bool,
+    total_value: u64,
+    fed_redeem: &[u8],
+    retiring: &Option<(Vec<u8>, bitcoin::ScriptBuf)>,
+    pays_live_federation: &impl Fn(&bitcoin::ScriptBuf) -> bool,
+    rsk_height: u64,
+    config: &BridgeConstants,
+    hardfork_cfg: &RskHardforkConfig,
+    tx_ctx: &BridgeTxContext,
+) {
+    // TODO(rustock): a rejected peg-in paying BOTH live federations would
+    // need per-input redeem scripts in the refund; none exists on
+    // mainnet pre-wasabi. Inputs paying the retiring federation use its
+    // redeem via the same builder when the active outputs are absent.
+    let pegin_utxos: Vec<BridgeUtxo> = btc_tx
+        .output
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| pays_live_federation(&o.script_pubkey))
+        .map(|(index, o)| BridgeUtxo {
+            tx_hash: btc_txid_event_bytes(btc_tx),
+            vout: index as u32,
+            value_satoshis: o.value.to_sat(),
+            height: 0,
+            script: o.script_pubkey.to_bytes(),
+            coinbase: btc_tx.is_coinbase(),
+        })
+        .collect();
+    let refund_redeem = if pegin_utxos
+        .iter()
+        .all(|u| retiring.as_ref().is_some_and(|(_, rs)| u.script == rs.to_bytes()))
+    {
+        &retiring.as_ref().expect("checked above").0
+    } else {
+        fed_redeem
+    };
+    let fee_per_kb = get_effective_fee_per_kb(ctx, config);
+    let tx_version = if hardfork_cfg.has_rskip201(rsk_height) { 2 } else { 1 };
+    let refund_script = if refund_is_p2sh {
+        p2sh_output_script(refund_hash160)
+    } else {
+        p2pkh_output_script(refund_hash160)
+    };
+    let built = super::release_tx::build_empty_wallet_to(
+        &pegin_utxos,
+        &refund_script,
+        refund_redeem,
+        fee_per_kb,
+        tx_version,
+    );
+    tracing::debug!(
+        "pegin rejection release: utxos {} fee_per_kb {} built {:?}",
+        pegin_utxos.len(),
+        fee_per_kb,
+        built.as_ref().map(|b| b.tx.compute_txid().to_string())
+    );
+    if let Some(built) = built {
+        // rskj generateRejectionRelease: post-RSKIP146 the entry carries
+        // this registerBtcTransaction tx hash and logs release_requested.
+        let use_tx_hash = hardfork_cfg.has_rskip146(rsk_height);
+        let mut waiting = load_pegout_confirmation_set(ctx, use_tx_hash);
+        waiting.push(PegoutWaitingForConfirmations {
+            btc_tx_raw: btc_serialize(&built.tx),
+            rsk_block_height: rsk_height,
+            rsk_tx_hash: use_tx_hash.then_some(tx_ctx.rsk_tx_hash),
+        });
+        if use_tx_hash {
+            super::events::log_release_requested(
+                ctx,
+                &tx_ctx.rsk_tx_hash,
+                &btc_txid_event_bytes(&built.tx),
+                total_value,
+            );
+        }
+        store_pegout_confirmation_set(ctx, &waiting, use_tx_hash);
+    }
 }
 
 /// rskj `BtcLockSender.TxType`: the peg-in sender classification derived
@@ -1814,11 +1928,6 @@ fn btc_txid_event_bytes(tx: &BtcTransaction) -> [u8; 32] {
     bytes
 }
 
-/// Whether the peg-in carries an OP_RETURN destination (protocol v1).
-fn has_op_return_destination(tx: &BtcTransaction) -> bool {
-    tx.output.iter().any(|o| o.script_pubkey.is_op_return())
-}
-
 /// Compress a SEC1 public key (33- or 65-byte) to its 33-byte form.
 fn compress_pubkey(key: &[u8]) -> Option<[u8; 33]> {
     use k256::elliptic_curve::sec1::ToEncodedPoint;
@@ -2352,34 +2461,6 @@ fn parse_bytes_array(args: &[u8], array_offset: usize) -> Vec<Vec<u8>> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Extract the RSK destination address from a BTC peg-in transaction.
-///
-/// Checks for OP_RETURN data first (20-byte RSK address embedded after
-/// the OP_RETURN opcode). Falls back to deriving the address from the
-/// first input's P2PKH public key (matching rskj's PegUtils).
-fn extract_rsk_destination(btc_tx: &BtcTransaction) -> Option<RskAddress> {
-    // 1. Check OP_RETURN outputs for embedded RSK address
-    for output in &btc_tx.output {
-        if output.script_pubkey.is_op_return() {
-            let script_bytes = output.script_pubkey.as_bytes();
-            // OP_RETURN (0x6a) + push opcode + data
-            // The RSK address is typically 20 bytes following the push
-            if script_bytes.len() >= 22 {
-                let data_start = 2; // skip OP_RETURN + push opcode
-                if script_bytes.len() >= data_start + 20 {
-                    return Some(RskAddress::from_slice(
-                        &script_bytes[data_start..data_start + 20],
-                    ));
-                }
-            }
-        }
-    }
-
-    // No OP_RETURN destination; the caller falls back to the sender's
-    // pubkey-derived address.
-    None
-}
 
 /// Convert BTC satoshis to RBTC wei.
 /// 1 BTC = 10^8 satoshis = 10^18 wei RBTC, so 1 satoshi = 10^10 wei.

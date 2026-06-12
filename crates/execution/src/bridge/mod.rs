@@ -18,6 +18,7 @@ pub mod federation;
 pub mod getters;
 pub mod governance;
 pub mod peg;
+pub mod pegin_instructions;
 pub mod pmt;
 pub mod release_tx;
 pub mod serialization;

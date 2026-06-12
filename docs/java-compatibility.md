@@ -2096,6 +2096,60 @@ gating in `setBtcBestBlockHashByHeight`). Tests:
 root `0x038ae437…` (0 diverging leaves) and 419 downstream blocks
 (→ #3,623,000) match state + receipts roots exactly.
 
+## 43. RSKIP170: peg-in v1 OP_RETURN parser (exact payload layout + reject-vs-legacy distinction)
+
+A peg-in BTC tx may carry an `RSKT`-magic OP_RETURN output that overrides the
+sender-derived destination with an explicit one ("peg-in v1", RSKIP170,
+iris300). rskj parses it in `PeginInstructionsProvider.buildPeginInstructions`
++ `PeginInstructionsBase` + `PeginInstructionsVersion1`.
+
+**Payload layout** (the data pushed after the `OP_RETURN` opcode, i.e. bitcoinj
+`getChunks().get(1).data`):
+
+```
+[0..4]   "RSKT" magic = 0x52534b54
+[4]      protocol version (u8); only 1 is supported
+[5..25]  RSK destination address (20 bytes)            ── length 25 stops here
+[25]     BTC refund address type: 1 = P2PKH, 2 = P2SH
+[26..46] refund address hash160 (20 bytes)             ── length 46
+```
+
+Valid payload lengths are **exactly 25 or 46**.
+
+**An OP_RETURN counts as "for RSK"** only when its second chunk is data of
+length ≥ 4 starting with the RSKT magic (`hasOpReturnForRsk`). rskj scans ALL
+outputs; **more than one** RSKT OP_RETURN throws `PeginInstructionsException`.
+
+**The reject-vs-legacy distinction is consensus-critical**
+(`PeginInstructionsProvider`):
+- **No** RSKT OP_RETURN → `NoOpReturnException` → `Optional.empty()` →
+  peg-in falls back to **legacy (v0)** processing (sender-derived destination,
+  whitelist + locking-cap gate). Modeled as `Ok(None)`.
+- A **malformed** RSKT OP_RETURN (>1 RSKT output, unsupported version, bad
+  length, bad refund-address type) → `PeginInstructionsException` →
+  `processPegIn` **rejects** the peg-in: refund to the sender, mark processed,
+  and (RSKIP181) log `rejected_pegin(PEGIN_V1_INVALID_PAYLOAD = 4)`. Modeled as
+  `Err(PeginInstructionsError)`.
+
+**The v1 processing path differs from legacy**
+(`BridgeSupport.processPegInVersion1`, IRIS-3.0.0 l.570): it does **NOT** consult
+the lock whitelist — only the locking cap (`verifyLockDoesNotSurpassLockingCap`).
+A cap-surpassed v1 peg-in refunds via `refundTxSender` (to the v1 refund address
+if present, else the BtcLockSender address; if neither, non-refundable) and logs
+`rejected_pegin(PEGIN_CAP_SURPASSED = 1)`. The destination credited is the
+OP_RETURN's `rskDestinationAddress`; `pegin_btc` is logged with
+`protocolVersion = 1`. The tx is marked processed at the end of `processPegIn`
+(both legacy and v1 success paths).
+
+**rustock:** `crates/execution/src/bridge/pegin_instructions.rs`
+(`build_pegin_instructions`, the parser + 11 ported tests), wired into
+`peg.rs::register_btc_transaction` (the v1/v0 branch, `v1_refund_target`,
+`emit_pegin_rejection_release`). The old `extract_rsk_destination`
+(`script_bytes[2..22]` of any OP_RETURN, no magic/version/length checks) and the
+`has_op_return_destination` v1-flag heuristic were removed. Tests ported from
+rskj `PeginInstructionsProviderTest` / `PeginInstructionsVersion1Test`
+(byte layout from `PegTestUtils.createOpReturnScriptForRsk`).
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`
