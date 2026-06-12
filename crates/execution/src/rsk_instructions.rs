@@ -46,6 +46,10 @@ thread_local! {
     /// Set by `install` for the block being executed (single-threaded).
     static EXTCODESIZE_MAX_PRECOMPILES: core::cell::RefCell<Vec<Address>> =
         const { core::cell::RefCell::new(Vec::new()) };
+    /// Active precompiles for which EXTCODEHASH must report `keccak256("")`
+    /// (rskj `VM.doEXTCODEHASH` precompile branch). Set by `install`.
+    static EXTCODEHASH_PRECOMPILES: core::cell::RefCell<Vec<Address>> =
+        const { core::cell::RefCell::new(Vec::new()) };
 }
 
 /// Install the rskj-semantics CALL family into an instruction table.
@@ -59,6 +63,7 @@ pub fn install<WIRE, HOST>(
     extcodehash_enabled: bool,
     istanbul_opcodes_enabled: bool,
     extcodesize_max_precompiles: &[Address],
+    extcodehash_precompiles: &[Address],
 ) where
     WIRE: InterpreterTypes,
     HOST: Host,
@@ -67,6 +72,15 @@ pub fn install<WIRE, HOST>(
         instructions.insert_instruction(
             opcode::EXTCODEHASH,
             Instruction::new(invalid_opcode::<WIRE, HOST>, 0),
+        );
+    } else {
+        // rskj `VM.doEXTCODEHASH` keys on trie existence and special-cases
+        // active precompiles to `keccak256("")` — see `rsk_extcodehash`.
+        EXTCODEHASH_PRECOMPILES
+            .with(|p| *p.borrow_mut() = extcodehash_precompiles.to_vec());
+        instructions.insert_instruction(
+            opcode::EXTCODEHASH,
+            Instruction::new(rsk_extcodehash::<WIRE, HOST>, 400),
         );
     }
     // RSKIP152 CHAINID / RSKIP151 SELFBALANCE (papyrus200): the spec stays
@@ -183,6 +197,58 @@ fn invalid_opcode<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context.interpreter.halt(InstructionResult::OpcodeNotFound);
 }
 
+/// `keccak256("")`, the code hash rskj reports for an existing-but-codeless
+/// account and for active precompiles (`Keccak256Helper.keccak256(EMPTY)`).
+pub(crate) const KECCAK_EMPTY: B256 = B256::new([
+    0xc5, 0xd2, 0x46, 0x01, 0x86, 0xf7, 0x23, 0x3c, 0x92, 0x7e, 0x7d, 0xb2, 0xdc, 0xc7, 0x03, 0xc0,
+    0xe5, 0x00, 0xb6, 0x53, 0xca, 0x82, 0x27, 0x3b, 0x7b, 0xfa, 0xd8, 0x04, 0x5d, 0x85, 0xa4, 0x70,
+]);
+
+/// EXTCODEHASH with rskj's `VM.doEXTCODEHASH` / `getCodeHashStandard`
+/// semantics, which key on TRIE EXISTENCE (RSK never adopted EIP-161/1052
+/// emptiness):
+///   - active precompile  -> `keccak256("")` (rskj special-cases precompiles);
+///   - account absent from the trie -> `0`;
+///   - account present but not a contract (no code) -> `keccak256("")`;
+///   - contract -> its code hash.
+/// revm's stock EXTCODEHASH instead returns `0` whenever `AccountInfo::is_empty()`
+/// (EIP-161: balance==0 && nonce==0 && no code), so an existing-but-empty
+/// account (e.g. a zero-balance EOA that a prior tx created via a 0-value call)
+/// would wrongly hash to `0` instead of `keccak256("")` — block #3,631,998 tx[1]
+/// exposed this (+11 gas, divergent revert branch). `is_empty` here is the
+/// host's flag (`true` only when `Database::basic` returned `None`, i.e. the
+/// trie has no node — see the HOMESTEAD journal pin in `RskHandler`), which is
+/// exactly rskj's `isExist`.
+fn rsk_extcodehash<WIRE: InterpreterTypes, H: Host + ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+) {
+    let Some(([], top)) = context.interpreter.stack.popn_top::<0>() else {
+        context.interpreter.halt_underflow();
+        return;
+    };
+    let addr = Address::from_word(B256::from(*top));
+
+    if EXTCODEHASH_PRECOMPILES.with(|p| p.borrow().contains(&addr)) {
+        *top = KECCAK_EMPTY.into();
+        return;
+    }
+
+    let Ok(load) = context.host.load_account_info_skip_cold_load(addr, false, false) else {
+        context.interpreter.halt_fatal();
+        return;
+    };
+    // `is_empty` is the host's trie-existence flag (rskj `isExist`): absent ->
+    // 0; present-but-codeless -> keccak256(""); contract -> its code hash.
+    let result = if load.is_empty {
+        B256::ZERO
+    } else if load.account.is_empty_code_hash() || load.account.code_hash.is_zero() {
+        KECCAK_EMPTY
+    } else {
+        load.account.code_hash
+    };
+    *top = result.into();
+}
+
 /// CHAINID without revm's ISTANBUL spec check (RSKIP152 activates it at
 /// papyrus200 while the spec stays PETERSBURG).
 fn rsk_chainid<WIRE: InterpreterTypes, H: Host + ?Sized>(
@@ -291,6 +357,7 @@ fn traced_all<WIRE: InterpreterTypes, HOST: Host>(
         opcode::EXTCODEHASH if !EXTCODEHASH_ENABLED.with(|f| f.get()) => {
             invalid_opcode(context)
         }
+        opcode::EXTCODEHASH => rsk_extcodehash(context),
         opcode::CHAINID => {
             if ISTANBUL_OPCODES_ENABLED.with(|f| f.get()) {
                 rsk_chainid(context)

@@ -2222,6 +2222,58 @@ caller address + call depth are plumbed through `execute_bridge`/`execute_method
 `flyover_derivation_hash_groundtruth`, `flyover_redeem_script_and_p2sh_groundtruth`,
 `flyover_hash_used_key_byte_order` (peg.rs).
 
+## 45. EXTCODEHASH keys on TRIE EXISTENCE (rskj `isExist`), not EIP-161 emptiness
+
+**rskj behavior** (`org.ethereum.vm.VM.doEXTCODEHASH` →
+`Program.getCodeHashAt(addr, standard=RSKIP169)` →
+`MutableRepository.getCodeHashStandard`):
+
+```java
+// VM.doEXTCODEHASH
+if (isPrecompiledContract) {            // any active precompile
+    stackPush(keccak256(EMPTY));        // keccak256("")
+} else {
+    Keccak256 h = getCodeHashAt(addr, RSKIP169);
+    stackPush(h.equals(ZERO_HASH) ? ZERO : h);
+}
+// MutableRepository.getCodeHashStandard (RSKIP169 / standard path):
+if (!isExist(addr))    return ZERO_HASH;           // not in the trie -> 0
+if (!isContract(addr)) return KECCAK_256_OF_EMPTY; // present, no code -> keccak256("")
+return internalGetValueHash(getCodeKey(addr))      // contract -> its code hash
+         .orElse(KECCAK_256_OF_EMPTY);
+```
+
+The existence test is `isExist` = **the account node is present in the trie**.
+RSK never adopted EIP-161/EIP-1052 emptiness, so an account that exists but is
+"empty" by Ethereum's definition (nonce 0, balance 0, no code) hashes to
+`keccak256("")`, **not** 0. Only a genuinely absent account hashes to 0. Active
+precompiles always hash to `keccak256("")` regardless of their stored state.
+
+**revm divergence:** revm's stock `EXTCODEHASH` (`instructions/host.rs`) returns
+`B256::ZERO` whenever `AccountInfo::is_empty()` (EIP-161: balance == 0 &&
+nonce == 0 && no code), otherwise the code hash. So an *existing-but-empty*
+account wrongly hashes to 0 instead of `keccak256("")`.
+
+**Mainnet impact — block #3,631,998 tx[1]** (computed gasUsed 27,540 vs header
+27,529, +11): a token-bridge `receiveTokensTo(token, to, amount)` call validated
+the token via `EXTCODEHASH(token) == keccak256("")`. The token
+`0xdAC17F958D2ee523a2206206994597C13D831ec7` (USDT-on-Ethereum) has no code on
+RSK but its account *node existed* in the trie (a prior 0-value call had created
+it under frontier semantics). rskj returned `keccak256("")` (account exists, not
+a contract) → the proxy took one branch; rustock returned 0 → the other branch,
+diverging the revert path and the gas. A receipts + state-root fork (both tx[1]
+status and gasUsed differed).
+
+**rustock:** `crates/execution/src/rsk_instructions.rs` — `rsk_extcodehash`
+replaces revm's stock instruction whenever RSKIP140 is active. It keys on the
+HOST's `is_empty` flag (the journal sets it `true` only when `Database::basic`
+returned `None`, i.e. the trie has no node — see the HOMESTEAD journal pin in
+`RskHandler`, §10a/account-semantics), which is exactly rskj's `isExist`:
+absent → 0; present-but-codeless → `keccak256("")`; contract → its code hash.
+Active precompiles (passed via `extcodehash_precompiles`, gated on RSKIP140 in
+`executor.rs`) → `keccak256("")`. Test:
+`test_extcodehash_existing_empty_account_is_keccak_empty` (executor.rs).
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`

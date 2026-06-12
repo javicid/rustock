@@ -132,12 +132,21 @@ impl RskExecutor {
         };
         let pre_rskip150_precompiles = (!self.hardfork_cfg.has_rskip150(header.number))
             .then(|| active_precompiles.clone());
+        // rskj `VM.doEXTCODEHASH` reports `keccak256("")` for any active
+        // precompile; EXTCODEHASH activates at RSKIP140 (papyrus).
+        let extcodehash_precompiles: Vec<Address> =
+            if self.hardfork_cfg.has_rskip140(header.number) {
+                active_precompiles.clone()
+            } else {
+                Vec::new()
+            };
         let mut evm = ctx.build_mainnet().with_precompiles(precompile_provider);
         crate::rsk_instructions::install(
             &mut evm.instruction,
             self.hardfork_cfg.has_rskip140(header.number),
             self.hardfork_cfg.has_chainid(header.number),
             &extcodesize_max_precompiles,
+            &extcodehash_precompiles,
         );
 
         let exec_out = {
@@ -225,12 +234,21 @@ impl RskExecutor {
         };
         let pre_rskip150_precompiles = (!self.hardfork_cfg.has_rskip150(header.number))
             .then(|| active_precompiles.clone());
+        // rskj `VM.doEXTCODEHASH` reports `keccak256("")` for any active
+        // precompile; EXTCODEHASH activates at RSKIP140 (papyrus).
+        let extcodehash_precompiles: Vec<Address> =
+            if self.hardfork_cfg.has_rskip140(header.number) {
+                active_precompiles.clone()
+            } else {
+                Vec::new()
+            };
         let mut evm = ctx.build_mainnet().with_precompiles(precompile_provider);
         crate::rsk_instructions::install(
             &mut evm.instruction,
             self.hardfork_cfg.has_rskip140(header.number),
             self.hardfork_cfg.has_chainid(header.number),
             &extcodesize_max_precompiles,
+            &extcodehash_precompiles,
         );
 
         let mut total_gas = 0u64;
@@ -1184,6 +1202,107 @@ mod tests {
             .get(&U256::ZERO)
             .expect("slot 0");
         assert_eq!(slot0.present_value, U256::from(4), "4 >> 0 == 4");
+    }
+
+    /// Regression for mainnet #3,631,998 tx[1] (gas used 27,540 vs 27,529, +11,
+    /// divergent revert branch): rskj `VM.doEXTCODEHASH` (`getCodeHashStandard`)
+    /// keys on TRIE EXISTENCE, not EIP-161 emptiness. An account that exists in
+    /// the trie but is "empty" (nonce 0, balance 0, no code) must hash to
+    /// `keccak256("")`, while an account absent from the trie hashes to 0. revm's
+    /// stock EXTCODEHASH returns 0 for both (it uses `AccountInfo::is_empty()`),
+    /// so the existing-empty case forked. Ground truth: a USDT-on-ETH address
+    /// (no code on RSK) that a prior 0-value call had created hashed to
+    /// `keccak256("")` in rskj, sending the proxy down a different branch.
+    #[test]
+    fn test_extcodehash_existing_empty_account_is_keccak_empty() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let mut root = TrieNode::empty();
+        let sender = Address::repeat_byte(0xAC);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+
+        // An existing-but-empty account (nonce 0, balance 0, no code): present
+        // in the trie, yet EIP-161-empty. rskj -> keccak256(""); revm stock -> 0.
+        let existing_empty = Address::repeat_byte(0xE1);
+        root = put_account(&root, store.as_ref(), &existing_empty, 0, U256::ZERO);
+
+        // An address never placed in the trie: rskj & rustock both -> 0.
+        let absent = Address::repeat_byte(0xE2);
+
+        let block_store =
+            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+
+        // Runtime: EXTCODEHASH(existing_empty) -> slot 0;
+        //          EXTCODEHASH(absent)         -> slot 1; STOP.
+        let mut runtime: Vec<u8> = Vec::new();
+        runtime.push(0x73); // PUSH20 existing_empty
+        runtime.extend_from_slice(existing_empty.as_slice());
+        runtime.extend_from_slice(&[0x3f, 0x60, 0x00, 0x55]); // EXTCODEHASH; PUSH1 0; SSTORE
+        runtime.push(0x73); // PUSH20 absent
+        runtime.extend_from_slice(absent.as_slice());
+        runtime.extend_from_slice(&[0x3f, 0x60, 0x01, 0x55]); // EXTCODEHASH; PUSH1 1; SSTORE
+        runtime.push(0x00); // STOP
+
+        // Init: CODECOPY the runtime to memory and RETURN it.
+        let rt_len = runtime.len() as u8;
+        let mut init = vec![
+            0x60, rt_len, // PUSH1 <len>
+            0x60, 0x0c, // PUSH1 0x0c (runtime offset in this init)
+            0x60, 0x00, // PUSH1 0
+            0x39, // CODECOPY
+            0x60, rt_len, // PUSH1 <len>
+            0x60, 0x00, // PUSH1 0
+            0xf3, // RETURN
+        ];
+        init.extend_from_slice(&runtime);
+
+        let deploy = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(1_000_000),
+            to: Bytes::new(),
+            value: U256::ZERO,
+            input: Bytes::from(init),
+            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+        };
+        // papyrus200 (>= 2,392,700) so EXTCODEHASH (RSKIP140) is active.
+        let header1 = dummy_header(2_392_800);
+        let r1 = executor
+            .execute_block(&header1, &[(deploy, sender)], &root, store.clone())
+            .expect("deploy block");
+        assert!(r1.tx_results[0].success, "deploy must succeed");
+        let deployed = sender.create(0);
+        let root2 =
+            crate::state::apply_state_changes(&root, store.as_ref(), &r1.state_changes, &r1.markers);
+
+        let call = rustock_core::Transaction {
+            nonce: 1,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(1_000_000),
+            to: Bytes::copy_from_slice(deployed.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::new(),
+            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+        };
+        let header2 = dummy_header(2_392_801);
+        let r2 = executor
+            .execute_block(&header2, &[(call, sender)], &root2, store.clone())
+            .expect("call block");
+        assert!(r2.tx_results[0].success, "EXTCODEHASH call must succeed");
+
+        let storage = &r2.state_changes.get(&deployed).expect("contract").storage;
+        let slot0 = storage.get(&U256::ZERO).expect("slot 0").present_value;
+        let slot1 = storage.get(&U256::from(1)).map(|s| s.present_value).unwrap_or(U256::ZERO);
+
+        // Existing-but-empty account -> keccak256(""), NOT 0.
+        assert_eq!(
+            B256::from(slot0.to_be_bytes()),
+            crate::rsk_instructions::KECCAK_EMPTY,
+            "EXTCODEHASH of an existing-but-empty account must be keccak256(\"\")"
+        );
+        // Absent account -> 0.
+        assert_eq!(slot1, U256::ZERO, "EXTCODEHASH of an absent account must be 0");
     }
 
     /// Regression for mainnet #2,430,894: CHAINID (RSKIP152) and SELFBALANCE
