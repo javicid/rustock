@@ -1074,7 +1074,7 @@ impl RskPrecompileProvider {
         } else if *addr == BLOCK_HEADER_ADDR {
             self.run_block_header(context, &input_bytes, inputs.gas_limit)
         } else if *addr == BRIDGE_ADDR {
-            self.run_bridge(context, &input_bytes, inputs.gas_limit)
+            self.run_bridge(context, &input_bytes, inputs.gas_limit, inputs.caller)
         } else {
             self.run_remasc(context, &input_bytes, inputs.gas_limit)
         };
@@ -1352,9 +1352,15 @@ impl RskPrecompileProvider {
         context: &mut CTX,
         input: &[u8],
         gas_limit: u64,
+        caller: Address,
     ) -> Result<PrecompileOutput, PrecompileError> {
+        use revm::context_interface::JournalTr;
         let block_number = context.block().number().to::<u64>();
         let use_v2 = self.hardfork_cfg.has_stored_block_v2(block_number);
+        // Call depth as seen by the Bridge precompile: > 1 means the Bridge was
+        // reached via a contract CALL (rskj `isContractTx`). revm's depth here
+        // already counts the precompile's own frame.
+        let call_depth = context.journal().depth();
         let tx_ctx = self.bridge_tx_context.lock()
             .map(|g| g.clone())
             .unwrap_or_default();
@@ -1367,6 +1373,8 @@ impl RskPrecompileProvider {
             use_v2,
             &self.hardfork_cfg,
             &tx_ctx,
+            caller,
+            call_depth,
         )
     }
 

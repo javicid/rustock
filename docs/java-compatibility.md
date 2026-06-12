@@ -2150,6 +2150,78 @@ OP_RETURN's `rskDestinationAddress`; `pegin_btc` is logged with
 rskj `PeginInstructionsProviderTest` / `PeginInstructionsVersion1Test`
 (byte layout from `PegTestUtils.createOpReturnScriptForRsk`).
 
+## 44. RSKIP176 flyover: `registerFastBridgeBtcTransaction` (derivation hash, flyover P2SH, return codes)
+
+The flyover (fast-bridge) peg-in lets a Liquidity Bridge Contract (LBC) register
+a BTC tx that paid a *derivation-specific* federation P2SH and have the funds
+credited to the LBC. Full port of rskj `BridgeSupport.registerFlyoverBtcTransaction`
+(RSKIP176, iris300). The method is only callable from another contract and
+returns an `int256`.
+
+**ABI:** `registerFastBridgeBtcTransaction(bytes btcTx, uint256 height,
+bytes pmt, bytes32 derivationArgumentsHash, bytes userRefundAddress,
+address lbcAddress, bytes lpBtcAddress, bool shouldTransferToContract)
+→ int256`, fixed gas 25 000 (`BridgeMethods.REGISTER_FAST_BRIDGE_BTC_TRANSACTION`).
+
+**Return value:** the locked amount **in wei** on success
+(`co.rsk.core.Coin.fromBitcoin(totalAmount).asBigInteger()`), or a negative
+`FlyoverTxResponseCodes` on every reject/unprocessable path: REFUNDED_USER(-100),
+REFUNDED_LP(-200), NOT_CONTRACT(-300), INVALID_SENDER(-301),
+ALREADY_PROCESSED(-302), VALIDATIONS(-303), VALUE_ZERO(-304), GENERIC(-900).
+The method only ever *fails the tx* for a malformed BTC tx / PMT (rskj's outer
+try/catch otherwise returns GENERIC_ERROR).
+
+**Derivation hash** (`PegUtils.getFlyoverDerivationHash`):
+`keccak256(derivationArgumentsHash(32) || userRefundAddrBytes || lbcAddress(20)
+|| lpBtcAddrBytes)`. **The array-copy order puts the LBC address BEFORE the LP
+address — NOT the parameter order.** The BTC address bytes are
+`serializeBtcAddressWithVersion`; pre-RSKIP284 (iris) that is
+`BigInteger.valueOf(version).toByteArray() || hash160`, which for every mainnet
+address version round-trips the input `[version || hash160]` arg unchanged — so
+the raw 21-byte ABI args are used verbatim. Ground-truth vector
+(`56d4f6bd…44d8`) ported from rskj `PegUtilsTest`.
+
+**Flyover redeem script** (`FlyoverRedeemScriptBuilderImpl.of`):
+`PUSH(derivationHash 32) OP_DROP <federationRedeemScript chunks>`; the flyover
+P2SH = HASH160 of that (`createP2SHOutputScript`, the non-segwit form at iris).
+Ground-truth redeem + P2SH hash160 (`18fc3b52…7730`) ported from rskj `PegUtilsTest`.
+
+**Storage keys** (`BridgeStorageProvider`):
+- flyover-hash-used: `fastBridgeHashUsedInBtcTx-` + `Sha256Hash.toString()`
+  (**display** order) + `Keccak256.toString()` (**forward** order), value = one
+  TRUE byte. **The mark and the second already-used check use the
+  witness-stripped legacy txid (`getHash(false)`)**; only the FIRST already-used
+  check uses the wtxid (`calculateBtcTxHash`). (This subsumes the narrow
+  wtxid-vs-txid item the old stub got wrong.)
+- flyover federation info: `fastBridgeFederationInformation-` +
+  hex(flyoverFederationRedeemScriptHash), value =
+  `RLP([derivationHash, federationP2SHHash])`.
+
+**Flow:** isContractTx (call depth > 1) → sender == lbcAddress → wtxid
+already-used check → validationsForRegisterBtcTransaction → parse tx → legacy-txid
+already-used check → build active flyover P2SH → validateFlyoverPeginValue
+(pre-293: amount to the flyover address must be non-zero) →
+verifyLockDoesNotSurpassLockingCap (RSKIP134): on surplus, mark used + refund
+(LP if shouldTransferToContract, else user) via an empty-wallet release with the
+FLYOVER redeem script + return REFUNDED_LP/USER → else transferTo(lbcAddress),
+mark used, save flyover fed info, add the flyover UTXOs to the ACTIVE federation
+UTXO set, return the wei amount.
+
+**Gates:** RSKIP176 = iris300 (the whole subsystem). RSKIP293 (hop400) adds the
+retiring-federation flyover and a per-UTXO minimum to the value validation —
+NOT implemented (logged in TODO.md); a `has_rskip293` guard warns if a retiring
+federation exists post-hop400 so the gap is loud before it can fork.
+
+**rustock:** `crates/execution/src/bridge/peg.rs` —
+`register_fast_bridge_btc_transaction` (replaces the PMT-only stub),
+`flyover_derivation_hash`, `flyover_redeem_script`, `flyover_hash_used_key`,
+`is_flyover_derivation_hash_used`, `mark_flyover_derivation_hash_used`,
+`set_flyover_federation_information`, `emit_flyover_rejection_release`. The
+caller address + call depth are plumbed through `execute_bridge`/`execute_method`/
+`run_bridge` (precompiles.rs `inputs.caller` + `journal().depth()`). Tests:
+`flyover_derivation_hash_groundtruth`, `flyover_redeem_script_and_p2sh_groundtruth`,
+`flyover_hash_used_key_byte_order` (peg.rs).
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`

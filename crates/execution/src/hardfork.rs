@@ -283,6 +283,18 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Hop400
     }
 
+    /// RSKIP284: BTC address-with-version serialization uses a single version
+    /// byte instead of `BigInteger.toByteArray()` (Hop400, mainnet 4_598_500).
+    pub fn has_rskip284(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Hop400
+    }
+
+    /// RSKIP293: flyover peg-ins also credit the retiring federation, and the
+    /// per-UTXO minimum applies to flyover value validation (Hop400).
+    pub fn has_rskip293(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Hop400
+    }
+
     /// RSKIP375: pegouts-waiting-for-signatures keyed by the pegout creation
     /// RSK tx hash again (Fingerroot500).
     pub fn has_rskip375(&self, block_number: u64) -> bool {

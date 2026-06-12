@@ -37,8 +37,7 @@ use std::collections::BTreeMap;
 use sha2;
 use ripemd;
 
-use super::btc_chain::b256_to_bitcoin_hash;
-use super::btc_store::{get_stored_block, load_chain_head};
+use super::btc_store::load_chain_head;
 use super::constants::BridgeConstants;
 use super::pmt::PartialMerkleTree;
 use super::serialization::{rlp_decode_list, rlp_encode_element, rlp_encode_list, rlp_encode_u64};
@@ -807,141 +806,415 @@ fn register_federation_outputs<CTX: crate::RskContextTr>(
 // registerFastBridgeBtcTransaction (Flyover)
 // ---------------------------------------------------------------------------
 
+/// rskj `FlyoverTxResponseCodes`: the int256 status the method returns on the
+/// rejection / unprocessable paths. The success path returns the locked amount
+/// in wei instead.
+mod flyover_codes {
+    pub const REFUNDED_USER: i64 = -100;
+    pub const REFUNDED_LP: i64 = -200;
+    pub const UNPROCESSABLE_NOT_CONTRACT: i64 = -300;
+    pub const UNPROCESSABLE_INVALID_SENDER: i64 = -301;
+    pub const UNPROCESSABLE_ALREADY_PROCESSED: i64 = -302;
+    pub const UNPROCESSABLE_VALIDATIONS: i64 = -303;
+    pub const UNPROCESSABLE_VALUE_ZERO: i64 = -304;
+    pub const GENERIC_ERROR: i64 = -900;
+}
+
+/// ABI-encode a signed int256 response code as 32 big-endian bytes (two's
+/// complement), matching rskj `BigInteger.valueOf(code)` Solidity encoding.
+fn flyover_code_output(code: i64) -> Bytes {
+    Bytes::copy_from_slice(&U256::from(code as i128 as u128).to_be_bytes::<32>())
+}
+
+/// rskj `PegUtils.getFlyoverDerivationHash`:
+/// `keccak256(derivationArgumentsHash(32) || userRefundAddrBytes ||
+/// lbcAddress(20) || lpBtcAddrBytes)`. Note the array-copy order puts the LBC
+/// address BEFORE the LP address (NOT the parameter order). The BTC-address
+/// bytes are `serializeBtcAddressWithVersion`; pre-RSKIP284 (iris) that
+/// round-trips the input `[version || hash160]` arg unchanged (a single version
+/// byte for every mainnet address version), so the raw 21-byte ABI args are
+/// used verbatim.
+fn flyover_derivation_hash(
+    derivation_arguments_hash: &[u8; 32],
+    user_refund_addr_bytes: &[u8],
+    lbc_address: &RskAddress,
+    lp_btc_addr_bytes: &[u8],
+) -> [u8; 32] {
+    use sha3::Digest;
+    let mut preimage = Vec::with_capacity(32 + user_refund_addr_bytes.len() + 20 + lp_btc_addr_bytes.len());
+    preimage.extend_from_slice(derivation_arguments_hash);
+    preimage.extend_from_slice(user_refund_addr_bytes);
+    preimage.extend_from_slice(lbc_address.as_slice());
+    preimage.extend_from_slice(lp_btc_addr_bytes);
+    sha3::Keccak256::digest(&preimage).into()
+}
+
+/// rskj `FlyoverRedeemScriptBuilderImpl.of`: prepend `PUSH(derivationHash)
+/// OP_DROP` to the federation redeem script.
+fn flyover_redeem_script(flyover_derivation_hash: &[u8; 32], federation_redeem: &[u8]) -> Vec<u8> {
+    let mut script = Vec::with_capacity(34 + federation_redeem.len());
+    script.push(32); // OP_PUSHBYTES_32
+    script.extend_from_slice(flyover_derivation_hash);
+    script.push(0x75); // OP_DROP
+    script.extend_from_slice(federation_redeem);
+    script
+}
+
 /// `registerFastBridgeBtcTransaction(bytes,uint256,bytes,bytes32,bytes,address,bytes,bool)`
 ///
-/// Flyover peg-in variant. Similar to registerBtcTransaction but with
-/// additional derivation hash validation and separate tracking.
+/// Flyover (RSKIP176, iris300) peg-in. Full port of rskj
+/// `BridgeSupport.registerFlyoverBtcTransaction`. Returns an int256:
+/// the locked amount in wei on success, or a negative `FlyoverTxResponseCodes`
+/// value on every rejection / unprocessable path. The method only ever fails
+/// the tx for a malformed BTC transaction or PMT (mirrors rskj's outer
+/// try/catch returning GENERIC_ERROR for those).
+#[allow(clippy::too_many_arguments)]
 pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
     gas_cost: u64,
     config: &BridgeConstants,
+    hardfork_cfg: &RskHardforkConfig,
+    tx_ctx: &BridgeTxContext,
+    caller: RskAddress,
+    call_depth: usize,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    // The Flyover peg-in has 8 parameters.
-    // For now, implement the core verification (PMT + merkle root + confirmations)
-    // and mark as processed. Full Flyover-specific logic (derivation hash,
-    // federation info lookup, separate UTXO tracking) will be refined later.
+    let ok = |code: Bytes| Ok(PrecompileOutput::new(gas_cost, code));
 
-    if args.len() < 256 {
-        return Err(PrecompileError::other(
-            "registerFastBridgeBtcTransaction: args too short",
-        ));
+    // rskj wraps the whole body in try/catch → GENERIC_ERROR. Any malformed
+    // ABI / arg shape returns GENERIC_ERROR (NOT a failed tx).
+    let parse = (|| -> Option<(usize, u64, usize, [u8; 32], Vec<u8>, RskAddress, Vec<u8>, bool)> {
+        if args.len() < 256 {
+            return None;
+        }
+        let btc_tx_offset = U256::from_be_slice(args.get(0..32)?).to::<usize>();
+        let btc_block_height = U256::from_be_slice(args.get(32..64)?).to::<u64>();
+        let pmt_offset = U256::from_be_slice(args.get(64..96)?).to::<usize>();
+        let derivation_args_hash: [u8; 32] = args.get(96..128)?.try_into().ok()?;
+        let user_refund_offset = U256::from_be_slice(args.get(128..160)?).to::<usize>();
+        // arg5: address (right-aligned in 32 bytes → low 20 bytes).
+        let lbc_address = RskAddress::from_slice(args.get(172..192)?);
+        let lp_offset = U256::from_be_slice(args.get(192..224)?).to::<usize>();
+        let should_transfer_to_contract = U256::from_be_slice(args.get(224..256)?) != U256::ZERO;
+        let user_refund_addr = read_dynamic_bytes(args, user_refund_offset).ok()?;
+        let lp_btc_addr = read_dynamic_bytes(args, lp_offset).ok()?;
+        Some((
+            btc_tx_offset, btc_block_height, pmt_offset, derivation_args_hash,
+            user_refund_addr, lbc_address, lp_btc_addr, should_transfer_to_contract,
+        ))
+    })();
+    let Some((
+        btc_tx_offset, btc_block_height, pmt_offset, derivation_args_hash,
+        user_refund_addr, lbc_address, lp_btc_addr, should_transfer_to_contract,
+    )) = parse
+    else {
+        return ok(flyover_code_output(flyover_codes::GENERIC_ERROR));
+    };
+
+    // rskj `isContractTx`: the rskTx must be an InternalTransaction (the Bridge
+    // was reached via a contract CALL), i.e. call depth > 1.
+    if call_depth <= 1 {
+        return ok(flyover_code_output(flyover_codes::UNPROCESSABLE_NOT_CONTRACT));
     }
-
-    // arg0: bytes btcTxSerialized (dynamic)
-    // arg1: uint256 height
-    // arg2: bytes pmtSerialized (dynamic)
-    // arg3: bytes32 derivationArgumentsHash
-    // arg4: bytes userRefundBtcAddress (dynamic)
-    // arg5: address liquidityBridgeContractAddress
-    // arg6: bytes liquidityProviderBtcAddress (dynamic)
-    // arg7: bool shouldTransferToContract
-
-    let btc_tx_offset = U256::from_be_slice(&args[0..32]).to::<usize>();
-    let btc_block_height = U256::from_be_slice(&args[32..64]).to::<u64>();
-    let pmt_offset = U256::from_be_slice(&args[64..96]).to::<usize>();
-    let _derivation_hash: [u8; 32] = args[96..128].try_into().unwrap();
+    // The calling contract must be the declared LBC address.
+    if caller != lbc_address {
+        return ok(flyover_code_output(flyover_codes::UNPROCESSABLE_INVALID_SENDER));
+    }
 
     let btc_tx_data = read_dynamic_bytes(args, btc_tx_offset)?;
     let pmt_data = read_dynamic_bytes(args, pmt_offset)?;
 
+    // wtxid (calculateBtcTxHash over the raw bytes) — the first already-used key.
     let btc_tx_hash = calculate_btc_tx_hash(&btc_tx_data);
 
-    // Check hash+derivation not already used
-    let flyover_key = {
-        let hash_hex = super::tx::btc_hash_hex_display(&btc_tx_hash);
-        compound_key(FAST_BRIDGE_HASH_USED_KEY, "-", &hash_hex)
-    };
-    let already_used = super::storage::bridge_load_raw(ctx, flyover_key).is_some();
-    if already_used {
-        return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let use_v2 = hardfork_cfg.has_stored_block_v2(block_number);
+    let rskip199 = hardfork_cfg.has_rskip199(block_number);
+    super::btc_chain::ensure_btc_chain_seeded(ctx, config, use_v2, rskip199);
+
+    // getFlyoverDerivationHash (over the raw 21-byte address args; see helper).
+    let flyover_hash = flyover_derivation_hash(
+        &derivation_args_hash,
+        &user_refund_addr,
+        &lbc_address,
+        &lp_btc_addr,
+    );
+
+    // First already-used check, keyed by the wtxid.
+    if is_flyover_derivation_hash_used(ctx, &btc_tx_hash, &flyover_hash) {
+        return ok(flyover_code_output(flyover_codes::UNPROCESSABLE_ALREADY_PROCESSED));
     }
 
-    // PMT verification
-    if !PartialMerkleTree::has_expected_size(&pmt_data) {
-        return Err(PrecompileError::other(
-            "registerFastBridgeBtcTransaction: invalid PMT size",
-        ));
-    }
-
-    let pmt = PartialMerkleTree::parse(&pmt_data).ok_or_else(|| {
-        PrecompileError::other("registerFastBridgeBtcTransaction: failed to parse PMT")
-    })?;
-
-    let pmt_result = pmt.extract_matches().ok_or_else(|| {
-        PrecompileError::other("registerFastBridgeBtcTransaction: PMT verification failed")
-    })?;
-
-    if !pmt_result.matched_hashes.contains(&btc_tx_hash) {
-        return Err(PrecompileError::other(
-            "registerFastBridgeBtcTransaction: tx not in PMT",
-        ));
-    }
-
-    // Block and merkle root verification (same as registerBtcTransaction)
-    let block_hash_b256 = bridge_load_btc_block_hash_by_height(ctx, btc_block_height as u32);
-    let block_hash = match block_hash_b256 {
-        Some(h) => b256_to_bitcoin_hash(&h),
-        None => {
-            return Err(PrecompileError::other(
-                "registerFastBridgeBtcTransaction: BTC block not found",
-            ))
+    // validationsForRegisterBtcTransaction: PMT + merkle root + confirmations.
+    let validations = (|| -> bool {
+        if !PartialMerkleTree::has_expected_size(&pmt_data) {
+            return false;
         }
-    };
-
-    let stored_block = get_stored_block(ctx, &block_hash).ok_or_else(|| {
-        PrecompileError::other("registerFastBridgeBtcTransaction: stored block not found")
-    })?;
-
-    let block_merkle_root = {
-        let raw = stored_block.header.merkle_root.to_raw_hash();
-        *raw.as_byte_array()
-    };
-
-    if pmt_result.merkle_root != block_merkle_root {
-        // Witness-root fallback (rskj isBlockMerkleRootValid, RSKIP143): the
-        // coinbase info is keyed by the block hash in DISPLAY order and the
-        // stored witness root is also display order, vs the internal-order PMT
-        // root — both must be reversed (see register_btc_transaction).
-        let block_hash_bytes = {
-            let mut raw = *block_hash.to_raw_hash().as_byte_array();
-            raw.reverse();
-            raw
+        let Some(pmt) = PartialMerkleTree::parse(&pmt_data) else { return false };
+        let Some(pmt_result) = pmt.extract_matches() else { return false };
+        if !pmt_result.matched_hashes.contains(&btc_tx_hash) {
+            return false;
+        }
+        let Some(stored_block) =
+            super::btc_chain::stored_block_at_main_chain_height(ctx, btc_block_height as u32, rskip199)
+        else {
+            return false;
         };
-        match get_coinbase_information(ctx, &block_hash_bytes) {
-            Some(mut witness_root) => {
-                witness_root.reverse();
-                if pmt_result.merkle_root != witness_root {
-                    return Err(PrecompileError::other(
-                        "registerFastBridgeBtcTransaction: merkle root mismatch",
-                    ));
+        let block_hash = stored_block.header.block_hash();
+        let block_merkle_root = *stored_block.header.merkle_root.to_raw_hash().as_byte_array();
+        let root_valid = pmt_result.merkle_root == block_merkle_root || {
+            let block_hash_bytes = {
+                let mut raw = *block_hash.to_raw_hash().as_byte_array();
+                raw.reverse();
+                raw
+            };
+            match get_coinbase_information(ctx, &block_hash_bytes) {
+                Some(mut wr) => {
+                    wr.reverse();
+                    pmt_result.merkle_root == wr
                 }
+                None => false,
             }
-            None => {
-                return Err(PrecompileError::other(
-                    "registerFastBridgeBtcTransaction: merkle root mismatch",
-                ))
-            }
+        };
+        if !root_valid {
+            return false;
         }
+        let best_height = load_chain_head(ctx).map(|h| h.height).unwrap_or(0);
+        let confirmations = best_height as i64 - btc_block_height as i64 + 1;
+        confirmations >= config.btc2rsk_minimum_acceptable_confirmations as i64
+    })();
+    if !validations {
+        return ok(flyover_code_output(flyover_codes::UNPROCESSABLE_VALIDATIONS));
     }
 
-    // Confirmations
-    let chain_head = load_chain_head(ctx);
-    let best_height = chain_head.map(|h| h.height).unwrap_or(0);
-    if best_height < stored_block.height + config.btc2rsk_minimum_acceptable_confirmations {
-        return Err(PrecompileError::other(
-            "registerFastBridgeBtcTransaction: insufficient confirmations",
-        ));
+    // Parse the BTC tx and compute the witness-stripped txid (getHash(false)).
+    let btc_tx: BtcTransaction = deserialize(&btc_tx_data)
+        .map_err(|_| PrecompileError::other("registerFastBridgeBtcTransaction: invalid BTC transaction"))?;
+    let btc_tx_hash_no_witness = legacy_btc_txid(&btc_tx);
+
+    // Second already-used check, keyed by the legacy txid (only when it differs
+    // from the wtxid, i.e. a SegWit tx).
+    if btc_tx_hash_no_witness != btc_tx_hash
+        && is_flyover_derivation_hash_used(ctx, &btc_tx_hash_no_witness, &flyover_hash)
+    {
+        return ok(flyover_code_output(flyover_codes::UNPROCESSABLE_ALREADY_PROCESSED));
     }
 
-    // Mark as used (rskj saveFlyoverDerivationHash: a single TRUE_VALUE byte)
-    super::storage::bridge_store_raw(ctx, flyover_key, Some(vec![1]));
+    // createFlyoverFederationInformation for the ACTIVE federation: build the
+    // flyover redeem script (PUSH(hash) OP_DROP <fedRedeem>) and its P2SH.
+    let federation_keys = federation_keys_or_genesis(ctx, config, hardfork_cfg, block_number);
+    let threshold = (federation_keys.len() / 2) + 1;
+    let fed_redeem = build_federation_redeem_script(&federation_keys, threshold);
+    let fed_p2sh_hash = redeem_script_hash160(&fed_redeem);
+    let flyover_redeem = flyover_redeem_script(&flyover_hash, &fed_redeem);
+    let flyover_p2sh_hash = redeem_script_hash160(&flyover_redeem);
+    let flyover_script = p2sh_output_script(&flyover_p2sh_hash);
 
-    // Also mark as processed in the standard map
-    // Flyover (RSKIP176, iris300) is always post-RSKIP134.
-    set_btc_tx_processed(ctx, &btc_tx_hash, stored_block.height as u64, true);
+    // RSKIP293 (hop400) also processes the retiring federation; the iris era
+    // (RSKIP176) has only the active federation. The retiring-flyover path is
+    // unreachable until hop400 — see TODO.md.
+    if hardfork_cfg.has_rskip293(block_number)
+        && retiring_federation_keys(ctx, config, hardfork_cfg, block_number).is_some()
+    {
+        tracing::warn!(
+            "flyover: RSKIP293 retiring-federation flyover not implemented (block {block_number})"
+        );
+    }
 
-    Ok(PrecompileOutput::new(gas_cost, Bytes::new()))
+    // validateFlyoverPeginValue (pre-293): amount sent to the flyover address
+    // must be non-zero. getAmountSentToAddress: sum outputs paying the address.
+    let total_satoshis: u64 = btc_tx
+        .output
+        .iter()
+        .filter(|o| o.script_pubkey == flyover_script)
+        .map(|o| o.value.to_sat())
+        .sum();
+    if total_satoshis == 0 {
+        return ok(flyover_code_output(flyover_codes::UNPROCESSABLE_VALUE_ZERO));
+    }
+
+    let refund_to = |should_lp: bool| -> (&[u8], bool) {
+        // Refund destination: the LP BTC address when shouldTransferToContract,
+        // else the user refund address. Both are `[version || hash160]`.
+        if should_lp {
+            (&lp_btc_addr[..], true)
+        } else {
+            (&user_refund_addr[..], false)
+        }
+    };
+
+    // verifyLockDoesNotSurpassLockingCap (RSKIP134): a flyover peg-in is always
+    // post-RSKIP134 (iris). On surplus, refund (LP or user) and mark used.
+    if !verify_lock_does_not_surpass_locking_cap(ctx, config, total_satoshis) {
+        // markFlyoverDerivationHashAsUsed(btcTxHashWithoutWitness, hash).
+        mark_flyover_derivation_hash_used(ctx, &btc_tx_hash_no_witness, &flyover_hash);
+        let (refund_addr_bytes, is_lp) = refund_to(should_transfer_to_contract);
+        let refund_hash160: [u8; 20] = refund_addr_bytes
+            .get(1..21)
+            .and_then(|s| s.try_into().ok())
+            .unwrap_or([0u8; 20]);
+        // The refund address version byte distinguishes P2PKH from P2SH:
+        // use P2SH iff the version equals the network's P2SH header.
+        let p2sh_version: u8 = match config.btc_network {
+            super::constants::BtcNetwork::Mainnet => 5,
+            _ => 196,
+        };
+        let refund_is_p2sh = refund_addr_bytes.first() == Some(&p2sh_version);
+        let rsk_height = rsk_height_of(ctx);
+        emit_flyover_rejection_release(
+            ctx, &btc_tx, &refund_hash160, refund_is_p2sh, total_satoshis,
+            &flyover_redeem, rsk_height, config, hardfork_cfg, tx_ctx,
+        );
+        return ok(flyover_code_output(if is_lp {
+            flyover_codes::REFUNDED_LP
+        } else {
+            flyover_codes::REFUNDED_USER
+        }));
+    }
+
+    // transferTo(lbcAddress, amount): credit the LBC contract.
+    let rbtc_amount = btc_satoshi_to_rbtc_wei(total_satoshis);
+    if !rbtc_amount.is_zero() {
+        let _ = ctx.journal_mut().transfer(BRIDGE_ADDR, lbc_address, rbtc_amount);
+    }
+
+    // saveFlyoverActiveFederationDataInStorage:
+    //   - mark the flyover hash used (keyed by the legacy txid)
+    //   - persist the flyover federation information
+    //   - add the flyover UTXOs to the ACTIVE federation UTXO set
+    mark_flyover_derivation_hash_used(ctx, &btc_tx_hash_no_witness, &flyover_hash);
+    set_flyover_federation_information(ctx, &flyover_hash, &fed_p2sh_hash, &flyover_p2sh_hash);
+
+    let rsk_height = rsk_height_of(ctx);
+    let active_utxo_key = active_federation_utxo_key(ctx, config, hardfork_cfg, rsk_height);
+    register_federation_outputs(ctx, &btc_tx, &flyover_script, active_utxo_key);
+
+    // Returns the locked amount in wei (co.rsk.core.Coin.fromBitcoin.asBigInteger).
+    ok(Bytes::copy_from_slice(&rbtc_amount.to_be_bytes::<32>()))
+}
+
+/// Current RSK execution block number.
+fn rsk_height_of<CTX: crate::RskContextTr>(ctx: &mut CTX) -> u64 {
+    revm::context_interface::Block::number(ctx.block()).to::<u64>()
+}
+
+/// rskj `BridgeStorageProvider.isFlyoverDerivationHashUsed`: the cell at
+/// `fastBridgeHashUsedInBtcTx-<btcTxHash.toString()><derivationHash.toString()>`
+/// holds a single TRUE byte. `Sha256Hash.toString()` is DISPLAY order;
+/// `Keccak256.toString()` is forward order.
+fn is_flyover_derivation_hash_used<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    btc_tx_hash: &[u8; 32],
+    flyover_hash: &[u8; 32],
+) -> bool {
+    let key = flyover_hash_used_key(btc_tx_hash, flyover_hash);
+    super::storage::bridge_load_raw(ctx, key)
+        .is_some_and(|d| d.len() == 1 && d[0] == 1)
+}
+
+/// rskj `markFlyoverDerivationHashAsUsed` → `saveFlyoverDerivationHash`:
+/// `addStorageBytes(key, [TRUE])`.
+fn mark_flyover_derivation_hash_used<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    btc_tx_hash: &[u8; 32],
+    flyover_hash: &[u8; 32],
+) {
+    let key = flyover_hash_used_key(btc_tx_hash, flyover_hash);
+    super::storage::bridge_store_raw(ctx, key, Some(vec![1]));
+}
+
+/// rskj `getStorageKeyForFlyoverHash`:
+/// `fastBridgeHashUsedInBtcTx-` + `Sha256Hash.toString()` (display order) +
+/// `Keccak256.toString()` (forward order).
+fn flyover_hash_used_key(btc_tx_hash: &[u8; 32], flyover_hash: &[u8; 32]) -> U256 {
+    let identifier = format!(
+        "{}{}",
+        super::tx::btc_hash_hex_display(btc_tx_hash),
+        to_hex(flyover_hash)
+    );
+    compound_key(FAST_BRIDGE_HASH_USED_KEY, "-", &identifier)
+}
+
+/// rskj `setFlyoverFederationInformation` → `saveFlyoverFederationInformation`:
+/// store `RLP([derivationHash, federationRedeemScriptHash])` keyed by
+/// `fastBridgeFederationInformation-` + hex(flyoverFederationRedeemScriptHash).
+fn set_flyover_federation_information<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    flyover_hash: &[u8; 32],
+    fed_p2sh_hash: &[u8; 20],
+    flyover_p2sh_hash: &[u8; 20],
+) {
+    let key = compound_key(
+        FAST_BRIDGE_FEDERATION_INFO_KEY,
+        "-",
+        &to_hex(flyover_p2sh_hash),
+    );
+    let value = rlp_encode_list(&[
+        rlp_encode_element(flyover_hash),
+        rlp_encode_element(fed_p2sh_hash),
+    ]);
+    super::storage::bridge_store_raw(ctx, key, Some(value));
+}
+
+/// rskj `generateFlyoverRejectionReleaseWithWalletProvider`: build an
+/// empty-wallet refund of the flyover-federation outputs to `refund_hash160`
+/// using the FLYOVER redeem script, enqueue it, and log release_requested.
+#[allow(clippy::too_many_arguments)]
+fn emit_flyover_rejection_release<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    btc_tx: &BtcTransaction,
+    refund_hash160: &[u8; 20],
+    refund_is_p2sh: bool,
+    total_satoshis: u64,
+    flyover_redeem: &[u8],
+    rsk_height: u64,
+    config: &BridgeConstants,
+    hardfork_cfg: &RskHardforkConfig,
+    tx_ctx: &BridgeTxContext,
+) {
+    let flyover_script = p2sh_output_script(&redeem_script_hash160(flyover_redeem));
+    let utxos: Vec<BridgeUtxo> = btc_tx
+        .output
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| o.script_pubkey == flyover_script)
+        .map(|(index, o)| BridgeUtxo {
+            tx_hash: btc_txid_event_bytes(btc_tx),
+            vout: index as u32,
+            value_satoshis: o.value.to_sat(),
+            height: 0,
+            script: o.script_pubkey.to_bytes(),
+            coinbase: btc_tx.is_coinbase(),
+        })
+        .collect();
+    let fee_per_kb = get_effective_fee_per_kb(ctx, config);
+    let tx_version = if hardfork_cfg.has_rskip201(rsk_height) { 2 } else { 1 };
+    let refund_script = if refund_is_p2sh {
+        p2sh_output_script(refund_hash160)
+    } else {
+        p2pkh_output_script(refund_hash160)
+    };
+    let built = super::release_tx::build_empty_wallet_to(
+        &utxos, &refund_script, flyover_redeem, fee_per_kb, tx_version,
+    );
+    if let Some(built) = built {
+        let use_tx_hash = hardfork_cfg.has_rskip146(rsk_height);
+        let mut waiting = load_pegout_confirmation_set(ctx, use_tx_hash);
+        waiting.push(PegoutWaitingForConfirmations {
+            btc_tx_raw: btc_serialize(&built.tx),
+            rsk_block_height: rsk_height,
+            rsk_tx_hash: use_tx_hash.then_some(tx_ctx.rsk_tx_hash),
+        });
+        if use_tx_hash {
+            super::events::log_release_requested(
+                ctx,
+                &tx_ctx.rsk_tx_hash,
+                &btc_txid_event_bytes(&built.tx),
+                total_satoshis,
+            );
+        }
+        store_pegout_confirmation_set(ctx, &waiting, use_tx_hash);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3234,5 +3507,108 @@ mod tests {
             "require_funds_for_fee {fee} should be below {} so reason is LOW_AMOUNT",
             config.minimum_pegout_tx_value
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Flyover (RSKIP176) ground-truth tests
+    // -----------------------------------------------------------------------
+
+    /// rskj `BitcoinTestUtils.createP2PKHAddress`: priv = keccak256(seed),
+    /// address = `[version=0] || hash160(compressed pubkey)` on mainnet.
+    fn mainnet_p2pkh_addr_bytes(seed: &str) -> Vec<u8> {
+        use k256::ecdsa::SigningKey;
+        use sha3::Digest;
+        let priv_bytes: [u8; 32] = sha3::Keccak256::digest(seed.as_bytes()).into();
+        let sk = SigningKey::from_slice(&priv_bytes).unwrap();
+        let pubkey = sk.verifying_key().to_encoded_point(true); // compressed
+        let hash160 = pubkey_hash160(pubkey.as_bytes());
+        let mut out = vec![0u8]; // mainnet P2PKH version
+        out.extend_from_slice(&hash160);
+        out
+    }
+
+    /// Ported from rskj `PegUtilsTest.getFlyoverDerivationHash_returnsExpectedDerivationHash`
+    /// (hardcoded expected hash `56d4f6bd…44d8`).
+    #[test]
+    fn flyover_derivation_hash_groundtruth() {
+        // derivationArgumentsHash = PegTestUtils.createHash3(5) → byte[0]=5.
+        let mut derivation_args = [0u8; 32];
+        derivation_args[0] = 5;
+        let user_refund = mainnet_p2pkh_addr_bytes("userRefundBtcAddress");
+        let lp_btc = mainnet_p2pkh_addr_bytes("lpBtcAddress");
+        let lbc = RskAddress::from_slice(
+            &hex_to_bytes("461750b4824b14c3d9b7702bc6fbb82469082b23"),
+        );
+
+        let hash = flyover_derivation_hash(&derivation_args, &user_refund, &lbc, &lp_btc);
+        assert_eq!(
+            to_hex(&hash),
+            "56d4f6bd69378ef607e091832903ddc2b5aac5008bd06987a26f14bb248c44d8"
+        );
+    }
+
+    /// Ported from rskj `PegUtilsTest.getFlyoverValues_fromRealLegacyFedTx`:
+    /// the flyover redeem script (`PUSH(hash) OP_DROP <fedRedeem>`) and its
+    /// P2SH hash160 for derivation hash `fc2bb9…0439`.
+    #[test]
+    fn flyover_redeem_script_and_p2sh_groundtruth() {
+        let flyover_hash: [u8; 32] = hex_to_bytes(
+            "fc2bb93810d3d2332fed0b291c03822100a813eceaa0665896e0c82a8d500439",
+        )
+        .try_into()
+        .unwrap();
+        // The full expected flyover redeem script from rskj.
+        let expected_flyover_redeem = hex_to_bytes(
+            "20fc2bb93810d3d2332fed0b291c03822100a813eceaa0665896e0c82a8d50043975645521020ace50bab1230f8002a0bfe619482af74b338cc9e4c956add228df47e6adae1c21025093f439fb8006fd29ab56605ffec9cdc840d16d2361004e1337a2f86d8bd2db210275d473555de2733c47125f9702b0f870df1d817379f5587f09b6c40ed2c6c9492102a95f095d0ce8cb3b9bf70cc837e3ebe1d107959b1fa3f9b2d8f33446f9c8cbdb2103250c11be0561b1d7ae168b1f59e39cbc1fd1ba3cf4d2140c1a365b2723a2bf9321034851379ec6b8a701bd3eef8a0e2b119abb4bdde7532a3d6bcbff291b0daf3f25210350179f143a632ce4e6ac9a755b82f7f4266cfebb116a42cadb104c2c2a3350f92103b04fbd87ef5e2c0946a684c8c93950301a45943bbe56d979602038698facf9032103b58a5da144f5abab2e03e414ad044b732300de52fa25c672a7f7b3588877190659ae670350cd00b275532102370a9838e4d15708ad14a104ee5606b36caaaaf739d833e67770ce9fd9b3ec80210257c293086c4d4fe8943deda5f890a37d11bebd140e220faa76258a41d077b4d42103c2660a46aa73078ee6016dee953488566426cf55fc8011edd0085634d75395f92103cd3e383ec6e12719a6c69515e5559bcbe037d0aa24c187e1e26ce932e22ad7b354ae68",
+        );
+        // The federation redeem script is the suffix after `PUSH(32) hash OP_DROP`
+        // (33 + 1 bytes of prefix).
+        let federation_redeem = &expected_flyover_redeem[34..];
+
+        let flyover_redeem = flyover_redeem_script(&flyover_hash, federation_redeem);
+        assert_eq!(
+            to_hex(&flyover_redeem),
+            to_hex(&expected_flyover_redeem),
+            "flyover redeem script must match rskj"
+        );
+
+        let p2sh_hash = redeem_script_hash160(&flyover_redeem);
+        assert_eq!(
+            to_hex(&p2sh_hash),
+            "18fc3b52a5b7d5277f41b9765719b45bfa427730",
+            "flyover P2SH hash160 must match rskj"
+        );
+    }
+
+    /// The flyover-hash-used storage key uses the DISPLAY-order BTC tx hash and
+    /// the FORWARD-order derivation hash (rskj getStorageKeyForFlyoverHash).
+    #[test]
+    fn flyover_hash_used_key_byte_order() {
+        // wtxid in internal order; display order is the reverse.
+        let btc_hash = hex_to_bytes(
+            "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+        )
+        .try_into()
+        .unwrap();
+        let flyover_hash = hex_to_bytes(
+            "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+        )
+        .try_into()
+        .unwrap();
+        let key = flyover_hash_used_key(&btc_hash, &flyover_hash);
+        // Reconstruct the expected compound identifier: display(btc) + forward(flyover).
+        let expected = compound_key(
+            FAST_BRIDGE_HASH_USED_KEY,
+            "-",
+            "201f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090807060504030201a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+        );
+        assert_eq!(key, expected);
+    }
+
+    fn hex_to_bytes(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
     }
 }

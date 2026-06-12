@@ -427,6 +427,8 @@ impl RskExecutor {
                         use_v2,
                         &self.hardfork_cfg,
                         &tx_ctx,
+                        *sender,
+                        1, // a direct top-level tx is depth 1 (not a contract call)
                     );
                     match outcome {
                         Ok(out) => {
