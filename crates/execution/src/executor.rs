@@ -1257,6 +1257,103 @@ mod tests {
         assert_eq!(r3.tx_results[0].gas_used, 1_000_000, "invalid opcode consumes all gas");
     }
 
+    /// RSKIP197 (iris300): a CALL to a precompile that fails with a non-OOG
+    /// error is *handled* — the call pushes 0, the surplus forwarded gas is
+    /// refunded, and execution continues; the failing precompile costs exactly
+    /// its `getGasForData` requiredGas. Ported from rskj `ProgramTest`
+    /// (`testCallToPrecompiledAddress_throwPrecompiledContractException`:
+    /// post-197 `gasUsed == gasCost`, stack pushes 0).
+    ///
+    /// Here a deployed contract CALLs BLAKE2F (0x09) with a 213-byte input
+    /// whose final-block byte is 0x02 (invalid: must be 0 or 1) and `rounds`=1,
+    /// forwarding 900,000 gas. rskj's `Blake2F.execute` throws
+    /// `BLAKE2F_ERROR_FINAL_BLOCK_BYTES`; post-197 the call costs only
+    /// `requiredGas == rounds == 1` (the surplus is refunded), so the whole tx
+    /// settles far below the forwarded gas. The CALL result (0) is stored at
+    /// slot 0 to prove the failure was observed without aborting the frame.
+    #[test]
+    fn test_rskip197_failing_precompile_refunds_surplus_gas() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+        let sender = Address::repeat_byte(0xCD);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+        let block_store =
+            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+
+        // Runtime: build a BLAKE2F input (rounds=1, bad final byte), CALL 0x09
+        // forwarding 900,000 gas, then SSTORE the CALL result at slot 0.
+        let runtime: Vec<u8> = vec![
+            0x60, 0x01, 0x60, 0x03, 0x53, // PUSH1 1; PUSH1 3; MSTORE8  -> mem[3]=1 (rounds=1)
+            0x60, 0x02, 0x60, 0xd4, 0x53, // PUSH1 2; PUSH1 212; MSTORE8 -> mem[212]=2 (bad flag)
+            0x60, 0x00, // retLength 0
+            0x60, 0x00, // retOffset 0
+            0x60, 0xd5, // argsLength 213
+            0x60, 0x00, // argsOffset 0
+            0x60, 0x00, // value 0
+            0x60, 0x09, // addr 0x09 (blake2f)
+            0x62, 0x0d, 0xbb, 0xa0, // PUSH3 900000 (gas)
+            0xf1, // CALL
+            0x60, 0x00, 0x55, // PUSH1 0; SSTORE -> slot 0 = CALL result
+            0x00, // STOP
+        ];
+        // init: copy `runtime` to memory and RETURN it as the deployed code.
+        let rt_len = runtime.len() as u8;
+        let mut init = vec![
+            0x60, rt_len, 0x60, 0x0c, 0x60, 0x00, 0x39, // CODECOPY(0, 12, len)
+            0x60, rt_len, 0x60, 0x00, 0xf3, // RETURN(0, len)
+        ];
+        init.extend_from_slice(&runtime);
+        let deploy = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(1_000_000),
+            to: Bytes::new(),
+            value: U256::ZERO,
+            input: Bytes::from(init),
+            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+        };
+        let r1 = executor
+            .execute_block(&dummy_header(3_614_800), &[(deploy, sender)], &root, store.clone())
+            .expect("deploy block");
+        assert!(r1.tx_results[0].success, "deploy ok");
+        let deployed = sender.create(0);
+        let root2 =
+            crate::state::apply_state_changes(&root, store.as_ref(), &r1.state_changes, &r1.markers);
+
+        let call = rustock_core::Transaction {
+            nonce: 1,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(1_000_000),
+            to: Bytes::copy_from_slice(deployed.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::new(),
+            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+        };
+        let r2 = executor
+            .execute_block(&dummy_header(3_614_801), &[(call, sender)], &root2, store.clone())
+            .expect("call block");
+        assert!(
+            r2.tx_results[0].success,
+            "post-197 the failing precompile is handled; the caller frame does not abort"
+        );
+        // The CALL pushed 0 (failure) — slot 0 must be 0.
+        let storage = &r2.state_changes.get(&deployed).expect("contract").storage;
+        assert_eq!(
+            storage.get(&U256::ZERO).map(|s| s.present_value).unwrap_or(U256::ZERO),
+            U256::ZERO,
+            "CALL to a failing precompile pushes 0"
+        );
+        // The surplus of the 900,000 forwarded gas was refunded: the whole tx
+        // settles well below it (would be >= 900,000 if all child gas burned).
+        assert!(
+            r2.tx_results[0].gas_used < 100_000,
+            "post-197 refunds the surplus forwarded gas; gas_used = {}",
+            r2.tx_results[0].gas_used
+        );
+    }
+
     /// Regression for mainnet #2,814,761: RSKIP150 lowers the EVM call-stack
     /// limit to 400 (rskj Program.getMaxDepth); revm hard-codes 1024. A
     /// self-recursive contract must be cut off at depth 400 — frames at

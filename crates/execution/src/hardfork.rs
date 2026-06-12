@@ -260,6 +260,14 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Iris300
     }
 
+    /// RSKIP197: a failing precompile CALL is handled (push 0, refund the
+    /// surplus, continue) instead of propagating an exception that aborts the
+    /// calling frame and burns all its gas (Iris300). Post-197 a failed
+    /// precompile costs exactly its `getGasForData` requiredGas.
+    pub fn has_rskip197(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Iris300
+    }
+
     /// RSKIP219: updated minimum peg-in tx value (Iris300).
     pub fn has_rskip219(&self, block_number: u64) -> bool {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Iris300

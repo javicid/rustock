@@ -1838,6 +1838,92 @@ accepted and logged (header receipts root
 
 ---
 
+## 40. RSKIP197: a failing precompile CALL is handled (push 0, refund surplus) instead of aborting the caller
+
+Pre-iris, `Program.callToPrecompiledAddress` runs the deprecated
+`executePrecompiled`: it `refundGas(msg.gas - requiredGas)` first, then
+`out = contract.execute(data)`. If `execute` throws (a `VMException` wrapped in a
+`RuntimeException`, or any unchecked exception), the exception **propagates out of
+the calling frame** — the caller fails with an exceptional halt that consumes all
+of its remaining gas, and the stack is left untouched (no `0` pushed). This is the
+behavior `ProgramBeforeRSKIP197Test` asserts (`assertTrue(program.getStack().empty())`
+after the throw) and that the DSL test `PrecompiledContractsCallErrorHandlingTests
+.handleErrorOnFailedPrecompiledContractCall_beforeIris` asserts as
+`assertTransactionFail(...)` for the RSK precompiles.
+
+From **RSKIP197 (iris300, mainnet #3,614,800)** the call dispatches to
+`executePrecompiledAndHandleError`:
+
+```java
+try {
+    this.returnDataBuffer = contract.execute(data);
+    this.memorySaveLimited(outOffs, this.returnDataBuffer, outSize);
+    this.stackPushOne();          // success: push 1
+    track.commit();
+} catch (Exception e) {
+    this.stackPushZero();         // failure: push 0
+    track.rollback();
+    this.returnDataBuffer = null;
+} finally {
+    this.refundGas(msg.getGas().longValue() - requiredGas, CALL_PRECOMPILED_CAUSE);
+}
+```
+
+So post-197 a **non-OOG** precompile failure is *handled*: the call pushes `0`,
+rolls back the precompile's state, clears the return buffer, **refunds the surplus
+forwarded gas, and execution CONTINUES**. The precompile costs exactly
+`requiredGas` (= `getGasForData(data)`). `ProgramTest
+.testCallToPrecompiledAddress_throwPrecompiledContractException` is the
+groundtruth: post-197 `program.getResult().getGasUsed() == gasCost` and the stack
+shows `0`. (The earlier `requiredGas > msg.gas` branch — a genuine OOG — is
+unchanged across eras: it consumes all of the call's gas and pushes `0`.)
+
+**Reachable precompiles at iris.** Among the precompiles revm reports a *non-OOG*
+`Err` for, only these can throw post-iris: BN128 add/mul/pairing (0x06–0x08,
+`BN128PrecompiledContract.unsafeExecute` throws on an invalid result post-197) and
+BLAKE2F (0x09, RSKIP153 iris; `Blake2F.execute` throws on a bad input length or a
+bad final-block byte). ECRecover/SHA256/RIPEMD160/Identity never throw (they pad
+or catch), and modexp's only non-OOG error (`ModexpEip7823LimitSize`) is a
+Shanghai/Osaka feature not active at iris's PETERSBURG spec. `requiredGas`:
+add = 150, mul = 6 000, pairing = 45 000 + 34 000·(len/192) (EIP-1108 / Istanbul,
+matching rskj `BN128*.getGasForData`); blake2f = the big-endian `u32` rounds when
+`len == 213`, else 0 (`Blake2F.getGasForData`).
+
+**Consensus-load-bearing.** revm's `insert_call_outcome` returns the unspent child
+gas to the caller only for `is_ok_or_revert()` results; `PrecompileError`/
+`PrecompileOOG` are neither, so revm consumes the *entire forwarded* child gas on a
+precompile failure (push 0, continue). That happens to match an OOG but **not**
+the post-197 non-OOG case, where rskj refunds the surplus (charging only
+`requiredGas`). A from-scratch client that burns the full forwarded gas on a
+post-iris bn128/blake2f failure forks on **gasUsed → receipts root** wherever a
+contract CALLs one of those precompiles with invalid input and forwards more gas
+than `requiredGas`. (The pre-iris frame-abort behavior is a closed, already-
+validated window for these precompiles — pre-197 bn128 returns empty=success and
+blake2f does not yet exist; the pre-197 frame-kill for the RSK stateful precompiles
+called internally is logged in TODO, not yet observed on mainnet.)
+
+**rskj source**: `org.ethereum.vm.program.Program.callToPrecompiledAddress` /
+`executePrecompiledAndHandleError` (post-197) vs `executePrecompiled` (pre-197,
+`@Deprecated`); `ConsensusRule.RSKIP197` (reference.conf `rskip197 = iris300`);
+`co.rsk.pcc.altBN128.BN128PrecompiledContract` (safe/unsafe execute);
+`org.ethereum.vm.PrecompiledContracts.Blake2F`. Groundtruth tests:
+`org.ethereum.vm.program.ProgramTest` (post-197 `gasUsed == gasCost`) and
+`ProgramBeforeRSKIP197Test` (pre-197 propagation), plus
+`PrecompiledContractsCallErrorHandlingTests` (before/after iris).
+
+**rustock**: `crates/execution/src/precompiles.rs` — on a non-fatal, non-OOG
+precompile `Err`, when `has_rskip197` is active, the result is recorded as a
+`Revert` with empty output (so revm refunds the surplus via `is_ok_or_revert` and
+pushes `0` via `!is_ok`, leaving the returnDataBuffer empty) and the call is
+charged exactly `rskip197_required_gas_on_error(addr, input)`. Pre-iris the
+existing `PrecompileError`/`PrecompileOOG` path is preserved.
+`RskHardforkConfig::has_rskip197` (iris300) added in
+`crates/execution/src/hardfork.rs`. Test:
+`test_rskip197_failing_precompile_refunds_surplus_gas`
+(`crates/execution/src/executor.rs`) — a contract CALLs blake2f with a bad
+final-block byte forwarding 900 000 gas; post-iris the tx settles far below the
+forwarded gas and the CALL pushes 0 (ported from rskj `ProgramTest`).
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`

@@ -884,6 +884,43 @@ pub struct BridgeTxContext {
     pub rsk_sender: Address,
 }
 
+/// RSKIP197 (iris300): the `requiredGas` (rskj `getGasForData`) charged to a
+/// failing precompile CALL whose error is a *non-OOG* exception. Post-197 such
+/// a call costs exactly this amount (the surplus forwarded gas is refunded and
+/// execution continues with a `0` pushed) — `Program.executePrecompiledAndHandleError`
+/// runs `refundGas(msg.gas - requiredGas)` in its `finally` block.
+///
+/// Only the standard ETH precompiles that revm reports a non-OOG `Err` for can
+/// reach this path at iris: BN128 add/mul/pairing (0x06–0x08, throw on an
+/// invalid point post-RSKIP197 — `BN128PrecompiledContract.unsafeExecute`) and
+/// BLAKE2F (0x09, throws on a bad final-block byte or bad input length —
+/// `Blake2F.execute`). For BN128 the non-OOG `Err` is only returned after revm's
+/// internal `gas_used <= gas_limit` check, so `requiredGas <= gas_limit` always
+/// holds, matching rskj. Returns `None` for addresses that never reach the
+/// non-OOG error path (the gas is then irrelevant).
+fn rskip197_required_gas_on_error(addr: &Address, input: &[u8]) -> Option<u64> {
+    // EIP-1108 / Istanbul pricing, active for BN128 from papyrus200 in rskj
+    // (BN128Addition/Multiplication/Pairing.getGasForData).
+    const BN128_ADD: Address = Address::new(hex_addr("0000000000000000000000000000000000000006"));
+    const BN128_MUL: Address = Address::new(hex_addr("0000000000000000000000000000000000000007"));
+    const BN128_PAIR: Address = Address::new(hex_addr("0000000000000000000000000000000000000008"));
+    const BLAKE2F: Address = Address::new(hex_addr("0000000000000000000000000000000000000009"));
+    const BN128_PAIR_SIZE: usize = 192;
+
+    match *addr {
+        BN128_ADD => Some(150),
+        BN128_MUL => Some(6_000),
+        BN128_PAIR => Some(45_000 + 34_000 * (input.len() / BN128_PAIR_SIZE) as u64),
+        // Blake2F.getGasForData: malformed length -> 0 (can't read rounds);
+        // otherwise the big-endian u32 rounds count (rskj F_ROUND == 1).
+        BLAKE2F if input.len() == 213 => Some(u32::from_be_bytes(
+            input[..4].try_into().expect("len checked == 213"),
+        ) as u64),
+        BLAKE2F => Some(0),
+        _ => None,
+    }
+}
+
 /// Wraps an owned `Precompiles` set to implement revm's `PrecompileProvider`.
 ///
 /// Unlike `EthPrecompiles` which holds a `&'static Precompiles`, this owns the
@@ -944,6 +981,13 @@ impl RskPrecompileProvider {
                 called.push(addr);
             }
         }
+    }
+
+    /// RSKIP197 (iris300): whether failing precompile calls are handled
+    /// (push 0, refund the surplus, continue) rather than aborting the caller.
+    fn rskip197_active<CTX: crate::RskContextTr>(&self, context: &CTX) -> bool {
+        self.hardfork_cfg
+            .has_rskip197(context.block().number().to::<u64>())
     }
 }
 
@@ -1416,6 +1460,12 @@ impl<CTX: crate::RskContextTr> PrecompileProvider<CTX> for RskPrecompileProvider
             output: Bytes::new(),
         };
 
+        // RSKIP197 (iris300): `requiredGas` charged to this call if the
+        // precompile fails with a non-OOG error (computed from the input while
+        // it is still borrowed). Captured here so the error branch below can
+        // refund the surplus forwarded gas, matching rskj's
+        // `executePrecompiledAndHandleError` (gasUsed == getGasForData).
+        let required_gas_on_error;
         let exec_result = {
             let r;
             let input_bytes = match &inputs.input {
@@ -1429,6 +1479,9 @@ impl<CTX: crate::RskContextTr> PrecompileProvider<CTX> for RskPrecompileProvider
                 }
                 CallInput::Bytes(bytes) => bytes.0.iter().as_slice(),
             };
+            required_gas_on_error =
+                rskip197_required_gas_on_error(&inputs.bytecode_address, input_bytes)
+                    .unwrap_or(0);
             precompile.execute(input_bytes, inputs.gas_limit)
         };
 
@@ -1448,15 +1501,27 @@ impl<CTX: crate::RskContextTr> PrecompileProvider<CTX> for RskPrecompileProvider
             }
             Err(PrecompileError::Fatal(e)) => return Err(e),
             Err(e) => {
-                result.result = if e.is_oog() {
-                    InstructionResult::PrecompileOOG
+                if e.is_oog() {
+                    result.result = InstructionResult::PrecompileOOG;
+                } else if self.rskip197_active(context) {
+                    // RSKIP197 (iris300): a non-OOG precompile failure is
+                    // handled — the call pushes 0 and continues, costing only
+                    // `requiredGas` (the surplus forwarded gas is refunded).
+                    // Modeled as a Revert with empty output: revm refunds the
+                    // surplus (`is_ok_or_revert`) and pushes 0 (`!is_ok`),
+                    // leaving the returnDataBuffer empty — matching rskj's
+                    // `executePrecompiledAndHandleError`
+                    // (returnDataBuffer = null, refundGas(msg.gas - requiredGas)).
+                    let no_underflow = result.gas.record_cost(required_gas_on_error);
+                    debug_assert!(no_underflow, "requiredGas <= gas_limit post-RSKIP197");
+                    result.result = InstructionResult::Revert;
                 } else {
-                    InstructionResult::PrecompileError
-                };
-                if !e.is_oog() && context.journal().depth() == 1 {
-                    context
-                        .local_mut()
-                        .set_precompile_error_context(e.to_string());
+                    result.result = InstructionResult::PrecompileError;
+                    if context.journal().depth() == 1 {
+                        context
+                            .local_mut()
+                            .set_precompile_error_context(e.to_string());
+                    }
                 }
             }
         }
