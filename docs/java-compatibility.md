@@ -1510,12 +1510,46 @@ hash = Objects.hash(btcTransaction, Long(pegoutCreationRskBlockNumber))
 
 `btcTransaction.hashCode()` is bitcoinj `Sha256Hash.hashCode()` of the txid: the
 last four bytes of the **display-order** hash read big-endian
-(`Ints.fromBytes(bytes[28], bytes[29], bytes[30], bytes[31])`). The provider
-rebuilds the set with `new HashSet<>(entries)`, so the table length is
-`tableSizeFor(max((int)(n / 0.75f) + 1, 16))` for `n` entries (the constructor
-pre-sizes to fit, no resize). `Long.hashCode(v) = (int)(v ^ (v >>> 32))`; all of
-it is signed 32-bit `int` arithmetic, but the bucket index is a bitwise AND so
-unsigned `u32` with wrapping arithmetic reproduces the exact bit pattern.
+(`Ints.fromBytes(bytes[28], bytes[29], bytes[30], bytes[31])`).
+`Long.hashCode(v) = (int)(v ^ (v >>> 32))`; all of it is signed 32-bit `int`
+arithmetic, but the bucket index is a bitwise AND so unsigned `u32` with wrapping
+arithmetic reproduces the exact bit pattern.
+
+**Table capacity is the incremental-insertion history, NOT a pre-size from the
+final count.** rskj does NOT build the set with `new HashSet<>(collection)`.
+`BridgeStorageProvider.getPegoutsWaitingForConfirmations` does
+`Set entries = new HashSet<>(deser(legacyCell).getEntries())` (post-RSKIP146 the
+legacy cell is `0xc0`, so this is the empty collection → capacity 16) then
+`entries.addAll(deser(withTxHashCell).getEntries())` and caches `entries`
+directly. `HashSet.addAll` is `AbstractCollection.addAll`, i.e. one `add` per
+element; `deserializePegoutsWaitingForConfirmations` likewise adds one-by-one to
+a `new HashSet<>()`. So the table starts at capacity 16 and doubles whenever
+`size > capacity * 0.75` (`HashMap.putVal`: `if (++size > threshold) resize()`,
+`threshold = (int)(cap * 0.75)`). After `n` insertions the capacity is the
+smallest power of two `>= 16` with `n <= floor(cap * 0.75)`:
+
+| n        | 0–12 | 13–24 | 25–48 | 49–96 |
+|----------|------|-------|-------|-------|
+| capacity | 16   | 32    | 64    | 128   |
+
+This differs from the `new HashSet<>(collection)` pre-size formula
+`tableSizeFor(max((int)(n/0.75)+1, 16))` exactly at the resize boundaries: at
+`n = 12` the pre-size formula gives 32 but the incremental capacity is 16; at
+`n = 24` it gives 64 vs 32. A wrong capacity reshuffles every bucket index and
+forks the selection. (The #3,345,557 case had `n = 13`, where both formulas give
+32, which is why the original pre-size code happened to pass.)
+
+The insertion order into the set is the deserialization order = the stored
+`BTC_TX_COMPARATOR` order, which only matters for the intra-bucket tiebreak.
+**Latent edge (TODO):** in rskj the SAME cached set object survives the in-block
+`add()`s done earlier in the same `updateCollections` (migration/pegout
+creation), so its real insertion order is "pre-block entries (deser order) then
+in-block adds (add order)". rustock reloads the set from storage between the add
+and select steps, re-sorting by `BTC_TX_COMPARATOR`. The final *capacity* is
+identical (it depends only on the total count, not the order), so this only
+diverges if 2+ entries that confirm on the same block land in the *same* bucket
+AND were added in-block in an order differing from `BTC_TX_COMPARATOR` — left
+unfixed, logged.
 
 **Consensus-load-bearing:** which BTC pegout transaction is promoted to be
 signed (and which is left in the confirmation set) is pure Bridge state — gas
@@ -1539,10 +1573,12 @@ and `Entry.hashCode`; `co.rsk.bitcoinj.core.BtcTransaction.hashCode` /
 
 **rustock**: `crates/execution/src/bridge/peg.rs`
 `next_pegout_with_enough_confirmations` / `pegout_entry_hash` (replicate the
-bucket order), called from `process_confirmed_pegouts` (Step 2 of
-`update_collections`). Test:
+bucket order) + `java_hashset_capacity` (incremental-insertion capacity), called
+from `process_confirmed_pegouts` (Step 2 of `update_collections`). Tests:
 `rskj_next_pegout_hashset_iteration_order_groundtruth` (block #3,345,557 ground
-truth).
+truth), `java_hashset_capacity_resize_boundaries` and
+`pegout_selection_at_16_to_32_resize_boundary` (the n=12/13/24/25 capacity
+boundaries).
 
 ---
 

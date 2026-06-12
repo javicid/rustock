@@ -1279,10 +1279,20 @@ pub fn update_collections<CTX: crate::RskContextTr>(
 /// `hash = Objects.hash(btcTx, Long(height))`
 /// (`= 31*(31 + btcTx.hashCode()) + Long.hashCode(height)`), where
 /// `btcTx.hashCode()` is the last 4 bytes of the display-order txid read
-/// big-endian (bitcoinj `Sha256Hash.hashCode`). The provider rebuilds the set
-/// with `new HashSet<>(entries)`, so the table capacity is
-/// `tableSizeFor(max((int)(n / 0.75) + 1, 16))` for `n` entries (no resize, the
-/// constructor pre-sizes to fit). Returns the index into `entries`.
+/// big-endian (bitcoinj `Sha256Hash.hashCode`).
+///
+/// **Table capacity.** rskj does NOT pre-size from the final count. The cached
+/// set is built incrementally (`BridgeStorageProvider.getPegoutsWaitingForConfirmations`:
+/// `new HashSet<>(emptyLegacyCell)` then `entries.addAll(withTxHashCell)`,
+/// `HashSet.addAll` = `AbstractCollection.addAll` = one `add` per element), and
+/// `deserializePegoutsWaitingForConfirmations` likewise adds one-by-one to a
+/// default-16 set. So the table starts at capacity 16 and resizes to the next
+/// power of two whenever `size > capacity*0.75` (Java `HashMap.putVal`:
+/// `if (++size > threshold) resize()`). After `n` insertions the capacity is the
+/// smallest power-of-two `>= 16` with `n <= floor(cap*0.75)`. This differs from
+/// the `new HashSet<>(collection)` pre-size formula at the resize boundaries
+/// (e.g. `n = 12` -> cap 16 here, but pre-size would give 32; `n = 24` -> 32 vs
+/// 64), which would fork the bucket walk. Returns the index into `entries`.
 fn next_pegout_with_enough_confirmations(
     entries: &[PegoutWaitingForConfirmations],
     current_block: u64,
@@ -1292,10 +1302,7 @@ fn next_pegout_with_enough_confirmations(
         return None;
     }
 
-    // new HashSet<>(coll): initialCapacity = max((int)(size/0.75)+1, 16),
-    // table length = tableSizeFor(initialCapacity) (next power of two).
-    let init_cap = std::cmp::max((entries.len() as f32 / 0.75) as u32 + 1, 16);
-    let cap = init_cap.next_power_of_two();
+    let cap = java_hashset_capacity(entries.len());
 
     // Bucket each entry; within a bucket preserve insertion (storage) order.
     let mut buckets: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
@@ -1312,6 +1319,19 @@ fn next_pegout_with_enough_confirmations(
             .checked_sub(entries[i].rsk_block_height)
             .is_some_and(|d| d >= min_confirmations)
     })
+}
+
+/// Java `HashMap` table capacity after inserting `n` elements one-by-one into a
+/// default-constructed `HashSet` (initial capacity 16, load factor 0.75).
+/// The table doubles whenever `size > capacity * 0.75` (`HashMap.putVal`:
+/// `if (++size > threshold) resize()`), so the result is the smallest
+/// power-of-two `>= 16` whose threshold `floor(cap * 0.75)` is `>= n`.
+fn java_hashset_capacity(n: usize) -> u32 {
+    let mut cap = 16u32;
+    while n as u32 > (cap as f64 * 0.75) as u32 {
+        cap <<= 1;
+    }
+    cap
 }
 
 /// rskj `PegoutsWaitingForConfirmations.Entry.hashCode()`:
@@ -2814,6 +2834,61 @@ mod tests {
             "must promote the a7c69a46… tx (HashSet bucket 9) like rskj, not the \
              lexicographically-smaller 0260d432… tx (bucket 20)"
         );
+    }
+
+    /// rskj builds the pegouts-waiting-for-confirmations `HashSet` incrementally
+    /// (`new HashSet<>()` + one-by-one `add`), so the table capacity follows the
+    /// Java `HashMap` resize history (start 16, double when `size > cap*0.75`),
+    /// NOT the `new HashSet<>(collection)` pre-size formula. The two disagree at
+    /// the resize boundaries: a 12-entry set has capacity 16, but the pre-size
+    /// formula would give 32; a 24-entry set has capacity 32, not 64. Getting the
+    /// capacity wrong reshuffles the bucket walk and forks the pegout selection.
+    #[test]
+    fn java_hashset_capacity_resize_boundaries() {
+        // <=12 fit at the default capacity 16 (threshold = 12, resize is strict >).
+        assert_eq!(java_hashset_capacity(0), 16);
+        assert_eq!(java_hashset_capacity(1), 16);
+        assert_eq!(java_hashset_capacity(12), 16);
+        // 13th insertion crosses 16's threshold → 32 (threshold 24).
+        assert_eq!(java_hashset_capacity(13), 32);
+        assert_eq!(java_hashset_capacity(24), 32);
+        // 25th crosses 32's threshold → 64 (threshold 48).
+        assert_eq!(java_hashset_capacity(25), 64);
+        assert_eq!(java_hashset_capacity(48), 64);
+        assert_eq!(java_hashset_capacity(49), 128);
+    }
+
+    /// Resize-boundary selection: with the two real h=3,341,556 entries plus
+    /// fillers totalling exactly 13 entries the capacity is 32 (a7c69a46→bucket 9,
+    /// 0260d432→bucket 20), so the a7c69a46 tx is selected — the #3,345,557
+    /// groundtruth. The point here is the boundary count: 13 entries is the first
+    /// size that resizes 16→32, and the OLD pre-size formula also yielded 32, so
+    /// both gave the right answer at 13. This guards that the incremental model
+    /// keeps capacity 32 at 13 (and would have given 16 at 12).
+    #[test]
+    fn pegout_selection_at_16_to_32_resize_boundary() {
+        let selected_btc = hex::decode(
+            "010000000122fab61f4bdfe74f41dfecbe2a52d0cb5aa42c898687c6142d3f8497469ac6a701000000fdc80100000000000000004dbd0157210231a395e332dde8688800a0025cccc5771ea1aa874a633b8ab6e5c89d300c7c3621026b472f7d59d201ff1f540f111b6eb329e071c30a9d23e3d2bcd128fe73dc254c21027319afb15481dbeb3c426bcc37f9a30e7f51ceff586936d85548d9395bcc2344210294c817150f78607566e961b3c71df53a22022a80acbb982f83c0c8baac040adc2103250c11be0561b1d7ae168b1f59e39cbc1fd1ba3cf4d2140c1a365b2723a2bf9321033ada6ef3b1d93a1978b595c7a9e2aa613860b26d4f5a7abb88576aa42b3432ad210357f7ed4c118e581f49cd3b4d9dd1edb4295f4def49d6dcf2faaaaac87a1a0a42210372cd46831f3b6afd4c044d160b7667e8ebf659d6cb51a825a3104df6ee0638c62103ae72827d25030818c4947a800187b1fbcc33ae751e248ae60094cc989fb880f62103b3a7aa25702000c5c1faa300600e8e2bd89cde2be7fb1ec898a39c50d9de90d12103b53899c390573471ba30e5054f78376c5f797fda26dde7a760789f02908cbad22103e05bf6002b62651378b1954820539c36ca405cbb778c225395dd9ebff67802992103ecd8af1e93c57a1b8c7f917bd9980af798adeb0205e9687865673353eb041e8d5daeffffffff029a686c09000000001976a914fb53759d716de10362f5b57d28151a6481fd30e188ace354f1f00c00000017a914596cff92a275960df9cb2ab9df0ff69faa2b1d8a8700000000",
+        )
+        .unwrap();
+        let kept_btc = hex::decode(
+            "01000000010260d43256d4072e46f87acec7e3225752beff0fcb60288baf5088f5d5e9949401000000fdc80100000000000000004dbd0157210231a395e332dde8688800a0025cccc5771ea1aa874a633b8ab6e5c89d300c7c3621026b472f7d59d201ff1f540f111b6eb329e071c30a9d23e3d2bcd128fe73dc254c21027319afb15481dbeb3c426bcc37f9a30e7f51ceff586936d85548d9395bcc2344210294c817150f78607566e961b3c71df53a22022a80acbb982f83c0c8baac040adc2103250c11be0561b1d7ae168b1f59e39cbc1fd1ba3cf4d2140c1a365b2723a2bf9321033ada6ef3b1d93a1978b595c7a9e2aa613860b26d4f5a7abb88576aa42b3432ad210357f7ed4c118e581f49cd3b4d9dd1edb4295f4def49d6dcf2faaaaac87a1a0a42210372cd46831f3b6afd4c044d160b7667e8ebf659d6cb51a825a3104df6ee0638c62103ae72827d25030818c4947a800187b1fbcc33ae751e248ae60094cc989fb880f62103b3a7aa25702000c5c1faa300600e8e2bd89cde2be7fb1ec898a39c50d9de90d12103b53899c390573471ba30e5054f78376c5f797fda26dde7a760789f02908cbad22103e05bf6002b62651378b1954820539c36ca405cbb778c225395dd9ebff67802992103ecd8af1e93c57a1b8c7f917bd9980af798adeb0205e9687865673353eb041e8d5daeffffffff02a69bbc06000000001976a9140b9c738761bb47eba3802df6ac169717aa85b6f088ac104bd32d0100000017a914596cff92a275960df9cb2ab9df0ff69faa2b1d8a8700000000",
+        )
+        .unwrap();
+        let mk = |btc: &[u8], h: u64| PegoutWaitingForConfirmations {
+            btc_tx_raw: btc.to_vec(),
+            rsk_block_height: h,
+            rsk_tx_hash: Some([0u8; 32]),
+        };
+        let mut entries = vec![mk(&kept_btc, 3_341_556), mk(&selected_btc, 3_341_556)];
+        for i in 0..11u8 {
+            entries.push(mk(&[1, 0, 0, 0, i], 3_345_000));
+        }
+        assert_eq!(entries.len(), 13);
+        assert_eq!(java_hashset_capacity(entries.len()), 32);
+        let pos = next_pegout_with_enough_confirmations(&entries, 3_345_557, 4000)
+            .expect("one confirmed entry");
+        assert_eq!(entries[pos].btc_tx_raw, selected_btc);
     }
 
     /// Empty rskTxsWaitingFS: empty data → empty map (matches rskj behavior).
