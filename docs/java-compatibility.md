@@ -2532,6 +2532,66 @@ unchanged, preserving #4,600,948 tx[3]'s invisible-exception behavior. Test:
 `BridgeSupportTest.when_RegisterBtcCoinbaseTransaction_HashNotInPmt_noSent` /
 `..._not_equal_merkle_root_noSent`, and matching #4,603,038's state root.
 
+## §52 commitFederation: ERP federation redeem script (RSKIP201/284/293/353)
+
+**rskj behavior.** Once RSKIP201 (iris300) is active, `commitFederation`
+builds the new federation as an **ERP federation**, not a standard multisig
+(`co/rsk/peg/federation/PendingFederation.java:117-133` →
+`FederationFactory.java`). The *type* is selected by activations:
+- `!RSKIP201` → standard multisig (`FederationFormatVersion` 1000).
+- `RSKIP201 && !RSKIP353` → **non-standard ERP** (2000); the builder is chosen
+  by `NonStandardErpRedeemScriptBuilderFactory`: with RSKIP284 & RSKIP293 both
+  active (mainnet hop400) it is `NonStandardErpRedeemScriptBuilder`.
+- `RSKIP353 && !RSKIP305` → **P2SH-ERP** (3000), `P2shErpRedeemScriptBuilder`.
+- `RSKIP305` → P2SH-P2WSH-ERP (4000), same redeem template as P2SH-ERP.
+
+RSKIP→fork (rskj `reference.conf`): rskip201=iris300, rskip284/293=hop400,
+**rskip353=hop401** (mainnet 4,976,300), rskip305=reed800. So at the first real
+mainnet federation change, **#4,652,781** (hop400-era, hop401 NOT yet active),
+the committed federation is a **non-standard ERP federation**, address
+`3DsneJha6CY6X9gU2M9uEc4nSdbYECB4Gh`.
+
+**Redeem-script template** (`NonStandardErpRedeemScriptBuilder.java:46-61`,
+`P2shErpRedeemScriptBuilder.java:49-66`):
+`OP_NOTIF <default-multisig> OP_ELSE <push csv> OP_CHECKSEQUENCEVERIFY OP_DROP
+<emergency-multisig> OP_ENDIF`. Non-standard strips the trailing
+`OP_CHECKMULTISIG` (`ErpRedeemScriptBuilderUtils.removeOpCheckMultisig`, last
+chunk) from BOTH inner scripts and appends ONE `OP_CHECKMULTISIG` after
+`OP_ENDIF`; P2SH-ERP keeps each inner `OP_CHECKMULTISIG` and emits nothing
+after `OP_ENDIF`. Default threshold = `members/2+1`; emergency threshold =
+`erpKeys/2+1` (`ErpFederation.getNumberOfEmergencySignaturesRequired`). Inner
+multisig keys are sorted unsigned-lexicographically by compressed pubkey
+(`ScriptBuilder.createRedeemScript` → `BtcECKey.PUBKEY_COMPARATOR`).
+
+**Consensus-critical CSV-delay encoding.** The CSV value
+(`erpFedActivationDelay`, mainnet 52,560) is pushed via
+`Utils.signedLongToByteArrayLE` = `reverseBytes(BigInteger.valueOf(v)
+.toByteArray())`: minimal big-endian two's complement (Java keeps a leading
+`0x00` sign byte when the top bit is set), reversed to LE. For 52,560 this is
+`50 cd 00` (3 bytes), NOT the BIP68-minimal `50 cd`. A from-scratch client doing
+minimal CSV encoding forks.
+
+**Storage / event.** The federation format-version cells
+(`newFederationFormatVersion`/`oldFederationFormatVersion`) store the TYPE
+integer (1000/2000/3000); the commit_federation event logs
+`newFederation.getAddress()` (the ERP P2SH base58) and
+`lastRetiredFederationP2SHScript` is the retiring fed's `getP2SHScript()` (its
+own type's redeem; RSKIP377 — which would switch to `getDefaultP2SHScript()` —
+is fingerroot500, inactive here).
+
+**rustock.** `crates/execution/src/bridge/peg.rs`
+`build_committed_federation_redeem_script` + `build_erp_redeem_script` +
+`signed_long_to_byte_array_le`; type selection via new
+`hardfork.rs::has_rskip353`/`has_rskip305` (explicit per-chain hop401/reed800
+heights, since rustock collapses hop401 into Hop400). Wired into
+`governance.rs::commit_pending_federation` for the new and (creation-block-keyed)
+old federation redeem scripts and the format-version cells
+(`federation_format_version`). Ground-truth tests:
+`nonstandard_erp_federation_address_mainnet_4652781` (the on-chain address),
+`p2sh_erp_federation_address_rskj_fixture` (ported from rskj
+`P2shErpFederationTest`), `erp_csv_delay_encoding_groundtruth`. Verified by both
+the state root (`0xf133febc…`) and receipts root (`0x883ea305…`) of #4,652,781.
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`

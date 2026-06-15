@@ -2572,9 +2572,119 @@ pub fn build_federation_redeem_script(keys: &[[u8; 33]], threshold: usize) -> Ve
     script
 }
 
+/// rskj `Utils.signedLongToByteArrayLE`: `reverseBytes(BigInteger.valueOf(v)
+/// .toByteArray())` — the minimal big-endian two's-complement byte array
+/// (Java `BigInteger.toByteArray`, which keeps a leading 0x00 sign byte when
+/// the top bit is set) reversed to little-endian. NOT BIP68-minimal: e.g.
+/// 52560 -> `50 cd 00` (3 bytes), because 0xCD has its high bit set. This is
+/// the CSV-delay push consensus byte sequence; a from-scratch minimal encoding
+/// would emit `50 cd` and fork. (co/rsk/bitcoinj/core/Utils.java)
+fn signed_long_to_byte_array_le(value: i64) -> Vec<u8> {
+    // BigInteger.valueOf(value).toByteArray(): minimal big-endian two's complement.
+    let mut be = value.to_be_bytes().to_vec();
+    // Strip redundant sign-extension bytes (keep one byte that carries the sign).
+    while be.len() > 1 {
+        let b0 = be[0];
+        let b1 = be[1];
+        // Drop a leading 0x00 only if the next byte's top bit is also 0 (still
+        // positive), or a leading 0xFF only if the next byte's top bit is 1.
+        if (b0 == 0x00 && b1 & 0x80 == 0) || (b0 == 0xff && b1 & 0x80 != 0) {
+            be.remove(0);
+        } else {
+            break;
+        }
+    }
+    be.reverse();
+    be
+}
+
+/// rskj `NonStandardErpRedeemScriptBuilder` (post-RSKIP284/293) and
+/// `P2shErpRedeemScriptBuilder` (post-RSKIP353) emergency-multisig template.
+///
+/// Both wrap a default N-of-M multisig and an emergency K-of-J multisig in a
+/// CSV-gated `OP_NOTIF ... OP_ELSE <csv> OP_CHECKSEQUENCEVERIFY OP_DROP ...
+/// OP_ENDIF`. The non-standard form strips the trailing `OP_CHECKMULTISIG`
+/// from each inner script and appends a single `OP_CHECKMULTISIG` after
+/// `OP_ENDIF`; the P2SH-ERP form keeps each inner script intact (incl. its
+/// `OP_CHECKMULTISIG`) and emits nothing after `OP_ENDIF`. Inner scripts are
+/// standard multisig with keys sorted lexicographically (see
+/// [`build_federation_redeem_script`]). The CSV delay is pushed via
+/// [`signed_long_to_byte_array_le`].
+fn build_erp_redeem_script(
+    default_keys: &[[u8; 33]],
+    default_threshold: usize,
+    erp_keys: &[[u8; 33]],
+    erp_threshold: usize,
+    csv_delay: i64,
+    p2sh: bool,
+) -> Vec<u8> {
+    let default_redeem = build_federation_redeem_script(default_keys, default_threshold);
+    let erp_redeem = build_federation_redeem_script(erp_keys, erp_threshold);
+    let csv = signed_long_to_byte_array_le(csv_delay);
+
+    // `removeOpCheckMultisig`: drop the trailing OP_CHECKMULTISIG (last byte).
+    let default_inner: &[u8] = if p2sh { &default_redeem } else { &default_redeem[..default_redeem.len() - 1] };
+    let erp_inner: &[u8] = if p2sh { &erp_redeem } else { &erp_redeem[..erp_redeem.len() - 1] };
+
+    let mut script = Vec::with_capacity(default_inner.len() + erp_inner.len() + csv.len() + 8);
+    script.push(0x64); // OP_NOTIF
+    script.extend_from_slice(default_inner);
+    script.push(0x67); // OP_ELSE
+    script.push(csv.len() as u8); // push CSV bytes
+    script.extend_from_slice(&csv);
+    script.push(0xb2); // OP_CHECKSEQUENCEVERIFY
+    script.push(0x75); // OP_DROP
+    script.extend_from_slice(erp_inner);
+    script.push(0x68); // OP_ENDIF
+    if !p2sh {
+        script.push(0xae); // OP_CHECKMULTISIG
+    }
+    script
+}
+
+/// rskj `PendingFederation.buildFederation` redeem-script selection: a
+/// committed federation is a standard multisig (pre-RSKIP201), a non-standard
+/// ERP federation (RSKIP201 active, RSKIP353 not), a P2SH-ERP federation
+/// (RSKIP353 active, RSKIP305 not), or a P2SH-P2WSH-ERP federation (RSKIP305).
+/// The emergency keys/threshold and CSV delay come from the network's
+/// federation constants. Returns the redeem script whose hash160 is the
+/// federation's P2SH address. (P2SH-P2WSH-ERP shares the P2SH-ERP redeem
+/// template — see FederationFactory.buildP2shP2wshErpFederation.)
+pub fn build_committed_federation_redeem_script(
+    keys: &[[u8; 33]],
+    config: &BridgeConstants,
+    hardfork_cfg: &RskHardforkConfig,
+    block_number: u64,
+) -> Vec<u8> {
+    let threshold = keys.len() / 2 + 1;
+    if !hardfork_cfg.has_rskip201(block_number) {
+        return build_federation_redeem_script(keys, threshold);
+    }
+    let erp_keys: Vec<[u8; 33]> = config
+        .erp_fed_pubkeys
+        .iter()
+        .map(|hex| {
+            let bytes = alloy_primitives::hex::decode(hex).expect("valid erp pubkey hex");
+            bytes.try_into().expect("33-byte compressed erp pubkey")
+        })
+        .collect();
+    let erp_threshold = erp_keys.len() / 2 + 1;
+    let csv = config.erp_fed_activation_delay;
+    let p2sh = hardfork_cfg.has_rskip353(block_number);
+    build_erp_redeem_script(keys, threshold, &erp_keys, erp_threshold, csv, p2sh)
+}
+
 /// Public wrapper for governance (commit_federation event addresses).
 pub fn redeem_script_hash160_pub(redeem_script: &[u8]) -> [u8; 20] {
     redeem_script_hash160(redeem_script)
+}
+
+/// P2SH output script program bytes for a script hash160
+/// (`OP_HASH160 <hash160> OP_EQUAL`), matching bitcoinj
+/// `ScriptBuilder.createP2SHOutputScript(...).getProgram()`. Used by the
+/// federation handover to persist `lastRetiredFederationP2SHScript`.
+pub fn p2sh_output_script_program(hash160: &[u8; 20]) -> Vec<u8> {
+    p2sh_output_script(hash160).into_bytes()
 }
 
 /// Compute RIPEMD160(SHA256(redeem_script)) = P2SH address hash160.
@@ -3203,6 +3313,88 @@ mod tests {
         let script = build_federation_redeem_script(&keys, 1);
         let hash = redeem_script_hash160(&script);
         assert_ne!(hash, [0u8; 20], "hash160 should not be zero");
+    }
+
+    fn key(hex: &str) -> [u8; 33] {
+        alloy_primitives::hex::decode(hex).unwrap().try_into().unwrap()
+    }
+
+    fn p2sh_base58_mainnet(redeem: &[u8]) -> String {
+        let mut payload = [0u8; 21];
+        payload[0] = 5; // mainnet P2SH version
+        payload[1..].copy_from_slice(&redeem_script_hash160(redeem));
+        bitcoin::base58::encode_check(&payload)
+    }
+
+    /// rskj `Utils.signedLongToByteArrayLE`: 52560 -> `50 cd 00` (sign byte
+    /// preserved, NOT BIP68-minimal). Consensus-critical CSV-delay encoding.
+    #[test]
+    fn erp_csv_delay_encoding_groundtruth() {
+        assert_eq!(signed_long_to_byte_array_le(52560), vec![0x50, 0xcd, 0x00]);
+        assert_eq!(signed_long_to_byte_array_le(500), vec![0xf4, 0x01]);
+        assert_eq!(signed_long_to_byte_array_le(1), vec![0x01]);
+    }
+
+    /// Ground truth: the first real RSK mainnet federation change committed at
+    /// block #4,652,781 produced a NON-STANDARD ERP federation (RSKIP201 active,
+    /// RSKIP353 not). Its base58 P2SH address appears in the block's
+    /// commit_federation event (header receipts root
+    /// 0x883ea305...). New federation 5-of-9 default keys + the 4 mainnet
+    /// emergency keys, CSV 52560.
+    #[test]
+    fn nonstandard_erp_federation_address_mainnet_4652781() {
+        let new_keys = [
+            "020ace50bab1230f8002a0bfe619482af74b338cc9e4c956add228df47e6adae1c",
+            "0231a395e332dde8688800a0025cccc5771ea1aa874a633b8ab6e5c89d300c7c36",
+            "025093f439fb8006fd29ab56605ffec9cdc840d16d2361004e1337a2f86d8bd2db",
+            "026b472f7d59d201ff1f540f111b6eb329e071c30a9d23e3d2bcd128fe73dc254c",
+            "03250c11be0561b1d7ae168b1f59e39cbc1fd1ba3cf4d2140c1a365b2723a2bf93",
+            "0357f7ed4c118e581f49cd3b4d9dd1edb4295f4def49d6dcf2faaaaac87a1a0a42",
+            "03ae72827d25030818c4947a800187b1fbcc33ae751e248ae60094cc989fb880f6",
+            "03e05bf6002b62651378b1954820539c36ca405cbb778c225395dd9ebff6780299",
+            "03ecd8af1e93c57a1b8c7f917bd9980af798adeb0205e9687865673353eb041e8d",
+        ]
+        .map(key);
+        let erp_keys = BridgeConstants::mainnet()
+            .erp_fed_pubkeys
+            .iter()
+            .map(|h| key(h))
+            .collect::<Vec<_>>();
+        // NonStandard ERP (p2sh = false): default 5-of-9, emergency 3-of-4.
+        let redeem = build_erp_redeem_script(&new_keys, 5, &erp_keys, 3, 52560, false);
+        assert_eq!(p2sh_base58_mainnet(&redeem), "3DsneJha6CY6X9gU2M9uEc4nSdbYECB4Gh");
+    }
+
+    /// Ground truth ported from rskj P2shErpFederationTest
+    /// `createdFederationInfo_withRealValues_equalsExistingFederationInfo_mainnet`:
+    /// P2SH-ERP federation (RSKIP353 active) for a real mainnet fed →
+    /// program `a9142c1bab6ea51fdaf85c8366bd2b1502eaa69b6ae687`, address
+    /// `35iEoWHfDfEXRQ5ZWM5F6eMsY2Uxrc64YK`.
+    #[test]
+    fn p2sh_erp_federation_address_rskj_fixture() {
+        let default_keys = [
+            "020ace50bab1230f8002a0bfe619482af74b338cc9e4c956add228df47e6adae1c",
+            "0275d473555de2733c47125f9702b0f870df1d817379f5587f09b6c40ed2c6c949",
+            "025093f439fb8006fd29ab56605ffec9cdc840d16d2361004e1337a2f86d8bd2db",
+            "026b472f7d59d201ff1f540f111b6eb329e071c30a9d23e3d2bcd128fe73dc254c",
+            "03250c11be0561b1d7ae168b1f59e39cbc1fd1ba3cf4d2140c1a365b2723a2bf93",
+            "0357f7ed4c118e581f49cd3b4d9dd1edb4295f4def49d6dcf2faaaaac87a1a0a42",
+            "03ae72827d25030818c4947a800187b1fbcc33ae751e248ae60094cc989fb880f6",
+            "03e05bf6002b62651378b1954820539c36ca405cbb778c225395dd9ebff6780299",
+            "03b58a5da144f5abab2e03e414ad044b732300de52fa25c672a7f7b35888771906",
+        ]
+        .map(key);
+        let erp_keys = BridgeConstants::mainnet()
+            .erp_fed_pubkeys
+            .iter()
+            .map(|h| key(h))
+            .collect::<Vec<_>>();
+        let redeem = build_erp_redeem_script(&default_keys, 5, &erp_keys, 3, 52560, true);
+        assert_eq!(
+            alloy_primitives::hex::encode(p2sh_output_script(&redeem_script_hash160(&redeem)).as_bytes()),
+            "a9142c1bab6ea51fdaf85c8366bd2b1502eaa69b6ae687"
+        );
+        assert_eq!(p2sh_base58_mainnet(&redeem), "35iEoWHfDfEXRQ5ZWM5F6eMsY2Uxrc64YK");
     }
 
     // -----------------------------------------------------------------------

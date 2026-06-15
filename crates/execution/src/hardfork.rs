@@ -295,6 +295,31 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Hop400
     }
 
+    /// RSKIP353: committed federations become P2SH-ERP federations instead of
+    /// non-standard ERP (mainnet hop401 = 4,976,300; testnet 3,362,200;
+    /// regtest 0). rustock collapses hop401 into Hop400 in the upgrade ladder,
+    /// so this consensus boundary needs an explicit per-chain height.
+    pub fn has_rskip353(&self, block_number: u64) -> bool {
+        let height = match self.chain_id {
+            RSK_MAINNET_CHAIN_ID => 4_976_300,
+            RSK_TESTNET_CHAIN_ID => 3_362_200,
+            _ => 0,
+        };
+        block_number >= height
+    }
+
+    /// RSKIP305: committed federations become P2SH-P2WSH-ERP federations
+    /// instead of P2SH-ERP (mainnet reed800 = 8,052,200; testnet 6,835,700;
+    /// regtest 0).
+    pub fn has_rskip305(&self, block_number: u64) -> bool {
+        let height = match self.chain_id {
+            RSK_MAINNET_CHAIN_ID => 8_052_200,
+            RSK_TESTNET_CHAIN_ID => 6_835_700,
+            _ => 0,
+        };
+        block_number >= height
+    }
+
     /// RSKIP375: pegouts-waiting-for-signatures keyed by the pegout creation
     /// RSK tx hash again (Fingerroot500).
     pub fn has_rskip375(&self, block_number: u64) -> bool {
@@ -315,6 +340,14 @@ impl RskHardforkConfig {
 
     /// RSKIP170: pegin_btc event replaces lock_btc (Iris300).
     pub fn has_rskip170(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Iris300
+    }
+
+    /// RSKIP186: on a federation handover, persist
+    /// `nextFederationCreationBlockHeight` and `lastRetiredFederationP2SHScript`
+    /// (Iris300). Enables the funds-migration / active-federation-block-height
+    /// bookkeeping read on later blocks.
+    pub fn has_rskip186(&self, block_number: u64) -> bool {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Iris300
     }
 
