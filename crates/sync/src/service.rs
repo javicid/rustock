@@ -11,12 +11,14 @@ use rustock_networking::protocol::{
     BlockHashRequest, BlockIdentifier, BodyRequest, P2pMessage, RskMessage, RskSubMessage,
     SkeletonRequest,
 };
+use rustock_storage::BlockStore;
 use rustock_trie::{TrieNode, TrieStore};
 use alloy_primitives::{B256, B512};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tracing::{info, debug, trace, warn, error};
 
 /// Timeout for pending requests before resetting to Idle.
@@ -72,6 +74,35 @@ pub trait ExternalBlockSource: Send + Sync {
     fn body_by_hash(&self, hash: B256) -> Option<(Vec<Transaction>, Vec<Header>)>;
 }
 
+/// Result of executing one downloaded batch on a blocking thread.
+pub(crate) struct ExecOutcome {
+    /// `false` when a block failed to execute (or a parent/body was missing);
+    /// the sync must not advance past it.
+    pub(crate) all_ok: bool,
+    /// State root after the last successfully executed block in the batch.
+    /// Becomes the starting root for the next batch's execution.
+    pub(crate) new_state_root: TrieNode,
+    /// Number of `blocks_since_flush` accumulated but not yet flushed when the
+    /// batch ended (carried back so flush cadence survives across batches).
+    pub(crate) blocks_since_flush: u64,
+}
+
+/// A batch currently executing off the async event loop.
+struct ExecutionJob {
+    handle: JoinHandle<ExecOutcome>,
+    /// `peer_best` of the round that produced this batch, used to decide
+    /// whether to keep syncing or enter follow mode after it completes.
+    peer_best: u64,
+}
+
+/// The execution step run on a blocking thread for one downloaded batch.
+/// Captures the (cloneable, thread-safe) handles execution needs; production
+/// wires this to [`process_downloaded_blocks`]. Boxed so tests can substitute
+/// a controllable stand-in and exercise the scheduling logic in isolation.
+pub(crate) type ExecFn = Arc<
+    dyn Fn(TrieNode, u64, Vec<(B256, Header)>) -> ExecOutcome + Send + Sync + 'static,
+>;
+
 /// Skeleton-based forward sync with pipelining, multi-peer downloads,
 /// and overlapping skeleton pre-fetch.
 pub struct SyncService {
@@ -85,9 +116,21 @@ pub struct SyncService {
     /// pre-fetches were starving the retry path for minutes).
     last_body_progress: Instant,
     progress: SyncProgress,
-    block_processor: Option<BlockProcessor>,
+    block_processor: Option<Arc<BlockProcessor>>,
     trie_store: Option<Arc<dyn TrieStore>>,
     current_state_root: Option<TrieNode>,
+    /// One-batch-ahead execution pipeline: the batch currently executing on a
+    /// blocking thread, if any. While set, downloads may run for the next
+    /// batch but no further batch may begin executing — enforcing a strict
+    /// "one executing, at most one downloading" depth.
+    executing: Option<ExecutionJob>,
+    /// A fully-downloaded batch parked because execution of the previous batch
+    /// is still in flight. Holds `(pending_headers, peer_best)`. Execution
+    /// starts (and N+2 download resumes) only once `executing` completes.
+    pending_exec: Option<(Vec<(B256, Header)>, u64)>,
+    /// Closure run on a blocking thread to execute a batch. Set when a block
+    /// processor is attached; tests may override it to control timing/outcome.
+    exec_fn: Option<ExecFn>,
     last_body_height: u64,
     pending_follow_bodies: HashMap<u64, (B256, Header)>,
     tx_pool: Option<Arc<crate::TransactionPool>>,
@@ -119,6 +162,9 @@ impl SyncService {
             block_processor: None,
             trie_store: None,
             current_state_root: None,
+            executing: None,
+            pending_exec: None,
+            exec_fn: None,
             last_body_height: 0,
             pending_follow_bodies: HashMap::new(),
             tx_pool: None,
@@ -161,10 +207,59 @@ impl SyncService {
         trie_store: Arc<dyn TrieStore>,
         initial_state_root: TrieNode,
     ) -> Self {
-        self.block_processor = Some(processor);
-        self.trie_store = Some(trie_store);
+        let processor = Arc::new(processor);
+        self.block_processor = Some(processor.clone());
+        self.trie_store = Some(trie_store.clone());
         self.current_state_root = Some(initial_state_root);
+
+        // Wire the execution step to the real block processor. Cloned handles
+        // (Arc<BlockProcessor>, Arc<dyn TrieStore>, Arc<BlockStore>, Arc<pool>)
+        // are all Send + Sync, so the closure runs safely on a blocking thread.
+        let store = self.manager.store.clone();
+        let tx_pool = self.tx_pool.clone();
+        self.exec_fn = Some(Arc::new(move |state_root, blocks_since_flush, pending| {
+            process_downloaded_blocks(
+                &processor,
+                trie_store.clone(),
+                state_root,
+                &store,
+                tx_pool.as_deref(),
+                blocks_since_flush,
+                &pending,
+            )
+        }));
         self
+    }
+
+    /// Test seam: install a controllable execution step and a starting state
+    /// root, standing in for a real block processor. Lets scheduling tests
+    /// drive batch execution timing/outcome without a full EVM/trie setup.
+    #[cfg(test)]
+    pub(crate) fn set_test_exec(&mut self, exec_fn: ExecFn) {
+        self.exec_fn = Some(exec_fn);
+        if self.current_state_root.is_none() {
+            self.current_state_root = Some(TrieNode::empty());
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_executing_for_test(&self) -> bool {
+        self.executing.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_parked_batch_for_test(&self) -> bool {
+        self.pending_exec.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_body_height_for_test(&self) -> u64 {
+        self.last_body_height
+    }
+
+    #[cfg(test)]
+    pub(crate) fn peer_store_for_test(&self) -> Arc<rustock_networking::peers::PeerStore> {
+        self.peer_store.clone()
     }
 
     pub async fn start(mut self) {
@@ -202,9 +297,18 @@ impl SyncService {
     }
 
     pub(crate) async fn on_tick(&mut self) {
+        // Reap a finished background execution before driving the state machine
+        // so a parked next batch can start executing and downloads can resume.
+        self.poll_execution().await;
+
         match &self.state {
             SyncState::Idle => {
-                self.try_start_sync().await;
+                // Don't kick off a fresh sync round while a batch is executing
+                // (or a downloaded batch is parked waiting to execute): that
+                // would let a second batch begin downloading ahead of the cap.
+                if self.executing.is_none() && self.pending_exec.is_none() {
+                    self.try_start_sync().await;
+                }
             }
             SyncState::Following => {
                 self.check_follow_gap().await;
@@ -822,6 +926,13 @@ impl SyncService {
         }
 
         if metadata.best_number > our_height + LONG_SYNC_LIMIT {
+            // Don't open a fresh round while a batch is parked waiting to
+            // execute (that would put a batch beyond the one-ahead cap in
+            // flight). A batch merely executing is fine — that's the point of
+            // pipelining, and finish_batch parks rather than over-fetches.
+            if self.pending_exec.is_some() {
+                return;
+            }
             info!(
                 target: "rustock::sync",
                 "Fell behind by {} blocks, switching to skeleton sync",
@@ -904,35 +1015,127 @@ impl SyncService {
         self.send_body_requests().await;
     }
 
-    /// Execute a fully-downloaded batch and advance (or halt) the sync.
-    async fn finish_batch(&mut self, pending: &[(B256, Header)], peer_best: u64) {
-        if self.process_downloaded_blocks(pending).await {
-            self.last_body_height = pending
-                .last()
-                .map(|(_, h)| h.number)
-                .unwrap_or(self.last_body_height);
+    /// A batch (N) finished downloading. Advance the *download* cursor and,
+    /// respecting the one-batch-ahead cap, either kick off N's execution on a
+    /// blocking thread (freeing the event loop to download N+1) or — if a
+    /// previous batch is still executing — park this batch until it completes.
+    pub(crate) async fn finish_batch(&mut self, pending: &[(B256, Header)], peer_best: u64) {
+        // The download succeeded: advance the download cursor so the next
+        // skeleton round queues the blocks that follow this batch. Execution
+        // (the exec_head cursor) advances independently when the spawned job
+        // completes.
+        self.last_body_height = pending
+            .last()
+            .map(|(_, h)| h.number)
+            .unwrap_or(self.last_body_height);
+
+        // No execution configured (header/body-only sync): keep the original
+        // straight-through behaviour.
+        if self.exec_fn.is_none() {
             self.continue_after_bodies(peer_best).await;
-        } else {
-            // A block failed to execute: do not advance past it. Reset the
-            // body cursor to the executed head so the retry re-downloads
-            // and re-executes from there — a stale cursor would skip the
-            // failed range and execute later blocks on the wrong parent state.
-            let exec_number = self
-                .manager
-                .store
-                .exec_head()
-                .ok()
-                .flatten()
-                .and_then(|(hash, _)| self.manager.store.header(hash).ok().flatten())
-                .map(|h| h.number)
-                .unwrap_or(0);
-            self.last_body_height = exec_number;
-            error!(
-                target: "rustock::sync",
-                "Sync halted: block execution failed; will retry from executed head #{exec_number}"
-            );
-            self.state = SyncState::Idle;
+            return;
         }
+
+        if self.executing.is_some() {
+            // A previous batch is still executing. Cap depth at one: park this
+            // batch and stop downloading (no N+2). It will be executed — and
+            // downloads resumed — when the running job is reaped in on_tick.
+            // The "at most one parked batch" invariant holds because we never
+            // download a further batch while pending_exec is set.
+            debug!(
+                target: "rustock::sync",
+                "Batch downloaded (up to #{}) while previous batch still executing; parking",
+                self.last_body_height
+            );
+            self.pending_exec = Some((pending.to_vec(), peer_best));
+            self.state = SyncState::Idle;
+        } else {
+            // Nothing executing: start this batch on a blocking thread and
+            // immediately continue downloading the next batch concurrently.
+            self.spawn_execution(pending.to_vec(), peer_best);
+            self.continue_after_bodies(peer_best).await;
+        }
+    }
+
+    /// Move execution of `pending` off the async event loop onto a blocking
+    /// thread and track it as `self.executing`. Execution owns the trie state;
+    /// concurrent downloading only writes headers/bodies (an independent key
+    /// space) and touches network state, so the two cannot race.
+    fn spawn_execution(&mut self, pending: Vec<(B256, Header)>, peer_best: u64) {
+        let (Some(exec_fn), Some(state_root)) =
+            (self.exec_fn.clone(), self.current_state_root.clone())
+        else {
+            // No processor configured — should not reach here (finish_batch
+            // guards on it), but stay safe and just advance.
+            return;
+        };
+        let blocks_since_flush = self.blocks_since_flush;
+        let handle = tokio::task::spawn_blocking(move || {
+            exec_fn(state_root, blocks_since_flush, pending)
+        });
+        self.executing = Some(ExecutionJob { handle, peer_best });
+    }
+
+    /// If a background execution job has finished, reap it and apply the
+    /// outcome (advance the execution cursor or halt). On success, start any
+    /// parked next batch and resume downloading; on failure, halt the sync.
+    async fn poll_execution(&mut self) {
+        let Some(job) = &mut self.executing else { return };
+        if !job.handle.is_finished() {
+            return;
+        }
+        let job = self.executing.take().unwrap();
+        let outcome = match job.handle.await {
+            Ok(o) => o,
+            Err(e) => {
+                error!(target: "rustock::sync", "Block execution task panicked: {e}");
+                self.halt_after_exec_failure();
+                return;
+            }
+        };
+        self.blocks_since_flush = outcome.blocks_since_flush;
+        self.current_state_root = Some(outcome.new_state_root);
+
+        if !outcome.all_ok {
+            self.halt_after_exec_failure();
+            return;
+        }
+
+        // The batch executed cleanly. If a next batch was parked, execute it
+        // now (and only now may downloading resume past the cap). Otherwise
+        // continue the normal download flow if we weren't already mid-round.
+        if let Some((pending, peer_best)) = self.pending_exec.take() {
+            self.spawn_execution(pending, job.peer_best);
+            // Resume downloading the batch after the one we just started.
+            if matches!(self.state, SyncState::Idle) {
+                self.continue_after_bodies(peer_best).await;
+            }
+        }
+    }
+
+    /// A block failed to execute (or its body/parent was missing). Do not
+    /// advance past it: reset the download cursor to the executed head so the
+    /// retry re-downloads and re-executes from there, drop any parked batch
+    /// (it must not execute on the wrong parent state — its already-stored
+    /// bodies are kept and reused), and go Idle. Mirrors rskj treating such a
+    /// block as invalid and stopping there.
+    fn halt_after_exec_failure(&mut self) {
+        let exec_number = self
+            .manager
+            .store
+            .exec_head()
+            .ok()
+            .flatten()
+            .and_then(|(hash, _)| self.manager.store.header(hash).ok().flatten())
+            .map(|h| h.number)
+            .unwrap_or(0);
+        self.last_body_height = exec_number;
+        self.pending_exec = None;
+        error!(
+            target: "rustock::sync",
+            "Sync halted: block execution failed; will retry from executed head #{exec_number}"
+        );
+        self.state = SyncState::Idle;
     }
 
     /// After body downloads (or when no bodies needed), decide whether to
@@ -1175,156 +1378,6 @@ impl SyncService {
         }
     }
 
-    /// Process blocks that have been downloaded (headers + bodies).
-    /// Executes each block in order, applying state changes to the trie.
-    ///
-    /// Returns `false` when a block failed to execute; the sync must not
-    /// advance past it (rskj treats such a block as invalid and stops there).
-    async fn process_downloaded_blocks(
-        &mut self,
-        pending_headers: &[(B256, Header)],
-    ) -> bool {
-        let (processor, trie_store, state_root) = match (
-            &self.block_processor,
-            &self.trie_store,
-            &self.current_state_root,
-        ) {
-            (Some(p), Some(ts), Some(sr)) => (p, ts.clone(), sr.clone()),
-            _ => {
-                debug!(
-                    target: "rustock::sync",
-                    "No block processor configured, skipping execution"
-                );
-                return true;
-            }
-        };
-
-        let mut current_root = state_root;
-        let mut processed = 0u64;
-        let mut all_ok = true;
-        let mut last_executed: Option<(B256, B256)> = None;
-
-        // Lineage guard: the first block must extend the executed head and
-        // each block its predecessor; executing out of order would apply
-        // transactions to the wrong parent state.
-        let mut expected_parent = self
-            .manager
-            .store
-            .exec_head()
-            .ok()
-            .flatten()
-            .map(|(hash, _)| hash)
-            .or_else(|| self.manager.store.canonical_hash(0).ok().flatten());
-
-        for (hash, header) in pending_headers {
-            if let Some(parent) = expected_parent {
-                if header.parent_hash != parent {
-                    error!(
-                        target: "rustock::sync",
-                        "Block #{} does not extend the executed head (parent {:?}, expected {:?}); halting sync",
-                        header.number, header.parent_hash, parent
-                    );
-                    all_ok = false;
-                    break;
-                }
-            }
-            expected_parent = Some(*hash);
-
-            let (transactions, ommers) = match self.manager.store.body(*hash) {
-                Ok(Some(body)) => body,
-                Ok(None) => {
-                    // Executing past a missing body would apply the next block
-                    // to the wrong parent state — halt here instead.
-                    warn!(
-                        target: "rustock::sync",
-                        "Body not found for block #{} ({:?}); halting sync at this block",
-                        header.number, hash
-                    );
-                    all_ok = false;
-                    break;
-                }
-                Err(e) => {
-                    error!(
-                        target: "rustock::sync",
-                        "Failed to read body for block #{}: {:?}", header.number, e
-                    );
-                    all_ok = false;
-                    break;
-                }
-            };
-
-            if let Some(pool) = &self.tx_pool {
-                pool.remove_mined(&transactions);
-            }
-
-            let block = Block {
-                header: header.clone(),
-                transactions,
-                ommers,
-            };
-
-            match processor.process_and_commit(&block, &current_root, trie_store.clone()) {
-                Ok(result) => {
-                    current_root = result.new_state_root;
-                    last_executed = Some((*hash, result.state_root_hash));
-                    processed += 1;
-                    self.blocks_since_flush += 1;
-                    if self.blocks_since_flush >= 100 {
-                        trie_store.flush();
-                        self.blocks_since_flush = 0;
-                        let _ = self.manager.store.set_exec_head(*hash, result.state_root_hash);
-                        // Let the event loop breathe: batch execution would
-                        // otherwise block ticks (progress reporting, request
-                        // timeouts) for the whole round.
-                        tokio::task::yield_now().await;
-                    }
-                    if processed.is_multiple_of(100) {
-                        debug!(
-                            target: "rustock::sync",
-                            "Processed {} blocks (latest #{}, state root {:?})",
-                            processed, header.number, result.state_root_hash
-                        );
-                    }
-                    // Mid-batch execution progress at INFO: the sync tick
-                    // (and its progress line) cannot run while a batch
-                    // executes in this same task.
-                    if processed.is_multiple_of(1000) {
-                        info!(
-                            target: "rustock::sync",
-                            "Executing batch: #{} ({}/{} blocks)",
-                            header.number, processed, pending_headers.len()
-                        );
-                    }
-                }
-                Err(e) => {
-                    error!(
-                        target: "rustock::sync",
-                        "Block #{} execution failed: {}; halting sync at this block",
-                        header.number, e
-                    );
-                    all_ok = false;
-                    break;
-                }
-            }
-        }
-
-        if processed > 0 {
-            trie_store.flush();
-            self.blocks_since_flush = 0;
-            if let Some((hash, root_hash)) = last_executed {
-                let _ = self.manager.store.set_exec_head(hash, root_hash);
-            }
-            info!(
-                target: "rustock::sync",
-                "Processed {} blocks, state root: {:?}",
-                processed, current_root.compute_hash(trie_store.as_ref())
-            );
-            self.current_state_root = Some(current_root);
-        }
-
-        all_ok
-    }
-
     /// Process a single block received in follow mode.
     async fn process_single_block(
         &mut self,
@@ -1407,5 +1460,142 @@ fn identify_chunk_by_content(
     skeleton
         .iter()
         .position(|entry| entry.number == max_number)
+}
+
+/// Execute a downloaded batch (headers + bodies) in order, applying state
+/// changes to the trie. Runs on a blocking thread (off the async event loop)
+/// so body downloads for the next batch proceed concurrently.
+///
+/// `all_ok` is `false` when a block failed to execute (or a parent/body was
+/// missing); the sync must not advance past it (rskj treats such a block as
+/// invalid and stops there). The returned state root and flush counter are
+/// carried back into the service for the next batch.
+fn process_downloaded_blocks(
+    processor: &BlockProcessor,
+    trie_store: Arc<dyn TrieStore>,
+    state_root: TrieNode,
+    store: &BlockStore,
+    tx_pool: Option<&crate::TransactionPool>,
+    mut blocks_since_flush: u64,
+    pending_headers: &[(B256, Header)],
+) -> ExecOutcome {
+    let mut current_root = state_root;
+    let mut processed = 0u64;
+    let mut all_ok = true;
+    let mut last_executed: Option<(B256, B256)> = None;
+
+    // Lineage guard: the first block must extend the executed head and
+    // each block its predecessor; executing out of order would apply
+    // transactions to the wrong parent state.
+    let mut expected_parent = store
+        .exec_head()
+        .ok()
+        .flatten()
+        .map(|(hash, _)| hash)
+        .or_else(|| store.canonical_hash(0).ok().flatten());
+
+    for (hash, header) in pending_headers {
+        if let Some(parent) = expected_parent {
+            if header.parent_hash != parent {
+                error!(
+                    target: "rustock::sync",
+                    "Block #{} does not extend the executed head (parent {:?}, expected {:?}); halting sync",
+                    header.number, header.parent_hash, parent
+                );
+                all_ok = false;
+                break;
+            }
+        }
+        expected_parent = Some(*hash);
+
+        let (transactions, ommers) = match store.body(*hash) {
+            Ok(Some(body)) => body,
+            Ok(None) => {
+                // Executing past a missing body would apply the next block
+                // to the wrong parent state — halt here instead.
+                warn!(
+                    target: "rustock::sync",
+                    "Body not found for block #{} ({:?}); halting sync at this block",
+                    header.number, hash
+                );
+                all_ok = false;
+                break;
+            }
+            Err(e) => {
+                error!(
+                    target: "rustock::sync",
+                    "Failed to read body for block #{}: {:?}", header.number, e
+                );
+                all_ok = false;
+                break;
+            }
+        };
+
+        if let Some(pool) = tx_pool {
+            pool.remove_mined(&transactions);
+        }
+
+        let block = Block {
+            header: header.clone(),
+            transactions,
+            ommers,
+        };
+
+        match processor.process_and_commit(&block, &current_root, trie_store.clone()) {
+            Ok(result) => {
+                current_root = result.new_state_root;
+                last_executed = Some((*hash, result.state_root_hash));
+                processed += 1;
+                blocks_since_flush += 1;
+                if blocks_since_flush >= 100 {
+                    trie_store.flush();
+                    blocks_since_flush = 0;
+                    let _ = store.set_exec_head(*hash, result.state_root_hash);
+                }
+                if processed.is_multiple_of(100) {
+                    debug!(
+                        target: "rustock::sync",
+                        "Processed {} blocks (latest #{}, state root {:?})",
+                        processed, header.number, result.state_root_hash
+                    );
+                }
+                if processed.is_multiple_of(1000) {
+                    info!(
+                        target: "rustock::sync",
+                        "Executing batch: #{} ({}/{} blocks)",
+                        header.number, processed, pending_headers.len()
+                    );
+                }
+            }
+            Err(e) => {
+                error!(
+                    target: "rustock::sync",
+                    "Block #{} execution failed: {}; halting sync at this block",
+                    header.number, e
+                );
+                all_ok = false;
+                break;
+            }
+        }
+    }
+
+    if processed > 0 {
+        trie_store.flush();
+        blocks_since_flush = 0;
+        if let Some((hash, root_hash)) = last_executed {
+            let _ = store.set_exec_head(hash, root_hash);
+        }
+        info!(
+            target: "rustock::sync",
+            "Processed {} blocks, state root: {:?}",
+            processed, current_root.compute_hash(trie_store.as_ref())
+        );
+    }
+
+    ExecOutcome {
+        all_ok,
+        new_state_root: current_root,
+        blocks_since_flush,
+    }
 }
 

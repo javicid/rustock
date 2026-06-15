@@ -2087,3 +2087,337 @@ async fn test_tx_relay_submit_transaction() {
     assert_ne!(hash, alloy_primitives::B256::ZERO);
     assert!(rx_a.try_recv().is_ok(), "peer should receive broadcast");
 }
+
+// ========== One-batch-ahead execution pipelining ==========
+//
+// These tests drive the scheduling logic with a controllable execution step
+// (set_test_exec) so they exercise finish_batch / poll_execution without a
+// real EVM/trie. The mock blocks each invocation until the test releases it,
+// letting the test assert state mid-execution (e.g. that the next batch is
+// already downloading).
+
+use std::collections::VecDeque;
+use std::sync::{Condvar, Mutex};
+
+/// Controllable stand-in for block execution. Each invocation records the
+/// batch's last block number, then blocks until the test releases it with an
+/// outcome (all_ok). Reports completion so the test can deterministically wait
+/// before reaping the job.
+#[derive(Default)]
+struct ExecControllerInner {
+    /// Last block number of each batch as it *started* executing, in order.
+    started: Vec<u64>,
+    /// Number of batches that have finished executing.
+    completed: usize,
+    /// Pending release tokens: each `Some(all_ok)` releases one waiting batch.
+    releases: VecDeque<bool>,
+}
+
+struct ExecController {
+    inner: Mutex<ExecControllerInner>,
+    cv: Condvar,
+}
+
+impl ExecController {
+    fn new() -> Arc<Self> {
+        Arc::new(Self { inner: Mutex::new(ExecControllerInner::default()), cv: Condvar::new() })
+    }
+
+    /// Build an ExecFn bound to this controller.
+    fn exec_fn(self: &Arc<Self>) -> crate::service::ExecFn {
+        let this = self.clone();
+        Arc::new(move |state_root, blocks_since_flush, pending: Vec<(B256, Header)>| {
+            let last = pending.last().map(|(_, h)| h.number).unwrap_or(0);
+            let mut guard = this.inner.lock().unwrap();
+            guard.started.push(last);
+            this.cv.notify_all();
+            // Wait for a release token.
+            while guard.releases.is_empty() {
+                guard = this.cv.wait(guard).unwrap();
+            }
+            let all_ok = guard.releases.pop_front().unwrap();
+            guard.completed += 1;
+            this.cv.notify_all();
+            crate::service::ExecOutcome {
+                all_ok,
+                new_state_root: state_root,
+                blocks_since_flush,
+            }
+        })
+    }
+
+    /// Block until at least `n` batches have *started* executing.
+    fn wait_started(&self, n: usize) {
+        let mut guard = self.inner.lock().unwrap();
+        while guard.started.len() < n {
+            guard = self.cv.wait(guard).unwrap();
+        }
+    }
+
+    /// Block until at least `n` batches have *completed*.
+    fn wait_completed(&self, n: usize) {
+        let mut guard = self.inner.lock().unwrap();
+        while guard.completed < n {
+            guard = self.cv.wait(guard).unwrap();
+        }
+    }
+
+    /// Release one waiting batch with the given outcome.
+    fn release(&self, all_ok: bool) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.releases.push_back(all_ok);
+        self.cv.notify_all();
+    }
+
+    fn started(&self) -> Vec<u64> {
+        self.inner.lock().unwrap().started.clone()
+    }
+}
+
+/// Store genesis + a linear chain of `count` blocks (headers, canonical map,
+/// bodies, TD, head) and return the non-genesis headers in ascending order.
+fn store_chain(store: &BlockStore, count: u64) -> Vec<Header> {
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    store.put_body(genesis.hash(), &[], &[]).unwrap();
+    store.set_exec_head(genesis.hash(), B256::ZERO).unwrap();
+
+    let mut prev = genesis.hash();
+    let mut td = U256::from(1);
+    let mut headers = Vec::new();
+    for n in 1..=count {
+        let h = dummy_header(n, prev, U256::from(1));
+        let hash = h.hash();
+        td += U256::from(1);
+        store.put_header(&h).unwrap();
+        store.put_canonical_hash(n, hash).unwrap();
+        store.put_total_difficulty(hash, td).unwrap();
+        store.put_body(hash, &[], &[]).unwrap();
+        store.update_head(&h, td).unwrap();
+        prev = hash;
+        headers.push(h);
+    }
+    headers
+}
+
+fn pending_of(headers: &[Header]) -> Vec<(B256, Header)> {
+    headers.iter().map(|h| (h.hash(), h.clone())).collect()
+}
+
+fn make_service(store: Arc<BlockStore>) -> SyncService {
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store, verifier, peer_store.clone()));
+    let (_tx, rx) = mpsc::unbounded_channel();
+    SyncService::new(manager, peer_store, rx)
+}
+
+/// (a) Execution of batch N runs off the event loop, so batch N+1's download
+/// begins (next skeleton requested) while N is still executing.
+#[tokio::test]
+async fn test_pipeline_next_batch_downloads_while_executing() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let headers = store_chain(&store, 6);
+
+    let ctrl = ExecController::new();
+    let mut service = make_service(store.clone());
+    service.set_test_exec(ctrl.exec_fn());
+
+    // Register a peer so continue_after_bodies can request the next skeleton.
+    let peer = B512::repeat_byte(0x01);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    service.peer_store_for_test().add_peer(peer, tx).await;
+    service.peer_store_for_test()
+        .update_metadata(&peer, rustock_networking::peers::PeerMetadata {
+            best_number: 1000,
+            total_difficulty: U256::from(1000),
+            ..Default::default()
+        })
+        .await;
+
+    // Batch N = blocks 1..=3, peer_best ahead so we keep syncing.
+    let batch_n = pending_of(&headers[0..3]);
+    service.finish_batch(&batch_n, 1000).await;
+
+    // N is executing on the blocking thread.
+    ctrl.wait_started(1);
+    assert_eq!(ctrl.started(), vec![3]);
+    assert!(service.is_executing_for_test(), "batch N should be executing");
+
+    // Meanwhile the next skeleton round was requested (download of N+1 started).
+    assert!(matches!(service.state, SyncState::DownloadingSkeleton { .. }),
+        "next batch download should start concurrently, got {:?}", service.state);
+    assert!(rx.try_recv().is_ok(), "a skeleton request should have been sent");
+
+    ctrl.release(true);
+    ctrl.wait_completed(1);
+}
+
+/// (b) Depth cap: while N executes, completing N+1's download must NOT start
+/// N+2's download. N+1 is parked; only after N finishes does N+1 execute.
+#[tokio::test]
+async fn test_pipeline_depth_capped_at_one_ahead() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let headers = store_chain(&store, 9);
+
+    let ctrl = ExecController::new();
+    let mut service = make_service(store.clone());
+    service.set_test_exec(ctrl.exec_fn());
+
+    let peer = B512::repeat_byte(0x01);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    service.peer_store_for_test().add_peer(peer, tx).await;
+    service.peer_store_for_test()
+        .update_metadata(&peer, rustock_networking::peers::PeerMetadata {
+            best_number: 1000,
+            total_difficulty: U256::from(1000),
+            ..Default::default()
+        })
+        .await;
+
+    // N = 1..=3 starts executing.
+    service.finish_batch(&pending_of(&headers[0..3]), 1000).await;
+    ctrl.wait_started(1);
+    assert!(service.is_executing_for_test());
+
+    // N+1 = 4..=6 finishes downloading while N still executes → parked.
+    service.finish_batch(&pending_of(&headers[3..6]), 1000).await;
+
+    // The cap: N+1 must NOT have started executing, and no N+2 download begins.
+    assert_eq!(ctrl.started(), vec![3], "N+1 must not execute while N runs");
+    assert!(service.has_parked_batch_for_test(), "N+1 should be parked");
+    assert!(matches!(service.state, SyncState::Idle),
+        "downloading must pause at the cap (no N+2), got {:?}", service.state);
+
+    // on_tick while N still executes must not start N+2 either.
+    service.on_tick().await;
+    assert!(service.has_parked_batch_for_test());
+    assert_eq!(ctrl.started(), vec![3]);
+
+    // Now let N finish: poll_execution should start N+1 and resume downloading.
+    ctrl.release(true);   // releases N
+    ctrl.wait_completed(1);
+    service.on_tick().await; // reaps N, spawns N+1
+    ctrl.wait_started(2);
+    assert_eq!(ctrl.started(), vec![3, 6], "N+1 executes only after N completes");
+    assert!(!service.has_parked_batch_for_test(), "parked batch consumed");
+
+    ctrl.release(true);   // releases N+1
+    ctrl.wait_completed(2);
+}
+
+/// (c) An execution failure on batch N halts the sync, does not advance the
+/// download cursor past the executed head, and drops any parked batch.
+#[tokio::test]
+async fn test_pipeline_exec_failure_halts() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let headers = store_chain(&store, 6);
+
+    let ctrl = ExecController::new();
+    let mut service = make_service(store.clone());
+    service.set_test_exec(ctrl.exec_fn());
+
+    let peer = B512::repeat_byte(0x01);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    service.peer_store_for_test().add_peer(peer, tx).await;
+    service.peer_store_for_test()
+        .update_metadata(&peer, rustock_networking::peers::PeerMetadata {
+            best_number: 1000,
+            total_difficulty: U256::from(1000),
+            ..Default::default()
+        })
+        .await;
+
+    // N = 1..=3 begins executing; N+1 = 4..=6 gets parked.
+    service.finish_batch(&pending_of(&headers[0..3]), 1000).await;
+    ctrl.wait_started(1);
+    service.finish_batch(&pending_of(&headers[3..6]), 1000).await;
+    assert!(service.has_parked_batch_for_test());
+
+    // N fails. poll_execution must halt: the parked batch is dropped (it must
+    // not execute on the wrong parent state), nothing is left executing, and
+    // the download cursor is reset to the executed head (genesis, #0 — nothing
+    // was committed by the mock) so the retry re-downloads/re-executes from
+    // there rather than skipping past the failed range. (A halt leaves the
+    // service Idle; the very next tick may legitimately restart a fresh round,
+    // so we assert the durable halt effects, not the transient Idle state.)
+    ctrl.release(false);
+    ctrl.wait_completed(1);
+    service.on_tick().await;
+
+    assert!(!service.has_parked_batch_for_test(), "parked batch must be dropped on halt");
+    assert!(!service.is_executing_for_test(), "no batch should be executing after halt");
+    assert_eq!(service.last_body_height_for_test(), 0,
+        "download cursor must reset to executed head, not advance past the failure");
+}
+
+/// (d) Across a normal two-batch sequence, both batches execute in order and
+/// the execution cursor (exec_head) advances to the last block.
+#[tokio::test]
+async fn test_pipeline_two_batches_advance_exec_head() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let headers = store_chain(&store, 6);
+
+    // Real-ish exec that advances exec_head to the batch's last block so we
+    // can assert cursor progress (the scheduling, not EVM, is under test).
+    let store_for_exec = store.clone();
+    let exec_fn: crate::service::ExecFn = Arc::new(move |state_root, bsf, pending: Vec<(B256, Header)>| {
+        if let Some((hash, h)) = pending.last() {
+            let _ = store_for_exec.set_exec_head(*hash, B256::from_slice(&[h.number as u8; 32]));
+        }
+        crate::service::ExecOutcome { all_ok: true, new_state_root: state_root, blocks_since_flush: bsf }
+    });
+
+    let mut service = make_service(store.clone());
+    service.set_test_exec(exec_fn);
+
+    let peer = B512::repeat_byte(0x01);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    service.peer_store_for_test().add_peer(peer, tx).await;
+    service.peer_store_for_test()
+        .update_metadata(&peer, rustock_networking::peers::PeerMetadata {
+            best_number: 1000,
+            total_difficulty: U256::from(1000),
+            ..Default::default()
+        })
+        .await;
+
+    // Batch 1 = 1..=3. Executes (synchronously-ish; mock returns immediately).
+    service.finish_batch(&pending_of(&headers[0..3]), 1000).await;
+    // Reap batch 1.
+    drain_executions(&mut service).await;
+    assert_eq!(exec_head_number(&store), 3, "exec head should reach #3 after batch 1");
+
+    // Batch 2 = 4..=6.
+    service.finish_batch(&pending_of(&headers[3..6]), 1000).await;
+    drain_executions(&mut service).await;
+    assert_eq!(exec_head_number(&store), 6, "exec head should reach #6 after batch 2");
+
+    assert_eq!(service.last_body_height_for_test(), 6, "download cursor at #6");
+}
+
+/// Poll on_tick until no background execution remains in flight.
+async fn drain_executions(service: &mut SyncService) {
+    for _ in 0..100 {
+        if !service.is_executing_for_test() && !service.has_parked_batch_for_test() {
+            return;
+        }
+        service.on_tick().await;
+        tokio::task::yield_now().await;
+    }
+    panic!("executions did not drain");
+}
+
+fn exec_head_number(store: &BlockStore) -> u64 {
+    store
+        .exec_head()
+        .ok()
+        .flatten()
+        .and_then(|(hash, _)| store.header(hash).ok().flatten())
+        .map(|h| h.number)
+        .unwrap_or(0)
+}
