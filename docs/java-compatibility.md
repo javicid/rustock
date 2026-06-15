@@ -2441,6 +2441,57 @@ and stores the emptied with-txhash queue via
 (`crates/execution/src/bridge/events.rs`), ground-truthed against the #4,598,891
 tx 2 event topics/data.
 
+## 50. A Bridge method that THROWS consumes only `requiredGas`, NOT all the gas (direct tx = invisible-exception SUCCESS; internal CALL = plain failure)
+
+When a top-level transaction calls a precompile (the Bridge), rskj
+`TransactionExecutor.call` precomputes `requiredGas = getGasForData(data)` and
+`gasUsed = requiredGas + basicTxCost` **before** invoking
+`precompiledContract.execute(data)`. If `execute` throws — and `Bridge.execute`
+wraps any method `RuntimeException`/`BridgeIllegalArgumentException` in a
+`VMException` — the catch block merely does `result.setException(e)` and then
+`result.spendGas(gasUsed)`; it does **not** call `execError(...)`. Consequences
+(`TransactionExecutor.java:344-377,564,681-682`,
+`TransactionExecutionSummary.java:63-85,177-178`):
+
+- **Receipt status = SUCCESS** (`executionError` stays empty → `SUCCESS_STATUS`).
+- **Receipt `gasUsed` = `requiredGas + basicTxCost`** (`getGasConsumed =
+  gasLimit - gasLeftover`, with `gasLeftover = gasLimit - gasUsed`); the unused
+  gas is refunded.
+- **But the sender is charged the FULL gas limit as a fee**: the summary is
+  flagged `markAsFailed()` because `result.getException() != null`, and
+  `getFee()` returns `calcCost(gasLimit)` (refund/leftover = 0). REMASC receives
+  `gasLimit * gasPrice`.
+- **No logs, no endowment** (the throw aborts before they take effect).
+
+This is the same "invisible exception" already implemented for a post-RSKIP88
+parse failure (§ for `addLockWhitelistAddress` / #764,123) — a method throw is
+just another `VMException` on the identical code path. For an **internal**
+(depth>1) Bridge CALL, rskj `Program.executePrecompiledAndHandleError`
+(`Program.java:1568-1570,1628-1647`) had already charged `requiredGas` before the
+call and, on a throw, pushes zero (the CALL fails) and refunds `gas -
+requiredGas`, so only `requiredGas` is consumed and the caller sees a plain CALL
+failure.
+
+**Consensus-critical:** a from-scratch client that lets a precompile error
+forfeit the whole forwarded gas (revm's default `InstructionResult::PrecompileError`)
+forks both on gas-used and on receipt status. Mainnet **#4,600,948** tx[3]
+(`registerBtcCoinbaseTransaction`, PMT verification fails) exposed this: header
+total gas `388220` (tx[3] = `41880` intrinsic + `11224` getGasForData = `53104`,
+receipt SUCCESS), rustock computed `1335116` (tx[3] = `1000000`, status false)
+until fixed.
+
+**rustock:** `crates/execution/src/bridge/mod.rs` — `execute_bridge` wraps the
+`execute_method` result: a non-OOG, non-`Fatal` throw becomes an
+`INVISIBLE_EXCEPTION_MARKER` (depth 1) or `INTERNAL_BRIDGE_THROW_MARKER`
+(depth>1), each carrying the `requiredGas`. `crates/execution/src/precompiles.rs`
+`run_stateful` records exactly that `requiredGas` (invisible → `Return`, sender
+charged full limit via the `invisible_exception` flag read by `RskHandler`;
+internal → `Revert`, leftover refunded). Tests:
+`test_rskip540_estimated_fees_for_pegout_amount_below_minimum_fails`
+(`crates/execution/src/executor.rs`), ground-truthed against rskj
+`BridgeTest.getEstimatedFeesForPegOutAmount_withAmountBelowMinimum_shouldThrowBridgeIllegalArgumentException`
+and matching #4,600,948 tx[3]'s `53104`.
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`

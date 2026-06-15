@@ -1097,7 +1097,7 @@ impl RskPrecompileProvider {
         // empty output and no endowment; `RskHandler` reads the flag during
         // fee finalization to charge the sender the full gas limit.
         if let Err(e) = &exec_result {
-            if crate::bridge::is_invisible_exception(e) {
+            if let Some(spent) = crate::bridge::invisible_exception_gas(e) {
                 self.invisible_exception
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 // The CALL frame already transferred the endowment; rskj
@@ -1107,11 +1107,22 @@ impl RskPrecompileProvider {
                         .journal_mut()
                         .transfer(inputs.target_address, inputs.caller, value);
                 }
-                // rskj getGasForData: 23,000 flat for a Bridge parse
-                // failure, 0 for REMASC.
-                let spent = if *addr == BRIDGE_ADDR { 23_000 } else { 0 };
+                // rskj `getGasForData` (requiredGas): the precompile frame
+                // records only this cost. REMASC carries 0; the Bridge carries
+                // the flat parse-failure cost or the method's getGasForData.
+                let spent = if *addr == BRIDGE_ADDR { spent } else { 0 };
                 let underflow = result.gas.record_cost(spent);
-                assert!(underflow, "gas pre-checked against the flat cost");
+                assert!(underflow, "gas pre-checked against the cost");
+                return Ok(Some(result));
+            }
+            // Internal (depth>1) Bridge method throw: rskj
+            // `Program.executePrecompiledAndHandleError` consumes only
+            // `requiredGas` and the CALL fails (pushes zero). Record that cost
+            // and revert so the caller refunds the forwarded leftover.
+            if let Some(spent) = crate::bridge::internal_throw_gas(e) {
+                let underflow = result.gas.record_cost(spent);
+                assert!(underflow, "gas pre-checked against requiredGas");
+                result.result = InstructionResult::Revert;
                 return Ok(Some(result));
             }
         }
@@ -1401,9 +1412,8 @@ impl RskPrecompileProvider {
         // a plain CALL failure for internal calls.
         use revm::context_interface::JournalTr;
         if context.journal().depth() == 1 {
-            return Err(PrecompileError::other(
-                crate::bridge::INVISIBLE_EXCEPTION_MARKER,
-            ));
+            // REMASC getGasForData is 0; the invisible path forces 0 anyway.
+            return Err(crate::bridge::invisible_exception_marker_with_gas(0));
         }
         Err(PrecompileError::other(
             "Remasc: invoked outside the block's REMASC system tx",

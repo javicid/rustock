@@ -4349,12 +4349,28 @@ mod tests {
         assert!(result.success, "method must execute from vetiver900");
     }
 
-    /// Ported from rskj BridgeTest.getEstimatedFeesForPegOutAmount_withAmountBelowMinimum_*:
-    /// amounts below the 0.004 BTC mainnet minimum are rejected.
+    /// Ported from rskj BridgeTest.getEstimatedFeesForPegOutAmount_withAmountBelowMinimum_shouldThrowBridgeIllegalArgumentException:
+    /// the method throws a BridgeIllegalArgumentException (wrapped in a
+    /// VMException by Bridge.execute). In a DIRECT transaction that exception
+    /// is invisible in the receipt — rskj TransactionExecutor.call catches it,
+    /// spends only requiredGas (getGasForData = 10000 + data.length*2) +
+    /// basicTxCost and records SUCCESS (the sender is still charged the full
+    /// gas limit as a fee). Same pattern as the disabled-method case above and
+    /// as mainnet #4,600,948 tx[3] (registerBtcCoinbaseTransaction throw).
     #[test]
     fn test_rskip540_estimated_fees_for_pegout_amount_below_minimum_fails() {
         let result = call_estimated_fees_for_pegout_amount(8_804_200, U256::from(1));
-        assert!(!result.success, "below-minimum amount must be rejected");
+        assert!(result.success, "rskj throws, but a direct tx records SUCCESS");
+
+        let mut input = vec![0u8; 36];
+        input[..4].copy_from_slice(&block_header_selector(
+            "getEstimatedFeesForPegOutAmount(uint256)",
+        ));
+        input[4..36].copy_from_slice(&U256::from(1).to_be_bytes::<32>());
+        let data_gas: u64 = input.iter().map(|b| if *b == 0 { 4 } else { 16 }).sum();
+        // requiredGas = getGasForData = 10000 (fixed) + 36*2; intrinsic =
+        // 21000 + RSKIP400 calldata cost.
+        assert_eq!(result.gas_used, 21_000 + data_gas + 10_000 + 36 * 2);
     }
 
     /// Regression for mainnet block #2646 (gas used mismatch 31280 vs 31272):

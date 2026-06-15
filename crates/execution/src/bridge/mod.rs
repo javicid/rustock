@@ -286,14 +286,54 @@ pub fn find_bridge_method(selector: &[u8; 4]) -> Option<&'static BridgeMethodInf
 // Bridge execution entry point
 // ---------------------------------------------------------------------------
 
-/// Marker for rskj's "invisible exception" on direct precompile calls:
-/// the receipt is SUCCESS with the flat parse-failure gas, but the sender
-/// is charged the full gas limit and the endowment is not transferred.
-pub const INVISIBLE_EXCEPTION_MARKER: &str = "rskj invisible exception";
+/// Marker prefix for rskj's "invisible exception" on direct (depth-1) Bridge
+/// calls. rskj `TransactionExecutor.call` precomputes `requiredGas` from
+/// `getGasForData` and, when `Bridge.execute` throws (parse failure OR a
+/// method `VMException`/`RuntimeException`), only spends `requiredGas +
+/// basicTxCost` while still flagging the summary as failed: the receipt is
+/// SUCCESS with that spent gas, no logs, no endowment, but the sender is
+/// charged the FULL gas limit. The marker carries `requiredGas` so the
+/// precompile frame can record exactly that cost (the basic tx cost is
+/// charged separately by revm's intrinsic accounting).
+pub const INVISIBLE_EXCEPTION_MARKER: &str = "rskj invisible exception:";
+
+/// Marker prefix for an INTERNAL (depth>1) Bridge method throw. rskj
+/// `Program.executePrecompiledAndHandleError` had already charged
+/// `requiredGas` before the call, then on a throw pushes zero (CALL fails)
+/// and refunds `gas - requiredGas`, so only `requiredGas` is consumed and the
+/// caller sees a plain CALL failure. The marker carries `requiredGas`.
+pub const INTERNAL_BRIDGE_THROW_MARKER: &str = "rskj bridge method throw:";
+
+fn marker_with_gas(prefix: &str, gas: u64) -> PrecompileError {
+    PrecompileError::other(format!("{prefix}{gas}"))
+}
+
+fn marker_gas(e: &PrecompileError, prefix: &str) -> Option<u64> {
+    match e {
+        PrecompileError::Other(msg) => msg.strip_prefix(prefix).and_then(|g| g.parse().ok()),
+        _ => None,
+    }
+}
+
+/// rskj invisible exception (direct, depth-1 Bridge call): returns the spent
+/// `requiredGas` if `e` is the invisible marker.
+pub fn invisible_exception_gas(e: &PrecompileError) -> Option<u64> {
+    marker_gas(e, INVISIBLE_EXCEPTION_MARKER)
+}
+
+/// Build the depth-1 invisible-exception error carrying its `requiredGas`.
+pub fn invisible_exception_marker_with_gas(gas: u64) -> PrecompileError {
+    marker_with_gas(INVISIBLE_EXCEPTION_MARKER, gas)
+}
 
 /// Whether a Bridge error is the direct-call invisible-exception marker.
 pub fn is_invisible_exception(e: &PrecompileError) -> bool {
-    matches!(e, PrecompileError::Other(msg) if msg == INVISIBLE_EXCEPTION_MARKER)
+    invisible_exception_gas(e).is_some()
+}
+
+/// Internal (depth>1) Bridge method throw: returns the spent `requiredGas`.
+pub fn internal_throw_gas(e: &PrecompileError) -> Option<u64> {
+    marker_gas(e, INTERNAL_BRIDGE_THROW_MARKER)
 }
 
 /// Main entry point for the Bridge precompile.
@@ -356,7 +396,8 @@ pub fn execute_bridge<CTX: crate::RskContextTr>(
         // calls observe the failure as a plain CALL failure.
         use revm::context_interface::JournalTr;
         if ctx.journal().depth() == 1 {
-            return Err(PrecompileError::other(INVISIBLE_EXCEPTION_MARKER));
+            // requiredGas for a parse failure is the flat releaseBtc cost.
+            return Err(marker_with_gas(INVISIBLE_EXCEPTION_MARKER, gas_cost));
         }
         return Err(PrecompileError::other("Bridge: invalid calldata"));
     };
@@ -368,7 +409,24 @@ pub fn execute_bridge<CTX: crate::RskContextTr>(
         return Err(PrecompileError::OutOfGas);
     }
 
-    execute_method(ctx, method.name, args, gas_cost, config, block_store, use_v2, hardfork_cfg, tx_ctx, caller, call_depth)
+    let result = execute_method(ctx, method.name, args, gas_cost, config, block_store, use_v2, hardfork_cfg, tx_ctx, caller, call_depth);
+    // rskj `Bridge.execute` wraps any method `RuntimeException` in a
+    // `VMException`, which `TransactionExecutor.call` / `Program` then handle
+    // by spending only `requiredGas` (the `getGasForData` cost) — NOT all the
+    // forwarded gas. Translate a non-OOG, non-Fatal method throw into the
+    // depth-aware markers so the precompile frame records exactly `gas_cost`.
+    // (OOG and Fatal keep their original semantics.)
+    match result {
+        Err(e) if !e.is_oog() && !matches!(e, PrecompileError::Fatal(_)) => {
+            use revm::context_interface::JournalTr;
+            if ctx.journal().depth() == 1 {
+                Err(marker_with_gas(INVISIBLE_EXCEPTION_MARKER, gas_cost))
+            } else {
+                Err(marker_with_gas(INTERNAL_BRIDGE_THROW_MARKER, gas_cost))
+            }
+        }
+        other => other,
+    }
 }
 
 /// rskj `Bridge.getGasForData` for a parsed call: functionCost plus
