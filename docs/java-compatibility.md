@@ -873,6 +873,57 @@ selector 0x1183d5d1 is createFederation, not updateCollections).
 3-arg add-multi votes, rollback election clear, multikey commit),
 `bridge/peg.rs` (old-federation version cell at migration end).
 
+### 19a. `saveNewFederation` re-writes the cell with the federation's OWN format version (not always 1000)
+
+**rskj behavior**: `FederationStorageProviderImpl.save()`
+(`FederationStorageProviderImpl.java:329-346`) calls `saveNewFederation`
+(lines 365-377), which writes `newFederationFormatVersion =
+newFederation.getFormatVersion()` (line 375). `getFormatVersion()`
+(`Federation.java:66-67`) returns the version the federation was DESERIALIZED
+with: `getNewFederation` (lines 109-130) reads the existing
+`newFederationFormatVersion` cell via `getStorageVersion` and passes it to
+`deserializeFederationAccordingToVersion`
+(`BridgeSerializationUtils.java:419-453`), which constructs the federation with
+that exact version (1000 STANDARD, 2000 NON_STANDARD_ERP, 3000 P2SH_ERP, 4000
+P2SH_P2WSH_ERP); when no cell exists it falls back to STANDARD (1000). So a
+re-save round-trips the stored version unchanged.
+
+**Dirtiness asymmetry** (consensus-critical): `saveNewFederation` guards ONLY
+on `newFederation == null` — there is NO dirty flag, so a federation merely
+READ (cached by `getNewFederation`) is re-serialized and its version cell
+re-written on every bridge call that resolves the active federation
+(`updateCollections`, `registerBtcTransaction` both do). In contrast,
+`saveOldFederation` (lines 379-392) and `savePendingFederation` (403-416) are
+guarded by `shouldSaveOldFederation` / `shouldSavePendingFederation`, set ONLY
+by `setOldFederation` / `setPendingFederation` (lines 178-182, 210-213) — a
+pure read does NOT re-write the old/pending cells. A from-scratch client that
+either (a) hardcodes the re-saved newFederation version to 1000, or (b) guards
+newFederation writes behind a dirty flag, or (c) re-writes oldFederation on a
+read, forks.
+
+**Trigger**: mainnet #4,652,783 — two blocks after the first real
+`commitFederation` (#4,652,781) stored an ERP `newFederation` at format **2000**
+and a standard `oldFederation` at format **1000**. `updateCollections` +
+`registerBtcTransaction` resolve the active federation, so rskj re-writes
+`newFederationFormatVersion` = 2000 (unchanged) and leaves
+`oldFederationFormatVersion` = 1000 untouched. rustock had hardcoded the
+re-saved value to `RLP(1000)`, corrupting the ERP fed's version cell to 1000:
+state root mismatch with receipts root matching (pure trie-state divergence,
+all gas/logs correct). The federation member-data cell itself is identical
+across formats 1000-4000 (multikey serialization is format-independent), so
+only the version cell diverged.
+
+**rskj source**: `FederationStorageProviderImpl.saveNewFederation`
+/`getNewFederation`/`getFormatVersion`,
+`BridgeSerializationUtils.deserializeFederationAccordingToVersion`,
+`FederationFactory` (per-type format versions).
+
+**rustock**: `bridge/federation.rs::save_new_federation_multikey` now reads the
+existing `newFederationFormatVersion` cell (default 1000 when absent) and
+re-writes that same value. Ground-truth test
+`federation_format_version_cell_encodings`; verified by both roots of
+#4,652,783 matching the mainnet header.
+
 ---
 
 ## 20. RSKIP134 Locking Cap (lazy initialization + peg-in gate)

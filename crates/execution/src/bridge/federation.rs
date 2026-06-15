@@ -241,6 +241,26 @@ mod tests {
         assert_eq!(remembers, members);
     }
 
+    /// Ground truth: re-saving the active federation (rskj `saveNewFederation`)
+    /// writes `newFederationFormatVersion = newFederation.getFormatVersion()`,
+    /// i.e. the version the federation was stored with — NOT always 1000.
+    /// rskj `BridgeSerializationUtils.serializeInteger` (RLP.encodeBigInteger):
+    /// 1000 STANDARD_MULTISIG -> 0x8203e8, 2000 NON_STANDARD_ERP -> 0x8207d0,
+    /// 3000 P2SH_ERP -> 0x820bb8. The ERP federation committed at mainnet
+    /// #4,652,781 is format 2000; updateCollections/registerBtcTransaction at
+    /// #4,652,783 must re-write the cell as 2000, not corrupt it to 1000.
+    #[test]
+    fn federation_format_version_cell_encodings() {
+        use super::super::serialization::rlp_encode_u64;
+        use super::super::storage::rlp_decode_uint;
+        assert_eq!(rlp_encode_u64(1000), vec![0x82, 0x03, 0xe8]);
+        assert_eq!(rlp_encode_u64(2000), vec![0x82, 0x07, 0xd0]);
+        assert_eq!(rlp_encode_u64(3000), vec![0x82, 0x0b, 0xb8]);
+        // Round-trip: the stored 2000 cell decodes back to 2000 (the value
+        // save_new_federation_multikey reads and re-writes unchanged).
+        assert_eq!(rlp_decode_uint(&rlp_encode_u64(2000)).to::<u64>(), 2000);
+    }
+
     #[test]
     fn federation_threshold() {
         let members: Vec<FederationMember> = (0..5)
@@ -425,10 +445,17 @@ pub fn load_stored_federation<CTX: crate::RskContextTr>(
 /// rskj `FederationStorageProviderImpl.saveNewFederation`: when a Bridge call
 /// has loaded the active (new) federation, `save()` re-serializes it. Once
 /// RSKIP123 (wasabi) is active it switches to the multikey member format and
-/// persists the format-version cell (`newFederationFormatVersion = 1000`,
-/// `STANDARD_MULTISIG_FEDERATION`). The first such save after activation
-/// migrates the stored federation in place (mainnet #1,591,009's
-/// updateCollections); the value is stable thereafter. No-op before RSKIP123.
+/// persists the format-version cell `newFederationFormatVersion =
+/// newFederation.getFormatVersion()`. `getFormatVersion()` returns the version
+/// the federation was DESERIALIZED with (the existing `newFederationFormatVersion`
+/// cell, or `STANDARD_MULTISIG_FEDERATION` = 1000 when no cell exists yet), NOT
+/// always 1000 — so a federation stored as a non-standard ERP (2000), P2SH-ERP
+/// (3000), or P2SH-P2WSH-ERP (4000) must be re-saved with its OWN version.
+/// Hardcoding 1000 corrupts the cell two blocks after the first real
+/// commitFederation (mainnet #4,652,783: the active fed is the ERP fed at
+/// format 2000). The first such save after RSKIP123 activation migrates the
+/// stored federation in place (mainnet #1,591,009's updateCollections); the
+/// value is stable thereafter. No-op before RSKIP123.
 pub fn save_new_federation_multikey<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     hardfork_cfg: &crate::hardfork::RskHardforkConfig,
@@ -436,7 +463,8 @@ pub fn save_new_federation_multikey<CTX: crate::RskContextTr>(
 ) {
     use super::serialization::rlp_encode_u64;
     use super::storage::{
-        bridge_store_bytes_named, NEW_FEDERATION_FORMAT_VERSION_KEY, NEW_FEDERATION_KEY,
+        bridge_load_bytes_named, bridge_store_bytes_named, rlp_decode_uint,
+        NEW_FEDERATION_FORMAT_VERSION_KEY, NEW_FEDERATION_KEY,
     };
     if !hardfork_cfg.has_rskip123(block_number) {
         return;
@@ -444,7 +472,21 @@ pub fn save_new_federation_multikey<CTX: crate::RskContextTr>(
     let Some(fed) = load_stored_federation(ctx, NEW_FEDERATION_KEY) else {
         return;
     };
-    bridge_store_bytes_named(ctx, NEW_FEDERATION_FORMAT_VERSION_KEY, &rlp_encode_u64(1000));
+    // newFederation.getFormatVersion(): the version it was deserialized with —
+    // the existing cell, defaulting to STANDARD_MULTISIG_FEDERATION (1000) when
+    // absent (rskj BridgeSerializationUtils.deserializeFederationAccordingToVersion
+    // / FederationStorageProviderImpl.getNewFederation).
+    let version_cell = bridge_load_bytes_named(ctx, NEW_FEDERATION_FORMAT_VERSION_KEY);
+    let format_version = if version_cell.is_empty() {
+        1000
+    } else {
+        rlp_decode_uint(&version_cell).to::<u64>()
+    };
+    bridge_store_bytes_named(
+        ctx,
+        NEW_FEDERATION_FORMAT_VERSION_KEY,
+        &rlp_encode_u64(format_version),
+    );
     let data =
         serialize_federation_multikey(&fed.members, fed.creation_time_millis, fed.creation_block);
     bridge_store_bytes_named(ctx, NEW_FEDERATION_KEY, &data);
