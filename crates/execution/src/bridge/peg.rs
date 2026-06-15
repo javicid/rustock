@@ -1243,17 +1243,16 @@ pub fn release_btc<CTX: crate::RskContextTr>(
     let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
     let call_value_wei = revm::context_interface::Transaction::value(ctx.tx());
 
-    if call_value_wei.is_zero() {
-        return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
-    }
+    // NOTE: do NOT early-return on a zero call value. rskj's
+    // `BridgeSupport.releaseBtc` always forwards to `requestRelease`, which
+    // rejects a below-minimum amount (a zero value is below any minimum) and,
+    // post-RSKIP185, refunds the sender and emits `release_request_rejected`.
+    // A zero-value EOA call therefore still produces a receipts-visible log
+    // (mainnet #4,212,341 tx[3]: value=0 empty-input Bridge call → LOW_AMOUNT).
 
     // Convert Wei to satoshis: 1 satoshi = 10^10 wei
     let satoshis_per_wei = U256::from(10_000_000_000u64);
     let amount_satoshis_u256 = call_value_wei / satoshis_per_wei;
-    if amount_satoshis_u256.is_zero() {
-        return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
-    }
-
     let amount_satoshis = amount_satoshis_u256.to::<u64>();
 
     // rskj BridgeSupport.requestRelease: post-RSKIP219 the minimum is INCLUSIVE

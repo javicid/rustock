@@ -541,6 +541,33 @@ mod tests {
         );
     }
 
+    /// Groundtruth from mainnet #4,212,341 tx 3 receipt (public-node.rsk.co):
+    /// a value=0, empty-input EOA call to the Bridge is forwarded to
+    /// `requestRelease` (NOT silently dropped) — zero is below the minimum
+    /// peg-out value, so post-RSKIP185 it is rejected with LOW_AMOUNT(1),
+    /// refunded (a no-op for 0 wei), and logged. This was the receipts-root
+    /// divergence at #4,212,341: rustock had a `call_value_wei.is_zero()`
+    /// early-return in `release_btc` that skipped the event entirely. Receipt:
+    ///   topic0 0xb607c3e1fbe6b38cd145b15b837f7b722b199caa60e3057b36c141adee3b75e7
+    ///   topic1 0x0000000000000000000000006338723180b802c5a5201f8ed12398eb7da31998
+    ///   data   0x...00 (amount 0) ...01 (reason LOW_AMOUNT)
+    #[test]
+    fn solidity_release_request_rejected_zero_value_mainnet_4212341() {
+        use alloy_primitives::hex;
+        let sender: Address = "0x6338723180b802c5a5201f8ed12398eb7da31998".parse().unwrap();
+        assert_eq!(
+            hex::encode(address_word(sender)),
+            "0000000000000000000000006338723180b802c5a5201f8ed12398eb7da31998"
+        );
+        // Pre-RSKIP427: data = uint256(amountSatoshis=0) || int256(reason=1)
+        let data = release_request_rejected_data(alloy_primitives::U256::ZERO, 1);
+        assert_eq!(
+            hex::encode(&data),
+            "0000000000000000000000000000000000000000000000000000000000000000\
+             0000000000000000000000000000000000000000000000000000000000000001"
+        );
+    }
+
     /// Post-RSKIP427 (lovell700) the `release_request_rejected` amount is the
     /// full wei value, not satoshis. 10,000 sat * 1e10 = 1e14 wei =
     /// 0x5af3107a4000. Signature is unchanged.

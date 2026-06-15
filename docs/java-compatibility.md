@@ -2305,6 +2305,47 @@ corrupting the opcode, `crates/execution/src/rsk_instructions.rs` installs
 thread-local (set from `header.beneficiary` in `executor.rs`'s two `install`
 call sites). Test: `test_coinbase_returns_real_miner_not_remasc` (executor.rs).
 
+## 47. RSKIP185: a ZERO-value `releaseBtc` call is rejected-and-logged, not silently dropped
+
+`BridgeSupport.releaseBtc(rskTx)` (`co.rsk.peg.BridgeSupport`, line ~882)
+unconditionally forwards an EOA peg-out request to `requestRelease` — there is
+**no zero-value short-circuit**. `requestRelease` computes
+`valueToReleaseInSatoshis = releaseRequestedValueInWeis.toBitcoin()` (0 for a
+zero-value call) and, post-RSKIP219, rejects it because `0 < minValue =
+max(minimumPegoutTxValue, requireFundsForFee)`. The reject reason is
+`LOW_AMOUNT(1)` when `minValue == minimumPegoutTxValue` (the flat minimum binds)
+and `FEE_ABOVE_VALUE(3)` when the fee estimate binds. Post-RSKIP185 the rejection
+is **not** a silent drop: `refundAndEmitRejectEvent` refunds the sender (a no-op
+transfer of 0 wei for a zero value) and `eventLogger.logReleaseBtcRequestRejected`
+emits `release_request_rejected(address indexed sender, uint256 amount, int256
+reason)` — a receipts-visible log.
+
+**Consensus-critical:** a from-scratch client that treats a zero-value (or
+sub-satoshi) call to the Bridge as a no-op forks on the receipts root the first
+time such a call lands post-iris300. Mainnet **#4,212,341** tx 3 exposed this: a
+`value=0`, empty-input EOA call to `0x…01000006` emitted
+`release_request_rejected(sender=0x6338723180b802c5a5201f8ed12398eb7da31998,
+amount=0, reason=1)` (topic0 `0xb607c3e1fbe6b38cd145b15b837f7b722b199caa60e3057b36c141adee3b75e7`)
+on the public node, while rustock emitted nothing — gas and state root matched,
+only the receipts root diverged (header
+`0xabdfe1bc…` vs computed `0xae1c39b0…`).
+
+This is the same family as §36/§39 (the *rejected* and *accepted* direct peg-out
+branches of `requestRelease`); the remaining unported arm was the degenerate
+zero/sub-satoshi amount, which rustock had short-circuited before reaching the
+reject logic.
+
+**rskj source:** `co.rsk.peg.BridgeSupport.releaseBtc` / `requestRelease` /
+`refundAndEmitRejectEvent` / `emitRejectEvent`, `co.rsk.peg.RejectedPegoutReason`.
+
+**rustock:** `crates/execution/src/bridge/peg.rs` (`release_btc`) — the
+`call_value_wei.is_zero()` and `amount_satoshis_u256.is_zero()` early-returns were
+removed so a zero amount flows into the existing RSKIP219/RSKIP185 reject path
+(refund + `log_release_request_rejected`). Test:
+`solidity_release_request_rejected_zero_value_mainnet_4212341`
+(`crates/execution/src/bridge/events.rs`), ground-truthed against the #4,212,341
+tx 3 public-node receipt.
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`
