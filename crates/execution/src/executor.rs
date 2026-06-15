@@ -147,6 +147,7 @@ impl RskExecutor {
             self.hardfork_cfg.has_chainid(header.number),
             &extcodesize_max_precompiles,
             &extcodehash_precompiles,
+            header.beneficiary,
         );
 
         let exec_out = {
@@ -249,6 +250,7 @@ impl RskExecutor {
             self.hardfork_cfg.has_chainid(header.number),
             &extcodesize_max_precompiles,
             &extcodehash_precompiles,
+            header.beneficiary,
         );
 
         let mut total_gas = 0u64;
@@ -1045,6 +1047,67 @@ mod tests {
             Address::from_slice(&slot0.present_value.to_be_bytes::<32>()[12..]),
             expected_child,
             "CREATE inside a freshly deployed contract must use nonce 0"
+        );
+    }
+
+    /// Regression for mainnet #3,650,574: rustock pins `block.beneficiary` to
+    /// REMASC_ADDR so revm routes gas fees to the REMASC contract, but rskj's
+    /// `OpCode.COINBASE` returns the block's *real* miner (`header.getCoinbase`).
+    /// A token contract that minted to `block.coinbase` produced a Transfer to
+    /// REMASC (0x…01000008) instead of the miner — diverging both the state and
+    /// receipts roots. COINBASE must return `header.beneficiary`, not REMASC.
+    #[test]
+    fn test_coinbase_returns_real_miner_not_remasc() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+        let block_store =
+            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+
+        // Init code: COINBASE; SSTORE(0, coinbase); RETURN empty runtime.
+        let init: Vec<u8> = vec![
+            0x41, // COINBASE
+            0x60, 0x00, // PUSH1 0
+            0x55, // SSTORE
+            0x60, 0x00, 0x60, 0x00, 0xf3, // PUSH1 0 PUSH1 0 RETURN
+        ];
+
+        let deploy = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(1_000_000),
+            to: Bytes::new(),
+            value: U256::ZERO,
+            input: Bytes::from(init),
+            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+        };
+        let mut header = dummy_header(892_000);
+        // A distinctive miner address, distinct from both REMASC_ADDR and the
+        // default repeat_byte(0x01).
+        let miner = Address::from_slice(
+            &alloy_primitives::hex!("31fe561eb2c628cd32ec52573d7c4b7e4c278bfa"),
+        );
+        header.beneficiary = miner;
+
+        let r1 = executor
+            .execute_block(&header, &[(deploy, sender)], &root, store.clone())
+            .expect("deploy block");
+        assert!(r1.tx_results[0].success);
+        let deployed = sender.create(0);
+        let slot0 = r1
+            .state_changes
+            .get(&deployed)
+            .expect("contract state")
+            .storage
+            .get(&U256::ZERO)
+            .expect("slot 0 written");
+        assert_eq!(
+            Address::from_slice(&slot0.present_value.to_be_bytes::<32>()[12..]),
+            miner,
+            "COINBASE must return the real miner, not REMASC_ADDR"
         );
     }
 

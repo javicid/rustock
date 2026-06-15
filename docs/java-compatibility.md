@@ -2274,6 +2274,37 @@ Active precompiles (passed via `extcodehash_precompiles`, gated on RSKIP140 in
 `executor.rs`) → `keccak256("")`. Test:
 `test_extcodehash_existing_empty_account_is_keccak_empty` (executor.rs).
 
+## 46. COINBASE returns the real miner (`header.getCoinbase`), NOT the gas-fee recipient
+
+In RSK, transaction gas fees are credited to the REMASC contract
+(`0x…01000008`), which later distributes rewards with delayed maturity — the
+miner (`header.getCoinbase()`, e.g. `0x31fe561e…`) is not paid directly during
+transaction execution. But the `COINBASE` opcode (`org.ethereum.vm.OpCode.COINBASE`
+→ `Program.getCoinbase()` → `ProgramInvoke.getCoinbase()` → the *block header's*
+coinbase) still returns the **real miner address**, not REMASC.
+
+These are two distinct roles of the same conceptual "beneficiary": (a) the gas-fee
+recipient and (b) the value the `COINBASE` opcode exposes to contracts. rskj keeps
+them separate; a naive port that uses one field for both will diverge whenever a
+contract reads `block.coinbase`.
+
+**Consensus-critical:** a from-scratch client that points `COINBASE` at the
+fee recipient (REMASC) forks from the network the first time any contract mints/
+sends/logs to `block.coinbase`. Mainnet **#3,650,574** exposed this: a token's
+mint-to-coinbase emitted a `Transfer` to `0x…01000008` (REMASC) in rustock vs the
+real miner `0x31fe561eb2c628cd32ec52573d7c4b7e4c278bfa` in rskj — diverging both
+the state root and the receipts root.
+
+**rskj:** `Program.getCoinbase()` returns `invoke.getCoinbase()`, sourced from the
+block header; fee crediting to REMASC happens separately in `TransactionExecutor`.
+
+**rustock:** `crates/execution/src/env.rs` pins `BlockEnv.beneficiary = REMASC_ADDR`
+so revm's `reward_beneficiary` routes gas fees to REMASC. To stop that from
+corrupting the opcode, `crates/execution/src/rsk_instructions.rs` installs
+`rsk_coinbase`, which pushes the real miner stashed in the `REAL_COINBASE`
+thread-local (set from `header.beneficiary` in `executor.rs`'s two `install`
+call sites). Test: `test_coinbase_returns_real_miner_not_remasc` (executor.rs).
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`

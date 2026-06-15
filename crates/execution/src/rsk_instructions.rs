@@ -50,6 +50,12 @@ thread_local! {
     /// (rskj `VM.doEXTCODEHASH` precompile branch). Set by `install`.
     static EXTCODEHASH_PRECOMPILES: core::cell::RefCell<Vec<Address>> =
         const { core::cell::RefCell::new(Vec::new()) };
+    /// The block's real miner address (`header.getCoinbase()`), pushed by the
+    /// COINBASE opcode. rustock sets `block.beneficiary = REMASC_ADDR` so revm
+    /// routes gas fees to REMASC; that would make COINBASE return REMASC, but
+    /// rskj's `OpCode.COINBASE` returns the actual miner. Set by `install`.
+    static REAL_COINBASE: core::cell::Cell<Address> =
+        const { core::cell::Cell::new(Address::ZERO) };
 }
 
 /// Install the rskj-semantics CALL family into an instruction table.
@@ -64,6 +70,7 @@ pub fn install<WIRE, HOST>(
     istanbul_opcodes_enabled: bool,
     extcodesize_max_precompiles: &[Address],
     extcodehash_precompiles: &[Address],
+    real_coinbase: Address,
 ) where
     WIRE: InterpreterTypes,
     HOST: Host,
@@ -135,6 +142,15 @@ pub fn install<WIRE, HOST>(
     instructions.insert_instruction(
         opcode::SELFDESTRUCT,
         Instruction::new(rsk_selfdestruct::<WIRE, HOST>, SUICIDE_STATIC_GAS),
+    );
+
+    // rskj `OpCode.COINBASE` returns the block's real miner; rustock keeps
+    // `block.beneficiary = REMASC_ADDR` (for gas-fee routing) so the default
+    // COINBASE would return REMASC. Push the real coinbase instead.
+    REAL_COINBASE.with(|c| c.set(real_coinbase));
+    instructions.insert_instruction(
+        opcode::COINBASE,
+        Instruction::new(rsk_coinbase::<WIRE, HOST>, 2),
     );
 
     // Divergence-hunt diagnostic (env-gated, temporary): log pc/op/gas for
@@ -255,6 +271,18 @@ fn rsk_chainid<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
 ) {
     if !context.interpreter.stack.push(context.host.chain_id()) {
+        context.interpreter.halt_overflow();
+    }
+}
+
+/// COINBASE returning rskj's real miner address (`header.getCoinbase()`)
+/// rather than revm's `block.beneficiary` (which rustock pins to REMASC_ADDR
+/// so gas fees route to the REMASC contract). See `REAL_COINBASE`.
+fn rsk_coinbase<WIRE: InterpreterTypes, H: Host + ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+) {
+    let coinbase = REAL_COINBASE.with(|c| c.get());
+    if !context.interpreter.stack.push(U256::from_be_bytes(coinbase.into_word().0)) {
         context.interpreter.halt_overflow();
     }
 }
