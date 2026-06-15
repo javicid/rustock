@@ -1471,6 +1471,12 @@ pub fn update_collections<CTX: crate::RskContextTr>(
             (deserialize_release_queue_legacy(&data), key)
         };
 
+        // RSKIP271: rskj processPegoutsInBatch sets nextPegoutHeight whenever
+        // the queue ends up empty — including the case where it was empty to
+        // begin with (BridgeSupport.processPegoutsInBatch line 1555). Track
+        // whether the queue is empty after this call so we can mirror that.
+        let mut queue_emptied = pending.is_empty();
+
         if !pending.is_empty() {
             let federation_keys =
                 federation_keys_or_genesis(ctx, config, hardfork_cfg, block_number);
@@ -1624,15 +1630,10 @@ pub fn update_collections<CTX: crate::RskContextTr>(
                         );
                         created_any = true;
                         bridge_store_bytes(ctx, queue_key, &[]);
+                        // The whole queue was batched into one BTC tx, so it
+                        // is now empty (rskj removeEntries(pegoutEntries)).
+                        queue_emptied = true;
                     }
-
-                    // Update nextPegoutHeight (RSKIP271)
-                    let next_height = block_number + config.number_of_blocks_between_pegouts;
-                    super::storage::bridge_store_u256(
-                        ctx,
-                        NEXT_PEGOUT_HEIGHT_KEY,
-                        U256::from(next_height),
-                    );
                 }
 
                 if created_any {
@@ -1640,6 +1641,21 @@ pub fn update_collections<CTX: crate::RskContextTr>(
                     store_utxos_at(ctx, active_utxo_key, &available);
                 }
             }
+        }
+
+        // RSKIP271: set nextPegoutHeight when there are no pending pegout
+        // requests left (either none to begin with, or all batched). This is
+        // independent of whether a BTC tx was actually built, matching rskj
+        // BridgeSupport.processPegoutsInBatch (the `pegoutRequests.getEntries()
+        // .isEmpty()` tail at line 1555). A failed/insufficient build leaves
+        // the queue non-empty and thus does NOT advance the height.
+        if use_rskip271 && queue_emptied {
+            let next_height = block_number + config.number_of_blocks_between_pegouts;
+            super::storage::bridge_store_u256(
+                ctx,
+                NEXT_PEGOUT_HEIGHT_KEY,
+                U256::from(next_height),
+            );
         }
     }
 
@@ -2903,6 +2919,41 @@ mod tests {
         // Member: applied normally.
         assert!(apply_signatures_to_tx(&mut tx, &[sign(&members[0].0)], &members[0].1));
         assert_ne!(tx.input[0].script_sig, before);
+    }
+
+    /// Regression for mainnet #4,598,511 (just after Hop400 / RSKIP271 at
+    /// #4,598,500): a state-root divergence caused by NOT advancing the
+    /// Bridge's `nextPegoutHeight` storage cell when an updateCollections call
+    /// runs with an empty release-request queue.
+    ///
+    /// rskj `BridgeSupport.processPegoutsInBatch` (BridgeSupport.java:1554-1559)
+    /// sets `nextPegoutHeight = currentBlock + numberOfBlocksBetweenPegouts`
+    /// whenever the queue ends up empty — *including* when it was empty to begin
+    /// with — as long as `currentBlock >= nextPegoutHeight` (the gate at
+    /// line 1501). At Hop400 the cell is unset (0), so the gate is open and the
+    /// very first updateCollections after activation writes the cell, mutating
+    /// Bridge storage and thus the state root.
+    ///
+    /// Ground truth: mainnet `numberOfBlocksBetweenPegouts = 360`
+    /// (BridgeMainNetConstants.java:45), so block #4,598,511 advances the height
+    /// to 4,598,871.
+    #[test]
+    fn rskip271_next_pegout_height_formula_mainnet() {
+        let cfg = crate::RskHardforkConfig::mainnet();
+        let constants = BridgeConstants::mainnet();
+        assert_eq!(constants.number_of_blocks_between_pegouts, 360);
+
+        // RSKIP271 active at Hop400 (#4,598,500) and onward.
+        assert!(cfg.has_rskip271(4_598_500));
+        assert!(cfg.has_rskip271(4_598_511));
+        assert!(!cfg.has_rskip271(4_598_499));
+
+        // The gate: a freshly-activated chain has nextPegoutHeight = 0, so any
+        // post-activation block satisfies `block >= nextPegoutHeight` and the
+        // empty-queue tail must advance the height.
+        let block_number = 4_598_511u64;
+        let next_height = block_number + constants.number_of_blocks_between_pegouts;
+        assert_eq!(next_height, 4_598_871);
     }
 
     #[test]

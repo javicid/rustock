@@ -2346,6 +2346,51 @@ removed so a zero amount flows into the existing RSKIP219/RSKIP185 reject path
 (`crates/execution/src/bridge/events.rs`), ground-truthed against the #4,212,341
 tx 3 public-node receipt.
 
+## 48. RSKIP271: `nextPegoutHeight` is advanced even when the release queue is EMPTY
+
+Post-RSKIP271 (Hop400, mainnet **#4,598,500**) peg-outs are batched. Each
+`updateCollections` calls `processPegoutsInBatch`, which is gated by
+`currentBlock >= nextPegoutCreationBlockNumber` (`BridgeSupport.java:1501`). When
+the gate is open, after attempting to batch any pending requests it runs:
+
+```java
+// set the next pegout creation block number when there are no pending pegout
+// requests to be processed or they have been already processed
+if (pegoutRequests.getEntries().isEmpty()) {
+    long nextPegoutHeight = currentBlockNumber + bridgeConstants.getNumberOfBlocksBetweenPegouts();
+    provider.setNextPegoutHeight(nextPegoutHeight);   // BridgeSupport.java:1554-1559
+}
+```
+
+The key subtlety: this fires when the queue is empty *after* processing —
+**including the case where it was empty to begin with**. At Hop400 the
+`nextPegoutHeight` storage cell is unset (reads as 0), so the gate
+`currentBlock >= 0` is always open, and the very first `updateCollections` after
+activation writes the cell (`= currentBlock + 360` on mainnet,
+`numberOfBlocksBetweenPegouts`, `BridgeMainNetConstants.java:45`). That write
+mutates Bridge storage and therefore the state root.
+
+**Consensus-critical:** a client that only updates `nextPegoutHeight` on the
+batching success path (i.e. when a BTC tx was actually built) never advances the
+cell while the queue is empty, so its Bridge storage — and the state root —
+forks from rskj. Mainnet **#4,598,511** (11 blocks past Hop400) exposed this: the
+block's `updateCollections` ran with an empty queue, rskj wrote
+`nextPegoutHeight = 4,598,871`, rustock wrote nothing → state root diverged
+(header `0x4f8a8d62…` vs computed `0x502cdda…`) while gas and receipts matched.
+A failed/insufficient batch build leaves the queue non-empty and thus does NOT
+advance the height (rskj returns early at lines 1513/1533, before the tail).
+
+**rskj source:** `co.rsk.peg.BridgeSupport.processPegoutsInBatch`
+(`rskj-core/src/main/java/co/rsk/peg/BridgeSupport.java:1490-1560`).
+
+**rustock:** `crates/execution/src/bridge/peg.rs` (`update_collections`) — the
+`nextPegoutHeight` write was moved out of the batching-success branch into a tail
+gated on `use_rskip271 && queue_emptied`, where `queue_emptied` is true when the
+queue started empty or was fully batched. Test:
+`rskip271_next_pegout_height_formula_mainnet`
+(`crates/execution/src/bridge/peg.rs`), ground-truthed against the #4,598,511
+header state root and the mainnet `numberOfBlocksBetweenPegouts = 360`.
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`
