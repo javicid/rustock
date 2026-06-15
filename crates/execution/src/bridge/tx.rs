@@ -217,11 +217,13 @@ pub fn register_btc_coinbase_transaction<CTX: crate::RskContextTr>(
         PrecompileError::other("registerBtcCoinbaseTransaction: PMT verification failed")
     })?;
 
-    // Check that the tx hash is among the matched hashes
+    // Check that the tx hash is among the matched hashes. rskj
+    // (BridgeSupport.registerBtcCoinbaseTransaction l.2503-2511) logs a
+    // warning and `return`s — it does NOT throw — so the call SUCCEEDS as a
+    // no-op (no coinbase info stored). A throw here would mark the summary
+    // failed and bill the full gas limit instead of gasUsed.
     if !pmt_result.matched_hashes.contains(&btc_tx_hash) {
-        return Err(PrecompileError::other(
-            "registerBtcCoinbaseTransaction: tx hash not in PMT",
-        ));
+        return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     }
 
     // Verify the merkle root matches the stored block's merkle root
@@ -235,10 +237,13 @@ pub fn register_btc_coinbase_transaction<CTX: crate::RskContextTr>(
         *raw.as_byte_array()
     };
 
+    // rskj (BridgeSupport.registerBtcCoinbaseTransaction l.2546-2555) logs the
+    // panic message and `return`s on a merkle-root mismatch — it does NOT
+    // throw. The call SUCCEEDS as a no-op (no coinbase info stored), so the
+    // summary is NOT marked failed and the sender is billed gasUsed, not the
+    // full gas limit (mainnet #4,603,038 tx[2]).
     if block_merkle_root != pmt_result.merkle_root {
-        return Err(PrecompileError::other(
-            "registerBtcCoinbaseTransaction: merkle root mismatch",
-        ));
+        return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     }
 
     // Validate witness commitment

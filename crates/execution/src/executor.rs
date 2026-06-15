@@ -4373,6 +4373,88 @@ mod tests {
         assert_eq!(result.gas_used, 21_000 + data_gas + 10_000 + 36 * 2);
     }
 
+    /// Ported from rskj BridgeSupportTest.when_RegisterBtcCoinbaseTransaction_HashNotInPmt_noSent
+    /// (and ..._not_equal_merkle_root_noSent): when the supplied btc tx is not
+    /// in the partial merkle tree (or the merkle roots don't match), rskj
+    /// `BridgeSupport.registerBtcCoinbaseTransaction` (l.2503-2511, 2546-2555)
+    /// logs a warning and `return`s — it does NOT throw. The direct tx is
+    /// therefore a plain SUCCESS billed `gasUsed * gasPrice`, NOT a failed
+    /// summary billed the full gas limit. Mainnet #4,603,038 tx[2] (a
+    /// merkle-root mismatch) over-charged paidFees by (gasLimit-gasUsed)*price
+    /// = 55,047,360,000,000 wei until this was fixed.
+    #[test]
+    fn test_register_btc_coinbase_tx_hash_not_in_pmt_succeeds() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let header = dummy_header(4_603_038);
+
+        // A PMT matching a single hash of all-0xAA. The btc tx bytes below
+        // hash (double-SHA256) to something else, so the tx hash is NOT in
+        // the PMT — rskj returns success without storing coinbase info.
+        let mut pmt = Vec::new();
+        pmt.extend_from_slice(&1u32.to_le_bytes()); // tx_count
+        pmt.push(1); // nHashes
+        pmt.extend_from_slice(&[0xAA; 32]); // hash
+        pmt.push(1); // nFlagBytes
+        pmt.push(0x01); // matched
+
+        let btc_tx = vec![0x01u8, 0x02, 0x03, 0x04];
+
+        // ABI-encode registerBtcCoinbaseTransaction(bytes,bytes32,bytes,bytes32,bytes32).
+        let mut input = block_header_selector(
+            "registerBtcCoinbaseTransaction(bytes,bytes32,bytes,bytes32,bytes32)",
+        )
+        .to_vec();
+        let head_len = 5 * 32;
+        let btc_tx_off = head_len;
+        let pmt_off = head_len + 32 + ((btc_tx.len() + 31) / 32) * 32;
+        // arg0: btcTx offset
+        input.extend_from_slice(&U256::from(btc_tx_off).to_be_bytes::<32>());
+        // arg1: blockHash (unused on this path — tx-not-in-PMT returns first)
+        input.extend_from_slice(&[0u8; 32]);
+        // arg2: pmt offset
+        input.extend_from_slice(&U256::from(pmt_off).to_be_bytes::<32>());
+        // arg3, arg4: witness fields
+        input.extend_from_slice(&[0u8; 32]);
+        input.extend_from_slice(&[0u8; 32]);
+        // btcTx: length + padded data
+        input.extend_from_slice(&U256::from(btc_tx.len()).to_be_bytes::<32>());
+        let mut padded = btc_tx.clone();
+        padded.resize(((btc_tx.len() + 31) / 32) * 32, 0);
+        input.extend_from_slice(&padded);
+        // pmt: length + padded data
+        input.extend_from_slice(&U256::from(pmt.len()).to_be_bytes::<32>());
+        let mut pmt_padded = pmt.clone();
+        pmt_padded.resize(((pmt.len() + 31) / 32) * 32, 0);
+        input.extend_from_slice(&pmt_padded);
+
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(1),
+            gas_limit: U256::from(1_000_000),
+            to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::from(input),
+            v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+        };
+
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        let result = executor.execute_tx(&header, &tx, sender, &root, store).unwrap();
+
+        assert!(result.success, "rskj returns (no throw) when the tx is not in the PMT");
+        // gasUsed is the real spent gas (intrinsic 21000 + RSKIP400 calldata +
+        // requiredGas getGasForData), 36016 here — well below the 1,000,000
+        // limit. The fee billed is gasUsed*gasPrice; an (incorrect)
+        // invisible-exception/markAsFailed path would instead bill the full
+        // 1,000,000 limit. Asserting the exact spent gas locks in "not failed".
+        assert_eq!(result.gas_used, 36_016);
+        assert!(result.gas_used < tx.gas_limit.to::<u64>());
+    }
+
     /// Regression for mainnet block #2646 (gas used mismatch 31280 vs 31272):
     /// rskj Bridge.getGasForData charges functionCost + data.length * 2.
     /// voteFeePerKbChange (enabled at every era):

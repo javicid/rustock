@@ -2492,6 +2492,46 @@ internal → `Revert`, leftover refunded). Tests:
 `BridgeTest.getEstimatedFeesForPegOutAmount_withAmountBelowMinimum_shouldThrowBridgeIllegalArgumentException`
 and matching #4,600,948 tx[3]'s `53104`.
 
+## 51. `registerBtcCoinbaseTransaction`: tx-not-in-PMT and merkle-root mismatch `return` (success), they do NOT throw
+
+`Bridge.registerBtcCoinbaseTransaction` is `throws VMException`, but only SOME
+failure paths actually throw. rskj `BridgeSupport.registerBtcCoinbaseTransaction`
+(`rskj-core/src/main/java/co/rsk/peg/BridgeSupport.java`):
+
+- **tx not in the supplied PMT** (l.2503-2511): `logger.warn(...)` + `return;`.
+- **supplied merkle root != block's merkle root** (l.2546-2555): `logger.warn(...)`
+  + `return;`.
+
+Both `return` WITHOUT storing coinbase info and WITHOUT throwing. The other
+paths DO throw `BridgeIllegalArgumentException`: witness-reserved-value length
+!= 32 (l.2485), PMT wrong size (l.2495), PMT parse failure (l.2515), block not
+registered (l.2536).
+
+**Consensus-critical fee impact.** Because these two cases do not throw, the
+`TransactionExecutionSummary` is NOT `markAsFailed()`, so `getFee()` returns
+`calcCost(gasLimit - gasLeftover - gasRefund)` = `gasUsed * gasPrice` — NOT the
+full `gasLimit * gasPrice` of the invisible-exception path (§50). A from-scratch
+client that treated a coinbase-registration failure as an exception would
+over-bill the sender `(gasLimit - gasUsed) * gasPrice` into `paidFees` and fork
+the block. Mainnet **#4,603,038** tx[2] (`registerBtcCoinbaseTransaction`,
+selector `0xccf417ae`, a merkle-root mismatch: gasUsed `82544`, gasLimit
+`1000000`, gasPrice `60000000`) exposed this: rustock had introduced §50's
+method-throw wrapper, which turned the mismatch into an invisible exception and
+billed the full limit, computing `paidFees` `177892013503048` vs header
+`122844653503048` — a `55,047,360,000,000` over-charge that equals exactly
+`(1000000 - 82544) * 60000000`.
+
+**rustock:** `crates/execution/src/bridge/tx.rs`
+`register_btc_coinbase_transaction` now returns `Ok(PrecompileOutput::new(...))`
+(success no-op) for the tx-not-in-PMT and merkle-root-mismatch checks, instead
+of `Err`, so §50's wrapper never sees a throw and the fee stays `gasUsed *
+gasPrice`. The genuine-throw paths (PMT size/parse, block not found) are
+unchanged, preserving #4,600,948 tx[3]'s invisible-exception behavior. Test:
+`test_register_btc_coinbase_tx_hash_not_in_pmt_succeeds`
+(`crates/execution/src/executor.rs`), ground-truthed against rskj
+`BridgeSupportTest.when_RegisterBtcCoinbaseTransaction_HashNotInPmt_noSent` /
+`..._not_equal_merkle_root_noSent`, and matching #4,603,038's state root.
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`
