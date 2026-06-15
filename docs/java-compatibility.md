@@ -2391,6 +2391,56 @@ queue started empty or was fully batched. Test:
 (`crates/execution/src/bridge/peg.rs`), ground-truthed against the #4,598,511
 header state root and the mainnet `numberOfBlocksBetweenPegouts = 360`.
 
+## 49. RSKIP271: a batched peg-out logs `batch_pegout_created` AND stores the emptied queue as `[0xc0]`
+
+When the RSKIP271 (Hop400) batching gate opens *with* a non-empty release queue,
+`BridgeSupport.processPegoutsInBatch` builds one batched BTC tx for the whole
+queue and does two things a from-scratch client easily gets wrong:
+
+1. **Two distinct events, in order.** `settleReleaseRequest` first logs
+   `release_requested(rskTxHash, btcTxHash, amount)` (the same event the
+   individual path uses, keyed by the batch creation RSK tx hash, total amount),
+   and *then* `processPegoutsInBatch` logs a **second** event
+   `batch_pegout_created(bytes32 indexed btcTxHash, bytes releaseRskTxHashes)`
+   (`BridgeSupport.java:1543` then `:1548`). `releaseRskTxHashes` is
+   `serializeRskTxHashes` — the raw concatenation of every batched request's
+   32-byte RSK creation tx hash, ABI-encoded as a single dynamic `bytes`
+   (`BridgeEventLoggerImpl.java:277-288,404-418`). Emitting only
+   `release_requested` (or only `batch_pegout_created`) gives the wrong receipt
+   logs → wrong logsBloom → wrong receipts root.
+
+2. **The emptied queue cell holds `[0xc0]`, not empty bytes.** After batching,
+   rskj clears the queue and `BridgeStorageProvider.saveReleaseRequestQueue`
+   re-serializes the now-empty queue via `serializeReleaseRequestQueueWithTxHash`
+   (`BridgeStorageProvider.java:196-206`), which is `RLP.encodeList([])` = the
+   single byte `0xc0`. Writing the cell as zero-length bytes instead produces a
+   different trie leaf value → wrong state root (logs are not in the trie, so
+   this is a *separate* divergence from #1).
+
+**Consensus-critical:** both are implementation quirks. A client that fires the
+"natural" single release event, or that represents an empty queue as empty bytes
+rather than RLP `[]`, computes correct gas yet forks on receipts and/or state.
+Mainnet **#4,598,891** exposed both at once (the first real batched peg-out after
+the prior empty-queue fix): receipts root header `0x59daa4b0…` and state root
+header `0x6e0b7633…`, with rustock computing `0xc5177f49…` / `0xdae534c7…` until
+fixed.
+
+**rskj source:** `co.rsk.peg.BridgeSupport.processPegoutsInBatch` /
+`settleReleaseRequest` (`BridgeSupport.java:1490-1560,1378-1437`),
+`co.rsk.peg.utils.BridgeEventLoggerImpl.logBatchPegoutCreated`
+(`:277-288,404-418`), `co.rsk.peg.BridgeStorageProvider.saveReleaseRequestQueue`
+(`:196-206`).
+
+**rustock:** `crates/execution/src/bridge/events.rs`
+(`log_batch_pegout_created`) and `crates/execution/src/bridge/peg.rs`
+(`update_collections`, RSKIP271 batch branch) — emits both events in rskj order
+and stores the emptied with-txhash queue via
+`serialize_release_queue_with_hash(&[])` (= `[0xc0]`). Both are inside the
+`use_rskip271` branch, so pre-Hop400 blocks are unaffected. Test:
+`batch_pegout_created_event_matches_mainnet_4598891`
+(`crates/execution/src/bridge/events.rs`), ground-truthed against the #4,598,891
+tx 2 event topics/data.
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`

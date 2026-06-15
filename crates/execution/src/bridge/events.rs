@@ -322,6 +322,29 @@ pub fn log_release_requested<CTX: crate::RskContextTr>(
     );
 }
 
+/// `batch_pegout_created(bytes32 indexed btcTxHash, bytes releaseRskTxHashes)`
+/// — rskj `logBatchPegoutCreated` (RSKIP271, peg-out batching). Fired by
+/// `processPegoutsInBatch` when the whole release-request queue is settled into
+/// a single batched BTC transaction. `btcTxHash` is the batch BTC tx's
+/// `Sha256Hash.getBytes()` (big-endian), and the data field is the raw
+/// concatenation of every batched request's 32-byte RSK creation tx hash
+/// (`serializeRskTxHashes`), ABI-encoded as a single dynamic `bytes`.
+pub fn log_batch_pegout_created<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    btc_tx_hash: &[u8; 32],
+    rsk_tx_hashes: &[[u8; 32]],
+) {
+    let serialized: Vec<u8> = rsk_tx_hashes.iter().flatten().copied().collect();
+    emit_topics(
+        ctx,
+        vec![
+            solidity_topic("batch_pegout_created(bytes32,bytes)"),
+            B256::from_slice(btc_tx_hash),
+        ],
+        abi_single_dynamic(&serialized),
+    );
+}
+
 /// `release_request_rejected(address indexed sender, uint256 amount, int256
 /// reason)` — rskj `logReleaseBtcRequestRejected`. The signature is identical in
 /// every era; only the `amount` encoding changes: pre-RSKIP427 (lovell700) it is
@@ -489,6 +512,45 @@ mod tests {
              d8af1e93c57a1b8c7f917bd9980af798adeb0205e9687865673353eb041e8d0000000000000000000000000000000000\
              0000000000000000000000000000000000000000000000000000000000000022334a59614d626a754b586b55524e704c\
              70444444574d7a55634e4d74324772654e63000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap();
+        assert_eq!(data, expected);
+    }
+
+    /// Groundtruth from mainnet block #4,598,891 tx 2 (updateCollections that
+    /// triggered the RSKIP271 batched peg-out): the `batch_pegout_created`
+    /// event. topic0 is the event signature, topic1 is the batched BTC tx's
+    /// Sha256Hash (big-endian), and the data is the ABI `bytes` holding the two
+    /// batched requests' 32-byte RSK creation tx hashes concatenated. Verifies
+    /// the signature hash and the `serializeRskTxHashes` + ABI-bytes layout
+    /// byte-for-byte.
+    #[test]
+    fn batch_pegout_created_event_matches_mainnet_4598891() {
+        use alloy_primitives::hex;
+        assert_eq!(
+            solidity_topic("batch_pegout_created(bytes32,bytes)"),
+            B256::from_slice(
+                &hex::decode("483d0191cc4e784b04a41f6c4801a0766b43b1fdd0b9e3e6bfdca74e5b05c2eb")
+                    .unwrap()
+            )
+        );
+        let h0: [u8; 32] =
+            hex::decode("61c6130f81c18343e003cbd3f2ea51c6770985a8a52390cb29fe277a73c705c4")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let h1: [u8; 32] =
+            hex::decode("0b667320dc677030d0c7314fd3728f60a21fe665befe3105204cebecad3501b4")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let serialized: Vec<u8> = [h0, h1].iter().flatten().copied().collect();
+        let data = abi_single_dynamic(&serialized);
+        let expected = hex::decode(
+            "0000000000000000000000000000000000000000000000000000000000000020\
+             0000000000000000000000000000000000000000000000000000000000000040\
+             61c6130f81c18343e003cbd3f2ea51c6770985a8a52390cb29fe277a73c705c4\
+             0b667320dc677030d0c7314fd3728f60a21fe665befe3105204cebecad3501b4",
         )
         .unwrap();
         assert_eq!(data, expected);

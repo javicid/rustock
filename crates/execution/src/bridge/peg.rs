@@ -1620,6 +1620,14 @@ pub fn update_collections<CTX: crate::RskContextTr>(
                         tx_version,
                     ) {
                         let total: u64 = pending.iter().map(|r| r.amount_satoshis).sum();
+                        // rskj logBatchPegoutCreated needs the batch BTC tx hash
+                        // and the per-request creation RSK tx hashes; capture
+                        // them before `settle` consumes `built`.
+                        let batch_btc_tx_hash = btc_txid_event_bytes(&built.tx);
+                        let batch_rsk_tx_hashes: Vec<[u8; 32]> = pending
+                            .iter()
+                            .map(|r| r.rsk_tx_hash.unwrap_or(tx_ctx.rsk_tx_hash))
+                            .collect();
                         settle(
                             ctx,
                             built,
@@ -1628,10 +1636,21 @@ pub fn update_collections<CTX: crate::RskContextTr>(
                             &mut available,
                             &mut waiting,
                         );
+                        // rskj BridgeSupport.processPegoutsInBatch logs
+                        // batch_pegout_created right after settleReleaseRequest
+                        // (which already logged release_requested), listing every
+                        // batched request's RSK creation tx hash.
+                        super::events::log_batch_pegout_created(
+                            ctx,
+                            &batch_btc_tx_hash,
+                            &batch_rsk_tx_hashes,
+                        );
                         created_any = true;
-                        bridge_store_bytes(ctx, queue_key, &[]);
                         // The whole queue was batched into one BTC tx, so it
                         // is now empty (rskj removeEntries(pegoutEntries)).
+                        // rskj re-serializes the emptied queue, so the cell
+                        // holds RLP.encodeList([]) = [0xc0], NOT empty bytes.
+                        bridge_store_bytes(ctx, queue_key, &serialize_release_queue_with_hash(&[]));
                         queue_emptied = true;
                     }
                 }
