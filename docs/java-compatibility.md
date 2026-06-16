@@ -2783,6 +2783,45 @@ P2SH-ERP template). Verified: #4,677,229 replays to state root
 path (`registerFastBridgeBtcTransaction`, peg.rs ~l.1009) still builds the active
 fed redeem with the plain builder — same latent bug, not yet reproduced in sync.
 
+## Spending an ERP federation input: extra OP_0 in the placeholder scriptSig (#4,677,503)
+
+**rskj.** bitcoinj-thin `Script.createEmptyInputScript` builds a P2SH multisig
+input placeholder as `OP_0 <OP_0 × m> <redeemScript>`, but when the redeem is an
+ERP type (`RedeemScriptParser.hasErpFormat()` — the `OP_NOTIF <default multisig>
+OP_ELSE <csv> OP_CSV OP_DROP <emergency multisig> OP_ENDIF` template, optionally
+behind a flyover `PUSH32 <hash> OP_DROP` prefix) it inserts an extra `OP_0`
+*before* the redeem-script push (`...number(OP_0).addChunk(redeemScript)`). That
+`OP_0` is the value `OP_NOTIF` pops to select the default-federation branch. The
+peg-out/migration unsigned BTC txid is computed over the tx with these
+USE_OP_ZERO placeholders, so a missing flag forks the txid. The fee estimate is
+*unaffected*: `Script.getNumberOfBytesRequiredToSpend` = `numSigs·SIG_SIZE +
+redeemScript.getProgram().length` and never counts the extra flag byte.
+
+Consensus-load-bearing and only reachable once the active federation is itself an
+ERP federation AND a peg-out/migration spends its UTXOs. At mainnet #4,677,503 a
+regular peg-out (`updateCollections`) spent the active NON_STANDARD_ERP
+federation's UTXOs; rustock's plain-multisig placeholder gave a wrong `release_requested`
+btcTxHash (forking both the receipts root via the event and the state root via the
+stored `pegoutsWaitingForConfirmations` tx). #4,671,312's migration only *output*
+to the ERP fed (a P2SH hash, no scriptSig) and *spent* the plain retiring fed, so
+this placeholder path was never exercised until now.
+
+rskj refs: bitcoinj-thin `co.rsk.bitcoinj.script.Script.createEmptyInputScript` /
+`isErpType`, `RedeemScriptParserFactory`, `BitcoinUtils.setSpendingBaseScriptLegacy`.
+
+**rustock.** `crates/execution/src/bridge/`: (1) `peg.rs` `update_collections`
+peg-out path now resolves the spending federation redeem via
+`active_federation_keys_and_redeem` / `retiring_federation_keys_and_redeem` (the
+format-version-aware helpers from §the previous fix) instead of the plain
+`build_federation_redeem_script`; (2) `release_tx.rs` `placeholder_scriptsig` adds
+the extra `OP_0` when `is_erp_redeem` (first opcode `OP_NOTIF`, after an optional
+flyover prefix). Verified: #4,677,503 replays to state root
+`0x872214f8…` and receipts root `0x40a521c8…`. Test
+`erp_placeholder_inserts_op0_before_redeem` (release_tx.rs). FOLLOW-UP: the
+`addSignature` path (`update_script_with_signature` / `has_enough_signatures`)
+does not yet account for the ERP flag `OP_0` sitting in the signature region —
+latent until a federation actually signs an ERP-fed peg-out in a later block.
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`

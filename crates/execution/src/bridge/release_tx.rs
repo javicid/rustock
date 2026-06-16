@@ -66,13 +66,38 @@ fn varint_len(n: usize) -> usize {
     }
 }
 
+/// bitcoinj `Script.isErpType` / `RedeemScriptParser.hasErpFormat`: an ERP
+/// redeem wraps the standard multisig as `OP_NOTIF <default multisig> OP_ELSE
+/// <csv> OP_CSV OP_DROP <emergency multisig> OP_ENDIF`. A flyover redeem may
+/// prefix it with `PUSH32 <hash> OP_DROP`. Detect by the first real opcode
+/// (after an optional flyover prefix) being OP_NOTIF.
+pub fn is_erp_redeem(redeem_script: &[u8]) -> bool {
+    let Some(chunks) = parse_chunks(redeem_script) else {
+        return false;
+    };
+    let mut chunks = chunks.as_slice();
+    // Skip an optional flyover prefix: Data(32) OP_DROP (0x75).
+    if let [Chunk::Data(d), Chunk::Op(0x75), rest @ ..] = chunks {
+        if d.len() == 32 {
+            chunks = rest;
+        }
+    }
+    matches!(chunks.first(), Some(Chunk::Op(0x64))) // OP_NOTIF
+}
+
 /// Build the placeholder scriptSig bitcoinj produces for an unsigned P2SH
-/// multisig input: `OP_0 <OP_0 x threshold> <redeemScript push>`.
+/// multisig input: `OP_0 <OP_0 x threshold> <redeemScript push>`. For an ERP
+/// redeem, bitcoinj `Script.createEmptyInputScript` inserts an extra `OP_0`
+/// before the redeem push — the flag that selects the `OP_NOTIF` (default
+/// federation) branch — so the unsigned txid matches.
 pub fn placeholder_scriptsig(redeem_script: &[u8], threshold: usize) -> Vec<u8> {
     let mut script = Vec::with_capacity(2 + threshold + redeem_script.len() + 3);
     script.push(0x00); // OP_0 (CHECKMULTISIG bug workaround)
     for _ in 0..threshold {
         script.push(0x00); // empty signature placeholder == OP_0
+    }
+    if is_erp_redeem(redeem_script) {
+        script.push(0x00); // OP_0 selecting the OP_NOTIF default branch
     }
     push_data(&mut script, redeem_script);
     script
@@ -662,6 +687,45 @@ mod tests {
         assert_eq!(min_non_dust_value(&p2pkh(1)), 2730);
         // P2SH output: 32 serialized bytes -> (32+148)*15 = 2700 satoshis.
         assert_eq!(min_non_dust_value(&p2sh(1)), 2700);
+    }
+
+    #[test]
+    fn erp_placeholder_inserts_op0_before_redeem() {
+        // Minimal ERP-shaped redeem: OP_NOTIF <m-of-n> OP_ELSE <csv> OP_CSV
+        // OP_DROP <m-of-n> OP_ENDIF. Detection only needs the leading OP_NOTIF.
+        let inner = test_redeem(2, 3);
+        let mut erp = vec![0x64]; // OP_NOTIF
+        erp.extend_from_slice(&inner[..inner.len() - 1]); // drop trailing CHECKMULTISIG
+        erp.push(0x67); // OP_ELSE
+        erp.extend_from_slice(&[0x03, 0x50, 0xcd, 0x00, 0xb2, 0x75]); // push csv, OP_CSV, OP_DROP
+        erp.extend_from_slice(&inner[..inner.len() - 1]);
+        erp.push(0x68); // OP_ENDIF
+        erp.push(0xae); // OP_CHECKMULTISIG
+
+        assert!(is_erp_redeem(&erp));
+        assert!(!is_erp_redeem(&test_redeem(2, 3))); // plain multisig
+
+        // Flyover-wrapped ERP and flyover-wrapped plain.
+        let mut flyover_erp = vec![0x20];
+        flyover_erp.extend_from_slice(&[0xaa; 32]);
+        flyover_erp.push(0x75); // OP_DROP
+        flyover_erp.extend_from_slice(&erp);
+        assert!(is_erp_redeem(&flyover_erp));
+        let mut flyover_plain = vec![0x20];
+        flyover_plain.extend_from_slice(&[0xbb; 32]);
+        flyover_plain.push(0x75);
+        flyover_plain.extend_from_slice(&test_redeem(2, 3));
+        assert!(!is_erp_redeem(&flyover_plain));
+
+        // ERP placeholder has the extra OP_0 (default-branch flag) before the
+        // redeem push: OP_0 + 2 sig placeholders + OP_0(flag) + PUSHDATA2 redeem.
+        let erp_ph = placeholder_scriptsig(&erp, 2);
+        assert_eq!(&erp_ph[..4], &[0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(erp_ph[4], 0x4c); // OP_PUSHDATA1 (218-byte erp redeem)
+        // Plain placeholder has NO extra flag: OP_0 + 2 placeholders + push.
+        let plain_ph = placeholder_scriptsig(&test_redeem(2, 3), 2);
+        assert_eq!(&plain_ph[..3], &[0x00, 0x00, 0x00]);
+        assert_eq!(plain_ph[3], 0x4c); // OP_PUSHDATA1 (105-byte redeem)
     }
 
     #[test]

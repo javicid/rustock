@@ -1543,11 +1543,14 @@ pub fn update_collections<CTX: crate::RskContextTr>(
         let mut queue_emptied = pending.is_empty();
 
         if !pending.is_empty() {
-            let federation_keys =
-                federation_keys_or_genesis(ctx, config, hardfork_cfg, block_number);
+            // rskj getActiveFederation().getRedeemScript(): the spending
+            // federation's redeem follows its STORED format version (plain /
+            // NON_STANDARD_ERP / P2SH-ERP / P2SH-P2WSH-ERP), not the plain
+            // multisig builder — otherwise the pegout's per-input placeholder
+            // scriptSig and the change P2SH (hence the txid) fork. See #4,677,503.
+            let (federation_keys, redeem_script) =
+                active_federation_keys_and_redeem(ctx, config, hardfork_cfg, block_number);
             if !federation_keys.is_empty() {
-                let threshold = (federation_keys.len() / 2) + 1;
-                let redeem_script = build_federation_redeem_script(&federation_keys, threshold);
                 let change_script = p2sh_output_script(&redeem_script_hash160(&redeem_script));
                 let fee_per_kb = get_effective_fee_per_kb(ctx, config);
                 let tx_version = if hardfork_cfg.has_rskip201(block_number) { 2 } else { 1 };
@@ -1560,13 +1563,10 @@ pub fn update_collections<CTX: crate::RskContextTr>(
                 // resolve a flyover UTXO's redeem per input (PUSH32 <hash> OP_DROP
                 // <fedRedeem>). getDestinationFederation searches active + retiring.
                 let mut candidate_fed_redeems = vec![redeem_script.clone()];
-                if let Some(retiring_keys) =
-                    retiring_federation_keys(ctx, config, hardfork_cfg, block_number)
+                if let Some((_, retiring_redeem)) =
+                    retiring_federation_keys_and_redeem(ctx, config, hardfork_cfg, block_number)
                 {
-                    candidate_fed_redeems.push(build_federation_redeem_script(
-                        &retiring_keys,
-                        retiring_keys.len() / 2 + 1,
-                    ));
+                    candidate_fed_redeems.push(retiring_redeem);
                 }
                 let flyover_overrides =
                     resolve_flyover_input_redeems(ctx, &available, &candidate_fed_redeems);
