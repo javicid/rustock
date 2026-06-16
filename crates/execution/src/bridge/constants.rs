@@ -157,7 +157,7 @@ impl BridgeConstants {
             legacy_minimum_pegout_tx_value: 800_000,   // 0.008 BTC
             minimum_pegout_tx_value: 400_000,          // 0.004 BTC
             minimum_pegout_value_percentage_to_receive_after_fee: 80,
-            max_inputs_per_pegout_transaction: 20,
+            max_inputs_per_pegout_transaction: 50,
             number_of_blocks_between_pegouts: 360,
             update_bridge_execution_period: 1,
             btc_height_when_block_index_activates: 696_000,
@@ -256,7 +256,7 @@ impl BridgeConstants {
             legacy_minimum_pegout_tx_value: 500_000,
             minimum_pegout_tx_value: 250_000,
             minimum_pegout_value_percentage_to_receive_after_fee: 80,
-            max_inputs_per_pegout_transaction: 20,
+            max_inputs_per_pegout_transaction: 50,
             number_of_blocks_between_pegouts: 360,
             update_bridge_execution_period: 1,
             btc_height_when_block_index_activates: 2_000_000,
@@ -343,7 +343,7 @@ impl BridgeConstants {
             legacy_minimum_pegout_tx_value: 500_000,
             minimum_pegout_tx_value: 250_000,
             minimum_pegout_value_percentage_to_receive_after_fee: 20,
-            max_inputs_per_pegout_transaction: 20,
+            max_inputs_per_pegout_transaction: 10,
             number_of_blocks_between_pegouts: 1,
             update_bridge_execution_period: 1,
             btc_height_when_block_index_activates: 0,

@@ -2643,6 +2643,53 @@ old federation redeem scripts and the format-version cells
 `P2shErpFederationTest`), `erp_csv_delay_encoding_groundtruth`. Verified by both
 the state root (`0xf133febc…`) and receipts root (`0x883ea305…`) of #4,652,781.
 
+## §53 RSKIP186: `updateFederationCreationBlockHeights` promotes `next`→`active` once the new federation reaches its activation age
+
+After a federation change commits, rskj records
+`nextFederationCreationBlockHeight` (= the new federation's creation block) at
+handover. Every subsequent `updateCollections` then calls
+`FederationSupportImpl.updateFederationCreationBlockHeights`
+(`BridgeSupport.updateCollections` line 1050), which — once the new federation
+is at least `getFederationActivationAge(activations)` blocks old — does a
+**one-time** promotion:
+
+```java
+if (currentBlockHeight < nextFederationCreationBlockHeight + activationAge) return;
+provider.setActiveFederationCreationBlockHeight(nextFederationCreationBlockHeight);
+provider.clearNextFederationCreationBlockHeight(); // saves null -> deletes the cell
+```
+
+This is **receipts-invisible** (pure state): no event, no gas change. It rewrites
+two Bridge cells — `activeFedCreationBlockHeight` gets set
+(`serializeLong = RLP.encodeBigInteger`) and `nextFedCreationBlockHeight` is
+deleted. A from-scratch client that skips it forks on the state root at the exact
+block the promotion fires, with gas and receipts still matching.
+
+**Mainnet groundtruth (#4,671,284).** The first real federation change committed
+at #4,652,781, writing `nextFedCreationBlockHeight = 4_652_781`. Pre-RSKIP383
+(fingerroot500) the federation activation age is the legacy `18_500`, so the
+threshold is `4_652_781 + 18_500 = 4_671_281`; the first `updateCollections`
+at/after it is **#4,671,284** (which is also the first funds-migration block,
+since `fundsMigrationAgeBegin = 0`). Before this fix rustock ran the migration
+correctly (receipts matched, the migration BTC tx hash in `release_requested`
+was byte-identical) but never promoted the creation-height cells, so the state
+root forked at #4,671,284 with everything else matching. After implementing the
+promotion, both roots match the mainnet header
+(`state 0x9c742c96…`, `receipts 0x2912df20…`).
+
+A storage-decode trap surfaced here: the `next` cell holds a *full* RLP encoding
+(`rlp_encode_u64` → `0x83 46 fe ed`), so it must be read with `rlp_decode_uint`
+(strips the RLP length prefix), **not** `rlp_decode_u64` (which reads raw content
+bytes of an already-extracted list element and would return `0x8346feed`).
+
+**rustock.** `crates/execution/src/bridge/governance.rs`
+`update_federation_creation_block_heights` (+ `get_next_federation_creation_block_height`),
+called from `peg.rs::update_collections` after the confirmed-pegout phase
+(rskj order). Clearing `next` stores `&[]`, which `RawStorage::put` maps to a leaf
+deletion (matching rskj's null-save). Test
+`federation_creation_height_promotion_threshold_4671284`; verified by the
+#4,671,284 header roots via `examples/replay_block`.
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`

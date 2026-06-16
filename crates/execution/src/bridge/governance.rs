@@ -392,6 +392,55 @@ pub(crate) fn federation_activation_age(
     }
 }
 
+/// rskj `FederationStorageProviderImpl.getNextFederationCreationBlockHeight`
+/// (RSKIP186): the pending next-federation creation height, or `None` when the
+/// cell is absent (`deserializeOptionalLong(null)`).
+fn get_next_federation_creation_block_height<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+) -> Option<u64> {
+    let data = bridge_load_bytes_named(ctx, NEXT_FEDERATION_CREATION_BLOCK_HEIGHT_KEY);
+    if data.is_empty() {
+        return None;
+    }
+    Some(rlp_decode_uint(&data).to::<u64>())
+}
+
+/// rskj `FederationSupportImpl.updateFederationCreationBlockHeights` (RSKIP186),
+/// called every `updateCollections`. Once the new federation reaches its
+/// activation age, promote the pending `nextFederationCreationBlockHeight` to
+/// `activeFederationCreationBlockHeight` and clear the next cell. Fires exactly
+/// once per federation change — on the first updateCollections at/after
+/// `nextCreation + federationActivationAge` — and is receipts-invisible (pure
+/// state). Without it the next/active cells fork from rskj at that block
+/// (mainnet #4,671,284 for the #4,652,781 federation change).
+pub(crate) fn update_federation_creation_block_heights<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    config: &super::constants::BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
+    block_number: u64,
+) {
+    if !hardfork_cfg.has_rskip186(block_number) {
+        return;
+    }
+    let Some(next_creation) = get_next_federation_creation_block_height(ctx) else {
+        return;
+    };
+    let activation_age = federation_activation_age(config, hardfork_cfg, block_number);
+    // newFederationShouldNotBeActiveYet
+    if block_number < next_creation + activation_age {
+        return;
+    }
+    // setActiveFederationCreationBlockHeight + clearNextFederationCreationBlockHeight.
+    // serializeLong = RLP.encodeBigInteger(BigInteger.valueOf(..)) = rlp_encode_u64;
+    // clearing saves null, which deletes the cell (empty value -> leaf removed).
+    bridge_store_bytes_named(
+        ctx,
+        ACTIVE_FEDERATION_CREATION_BLOCK_HEIGHT_KEY,
+        &serialization::rlp_encode_u64(next_creation),
+    );
+    bridge_store_bytes_named(ctx, NEXT_FEDERATION_CREATION_BLOCK_HEIGHT_KEY, &[]);
+}
+
 /// rskj legacyCommitPendingFederation: build the federation from the pending
 /// keys, move the active federation's UTXOs to the old-federation set, store
 /// active as old / built as new, wipe the pending federation, and log the
@@ -1252,5 +1301,32 @@ mod tests {
         let decoded_keys = serialization::rlp_decode_list(&decoded[2]).unwrap();
         assert_eq!(decoded_keys.len(), 6);
         assert_eq!(decoded_keys[0], vec![100u8; 33], "keys sorted");
+    }
+
+    /// RSKIP186 federation-creation-height promotion threshold, groundtruthed
+    /// against mainnet #4,671,284 (the #4,652,781 federation change). Pre-RSKIP383
+    /// (fingerroot500) the federation activation age is the legacy 18,500, so the
+    /// `nextFederationCreationBlockHeight` (= the commit block #4,652,781) is
+    /// promoted to `activeFederationCreationBlockHeight` on the first
+    /// updateCollections at/after 4,652,781 + 18,500 = #4,671,281 — which is
+    /// #4,671,284. `updateFederationCreationBlockHeights` matches there byte-for-byte.
+    #[test]
+    fn federation_creation_height_promotion_threshold_4671284() {
+        let cfg = super::super::constants::BridgeConstants::mainnet();
+        let hf = crate::hardfork::RskHardforkConfig::mainnet();
+        let next_creation = 4_652_781u64;
+
+        // Pre-fingerroot500 the legacy activation age (18,500) is in effect.
+        assert!(!hf.has_rskip383(4_671_284));
+        assert_eq!(federation_activation_age(&cfg, &hf, 4_671_284), 18_500);
+
+        let threshold = next_creation + federation_activation_age(&cfg, &hf, 4_671_284);
+        assert_eq!(threshold, 4_671_281);
+        // The divergence block is the first updateCollections at/after the threshold.
+        assert!(4_671_284 >= threshold);
+        assert!(4_671_280 < threshold);
+
+        // The promoted active-height cell encodes as serializeLong = RLP bigint.
+        assert_eq!(serialization::rlp_encode_u64(next_creation), vec![0x83, 0x46, 0xfe, 0xed]);
     }
 }

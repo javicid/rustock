@@ -1722,6 +1722,17 @@ pub fn update_collections<CTX: crate::RskContextTr>(
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Step 3: Promote the pending federation creation height once the new
+    // federation reaches its activation age (rskj updateFederationCreationBlockHeights).
+    // -----------------------------------------------------------------------
+    super::governance::update_federation_creation_block_heights(
+        ctx,
+        config,
+        hardfork_cfg,
+        block_number,
+    );
+
     Ok(PrecompileOutput::new(gas_cost, Bytes::new()))
 }
 
@@ -1848,7 +1859,21 @@ fn process_funds_migration<CTX: crate::RskContextTr>(
     }
 
     let mut old_utxos = super::storage::load_old_federation_utxos(ctx);
-    let balance: u64 = old_utxos.iter().map(|u| u.value_satoshis).sum();
+    // rskj `getRetiringFederationWallet`: post-RSKIP294 the spend wallet caps
+    // its UTXO set to the first `maxInputsPerPegoutTransaction` entries
+    // (`utxos.subList(0, limit)`, BridgeSupport.java:1249-1251, 312-323), so the
+    // migration balance, fee floor, and coin selection only ever see those.
+    let migration_utxos: Vec<super::storage::BridgeUtxo> = if hardfork_cfg.has_rskip294(block_number)
+    {
+        old_utxos
+            .iter()
+            .take(config.max_inputs_per_pegout_transaction as usize)
+            .cloned()
+            .collect()
+    } else {
+        old_utxos.clone()
+    };
+    let balance: u64 = migration_utxos.iter().map(|u| u.value_satoshis).sum();
     let fee_per_kb = get_effective_fee_per_kb(ctx, config);
 
     let should_migrate = (in_migration_age && balance > fee_per_kb / 2)
@@ -1856,9 +1881,21 @@ fn process_funds_migration<CTX: crate::RskContextTr>(
     if should_migrate {
         let threshold = retiring_keys.len() / 2 + 1;
         let retiring_redeem = build_federation_redeem_script(&retiring_keys, threshold);
+        // rskj `migrateFunds` sends the migration to `getActiveFederationAddress()`
+        // = the NEW (active) federation's P2SH address (BridgeSupport.java:1308,
+        // FederationSupportImpl.getActiveFederationAddress -> getAddress()). The
+        // active federation here is the ERP federation committed at #4,652,781, so
+        // its address derives from the (RSKIP201-era non-standard) ERP redeem
+        // script, NOT a plain multisig. Use the committed-federation redeem builder
+        // so this matches whatever federation format was committed (standard pre-
+        // RSKIP201, non-standard ERP, P2SH-ERP, or P2SH-P2WSH-ERP).
         let new_btc_keys = new_fed.btc_keys();
-        let new_threshold = new_btc_keys.len() / 2 + 1;
-        let new_redeem = build_federation_redeem_script(&new_btc_keys, new_threshold);
+        let new_redeem = build_committed_federation_redeem_script(
+            &new_btc_keys,
+            config,
+            hardfork_cfg,
+            block_number,
+        );
         let active_script = p2sh_output_script(&redeem_script_hash160(&new_redeem));
 
         // createMigrationTransaction: target the full balance, halving on
@@ -1870,7 +1907,7 @@ fn process_funds_migration<CTX: crate::RskContextTr>(
                 amount_satoshis: target,
             }];
             match super::release_tx::complete_pegout_tx(
-                &old_utxos,
+                &migration_utxos,
                 &outputs,
                 &active_script,
                 &retiring_redeem,

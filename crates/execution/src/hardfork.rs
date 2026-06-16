@@ -295,6 +295,13 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Hop400
     }
 
+    /// RSKIP294: the retiring/active federation spend wallet caps its UTXO set
+    /// to `maxInputsPerPegoutTransaction` (mainnet 50), so funds migration and
+    /// pegouts only ever see the first N UTXOs (Hop400, mainnet 4_598_500).
+    pub fn has_rskip294(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Hop400
+    }
+
     /// RSKIP353: committed federations become P2SH-ERP federations instead of
     /// non-standard ERP (mainnet hop401 = 4,976,300; testnet 3,362,200;
     /// regtest 0). rustock collapses hop401 into Hop400 in the upgrade ladder,
