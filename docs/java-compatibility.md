@@ -2737,6 +2737,52 @@ inner `OP_m` opcode (handles flyover/ERP wrappers). Verified: #4,671,312 replays
 `state 0x66b85d7f…`, `receipts 0x2e962f21…`. Test
 `flyover_input_sizes_and_signs_with_its_own_redeem` (release_tx.rs).
 
+## Live federation redeem script follows the STORED format version (#4,677,229)
+
+**rskj.** A `Federation` carries a *format version*
+(`FederationFormatVersion`: 1000 STANDARD_MULTISIG, 2000 NON_STANDARD_ERP,
+3000 P2SH_ERP, 4000 P2SH_P2WSH_ERP). On load,
+`BridgeSerializationUtils.deserializeFederationAccordingToVersion` picks the
+federation class — and therefore the redeem-script builder — purely from the
+stored version, NOT from the current block's activations. So a NON_STANDARD_ERP
+federation that outlives RSKIP353 still produces its non-standard ERP redeem
+script (and P2SH address); a STANDARD_MULTISIG retiring federation alive during a
+migration still uses a plain N-of-M redeem. `getActiveFederation()` /
+`getRetiringFederation()` → `Federation.getRedeemScript()` are what
+`registerBtcTransaction` (`getNoSpendWalletForLiveFederations`) uses to decide
+which outputs pay a federation (peg-in / migration change UTXO) and which inputs
+make a tx a peg-out. The NON_STANDARD_ERP builder is itself activation-selected at
+*creation* time (`NonStandardErpRedeemScriptBuilderFactory`: testnet pre-RSKIP284
+hardcoded, pre-RSKIP293 CSV-unsigned-BE, else generic) — mainnet is always the
+non-testnet branch.
+
+This is consensus-load-bearing and receipts-invisible: at mainnet #4,677,229 a
+`registerBtcTransaction` migration tx (50 retiring-fed inputs → 1 change output to
+the active ERP fed `3DsneJha6CY6X9gU2M9uEc4nSdbYECB4Gh`) registers the change UTXO
+into `newFederationBtcUTXOs` only if the active fed's P2SH is reconstructed
+correctly. No gas/log/receipt changes — only the `newFederationBtcUTXOs` storage
+cell — so the bug surfaces purely as a state-root fork.
+
+rskj refs:
+`co.rsk.peg.federation.FederationStorageProviderImpl.getNewFederation/getOldFederation`,
+`BridgeSerializationUtils.deserializeFederationAccordingToVersion`,
+`co.rsk.peg.federation.FederationFactory`,
+`co.rsk.peg.bitcoin.NonStandardErpRedeemScriptBuilderFactory`,
+`BridgeSupport.registerBtcTransaction` / `getNoSpendWalletForLiveFederations`.
+
+**rustock.** `crates/execution/src/bridge/peg.rs`: `register_btc_transaction`
+previously built both live federation scripts with the plain
+`build_federation_redeem_script`, which is wrong for an ERP active federation. Now
+`active_federation_keys_and_redeem` / `retiring_federation_keys_and_redeem` read
+each federation's `*FederationFormatVersion` cell
+(`federation_format_version`, defaulting to 1000 when absent) and dispatch through
+`federation_redeem_for_format` (1000 → plain, 2000 → non-standard ERP, 3000/4000 →
+P2SH-ERP template). Verified: #4,677,229 replays to state root
+`0x093eddb7c21c44d33beb6a0407cdc63759916f82d7e486d69068dfeffff3d1bf`. Test
+`federation_redeem_for_format_groundtruth` (peg.rs). KNOWN FOLLOW-UP: the flyover
+path (`registerFastBridgeBtcTransaction`, peg.rs ~l.1009) still builds the active
+fed redeem with the plain builder — same latent bug, not yet reproduced in sync.
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`

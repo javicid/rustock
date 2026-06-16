@@ -223,15 +223,19 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     // scripts identify which outputs are peg-ins and which inputs make the
     // tx a peg-out (rskj getNoSpendWalletForLiveFederations).
     let block_number_now = revm::context_interface::Block::number(ctx.block()).to::<u64>();
-    let federation_keys = federation_keys_or_genesis(ctx, config, hardfork_cfg, block_number_now);
-    let threshold = (federation_keys.len() / 2) + 1;
-    let fed_redeem = build_federation_redeem_script(&federation_keys, threshold);
+    // Each live federation's redeem script (and hence the P2SH address used to
+    // recognize peg-in outputs / peg-out inputs) is built from its STORED format
+    // version, not the current block — an ERP federation keeps its ERP script
+    // even after a later template hardfork (rskj getActiveFederation /
+    // getRetiringFederation → Federation.getRedeemScript()).
+    let (_federation_keys, fed_redeem) =
+        active_federation_keys_and_redeem(ctx, config, hardfork_cfg, block_number_now);
     let fed_script = p2sh_output_script(&redeem_script_hash160(&fed_redeem));
-    let retiring = retiring_federation_keys(ctx, config, hardfork_cfg, block_number_now).map(|keys| {
-        let redeem = build_federation_redeem_script(&keys, keys.len() / 2 + 1);
-        let script = p2sh_output_script(&redeem_script_hash160(&redeem));
-        (redeem, script)
-    });
+    let retiring = retiring_federation_keys_and_redeem(ctx, config, hardfork_cfg, block_number_now)
+        .map(|(_keys, redeem)| {
+            let script = p2sh_output_script(&redeem_script_hash160(&redeem));
+            (redeem, script)
+        });
 
     // rskj marks processed txs with the RSK execution block number
     // (BridgeSupport.markTxAsProcessed), not the BTC block height.
@@ -2134,6 +2138,54 @@ fn store_utxos_at<CTX: crate::RskContextTr>(ctx: &mut CTX, key: &str, utxos: &[B
     bridge_store_bytes_named(ctx, key, &super::storage::serialize_utxo_list(utxos));
 }
 
+/// Active federation keys together with the redeem script built from the
+/// federation's STORED format version (rskj `getActiveFederation().getRedeemScript()`).
+/// During the activation window the active federation is still the OLD one, so its
+/// format cell (and keys) must be used.
+fn active_federation_keys_and_redeem<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    config: &BridgeConstants,
+    hardfork_cfg: &RskHardforkConfig,
+    block_number: u64,
+) -> (Vec<[u8; 33]>, Vec<u8>) {
+    let new = super::federation::load_stored_federation(ctx, NEW_FEDERATION_KEY);
+    let old = super::federation::load_stored_federation(ctx, OLD_FEDERATION_KEY);
+    let age = super::governance::federation_activation_age(config, hardfork_cfg, block_number);
+    let (keys, format_key) = match (new, old) {
+        (Some(n), Some(o)) => {
+            if block_number >= n.creation_block + age {
+                (n.btc_keys(), super::storage::NEW_FEDERATION_FORMAT_VERSION_KEY)
+            } else {
+                (o.btc_keys(), super::storage::OLD_FEDERATION_FORMAT_VERSION_KEY)
+            }
+        }
+        (Some(n), None) => (n.btc_keys(), super::storage::NEW_FEDERATION_FORMAT_VERSION_KEY),
+        (None, _) => return {
+            let keys = genesis_federation_keys(config);
+            let redeem = build_federation_redeem_script(&keys, keys.len() / 2 + 1);
+            (keys, redeem)
+        },
+    };
+    let version = federation_format_version(ctx, format_key);
+    let redeem = federation_redeem_for_format(&keys, version, config);
+    (keys, redeem)
+}
+
+/// Retiring federation keys + redeem (rskj `getRetiringFederation().getRedeemScript()`).
+/// The retiring federation is the OLD federation once the new one has activated;
+/// its redeem script follows the OLD federation's stored format version.
+fn retiring_federation_keys_and_redeem<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    config: &BridgeConstants,
+    hardfork_cfg: &RskHardforkConfig,
+    block_number: u64,
+) -> Option<(Vec<[u8; 33]>, Vec<u8>)> {
+    let keys = retiring_federation_keys(ctx, config, hardfork_cfg, block_number)?;
+    let version = federation_format_version(ctx, super::storage::OLD_FEDERATION_FORMAT_VERSION_KEY);
+    let redeem = federation_redeem_for_format(&keys, version, config);
+    Some((keys, redeem))
+}
+
 /// Retiring federation keys (rskj getRetiringFederation): the old federation
 /// while both old+new exist and the new one has reached activation age.
 pub(crate) fn retiring_federation_keys<CTX: crate::RskContextTr>(
@@ -2810,6 +2862,54 @@ pub fn build_committed_federation_redeem_script(
     let csv = config.erp_fed_activation_delay;
     let p2sh = hardfork_cfg.has_rskip353(block_number);
     build_erp_redeem_script(keys, threshold, &erp_keys, erp_threshold, csv, p2sh)
+}
+
+/// Build a live federation's redeem script from its **stored format version**,
+/// mirroring rskj `BridgeSerializationUtils.deserializeFederationAccordingToVersion`
+/// + `FederationFactory`. A federation that outlives the hardfork that introduced
+/// a newer template keeps its original type, so the redeem script (and hence the
+/// P2SH address used to recognize peg-in outputs / peg-out inputs) must be chosen
+/// by the format the federation was stored with — NOT by the current block height.
+///   1000 STANDARD_MULTISIG      → plain N-of-M multisig
+///   2000 NON_STANDARD_ERP       → non-standard ERP (no trailing OP_CHECKMULTISIG per inner)
+///   3000 P2SH_ERP / 4000 P2SH_P2WSH_ERP → P2SH-ERP template
+/// (The P2SH-P2WSH-ERP federation reuses the P2SH-ERP redeem template — see
+/// `FederationFactory.buildP2shP2wshErpFederation`.)
+fn federation_redeem_for_format(
+    keys: &[[u8; 33]],
+    format_version: u64,
+    config: &BridgeConstants,
+) -> Vec<u8> {
+    let threshold = keys.len() / 2 + 1;
+    if format_version <= 1000 {
+        return build_federation_redeem_script(keys, threshold);
+    }
+    let erp_keys: Vec<[u8; 33]> = config
+        .erp_fed_pubkeys
+        .iter()
+        .map(|hex| {
+            let bytes = alloy_primitives::hex::decode(hex).expect("valid erp pubkey hex");
+            bytes.try_into().expect("33-byte compressed erp pubkey")
+        })
+        .collect();
+    let erp_threshold = erp_keys.len() / 2 + 1;
+    let csv = config.erp_fed_activation_delay;
+    // 2000 = non-standard ERP (p2sh=false); 3000/4000 = P2SH-ERP template (p2sh=true).
+    let p2sh = format_version >= 3000;
+    build_erp_redeem_script(keys, threshold, &erp_keys, erp_threshold, csv, p2sh)
+}
+
+/// Read a federation's stored format version (rskj
+/// `FederationStorageProviderImpl.getFederationFormatVersion`): the value in the
+/// `*FederationFormatVersion` cell, or `STANDARD_MULTISIG_FEDERATION` (1000) when
+/// the cell is absent (a pre-RSKIP123 only-BTC-keys federation).
+fn federation_format_version<CTX: crate::RskContextTr>(ctx: &mut CTX, key_name: &str) -> u64 {
+    let cell = bridge_load_bytes_named(ctx, key_name);
+    if cell.is_empty() {
+        1000
+    } else {
+        super::storage::rlp_decode_uint(&cell).to::<u64>()
+    }
 }
 
 /// Public wrapper for governance (commit_federation event addresses).
@@ -3533,6 +3633,58 @@ mod tests {
             "a9142c1bab6ea51fdaf85c8366bd2b1502eaa69b6ae687"
         );
         assert_eq!(p2sh_base58_mainnet(&redeem), "35iEoWHfDfEXRQ5ZWM5F6eMsY2Uxrc64YK");
+    }
+
+    /// Ground truth for `federation_redeem_for_format` — the dispatch that fixes
+    /// the #4,677,229 divergence. A live federation's redeem script must follow
+    /// its STORED format version, not the current block. At #4,677,229 the active
+    /// federation is the format-2000 (NON_STANDARD_ERP) fed and the retiring one
+    /// is format-1000 (STANDARD_MULTISIG); a `registerBtcTransaction` migration tx
+    /// pays the active fed's P2SH (3DsneJha6CY6X9gU2M9uEc4nSdbYECB4Gh), and the
+    /// change UTXO is only registered if that script is reconstructed correctly.
+    #[test]
+    fn federation_redeem_for_format_groundtruth() {
+        // The real format-2000 ERP federation active at #4,677,229 (== the fed
+        // committed at #4,652,781), 5-of-9 default keys.
+        let active_keys = [
+            "020ace50bab1230f8002a0bfe619482af74b338cc9e4c956add228df47e6adae1c",
+            "0231a395e332dde8688800a0025cccc5771ea1aa874a633b8ab6e5c89d300c7c36",
+            "025093f439fb8006fd29ab56605ffec9cdc840d16d2361004e1337a2f86d8bd2db",
+            "026b472f7d59d201ff1f540f111b6eb329e071c30a9d23e3d2bcd128fe73dc254c",
+            "03250c11be0561b1d7ae168b1f59e39cbc1fd1ba3cf4d2140c1a365b2723a2bf93",
+            "0357f7ed4c118e581f49cd3b4d9dd1edb4295f4def49d6dcf2faaaaac87a1a0a42",
+            "03ae72827d25030818c4947a800187b1fbcc33ae751e248ae60094cc989fb880f6",
+            "03e05bf6002b62651378b1954820539c36ca405cbb778c225395dd9ebff6780299",
+            "03ecd8af1e93c57a1b8c7f917bd9980af798adeb0205e9687865673353eb041e8d",
+        ]
+        .map(key);
+        let config = BridgeConstants::mainnet();
+
+        // format 2000 (NON_STANDARD_ERP) → the active fed's real mainnet P2SH.
+        let r2000 = federation_redeem_for_format(&active_keys, 2000, &config);
+        assert_eq!(
+            p2sh_base58_mainnet(&r2000),
+            "3DsneJha6CY6X9gU2M9uEc4nSdbYECB4Gh",
+            "format 2000 must build the non-standard ERP redeem script"
+        );
+
+        // format 1000 (STANDARD_MULTISIG) → plain N-of-M, a DIFFERENT address.
+        let r1000 = federation_redeem_for_format(&active_keys, 1000, &config);
+        assert_eq!(
+            r1000,
+            build_federation_redeem_script(&active_keys, active_keys.len() / 2 + 1),
+            "format 1000 must build a plain multisig redeem script"
+        );
+        assert_ne!(
+            p2sh_base58_mainnet(&r1000),
+            "3DsneJha6CY6X9gU2M9uEc4nSdbYECB4Gh",
+            "the standard multisig must NOT collide with the ERP address"
+        );
+
+        // format 3000 (P2SH_ERP) → the P2SH-ERP template (p2sh=true), distinct
+        // from the non-standard ERP form.
+        let r3000 = federation_redeem_for_format(&active_keys, 3000, &config);
+        assert_ne!(r3000, r2000, "P2SH-ERP and non-standard ERP differ");
     }
 
     // -----------------------------------------------------------------------
