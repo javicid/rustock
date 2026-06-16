@@ -3064,7 +3064,7 @@ fn apply_signatures_to_tx(
         // keeping any inputs already signed in this call. The signature
         // verified fine against the federator's own key, so without this
         // gate it would fill a placeholder it has no claim to (#2,448,984).
-        if !super::release_tx::redeem_script_keys(&redeems[i]).contains(fed_key) {
+        if !super::release_tx::spending_redeem_keys(&redeems[i]).contains(fed_key) {
             return signed;
         }
         let mut encoded = sigs[i].clone();

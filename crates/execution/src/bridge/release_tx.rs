@@ -471,6 +471,45 @@ pub fn redeem_script_keys(redeem_script: &[u8]) -> Vec<[u8; 33]> {
         .collect()
 }
 
+/// Public keys bitcoinj's `RedeemScriptParser.getPubKeys()` exposes for SIGNING
+/// a P2SH input. For an ERP redeem a normal (`OP_NOTIF` default-branch) spend
+/// uses only the DEFAULT-federation multisig, so the emergency keys after
+/// `OP_ELSE` must be excluded; otherwise sig insertion indexes against the wrong
+/// key set. For a plain (or flyover-plain) redeem this is every 33-byte push.
+pub fn spending_redeem_keys(redeem_script: &[u8]) -> Vec<[u8; 33]> {
+    let Some(chunks) = parse_chunks(redeem_script) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for c in &chunks {
+        match c {
+            Chunk::Op(0x67) => break, // OP_ELSE: emergency keys follow
+            Chunk::Data(d) if d.len() == 33 => {
+                if let Ok(k) = d.as_slice().try_into() {
+                    out.push(k);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The redeem script of a P2SH input scriptSig (its last data push), and whether
+/// it is ERP-typed. Used to size the trailing chunks bitcoinj reserves
+/// (`BridgeUtils.countValuesToSubstract`: redeem only, or `OP_NOTIF` flag +
+/// redeem for ERP).
+fn input_redeem_is_erp(chunks: &[Chunk]) -> bool {
+    chunks
+        .iter()
+        .rev()
+        .find_map(|c| match c {
+            Chunk::Data(d) => Some(is_erp_redeem(d)),
+            _ => None,
+        })
+        .unwrap_or(false)
+}
+
 /// bitcoinj `ScriptBuilder.updateScriptWithSignature` with `sigsPrefixCount =
 /// 1` and `sigsSuffixCount = 1`: insert `signature` at `target_index` among
 /// the signature slots, consuming one OP_0 placeholder. Returns `None` when
@@ -485,15 +524,20 @@ pub fn update_script_with_signature(
     if total < 3 {
         return None;
     }
-    // The chunk in the last signature slot must still be a placeholder.
-    if chunks[total - 2] != Chunk::OpZero {
+    // Trailing chunks bitcoinj reserves: the redeem, plus the ERP OP_NOTIF flag.
+    let suffix = if input_redeem_is_erp(&chunks) { 2 } else { 1 };
+    if total < 2 + suffix {
+        return None;
+    }
+    // The last signature slot (just before the suffix) must still be a placeholder.
+    if chunks[total - 1 - suffix] != Chunk::OpZero {
         return None;
     }
 
-    let mut result = Vec::with_capacity(total);
+    let mut result = Vec::with_capacity(total + 1);
     result.push(chunks[0].clone()); // prefix OP_0
 
-    let middle = &chunks[1..total - 1];
+    let middle = &chunks[1..total - suffix];
     let mut pos = 0;
     for chunk in middle {
         if pos == target_index {
@@ -514,7 +558,7 @@ pub fn update_script_with_signature(
         pos += 1;
     }
 
-    result.push(chunks[total - 1].clone()); // suffix: redeem script
+    result.extend_from_slice(&chunks[total - suffix..]); // suffix: [ERP flag] + redeem
     Some(chunks_to_script(&result))
 }
 
@@ -527,7 +571,7 @@ pub fn sig_insertion_index(
     signing_key: &[u8; 33],
     redeem_script: &[u8],
 ) -> usize {
-    let keys = redeem_script_keys(redeem_script);
+    let keys = spending_redeem_keys(redeem_script);
     let my_index = keys
         .iter()
         .position(|k| k == signing_key)
@@ -538,9 +582,14 @@ pub fn sig_insertion_index(
     if chunks.len() < 2 {
         return 0;
     }
+    // Skip the trailing redeem (and the ERP OP_NOTIF flag) when scanning sigs.
+    let suffix = if input_redeem_is_erp(&chunks) { 2 } else { 1 };
+    if chunks.len() < 1 + suffix {
+        return 0;
+    }
 
     let mut sig_index = 0;
-    for chunk in &chunks[1..chunks.len() - 1] {
+    for chunk in &chunks[1..chunks.len() - suffix] {
         if let Chunk::Data(sig) = chunk {
             let sig_key_index = find_sig_key_index(sig, sighash, &keys);
             if my_index < sig_key_index {
@@ -605,7 +654,13 @@ pub fn has_enough_signatures(tx: &BtcTransaction) -> bool {
         if chunks.len() < 3 {
             return false;
         }
-        if chunks[1..chunks.len() - 1]
+        // rskj BridgeUtils.countValuesToSubstract: skip the redeem (1), plus the
+        // OP_NOTIF flag (1 more) for an ERP redeem, when counting missing sigs.
+        let suffix = if input_redeem_is_erp(&chunks) { 2 } else { 1 };
+        if chunks.len() < 1 + suffix {
+            return false;
+        }
+        if chunks[1..chunks.len() - suffix]
             .iter()
             .any(|c| *c == Chunk::OpZero)
         {
@@ -726,6 +781,50 @@ mod tests {
         let plain_ph = placeholder_scriptsig(&test_redeem(2, 3), 2);
         assert_eq!(&plain_ph[..3], &[0x00, 0x00, 0x00]);
         assert_eq!(plain_ph[3], 0x4c); // OP_PUSHDATA1 (105-byte redeem)
+    }
+
+    #[test]
+    fn erp_signing_ignores_op_notif_flag() {
+        // Build a small ERP redeem (default 2-of-3) and its placeholder.
+        let inner = test_redeem(2, 3);
+        let mut erp = vec![0x64]; // OP_NOTIF
+        erp.extend_from_slice(&inner[..inner.len() - 1]);
+        erp.push(0x67); // OP_ELSE
+        erp.extend_from_slice(&[0x03, 0x50, 0xcd, 0x00, 0xb2, 0x75]);
+        erp.extend_from_slice(&inner[..inner.len() - 1]);
+        erp.push(0x68); // OP_ENDIF
+        erp.push(0xae);
+        let ph = placeholder_scriptsig(&erp, 2);
+
+        // A tx whose single input carries the ERP placeholder is NOT fully
+        // signed: the trailing OP_NOTIF flag OP_0 must not be counted.
+        let mk_tx = |ss: &[u8]| BtcTransaction {
+            version: Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint { txid: txid_from_stored_hash(&[1u8; 32]), vout: 0 },
+                script_sig: ScriptBuf::from_bytes(ss.to_vec()),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![],
+        };
+        assert!(!has_enough_signatures(&mk_tx(&ph)));
+
+        // Fill the two real sig slots (inserting before the flag); after both,
+        // it is fully signed even though the flag OP_0 remains before the redeem.
+        let sig = vec![0x30u8, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01, 0x01];
+        let one = update_script_with_signature(&ph, &sig, 0).expect("first sig");
+        assert!(!has_enough_signatures(&mk_tx(&one)));
+        let two = update_script_with_signature(&one, &sig, 1).expect("second sig");
+        assert!(has_enough_signatures(&mk_tx(&two)));
+        // Inserting a third must fail — no placeholder slot left (flag excluded).
+        assert!(update_script_with_signature(&two, &sig, 0).is_none());
+
+        // The flag OP_0 is still immediately before the redeem push.
+        let chunks = parse_chunks(&two).unwrap();
+        assert_eq!(chunks[chunks.len() - 2], Chunk::OpZero);
+        assert!(matches!(&chunks[chunks.len() - 1], Chunk::Data(d) if is_erp_redeem(d)));
     }
 
     #[test]

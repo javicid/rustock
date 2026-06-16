@@ -2822,6 +2822,42 @@ flyover prefix). Verified: #4,677,503 replays to state root
 does not yet account for the ERP flag `OP_0` sitting in the signature region —
 latent until a federation actually signs an ERP-fed peg-out in a later block.
 
+## Signing an ERP federation peg-out: the OP_NOTIF flag in addSignature (#4,681,515)
+
+**rskj.** `BridgeUtils.countInputScriptSigMissingSignatures` counts unfilled
+`OP_0` signature placeholders in `scriptSig[1 .. size - countValuesToSubstract]`,
+where `countValuesToSubstract(redeem)` is **1** for a plain redeem (skip the
+redeem push) and **2** for an ERP redeem (skip the redeem push AND the trailing
+`OP_NOTIF` flag `OP_0`). `hasEnoughSignatures` is true when every input has zero
+missing. Signature insertion (`Script.getSigInsertionIndex` /
+`ScriptBuilder.updateScriptWithSignature`) keys against
+`RedeemScriptParser.getPubKeys()` / `getM()`, which for an ERP redeem expose only
+the DEFAULT-federation multisig (the keys before `OP_ELSE`), not the emergency
+keys. So a normal peg-out spend reaches "fully signed" after the default-M
+signatures land, and `release_btc` is emitted on exactly that `addSignature` call.
+
+Consensus + receipts load-bearing: at mainnet #4,681,515 several federators sign
+an ERP-fed peg-out (`releaseRskTxHash` 0x107ed6ef…) across the block. rustock
+counted the trailing flag `OP_0` as a missing signature and indexed signatures
+against all keys (default + emergency), so it reached threshold two
+`addSignature` calls late — emitting `add_signature`/`release_btc` on the wrong
+transactions (forking the receipts root) and storing a differently-signed tx in
+`pegoutsWaitingForSignatures` (forking the state root).
+
+rskj refs: `BridgeUtils.countInputScriptSigMissingSignatures` /
+`countValuesToSubstract` / `hasEnoughSignatures`, bitcoinj-thin
+`Script.getSigInsertionIndex` / `getNumberOfSignaturesRequiredToSpend` over the
+ERP `RedeemScriptParser`.
+
+**rustock.** `crates/execution/src/bridge/release_tx.rs`: `has_enough_signatures`
+and `update_script_with_signature` reserve a 2-chunk suffix (flag + redeem) for
+ERP via `input_redeem_is_erp`; `sig_insertion_index` and the
+`apply_signatures_to_tx` membership check use new `spending_redeem_keys` (default
+keys only — stops before `OP_ELSE`). Verified: #4,681,515 replays to state root
+`0x5bb9b0e6…` and receipts root `0xfa93e32b…`. Test
+`erp_signing_ignores_op_notif_flag`. This closes the addSignature follow-up noted
+in the previous section.
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`
