@@ -1156,6 +1156,67 @@ fn set_flyover_federation_information<CTX: crate::RskContextTr>(
     super::storage::bridge_store_raw(ctx, key, Some(value));
 }
 
+/// rskj `BridgeStorageProvider.getFlyoverFederationInformation`: read the
+/// `RLP[derivationHash(32), fedRedeemScriptHash(20)]` stored for a flyover P2SH
+/// hash160, or `None` if the input is not a flyover UTXO.
+fn get_flyover_federation_information<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    flyover_p2sh_hash: &[u8; 20],
+) -> Option<([u8; 32], [u8; 20])> {
+    let key = compound_key(FAST_BRIDGE_FEDERATION_INFO_KEY, "-", &to_hex(flyover_p2sh_hash));
+    let data = super::storage::bridge_load_raw(ctx, key)?;
+    let items = super::serialization::rlp_decode_list(&data)?;
+    let derivation: [u8; 32] = items.first()?.as_slice().try_into().ok()?;
+    let fed_hash: [u8; 20] = items.get(1)?.as_slice().try_into().ok()?;
+    Some((derivation, fed_hash))
+}
+
+/// Extract the hash160 from a P2SH output script
+/// (`OP_HASH160 <20 bytes> OP_EQUAL`).
+fn p2sh_script_hash160(script: &[u8]) -> Option<[u8; 20]> {
+    if script.len() == 23 && script[0] == 0xa9 && script[1] == 0x14 && script[22] == 0x87 {
+        script[2..22].try_into().ok()
+    } else {
+        None
+    }
+}
+
+/// rskj `FlyoverCompatibleBtcWalletWithStorage.findRedeemDataFromScriptHash`:
+/// resolve the redeem script for each spending UTXO. A flyover UTXO (whose P2SH
+/// hash has stored flyover federation information) spends with
+/// `PUSH32 <derivationHash> OP_DROP <fedRedeem>`, where `fedRedeem` is the
+/// destination federation's redeem (the active or retiring federation whose
+/// hash160 matches the stored `fedRedeemScriptHash`); every other UTXO spends
+/// with `default_redeem`. Returns one redeem per UTXO, in input order.
+///
+/// `candidate_fed_redeems` lists the redeem scripts of the federations
+/// `getDestinationFederation` searches (active + retiring), used to rebuild the
+/// inner fed redeem from the stored hash. Returns a sparse map of per-UTXO
+/// flyover redeem overrides keyed by `(tx_hash, vout)`; UTXOs absent from the
+/// map spend with the default redeem. The map is stable across coin selection
+/// (it does not depend on the mutating available-UTXO list).
+fn resolve_flyover_input_redeems<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    utxos: &[BridgeUtxo],
+    candidate_fed_redeems: &[Vec<u8>],
+) -> std::collections::HashMap<([u8; 32], u32), Vec<u8>> {
+    let mut overrides = std::collections::HashMap::new();
+    for u in utxos {
+        let flyover = p2sh_script_hash160(&u.script)
+            .and_then(|h| get_flyover_federation_information(ctx, &h))
+            .and_then(|(derivation, fed_hash)| {
+                candidate_fed_redeems
+                    .iter()
+                    .find(|r| redeem_script_hash160(r) == fed_hash)
+                    .map(|fed_redeem| flyover_redeem_script(&derivation, fed_redeem))
+            });
+        if let Some(redeem) = flyover {
+            overrides.insert((u.tx_hash, u.vout), redeem);
+        }
+    }
+    overrides
+}
+
 /// rskj `generateFlyoverRejectionReleaseWithWalletProvider`: build an
 /// empty-wallet refund of the flyover-federation outputs to `refund_hash160`
 /// using the FLYOVER redeem script, enqueue it, and log release_requested.
@@ -1490,6 +1551,28 @@ pub fn update_collections<CTX: crate::RskContextTr>(
                 let active_utxo_key =
                     active_federation_utxo_key(ctx, config, hardfork_cfg, block_number);
                 let mut available = load_utxos_at(ctx, active_utxo_key);
+
+                // rskj getActiveFederationWallet builds a FlyoverCompatibleBtcWallet:
+                // resolve a flyover UTXO's redeem per input (PUSH32 <hash> OP_DROP
+                // <fedRedeem>). getDestinationFederation searches active + retiring.
+                let mut candidate_fed_redeems = vec![redeem_script.clone()];
+                if let Some(retiring_keys) =
+                    retiring_federation_keys(ctx, config, hardfork_cfg, block_number)
+                {
+                    candidate_fed_redeems.push(build_federation_redeem_script(
+                        &retiring_keys,
+                        retiring_keys.len() / 2 + 1,
+                    ));
+                }
+                let flyover_overrides =
+                    resolve_flyover_input_redeems(ctx, &available, &candidate_fed_redeems);
+                let redeem_for = |u: &BridgeUtxo| -> &[u8] {
+                    flyover_overrides
+                        .get(&(u.tx_hash, u.vout))
+                        .map(|r| r.as_slice())
+                        .unwrap_or(redeem_script.as_slice())
+                };
+
                 let mut waiting = load_pegout_confirmation_set(ctx, use_tx_hash);
                 let mut created_any = false;
 
@@ -1575,7 +1658,7 @@ pub fn update_collections<CTX: crate::RskContextTr>(
                             &available,
                             &outputs,
                             &change_script,
-                            &redeem_script,
+                            redeem_for,
                             fee_per_kb,
                             tx_version,
                         ) {
@@ -1615,7 +1698,7 @@ pub fn update_collections<CTX: crate::RskContextTr>(
                         &available,
                         &outputs,
                         &change_script,
-                        &redeem_script,
+                        redeem_for,
                         fee_per_kb,
                         tx_version,
                     ) {
@@ -1898,6 +1981,24 @@ fn process_funds_migration<CTX: crate::RskContextTr>(
         );
         let active_script = p2sh_output_script(&redeem_script_hash160(&new_redeem));
 
+        // rskj getRetiringFederationWallet builds a FlyoverCompatibleBtcWallet:
+        // a flyover UTXO in the migration set spends with the flyover redeem
+        // (PUSH32 <derivationHash> OP_DROP <fedRedeem>) of its destination
+        // federation, not the plain retiring redeem. Resolve per input.
+        // getDestinationFederation searches active + retiring; the stored
+        // fedRedeemScriptHash is the *plain* multisig hash of whichever fed was
+        // active at the flyover peg-in (now the retiring fed for this batch).
+        let plain_new_redeem = build_federation_redeem_script(&new_btc_keys, new_btc_keys.len() / 2 + 1);
+        let candidate_fed_redeems = vec![retiring_redeem.clone(), plain_new_redeem];
+        let flyover_overrides =
+            resolve_flyover_input_redeems(ctx, &migration_utxos, &candidate_fed_redeems);
+        let redeem_for = |u: &BridgeUtxo| -> &[u8] {
+            flyover_overrides
+                .get(&(u.tx_hash, u.vout))
+                .map(|r| r.as_slice())
+                .unwrap_or(retiring_redeem.as_slice())
+        };
+
         // createMigrationTransaction: target the full balance, halving on
         // size overflow (pre-RSKIP376 migrations are version 1).
         let mut target = balance;
@@ -1910,7 +2011,7 @@ fn process_funds_migration<CTX: crate::RskContextTr>(
                 &migration_utxos,
                 &outputs,
                 &active_script,
-                &retiring_redeem,
+                redeem_for,
                 fee_per_kb,
                 1,
             ) {

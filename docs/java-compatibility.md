@@ -2690,6 +2690,53 @@ deletion (matching rskj's null-save). Test
 `federation_creation_height_promotion_threshold_4671284`; verified by the
 #4,671,284 header roots via `examples/replay_block`.
 
+## Per-input flyover redeem script in peg-out / migration tx sizing (#4,671,312)
+
+**Consensus-critical implementation quirk.** When the Bridge builds a peg-out or
+funds-migration BTC transaction, rskj's spend wallet
+(`BridgeUtils.getFederationSpendWallet` / `getRetiringFederationWallet` →
+`FlyoverCompatibleBtcWalletWithStorage`) resolves the redeem script **per input**,
+not per transaction. A flyover UTXO (one paid into a flyover-federation P2SH,
+registered via `registerFastBridgeBtcTransaction`, RSKIP176) is spent with the
+*flyover redeem* `PUSH32(derivationHash) OP_DROP <fedRedeem>` — 34 bytes longer
+than the plain federation redeem. bitcoinj's fee sizing
+(`Wallet.calculateFee` → `estimateBytesForSigning` →
+`Script.getNumberOfBytesRequiredToSpend` = `numSigs * SIG_SIZE(75) +
+redeemScript.getProgram().length`) and the `USE_OP_ZERO` placeholder scriptSig
+both use that input's own redeem. The inner-multisig `numSigs`
+(`getNumberOfSignaturesRequiredToSpend`) is unchanged (7 for a 7-of-13 fed): it
+is the first `OP_1..OP_16` opcode found in the redeem, *after* the
+`PUSH32 OP_DROP` prefix.
+
+A from-scratch client that applies one redeem to every input computes a wrong
+unsigned txid (changes the placeholder scriptSig of the flyover input) and a fee
+that is 34 bytes (× feePerKb) too low — forking both the stored peg-out tx and
+the `release_requested` btcTxHash event topic. This bit the final
+funds-migration batch at mainnet #4,671,312 (49 inputs, input #38
+`e45ac5168027dc91…:1` a flyover UTXO): rskj txid
+`0x99fd3ef49673538e60321a0dca5b5b3ee74b43e9788d98dfe7caed9f429b6d75`, output
+17,371,806,971, fee 744,225. The analogous #4,671,284 batch did not fork because
+it had >50 standard UTXOs and was capped to 50 standard inputs (RSKIP294).
+
+rskj refs: `BridgeUtils.getFederationsSpendWallet`,
+`FlyoverCompatibleBtcWallet.findRedeemDataFromScriptHash` (lookup by output P2SH
+hash → `FlyoverFederationInformation{derivationHash, federationRedeemScriptHash}`
+→ `getDestinationFederation(redeemHash)` over active+retiring →
+`FlyoverRedeemScriptBuilderImpl.of(derivationHash, fedRedeem)`), bitcoinj
+`Script.getNumberOfBytesRequiredToSpend`.
+
+**rustock.** `crates/execution/src/bridge/peg.rs`: `resolve_flyover_input_redeems`
+reads the stored `fastBridgeFederationInformation-<hex(p2shHash)>` cell
+(`get_flyover_federation_information`), matches the stored fed redeem hash against
+the active/retiring federation redeems, and rebuilds the flyover redeem
+(`flyover_redeem_script`). Both migration (`process_funds_migration`) and regular
+peg-out (`update_collections`) pass a per-input `redeem_for` closure to
+`complete_pegout_tx` (`release_tx.rs`), which sizes and builds each input's
+placeholder scriptSig with its own redeem. `redeem_script_threshold` now finds the
+inner `OP_m` opcode (handles flyover/ERP wrappers). Verified: #4,671,312 replays to
+`state 0x66b85d7f…`, `receipts 0x2e962f21…`. Test
+`flyover_input_sizes_and_signs_with_its_own_redeem` (release_tx.rs).
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`

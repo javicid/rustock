@@ -99,11 +99,20 @@ pub fn push_data(script: &mut Vec<u8>, data: &[u8]) {
 
 /// Number of signatures required by an `OP_m ... OP_n OP_CHECKMULTISIG`
 /// redeem script (bitcoinj `Script.getNumberOfSignaturesRequiredToSpend`).
+///
+/// Flyover (`PUSH32 <hash> OP_DROP <fedRedeem>`) and ERP redeem scripts wrap a
+/// standard multisig: the `OP_m` we need is the first `OP_1..OP_16` opcode in
+/// the script, not necessarily the first byte. bitcoinj resolves the inner
+/// multisig the same way when sizing/signing a P2SH spend.
 pub fn redeem_script_threshold(redeem_script: &[u8]) -> usize {
-    match redeem_script.first() {
-        Some(op) if (0x51..=0x60).contains(op) => (op - 0x50) as usize,
-        _ => 0,
-    }
+    parse_chunks(redeem_script)
+        .into_iter()
+        .flatten()
+        .find_map(|c| match c {
+            Chunk::Op(op) if (0x51..=0x60).contains(&op) => Some((op - 0x50) as usize),
+            _ => None,
+        })
+        .unwrap_or(0)
 }
 
 /// Replica of `Wallet.completeTx` for the bridge peg-out path
@@ -111,22 +120,25 @@ pub fn redeem_script_threshold(redeem_script: &[u8]) -> usize {
 /// multisig federation, `ensureMinRequiredFee = true`).
 ///
 /// `available_utxos` is the federation UTXO list in storage order;
-/// `change_script` is the federation P2SH output script. Returns `None` on
-/// any of bitcoinj's build failures (dusty send, insufficient money, could
-/// not adjust downwards, exceeded max size).
-pub fn complete_pegout_tx(
+/// `change_script` is the federation P2SH output script. `redeem_for` returns
+/// the redeem script bitcoinj's spend wallet uses for a given UTXO — for a
+/// flyover UTXO this is the `PUSH32 <derivationHash> OP_DROP <fedRedeem>`
+/// wrapper (34 bytes longer than the plain fed redeem), which changes both the
+/// USE_OP_ZERO placeholder scriptSig and the per-input fee-sizing estimate.
+/// Returns `None` on any of bitcoinj's build failures (dusty send, insufficient
+/// money, could not adjust downwards, exceeded max size).
+pub fn complete_pegout_tx<'r, F>(
     available_utxos: &[BridgeUtxo],
     outputs: &[PegoutOutput],
     change_script: &ScriptBuf,
-    redeem_script: &[u8],
+    redeem_for: F,
     fee_per_kb: u64,
     version: i32,
-) -> Option<BuiltPegout> {
+) -> Option<BuiltPegout>
+where
+    F: Fn(&BridgeUtxo) -> &'r [u8],
+{
     if outputs.is_empty() {
-        return None;
-    }
-    let threshold = redeem_script_threshold(redeem_script);
-    if threshold == 0 {
         return None;
     }
 
@@ -138,9 +150,14 @@ pub fn complete_pegout_tx(
     }
 
     // RskAllowUnconfirmedCoinSelector: sort candidates by parent tx hash
-    // (BigInteger over bitcoinj's stored byte order) then output index.
-    let mut candidates: Vec<&BridgeUtxo> = available_utxos.iter().collect();
-    candidates.sort_by(|a, b| a.tx_hash.cmp(&b.tx_hash).then(a.vout.cmp(&b.vout)));
+    // (BigInteger over bitcoinj's stored byte order) then output index. Each
+    // candidate carries the redeem script its input must be signed with.
+    let mut candidates: Vec<(&BridgeUtxo, &[u8])> =
+        available_utxos.iter().map(|u| (u, redeem_for(u))).collect();
+    candidates.sort_by(|a, b| a.0.tx_hash.cmp(&b.0.tx_hash).then(a.0.vout.cmp(&b.0.vout)));
+    if candidates.iter().any(|(_, r)| redeem_script_threshold(r) == 0) {
+        return None;
+    }
 
     let value: u64 = outputs.iter().map(|o| o.amount_satoshis).sum();
     let n_outputs = outputs.len() as u64;
@@ -168,12 +185,12 @@ pub fn complete_pegout_tx(
         // Greedy selection until the target is gathered (InsufficientMoney
         // when the candidates cannot cover it).
         let mut gathered: u64 = 0;
-        let mut selected: Vec<&BridgeUtxo> = Vec::new();
-        for utxo in &candidates {
+        let mut selected: Vec<(&BridgeUtxo, &[u8])> = Vec::new();
+        for &(utxo, redeem) in &candidates {
             if gathered >= value {
                 break;
             }
-            selected.push(utxo);
+            selected.push((utxo, redeem));
             gathered += utxo.value_satoshis;
         }
         if gathered < value {
@@ -211,7 +228,7 @@ pub fn complete_pegout_tx(
 
         let inputs: Vec<TxIn> = selected
             .iter()
-            .map(|u| TxIn {
+            .map(|(u, _)| TxIn {
                 previous_output: OutPoint {
                     txid: txid_from_stored_hash(&u.tx_hash),
                     vout: u.vout,
@@ -230,23 +247,29 @@ pub fn complete_pegout_tx(
         };
 
         // calculateTxSize: empty-scriptSig serialization plus the estimated
-        // signing bytes per P2SH input.
+        // signing bytes per P2SH input — sized with that input's own redeem
+        // script (flyover inputs cost 34 extra bytes).
         let base_size = bitcoin::consensus::serialize(&tx).len();
-        let size = base_size + selected.len() * (threshold * SIG_SIZE + redeem_script.len());
+        let signing: usize = selected
+            .iter()
+            .map(|(_, r)| redeem_script_threshold(r) * SIG_SIZE + r.len())
+            .sum();
+        let size = base_size + signing;
 
         let fee_rate = fee_per_kb.max(REFERENCE_DEFAULT_MIN_TX_FEE);
         let fee_needed = fee_rate * size as u64 / 1000;
 
         if fee >= fee_needed {
-            // Done: fill in the USE_OP_ZERO placeholder scriptSigs.
-            let scriptsig = placeholder_scriptsig(redeem_script, threshold);
-            for input in &mut tx.input {
-                input.script_sig = ScriptBuf::from_bytes(scriptsig.clone());
+            // Done: fill in the USE_OP_ZERO placeholder scriptSigs (per-input
+            // redeem, so a flyover input embeds the flyover redeem).
+            for (input, (_, redeem)) in tx.input.iter_mut().zip(&selected) {
+                let scriptsig = placeholder_scriptsig(redeem, redeem_script_threshold(redeem));
+                input.script_sig = ScriptBuf::from_bytes(scriptsig);
             }
             if bitcoin::consensus::serialize(&tx).len() > MAX_STANDARD_TX_SIZE {
                 return None;
             }
-            let used_utxos = selected.into_iter().cloned().collect();
+            let used_utxos = selected.into_iter().map(|(u, _)| u.clone()).collect();
             return Some(BuiltPegout { tx, used_utxos });
         }
         fee = fee_needed;
@@ -662,7 +685,7 @@ mod tests {
             &utxos,
             &[PegoutOutput { script: p2pkh(7), amount_satoshis: 60_000 }],
             &p2sh(8),
-            &redeem,
+            |_| redeem.as_slice(),
             5000,
             1,
         )
@@ -683,7 +706,7 @@ mod tests {
             &utxos,
             &[PegoutOutput { script: p2pkh(7), amount_satoshis: 200_000 }],
             &p2sh(8),
-            &redeem,
+            |_| redeem.as_slice(),
             5000,
             1,
         )
@@ -724,7 +747,7 @@ mod tests {
             &utxos,
             &[PegoutOutput { script: p2pkh(7), amount_satoshis: 2_729 }],
             &p2sh(8),
-            &redeem,
+            |_| redeem.as_slice(),
             5000,
             1,
         )
@@ -739,7 +762,7 @@ mod tests {
             &utxos,
             &[PegoutOutput { script: p2pkh(7), amount_satoshis: 20_000 }],
             &p2sh(8),
-            &redeem,
+            |_| redeem.as_slice(),
             5000,
             1,
         )
@@ -757,7 +780,7 @@ mod tests {
             &utxos,
             &[PegoutOutput { script: p2pkh(7), amount_satoshis: 100_000 }],
             &p2sh(8),
-            &redeem,
+            |_| redeem.as_slice(),
             5000,
             1,
         )
@@ -765,6 +788,69 @@ mod tests {
         let tx = &built.tx;
         assert_eq!(tx.output.len(), 2);
         assert_eq!(tx.output[1].value.to_sat(), 2700);
+    }
+
+    /// A flyover UTXO spends with `PUSH32 <hash> OP_DROP <fedRedeem>` (34 bytes
+    /// longer than the plain redeem), which must size its own input and embed
+    /// its own placeholder scriptSig — exactly what forked block #4,671,312's
+    /// migration tx. Mixing one flyover input with one standard input, the fee
+    /// must account for the extra 34 bytes only on the flyover input, and each
+    /// input's placeholder scriptSig must carry its own redeem.
+    #[test]
+    fn flyover_input_sizes_and_signs_with_its_own_redeem() {
+        let std_redeem = test_redeem(2, 3);
+        let mut flyover_redeem = vec![32u8];
+        flyover_redeem.extend_from_slice(&[7u8; 32]); // PUSH32 <derivationHash>
+        flyover_redeem.push(0x75); // OP_DROP
+        flyover_redeem.extend_from_slice(&std_redeem); // <fedRedeem>
+        assert_eq!(flyover_redeem.len(), std_redeem.len() + 34);
+        // The inner multisig threshold is still 2.
+        assert_eq!(redeem_script_threshold(&flyover_redeem), 2);
+
+        // hash 01 vout 0 = standard input, hash 02 vout 0 = flyover input.
+        let utxos = vec![utxo(1, 0, 700_000), utxo(2, 0, 700_000)];
+        let redeem_for = |u: &BridgeUtxo| -> &[u8] {
+            if u.tx_hash[0] == 2 {
+                flyover_redeem.as_slice()
+            } else {
+                std_redeem.as_slice()
+            }
+        };
+        let built = complete_pegout_tx(
+            &utxos,
+            &[PegoutOutput { script: p2pkh(7), amount_satoshis: 1_000_000 }],
+            &p2sh(8),
+            redeem_for,
+            5000,
+            1,
+        )
+        .expect("build");
+        let tx = &built.tx;
+        assert_eq!(tx.input.len(), 2);
+
+        // Per-input placeholder scriptSigs use each input's own redeem.
+        for (input, u) in tx.input.iter().zip(&built.used_utxos) {
+            let redeem = redeem_for(u);
+            assert_eq!(
+                input.script_sig.as_bytes(),
+                placeholder_scriptsig(redeem, redeem_script_threshold(redeem)).as_slice()
+            );
+        }
+
+        // Fee covers base + per-input signing estimate (flyover input +34).
+        let recipient = tx.output[0].value.to_sat();
+        let change = tx.output[1].value.to_sat();
+        let fee = 1_400_000 - recipient - change;
+        let size = {
+            let mut unsigned = tx.clone();
+            for i in &mut unsigned.input {
+                i.script_sig = ScriptBuf::new();
+            }
+            bitcoin::consensus::serialize(&unsigned).len()
+                + (2 * SIG_SIZE + std_redeem.len())
+                + (2 * SIG_SIZE + flyover_redeem.len())
+        };
+        assert_eq!(fee, 5000 * size as u64 / 1000);
     }
 
     #[test]
