@@ -2858,6 +2858,41 @@ keys only — stops before `OP_ELSE`). Verified: #4,681,515 replays to state roo
 `erp_signing_ignores_op_notif_flag`. This closes the addSignature follow-up noted
 in the previous section.
 
+## Special-case funds-migration window end, RSKIP357/374 (#5,009,384)
+
+The funds-migration window is `[activationAge + begin, activationAge + end)`; once
+the active federation's age passes the end, `processFundsMigration` calls
+`clearRetiredFederation()` (`setOldFederation(null)` — deletes the `oldFederation`
+cell, sets `oldFederationFormatVersion = 1000`), a state change with no event.
+
+rskj `FederationConstants.getFundsMigrationAgeSinceActivationEnd(activations)`
+returns a **special-case** value while `RSKIP357` is active and `RSKIP374` is not —
+i.e. on mainnet between **hop401 (#4,976,300)** and **fingerroot500 (#5,468,000)** —
+of **172,800** instead of the normal **10,585** (`FederationMainNetConstants`).
+rustock had this as a TODO and used 10,585 unconditionally, so its migration window
+ended at age 29,085 (block creation + 29,085) instead of age 191,300. At #5,009,384
+the active federation (committed #4,980,299) reached age 29,085, so rustock cleared
+the retiring federation (#4,652,781) one window too early — deleting the
+`oldFederation` cell and rewriting the version cell — while rskj, still inside the
+extended window, left them untouched. Receipts matched (the clear emits nothing);
+only the state root forked.
+
+This was subtle to localize precisely because rskj's *latest* source reads as if it
+always clears at age ≥ `activationAge + 10585`; the consensus-load-bearing detail is
+that `getFundsMigrationAgeSinceActivationEnd` is **activation-gated** and returns the
+much larger special-case value for exactly the hop401..fingerroot500 window.
+
+rustock now: `has_rskip357` (hop401 height, per-chain) and `has_rskip374`
+(fingerroot500) in `hardfork.rs`, a `special_case_funds_migration_age_end` field in
+`BridgeConstants` (mainnet 172,800; testnet 900; regtest 150), and
+`process_funds_migration` selects the special-case end when
+`has_rskip357 && !has_rskip374`. Verified: #5,009,384 and the whole
+#5,009,384..#5,010,600 range replay to matching state+receipts roots. Tests
+`test_special_case_funds_migration_window_mainnet`. rskj source:
+`FederationConstants.getFundsMigrationAgeSinceActivationEnd`,
+`FederationSupportImpl.{getMigrationAgeEnd,isActiveFederationPastMigrationAge,
+clearRetiredFederation}`, `BridgeSupport.processFundsMigration`.
+
 ## Funds migration spending an ERP retiring federation (#4,998,800)
 
 The ERP-spend fix (#4,677,503) corrected the regular peg-out path

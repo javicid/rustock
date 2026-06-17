@@ -2003,10 +2003,19 @@ fn process_funds_migration<CTX: crate::RskContextTr>(
     let age = block_number.saturating_sub(new_fed.creation_block);
     let activation_age =
         super::governance::federation_activation_age(config, hardfork_cfg, block_number);
-    // TODO(rustock): RSKIP357/374 special-case migration end (172,800) for
-    // the fingerroot-era change; mainnet here is far pre-357.
+    // rskj FederationConstants.getFundsMigrationAgeSinceActivationEnd: while
+    // RSKIP357 is active and RSKIP374 is not (mainnet hop401 #4,976,300 ..
+    // fingerroot500 #5,468,000), the migration window end takes its special-case
+    // value (mainnet 172,800 instead of 10,585), greatly extending the window.
+    let migration_age_end = if hardfork_cfg.has_rskip357(block_number)
+        && !hardfork_cfg.has_rskip374(block_number)
+    {
+        config.special_case_funds_migration_age_end
+    } else {
+        config.funds_migration_age_end
+    };
     let migration_start = activation_age + config.funds_migration_age_begin;
-    let migration_end = activation_age + config.funds_migration_age_end;
+    let migration_end = activation_age + migration_age_end;
     let in_migration_age = age > migration_start && age < migration_end;
     let past_migration_age = age >= migration_end;
     if !in_migration_age && !past_migration_age {

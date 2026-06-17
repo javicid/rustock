@@ -315,6 +315,25 @@ impl RskHardforkConfig {
         block_number >= height
     }
 
+    /// RSKIP357: the funds-migration window end takes its special-case value
+    /// (mainnet 172,800 instead of 10,585). Activates at hop401 (same height as
+    /// RSKIP353); the special case applies only while RSKIP357 is active and
+    /// RSKIP374 is not (i.e. hop401 .. fingerroot500).
+    pub fn has_rskip357(&self, block_number: u64) -> bool {
+        let height = match self.chain_id {
+            RSK_MAINNET_CHAIN_ID => 4_976_300,
+            RSK_TESTNET_CHAIN_ID => 3_362_200,
+            _ => 0,
+        };
+        block_number >= height
+    }
+
+    /// RSKIP374: ends the special-case funds-migration window, restoring the
+    /// normal `fundsMigrationAgeSinceActivationEnd` (Fingerroot500).
+    pub fn has_rskip374(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Fingerroot500
+    }
+
     /// RSKIP305: committed federations become P2SH-P2WSH-ERP federations
     /// instead of P2SH-ERP (mainnet reed800 = 8,052,200; testnet 6,835,700;
     /// regtest 0).
@@ -641,5 +660,25 @@ mod tests {
         // vetiver900-mapped rskips activate later.
         assert!(!cfg.has_rskip544(7_604_199));
         assert!(cfg.has_rskip544(7_604_200));
+    }
+
+    /// RSKIP357 (hop401 #4,976,300) / RSKIP374 (fingerroot500 #5,468,000) gate
+    /// the special-case funds-migration window end on mainnet. Regression for
+    /// #5,009,384: a retiring-federation migration spanning this window must use
+    /// the extended end (172,800), not the normal 10,585.
+    #[test]
+    fn test_special_case_funds_migration_window_mainnet() {
+        let cfg = RskHardforkConfig::mainnet();
+        assert!(!cfg.has_rskip357(4_976_299));
+        assert!(cfg.has_rskip357(4_976_300));
+        assert!(!cfg.has_rskip374(5_467_999));
+        assert!(cfg.has_rskip374(5_468_000));
+        // The special case applies exactly on [hop401, fingerroot500).
+        let special = |n: u64| cfg.has_rskip357(n) && !cfg.has_rskip374(n);
+        assert!(!special(4_976_299));
+        assert!(special(4_976_300));
+        assert!(special(5_009_384)); // the divergent block
+        assert!(special(5_467_999));
+        assert!(!special(5_468_000));
     }
 }

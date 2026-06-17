@@ -110,6 +110,11 @@ pub struct BridgeConstants {
     pub funds_migration_age_begin: u64,
     /// rskj fundsMigrationAgeSinceActivationEnd (non-special-case).
     pub funds_migration_age_end: u64,
+    /// rskj specialCaseFundsMigrationAgeSinceActivationEnd: the funds-migration
+    /// window end used while RSKIP357 is active but RSKIP374 is not (mainnet
+    /// hop401 .. fingerroot500). On mainnet this is 172,800 (vs the normal
+    /// 10,585), greatly extending the migration window for that fork window.
+    pub special_case_funds_migration_age_end: u64,
     /// Genesis federation creation time as stored (epoch-seconds value kept
     /// in a millis field: Instant.ofEpochMilli semantics, rskj
     /// genesisFederationCreationTime).
@@ -230,6 +235,7 @@ impl BridgeConstants {
             federation_activation_age: 40_320,
             funds_migration_age_begin: 0,
             funds_migration_age_end: 10_585,
+            special_case_funds_migration_age_end: 172_800,
             genesis_federation_creation_time_millis: 1_514_948_400,
             // 35JUi1FxabGdhygLhnNUEFG4AgvpNMgxK1
             old_federation_address_hash160: [
@@ -323,6 +329,7 @@ impl BridgeConstants {
             federation_activation_age: 2_400,
             funds_migration_age_begin: 60,
             funds_migration_age_end: 900,
+            special_case_funds_migration_age_end: 900,
             genesis_federation_creation_time_millis: 1_538_967_600,
             // 2N7ZgQyhFKm17RbaLqygYbS7KLrQfapyZzu
             old_federation_address_hash160: [
@@ -396,6 +403,7 @@ impl BridgeConstants {
             federation_activation_age: 150,
             funds_migration_age_begin: 15,
             funds_migration_age_end: 150,
+            special_case_funds_migration_age_end: 150,
             genesis_federation_creation_time_millis: 1_451_606_400_000,
             // 2N7ZgQyhFKm17RbaLqygYbS7KLrQfapyZzu (same as testnet)
             old_federation_address_hash160: [
