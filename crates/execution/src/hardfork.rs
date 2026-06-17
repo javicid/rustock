@@ -396,6 +396,15 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Fingerroot500
     }
 
+    /// RSKIP377: on a federation handover the retiring federation's
+    /// `lastRetiredFederationP2SHScript` is stored as its members' P2SH script —
+    /// for an ERP federation this is the *default* (standard multisig branch)
+    /// P2SH, not the full ERP P2SH (Fingerroot500). See
+    /// `FederationSupportImpl.getFederationMembersP2SHScript`.
+    pub fn has_rskip377(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Fingerroot500
+    }
+
     /// RSKIP427: the RSKIP185 peg-out event amounts (release_request_received,
     /// release_request_rejected) switch from satoshis to full wei (Lovell700).
     pub fn has_rskip427(&self, block_number: u64) -> bool {

@@ -3399,6 +3399,46 @@ mod tests {
         assert!(!pegin_below_minimum(&[100_000, 600_000], min, false));
     }
 
+    /// Regression for mainnet #5,527,682 (RSKIP377, Fingerroot500): on a
+    /// federation handover the retiring ERP federation's
+    /// `lastRetiredFederationP2SHScript` is its *members* (default / standard
+    /// multisig branch) P2SH, NOT the full ERP P2SH. rskj
+    /// `FederationSupportImpl.getFederationMembersP2SHScript` returns
+    /// `ErpFederation.getDefaultP2SHScript()` for an ERP federation. Pre-RSKIP377
+    /// it stored the full ERP P2SH; the two hash160s differ, so getting this
+    /// wrong forks the state trie at the `lastRetiredFedP2SHScript` leaf.
+    #[test]
+    fn rskip377_last_retired_fed_uses_default_branch_p2sh() {
+        let config = crate::bridge::constants::BridgeConstants::mainnet();
+        let hardfork = RskHardforkConfig::mainnet();
+        // A P2SH-ERP federation (RSKIP353 active at fingerroot500).
+        let block = 5_527_682u64;
+        assert!(hardfork.has_rskip201(block));
+        assert!(hardfork.has_rskip353(block));
+        assert!(hardfork.has_rskip377(block));
+
+        let key = |seed: u8| -> [u8; 33] {
+            use k256::ecdsa::SigningKey;
+            let sk = SigningKey::from_slice(&[seed; 32]).unwrap();
+            sk.verifying_key().to_encoded_point(true).as_bytes().try_into().unwrap()
+        };
+        let mut keys: Vec<[u8; 33]> = (1u8..=5).map(key).collect();
+        keys.sort();
+
+        // Full ERP redeem (what the federation IS) vs the default/standard branch.
+        let full_erp = build_committed_federation_redeem_script(&keys, &config, &hardfork, block);
+        let default_branch = build_federation_redeem_script(&keys, keys.len() / 2 + 1);
+        assert_ne!(full_erp, default_branch, "ERP redeem must differ from its default branch");
+
+        let full_hash = redeem_script_hash160(&full_erp);
+        let default_hash = redeem_script_hash160(&default_branch);
+        // RSKIP377 stores the default-branch P2SH; the legacy bug stored the ERP one.
+        assert_ne!(
+            full_hash, default_hash,
+            "members P2SH (default branch) must differ from the full ERP P2SH",
+        );
+    }
+
     /// Regression for mainnet #2,448,984: a federator whose key is NOT in an
     /// input's redeem script (a NEW-federation member signing the migration
     /// tx that spends the OLD federation's UTXOs) must not have its

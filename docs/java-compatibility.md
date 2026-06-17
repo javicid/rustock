@@ -2626,9 +2626,11 @@ minimal CSV encoding forks.
 (`newFederationFormatVersion`/`oldFederationFormatVersion`) store the TYPE
 integer (1000/2000/3000); the commit_federation event logs
 `newFederation.getAddress()` (the ERP P2SH base58) and
-`lastRetiredFederationP2SHScript` is the retiring fed's `getP2SHScript()` (its
-own type's redeem; RSKIP377 — which would switch to `getDefaultP2SHScript()` —
-is fingerroot500, inactive here).
+`lastRetiredFederationP2SHScript` is the retiring fed's *members* P2SH script —
+pre-RSKIP377 this is `getP2SHScript()` (its own type's full redeem), but from
+RSKIP377 (fingerroot500, #5,468,000) on, an ERP federation contributes
+`ErpFederation.getDefaultP2SHScript()` (the standard / default multisig branch),
+not the full ERP P2SH (see §53b).
 
 **rustock.** `crates/execution/src/bridge/peg.rs`
 `build_committed_federation_redeem_script` + `build_erp_redeem_script` +
@@ -2689,6 +2691,46 @@ called from `peg.rs::update_collections` after the confirmed-pegout phase
 deletion (matching rskj's null-save). Test
 `federation_creation_height_promotion_threshold_4671284`; verified by the
 #4,671,284 header roots via `examples/replay_block`.
+
+## §53b RSKIP377: `lastRetiredFederationP2SHScript` is the ERP federation's *default-branch* P2SH (#5,527,682, fingerroot500)
+
+On a federation handover rskj persists the retiring federation's
+`lastRetiredFederationP2SHScript` (RSKIP186). The script written is the retiring
+fed's *members* P2SH script, computed by
+`FederationSupportImpl.getFederationMembersP2SHScript`:
+
+```java
+private static Script getFederationMembersP2SHScript(ActivationConfig.ForBlock activations, Federation federation) {
+    if (!activations.isActive(RSKIP377)) return federation.getP2SHScript();
+    if (!(federation instanceof ErpFederation)) return federation.getP2SHScript();
+    // when the federation also has erp keys, the members p2sh script is the default p2sh script
+    return ((ErpFederation) federation).getDefaultP2SHScript();
+}
+```
+
+`ErpFederation.getDefaultP2SHScript()` is the P2SH of the *default redeem script*
+— the standard N-of-M multisig branch extracted from the ERP redeem
+(`extractStandardRedeemScriptChunks`), NOT the full ERP/CSV-wrapped redeem. So
+from RSKIP377 (fingerroot500, #5,468,000) on, the retired-fed P2SH cell stores
+the standard-branch hash160, whereas before it stored the full ERP hash160. The
+two hash160s differ, so a from-scratch client that always stores
+`getP2SHScript()` forks the state trie at the `lastRetiredFedP2SHScript` leaf.
+
+Source: `../rskj/.../federation/FederationSupportImpl.java`
+`saveLastRetiredFederationScript` / `getFederationMembersP2SHScript` (lines
+755–778); `../rskj/.../federation/ErpFederation.java` `getDefaultP2SHScript` /
+`getDefaultRedeemScript` (lines 59–118); `rskip377 = fingerroot500` in
+`reference.conf`.
+
+**rustock.** `crates/execution/src/bridge/governance.rs`
+`commit_pending_federation`: when `has_rskip377(block_number)` and the retiring
+fed's stored format version is ERP (`old_format >= 2000`), the stored
+`lastRetiredFederationP2SHScript` is built from
+`build_federation_redeem_script(&old_keys, ..)` (the standard branch) rather than
+the full ERP `old_redeem`. Gate `hardfork.rs::has_rskip377` (Fingerroot500).
+Regression: `peg.rs::tests::rskip377_last_retired_fed_uses_default_branch_p2sh`;
+verified by the #5,527,682 state root (`0xa8a232eb…`) via `examples/diff_state`
+(0 diverging leaves) and `examples/replay_block` (state + receipts roots match).
 
 ## Per-input flyover redeem script in peg-out / migration tx sizing (#4,671,312)
 

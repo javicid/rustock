@@ -555,11 +555,22 @@ fn commit_pending_federation<CTX: crate::RskContextTr>(
     // (retiring) federation because the new federation's age (0) is below the
     // activation age, so lastRetiredFederationP2SHScript is the OLD fed's P2SH
     // script (FederationSupportImpl.saveLastRetiredFederationScript +
-    // setNextFederationCreationBlockHeight). Pre-RSKIP377 the members P2SH
-    // script equals the standard P2SH output script.
+    // setNextFederationCreationBlockHeight). For a standard multisig the members
+    // P2SH script equals its P2SH output script; for an ERP federation it is the
+    // full ERP P2SH before RSKIP377 and the *default* (standard multisig branch)
+    // P2SH from RSKIP377 on (FederationSupportImpl.getFederationMembersP2SHScript).
     if hardfork_cfg.has_rskip186(block_number) {
+        // RSKIP377: an ERP retiring federation (stored format >= 2000)
+        // contributes its default/standard-branch P2SH, not the full ERP P2SH.
+        let members_hash160 = if hardfork_cfg.has_rskip377(block_number) && old_format >= 2000 {
+            super::peg::redeem_script_hash160_pub(
+                &super::peg::build_federation_redeem_script(&old_keys, old_keys.len() / 2 + 1),
+            )
+        } else {
+            old_hash160
+        };
         let last_retired_script =
-            super::peg::p2sh_output_script_program(&old_hash160);
+            super::peg::p2sh_output_script_program(&members_hash160);
         bridge_store_bytes_named(
             ctx,
             LAST_RETIRED_FEDERATION_P2SH_SCRIPT_KEY,
