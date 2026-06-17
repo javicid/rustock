@@ -2858,6 +2858,33 @@ keys only — stops before `OP_ELSE`). Verified: #4,681,515 replays to state roo
 `erp_signing_ignores_op_notif_flag`. This closes the addSignature follow-up noted
 in the previous section.
 
+## Funds migration spending an ERP retiring federation (#4,998,800)
+
+The ERP-spend fix (#4,677,503) corrected the regular peg-out path
+(`processPegoutRequests`) to build the active federation's per-input redeem from
+its STORED format version. The **funds-migration** path
+(`process_funds_migration` / rskj `BridgeSupport.processFundsMigration` →
+`createMigrationTransaction`) spends the **retiring** federation and was still
+using the plain multisig builder (`build_federation_redeem_script(&retiring_keys,
+threshold)`). This stayed dormant while the retiring federation was a pre-ERP
+standard multisig (e.g. the #4,671,312 migration), but at #4,998,800 the retiring
+federation is itself a NON_STANDARD_ERP federation: the wrong (plain) per-input
+placeholder scriptSig produced a different unsigned migration txid
+(`0xd2ec2005…` vs rskj `0x1887b401…`, the `release_requested` topic3), forking
+both the receipts root (the event) and the state root (the queued
+`pegoutsWaitingForConfirmations` entry). The migrated amount matched, confirming
+the divergence was purely the redeem/serialization.
+
+rustock now resolves the retiring federation's spending redeem through
+`retiring_federation_keys_and_redeem` (= `getRetiringFederation().getRedeemScript()`,
+format-aware: plain / NON_STANDARD_ERP / P2SH-ERP / P2SH-P2WSH-ERP) exactly like
+the peg-out path. Verified: #4,998,800 replays to state root `0xae6c0b36…` and
+receipts root `0x4c2615f0…`, and the migration txid now equals `0x1887b401…`.
+Tests `erp_retiring_federation_migration_redeem_is_not_plain`,
+`federation_redeem_for_format_groundtruth`. rskj source:
+`co.rsk.peg.BridgeSupport.{processFundsMigration,createMigrationTransaction,
+getRetiringFederationWallet}`, `Federation.getRedeemScript()`.
+
 ## Classifying a migration that spends the LAST RETIRED federation (#4,683,511)
 
 `registerBtcTransaction` must classify each btc tx exactly as rskj's

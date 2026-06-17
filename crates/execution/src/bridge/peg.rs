@@ -2034,8 +2034,19 @@ fn process_funds_migration<CTX: crate::RskContextTr>(
     let should_migrate = (in_migration_age && balance > fee_per_kb / 2)
         || (past_migration_age && balance > 0);
     if should_migrate {
-        let threshold = retiring_keys.len() / 2 + 1;
-        let retiring_redeem = build_federation_redeem_script(&retiring_keys, threshold);
+        // The retiring federation spends with the redeem of its STORED format
+        // version (plain / NON_STANDARD_ERP / P2SH-ERP / P2SH-P2WSH-ERP), like
+        // the regular pegout path — `getRetiringFederation().getRedeemScript()`.
+        // Once the retiring federation is itself an ERP federation, the plain
+        // multisig builder gives the wrong per-input placeholder scriptSig and
+        // thus a wrong unsigned migration txid (same class as #4,677,503, but on
+        // the migration path — first hit at #4,998,800).
+        let retiring_redeem =
+            retiring_federation_keys_and_redeem(ctx, config, hardfork_cfg, block_number)
+                .map(|(_keys, redeem)| redeem)
+                .unwrap_or_else(|| {
+                    build_federation_redeem_script(&retiring_keys, retiring_keys.len() / 2 + 1)
+                });
         // rskj `migrateFunds` sends the migration to `getActiveFederationAddress()`
         // = the NEW (active) federation's P2SH address (BridgeSupport.java:1308,
         // FederationSupportImpl.getActiveFederationAddress -> getAddress()). The
@@ -4271,6 +4282,33 @@ mod tests {
         assert_eq!(
             to_hex(&std_hash160),
             "596cff92a275960df9cb2ab9df0ff69faa2b1d8a"
+        );
+    }
+
+    /// Regression for mainnet #4,998,800: a funds migration spends the RETIRING
+    /// federation. Once that federation is itself an ERP federation (stored
+    /// format 2000+), its spending redeem is the ERP redeem, not the plain
+    /// multisig — the migration path must resolve it via the same format-aware
+    /// builder the regular pegout uses (`getRetiringFederation().getRedeemScript()`),
+    /// otherwise the per-input placeholder scriptSig and the unsigned migration
+    /// txid fork. This locks that the format-2000 redeem differs from the plain
+    /// builder the buggy migration code used.
+    #[test]
+    fn erp_retiring_federation_migration_redeem_is_not_plain() {
+        let keys = [
+            "020ace50bab1230f8002a0bfe619482af74b338cc9e4c956add228df47e6adae1c",
+            "0231a395e332dde8688800a0025cccc5771ea1aa874a633b8ab6e5c89d300c7c36",
+            "025093f439fb8006fd29ab56605ffec9cdc840d16d2361004e1337a2f86d8bd2db",
+            "026b472f7d59d201ff1f540f111b6eb329e071c30a9d23e3d2bcd128fe73dc254c",
+            "03250c11be0561b1d7ae168b1f59e39cbc1fd1ba3cf4d2140c1a365b2723a2bf93",
+        ]
+        .map(key);
+        let config = BridgeConstants::mainnet();
+        let plain = build_federation_redeem_script(&keys, keys.len() / 2 + 1);
+        let erp = federation_redeem_for_format(&keys, 2000, &config);
+        assert_ne!(
+            plain, erp,
+            "an ERP retiring federation must not migrate with the plain multisig redeem"
         );
     }
 
