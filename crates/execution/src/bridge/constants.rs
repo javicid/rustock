@@ -115,6 +115,12 @@ pub struct BridgeConstants {
     /// genesisFederationCreationTime).
     pub genesis_federation_creation_time_millis: u64,
 
+    /// Hash160 of the hardcoded "old federation" P2SH address (rskj
+    /// FederationConstants.oldFederationAddress). A btc tx spending this
+    /// address is unconditionally treated as a migration
+    /// (PegUtilsLegacy.txIsFromOldFederation, RSKIP199).
+    pub old_federation_address_hash160: [u8; 20],
+
     /// ERP (Emergency Recovery Protocol) emergency public keys, compressed hex
     /// (rskj FederationConstants.erpFedPubKeysList). Used to build the
     /// non-standard/P2SH ERP federation redeem script once RSKIP201 is active.
@@ -225,6 +231,11 @@ impl BridgeConstants {
             funds_migration_age_begin: 0,
             funds_migration_age_end: 10_585,
             genesis_federation_creation_time_millis: 1_514_948_400,
+            // 35JUi1FxabGdhygLhnNUEFG4AgvpNMgxK1
+            old_federation_address_hash160: [
+                0x27, 0x9d, 0x4b, 0x44, 0xe8, 0xcf, 0x5e, 0x3f, 0x04, 0xc0, 0xea, 0x21, 0xc7,
+                0x8f, 0x1a, 0x0e, 0xca, 0xa4, 0xcd, 0x9f,
+            ],
             erp_fed_pubkeys: &[
                 "0257c293086c4d4fe8943deda5f890a37d11bebd140e220faa76258a41d077b4d4",
                 "03c2660a46aa73078ee6016dee953488566426cf55fc8011edd0085634d75395f9",
@@ -313,6 +324,11 @@ impl BridgeConstants {
             funds_migration_age_begin: 60,
             funds_migration_age_end: 900,
             genesis_federation_creation_time_millis: 1_538_967_600,
+            // 2N7ZgQyhFKm17RbaLqygYbS7KLrQfapyZzu
+            old_federation_address_hash160: [
+                0x9d, 0x0f, 0x4e, 0xb1, 0xed, 0xb9, 0xbc, 0xb7, 0x07, 0x8b, 0x36, 0xf4, 0x13,
+                0xa0, 0x1f, 0xbe, 0x85, 0xfa, 0xbf, 0x40,
+            ],
             erp_fed_pubkeys: &[
                 "0216c23b2ea8e4f11c3f9e22711addb1d16a93964796913830856b568cc3ea21d3",
                 "034db69f2112f4fb1bb6141bf6e2bd6631f0484d0bd95b16767902c9fe219d4a6f",
@@ -381,6 +397,11 @@ impl BridgeConstants {
             funds_migration_age_begin: 15,
             funds_migration_age_end: 150,
             genesis_federation_creation_time_millis: 1_451_606_400_000,
+            // 2N7ZgQyhFKm17RbaLqygYbS7KLrQfapyZzu (same as testnet)
+            old_federation_address_hash160: [
+                0x9d, 0x0f, 0x4e, 0xb1, 0xed, 0xb9, 0xbc, 0xb7, 0x07, 0x8b, 0x36, 0xf4, 0x13,
+                0xa0, 0x1f, 0xbe, 0x85, 0xfa, 0xbf, 0x40,
+            ],
             erp_fed_pubkeys: &[
                 "03b9fc46657cf72a1afa007ecf431de1cd27ff5cc8829fa625b66ca47b967e6b24",
                 "029cecea902067992d52c38b28bf0bb2345bda9b21eca76b16a17c477a64e43301",

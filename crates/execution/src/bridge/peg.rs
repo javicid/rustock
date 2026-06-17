@@ -228,28 +228,101 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     // version, not the current block — an ERP federation keeps its ERP script
     // even after a later template hardfork (rskj getActiveFederation /
     // getRetiringFederation → Federation.getRedeemScript()).
-    let (_federation_keys, fed_redeem) =
+    let (federation_keys, fed_redeem) =
         active_federation_keys_and_redeem(ctx, config, hardfork_cfg, block_number_now);
     let fed_script = p2sh_output_script(&redeem_script_hash160(&fed_redeem));
+    // rskj isPegOutTx compares against each federation's STANDARD redeem script
+    // (getStandardRedeemScript) — for an ERP federation this is the default
+    // multisig branch only, not the full ERP/flyover-wrapped redeem.
+    let fed_standard_redeem =
+        build_federation_redeem_script(&federation_keys, federation_keys.len() / 2 + 1);
     let retiring = retiring_federation_keys_and_redeem(ctx, config, hardfork_cfg, block_number_now)
         .map(|(_keys, redeem)| {
             let script = p2sh_output_script(&redeem_script_hash160(&redeem));
             (redeem, script)
         });
+    let retiring_standard_redeem = retiring_federation_keys(ctx, config, hardfork_cfg, block_number_now)
+        .map(|keys| build_federation_redeem_script(&keys, keys.len() / 2 + 1));
 
     // rskj marks processed txs with the RSK execution block number
     // (BridgeSupport.markTxAsProcessed), not the BTC block height.
     let rsk_height = revm::context_interface::Block::number(ctx.block()).to::<u64>();
 
-    // rskj BridgeUtils.isPegOutTx: an input spends the federation's P2SH
-    // (its scriptSig carries the federation redeem script). Peg-outs are
-    // registered to reclaim the change UTXOs; nothing is credited.
-    let is_pegout = btc_tx.input.iter().any(|i| {
+    // Minimum peg-in value (legacy until RSKIP219, strictly-below comparison
+    // per PegUtilsLegacy.isValidPegInTx). Needed both for the migration
+    // moveToActive check below and the peg-in value gate further down.
+    let min_pegin = if hardfork_cfg.has_rskip219(rsk_height) {
+        config.minimum_pegin_tx_value
+    } else {
+        config.legacy_minimum_pegin_tx_value
+    };
+
+    // rskj PegUtilsLegacy.getTransactionType — PEGOUT_OR_MIGRATION detection.
+    // An input "spends" a federation when its scriptSig redeem hashes to that
+    // federation's P2SH; isPegOutTx/migration compare the input's STANDARD
+    // (default-branch) redeem (extractStandardRedeemScript) to each fed's
+    // standard P2SH, while txIsFromOldFederation compares the FULL redeem.
+    let active_std_hash160 = redeem_script_hash160(&fed_standard_redeem);
+    let retiring_std_hash160 = retiring_standard_redeem.as_ref().map(|r| redeem_script_hash160(r));
+    // lastRetiredFederationP2SHScript (RSKIP186): the P2SH of the last fully
+    // retired federation, stored as serializeScript = RLP([program]).
+    let retired_hash160: Option<[u8; 20]> = if hardfork_cfg.has_rskip186(rsk_height) {
+        let raw = super::storage::bridge_load_bytes_named(
+            ctx,
+            super::storage::LAST_RETIRED_FEDERATION_P2SH_SCRIPT_KEY,
+        );
+        rlp_decode_list(&raw)
+            .and_then(|items| items.into_iter().next())
+            .filter(|p| p.len() == 23)
+            .map(|p| p[2..22].try_into().expect("23-byte P2SH program"))
+    } else {
+        None
+    };
+    let std_hash160_of = |full: &[u8]| -> [u8; 20] {
+        redeem_script_hash160(&build_federation_redeem_script(
+            &super::release_tx::spending_redeem_keys(full),
+            super::release_tx::redeem_script_threshold(full),
+        ))
+    };
+
+    // (1) txIsFromOldFederation (RSKIP199): any input spends the hardcoded old
+    //     federation address — unconditionally a migration.
+    let tx_from_old_fed = hardfork_cfg.has_rskip199(rsk_height)
+        && btc_tx.input.iter().any(|i| {
+            super::release_tx::extract_redeem_script(i.script_sig.as_bytes())
+                .is_some_and(|r| redeem_script_hash160(&r) == config.old_federation_address_hash160)
+        });
+    // (4) isPegOutTx(liveFeds): an input's standard redeem matches the active
+    //     or retiring federation.
+    let spends_live_fed = btc_tx.input.iter().any(|i| {
         super::release_tx::extract_redeem_script(i.script_sig.as_bytes()).is_some_and(|r| {
-            r == fed_redeem || retiring.as_ref().is_some_and(|(rr, _)| r == *rr)
+            let h = std_hash160_of(&r);
+            h == active_std_hash160 || retiring_std_hash160 == Some(h)
         })
     });
-    if is_pegout {
+    // (3) isMigrationTx: an input spends the retired or retiring federation AND
+    //     an output funds the active federation (moveFromRetiringOrRetired &&
+    //     moveToActive).
+    let spends_retired_or_retiring = btc_tx.input.iter().any(|i| {
+        super::release_tx::extract_redeem_script(i.script_sig.as_bytes()).is_some_and(|r| {
+            let h = std_hash160_of(&r);
+            Some(h) == retired_hash160 || retiring_std_hash160 == Some(h)
+        })
+    });
+    let active_output_values: Vec<u64> = btc_tx
+        .output
+        .iter()
+        .filter(|o| o.script_pubkey == fed_script)
+        .map(|o| o.value.to_sat())
+        .collect();
+    let move_to_active = if hardfork_cfg.has_rskip293(rsk_height) {
+        !active_output_values.is_empty() && active_output_values.iter().all(|v| *v >= min_pegin)
+    } else {
+        active_output_values.iter().sum::<u64>() >= min_pegin
+    };
+    let is_migration = spends_retired_or_retiring && move_to_active;
+
+    if tx_from_old_fed || is_migration || spends_live_fed {
         let active_utxo_key = active_federation_utxo_key(ctx, config, hardfork_cfg, rsk_height);
         register_federation_outputs(ctx, &btc_tx, &fed_script, active_utxo_key);
         if let Some((_, retiring_script)) = &retiring {
@@ -283,11 +356,6 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
 
     // Enforce minimum peg-in value (legacy minimum until RSKIP219,
     // strictly-below comparison per PegUtilsLegacy.isValidPegInTx).
-    let min_pegin = if hardfork_cfg.has_rskip219(rsk_height) {
-        config.minimum_pegin_tx_value
-    } else {
-        config.legacy_minimum_pegin_tx_value
-    };
     if total_value < min_pegin {
         if should_mark_rejected_pegin_as_processed(hardfork_cfg, rsk_height) {
             set_btc_tx_processed(ctx, &legacy_txid, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
@@ -4161,5 +4229,61 @@ mod tests {
             .step_by(2)
             .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
             .collect()
+    }
+
+    /// Regression for mainnet #4,683,511: a btc tx spending the LAST RETIRED
+    /// federation (a pre-ERP 7-of-13 multisig) and paying the active ERP
+    /// federation must classify as PEGOUT_OR_MIGRATION (registerNewUtxos, no
+    /// events) — rskj PegUtilsLegacy.isMigrationTx via
+    /// getLastRetiredFederationP2SHScript. The decisive step is reducing the
+    /// input's full redeem to its STANDARD redeem and hashing it
+    /// (extractStandardRedeemScript + createP2SHOutputScript), which must equal
+    /// the stored retired-federation P2SH hash160.
+    #[test]
+    fn retired_federation_input_reduces_to_its_standard_p2sh() {
+        // input[0] full redeem from the #4,683,511 migration tx (e92052db…).
+        let input_redeem = hex_to_bytes(
+            "57210231a395e332dde8688800a0025cccc5771ea1aa874a633b8ab6e5c89d300c7c36\
+21026b472f7d59d201ff1f540f111b6eb329e071c30a9d23e3d2bcd128fe73dc254c\
+21027319afb15481dbeb3c426bcc37f9a30e7f51ceff586936d85548d9395bcc2344\
+210294c817150f78607566e961b3c71df53a22022a80acbb982f83c0c8baac040adc\
+2103250c11be0561b1d7ae168b1f59e39cbc1fd1ba3cf4d2140c1a365b2723a2bf93\
+21033ada6ef3b1d93a1978b595c7a9e2aa613860b26d4f5a7abb88576aa42b3432ad\
+210357f7ed4c118e581f49cd3b4d9dd1edb4295f4def49d6dcf2faaaaac87a1a0a42\
+210372cd46831f3b6afd4c044d160b7667e8ebf659d6cb51a825a3104df6ee0638c6\
+2103ae72827d25030818c4947a800187b1fbcc33ae751e248ae60094cc989fb880f6\
+2103b3a7aa25702000c5c1faa300600e8e2bd89cde2be7fb1ec898a39c50d9de90d1\
+2103b53899c390573471ba30e5054f78376c5f797fda26dde7a760789f02908cbad2\
+2103e05bf6002b62651378b1954820539c36ca405cbb778c225395dd9ebff6780299\
+2103ecd8af1e93c57a1b8c7f917bd9980af798adeb0205e9687865673353eb041e8d\
+5dae",
+        );
+        // This federation is a plain (non-ERP) multisig: the standard redeem is
+        // the full redeem, so the standard P2SH equals the spent address.
+        let std_redeem = build_federation_redeem_script(
+            &super::super::release_tx::spending_redeem_keys(&input_redeem),
+            super::super::release_tx::redeem_script_threshold(&input_redeem),
+        );
+        assert_eq!(std_redeem, input_redeem, "non-ERP redeem is its own standard");
+        let std_hash160 = redeem_script_hash160(&std_redeem);
+        // hash160 of the spent address (the lastRetiredFederationP2SHScript at
+        // this block) — base58 35cqv4Hr…/program a914596cff92…87.
+        assert_eq!(
+            to_hex(&std_hash160),
+            "596cff92a275960df9cb2ab9df0ff69faa2b1d8a"
+        );
+    }
+
+    /// The hardcoded mainnet old-federation address (rskj
+    /// FederationMainNetConstants.oldFederationAddress
+    /// "35JUi1FxabGdhygLhnNUEFG4AgvpNMgxK1") decodes to this hash160, used by
+    /// PegUtilsLegacy.txIsFromOldFederation.
+    #[test]
+    fn mainnet_old_federation_address_hash160() {
+        let config = super::super::constants::BridgeConstants::mainnet();
+        assert_eq!(
+            to_hex(&config.old_federation_address_hash160),
+            "279d4b44e8cf5e3f04c0ea21c78f1a0ecaa4cd9f"
+        );
     }
 }

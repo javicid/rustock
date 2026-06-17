@@ -2858,6 +2858,73 @@ keys only — stops before `OP_ELSE`). Verified: #4,681,515 replays to state roo
 `erp_signing_ignores_op_notif_flag`. This closes the addSignature follow-up noted
 in the previous section.
 
+## Classifying a migration that spends the LAST RETIRED federation (#4,683,511)
+
+`registerBtcTransaction` must classify each btc tx exactly as rskj's
+`PegUtils.getTransactionType` → `PegUtilsLegacy.getTransactionType` (the legacy
+path, pre-RSKIP379 / before the pegout-tx-index grace period) does, because the
+chosen `PegTxType` decides the action: `PEGIN` runs `registerPegIn` (credits /
+refunds, emits events), `PEGOUT_OR_MIGRATION` runs `registerNewUtxos` (books the
+change UTXOs, emits nothing), `UNKNOWN` does nothing (no state change, not even
+marking the tx processed).
+
+rskj's legacy classification order (`PegUtilsLegacy.java`):
+
+1. **`txIsFromOldFederation`** (RSKIP199) — any input spends the *hardcoded* old
+   federation address (`FederationMainNetConstants.oldFederationAddress =
+   "35JUi1FxabGdhygLhnNUEFG4AgvpNMgxK1"`, hash160 `279d4b44…`). Unconditional
+   `PEGOUT_OR_MIGRATION`, checked *before* peg-in.
+2. **`isValidPegInTx`** → `PEGIN`. Returns false (i.e. *not* a peg-in) when an
+   input spends an active fed's P2SH, the `lastRetiredFederationP2SHScript`, or an
+   input's standard redeem matches an active fed — so a release/migration never
+   leaks into the peg-in path.
+3. **`isMigrationTx`** → `PEGOUT_OR_MIGRATION`. `moveFromRetiringOrRetired`: an
+   input's *standard* redeem P2SH matches the `lastRetiredFederationP2SHScript`
+   **or** the retiring fed's standard P2SH; **and** `moveToActive`:
+   `isValidPegInTx` for the active-fed-only wallet (an output funds the active
+   federation, all such outputs ≥ minimum pegin under RSKIP293).
+4. **`isPegOutTx(liveFederations)`** → `PEGOUT_OR_MIGRATION`. An input's standard
+   redeem P2SH matches the active or retiring fed's standard P2SH.
+5. else `UNKNOWN`.
+
+Two rskj-implementation details are load-bearing:
+
+- **`extractStandardRedeemScriptFromInput`** — `isPegOutTx`/`isMigrationTx`
+  compare against each fed's *standard* (default-branch) redeem, not the full
+  redeem. An input spending an ERP or flyover fed carries the wrapped redeem in
+  its scriptSig; rskj reduces it via `RedeemScriptParser.extractStandardRedeemScriptChunks()`
+  (drop the flyover `PUSH32 OP_DROP` prefix and the `OP_NOTIF…OP_ELSE…OP_ENDIF`
+  ERP wrapping, keeping the default `OP_m <keys> OP_n OP_CHECKMULTISIG`). By
+  contrast `txIsFromOldFederation` hashes the *full* redeem (`scriptCorrectlySpendsTx`).
+- **`getLastRetiredFederationP2SHScript`** (RSKIP186) — a separate storage cell
+  (`lastRetiredFedP2SHScript`, `serializeScript = RLP([program])`) written on
+  every federation handover (`FederationSupportImpl.saveLastRetiredFederationScript`).
+  A tx spending the most-recently-retired federation (which is neither active nor
+  retiring) is a migration *only* through this cell.
+
+The #4,683,511 bug: rustock's classifier only knew the active + retiring feds and
+used an exact full-redeem equality, so a migration spending the prior **7-of-13
+pre-ERP retired federation** (standard P2SH `596cff92…`) and paying the active
+5-of-9 ERP fed fell through to the peg-in path and wrongly emitted a
+`rejected_pegin` (reason 2, `LEGACY_PEGIN_MULTISIG_SENDER`) + `release_requested`
+refund. rskj emitted nothing (`registerNewUtxos`).
+
+rustock now (`peg.rs` `register_btc_transaction`): adds the hardcoded
+`old_federation_address_hash160` to `BridgeConstants`; reads the
+`LAST_RETIRED_FEDERATION_P2SH_SCRIPT_KEY` cell; reduces each input to its standard
+redeem hash160 via `spending_redeem_keys` + `redeem_script_threshold` +
+`build_federation_redeem_script`; and replicates the (1)/(3)/(4) `PEGOUT_OR_MIGRATION`
+sub-cases (`tx_from_old_fed`, `is_migration` with `move_to_active`,
+`spends_live_fed`). Verified: #4,683,511 replays to state root `0x1ff86cce…` and
+receipts root `0x775e9e9f…`. Tests
+`retired_federation_input_reduces_to_its_standard_p2sh`,
+`mainnet_old_federation_address_hash160`.
+
+rskj sources: `co.rsk.peg.PegUtilsLegacy.{getTransactionType,txIsFromOldFederation,
+isValidPegInTx,isMigrationTx,isPegOutTx}`, `co.rsk.peg.PegUtils.getTransactionType`,
+`co.rsk.peg.federation.FederationStorageProviderImpl.getLastRetiredFederationP2SHScript`,
+`co.rsk.peg.federation.FederationSupportImpl.saveLastRetiredFederationScript`.
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`
