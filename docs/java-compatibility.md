@@ -2583,6 +2583,66 @@ unchanged, preserving #4,600,948 tx[3]'s invisible-exception behavior. Test:
 `BridgeSupportTest.when_RegisterBtcCoinbaseTransaction_HashNotInPmt_noSent` /
 `..._not_equal_merkle_root_noSent`, and matching #4,603,038's state root.
 
+### 51b. Witness-commitment validation: extract the embedded commitment, hash `reversed(witnessMerkleRoot)`, and THROW on mismatch
+
+After the PMT/merkle-root checks pass, rskj calls
+`validateWitnessInformation` (`BridgeSupport.java` l.2557-2587):
+
+```java
+BtcTransaction btcTx = new BtcTransaction(networkParameters, btcTxSerialized);
+btcTx.verify();
+validateWitnessInformation(btcTx, witnessMerkleRoot, witnessReservedValue);
+// validateWitnessInformation:
+Optional<Sha256Hash> expectedWitnessCommitment = findWitnessCommitment(coinbaseTransaction, activations);
+Sha256Hash calculatedWitnessCommitment =
+    Sha256Hash.twiceOf(witnessMerkleRoot.getReversedBytes(), witnessReservedValue);
+if (expectedWitnessCommitment.isEmpty() ||
+    !expectedWitnessCommitment.get().equals(calculatedWitnessCommitment)) {
+    throw new BridgeIllegalArgumentException(...);   // NOT a no-op return
+}
+```
+
+Two consensus-load-bearing details:
+
+1. **Byte-order reversal.** The `witnessMerkleRoot` ABI arg arrives in INTERNAL
+   byte order (decoded via bitcoinj `Sha256Hash.wrap`). The commitment preimage
+   is `SHA256d(witnessMerkleRoot.getReversedBytes() ‖ witnessReservedValue)` —
+   the 32-byte root MUST be reversed to display order before hashing. A
+   from-scratch client that hashed the arg un-reversed computes the wrong
+   commitment and forks. (rustock previously discarded the computed hash AND
+   used the un-reversed root — a latent double bug.)
+
+2. **Commitment extraction & selection rule.** `BitcoinUtils.findWitnessCommitment`
+   (`rskj-core/.../peg/bitcoin/BitcoinUtils.java` l.300-357) scans the coinbase
+   outputs for a scriptPubKey of the form `OP_RETURN(0x6a) <push 0x24=36>
+   aa21a9ed <32-byte commitment>` (header `WITNESS_COMMITMENT_HEADER = aa21a9ed`,
+   `MINIMUM_WITNESS_COMMITMENT_SIZE = 38`). Per BIP141, if several such outputs
+   exist the LAST one wins, so rskj iterates `Lists.reverse(tx.getOutputs())`
+   and returns the first match; the 32-byte hash starts at offset 6.
+
+3. **Mismatch/absence THROWS** (unlike 51's no-op `return` paths).
+   `validateWitnessInformation` throws `BridgeIllegalArgumentException`, which
+   `Bridge.execute` wraps in a `VMException` (§50): the tx summary is marked
+   failed and the sender is billed only `requiredGas`. So a malformed-commitment
+   `registerBtcCoinbaseTransaction` stores NOTHING. A client that stored coinbase
+   info unconditionally after the merkle-root check (rustock's prior latent bug)
+   would diverge on the FIRST such tx mined into a block.
+
+Pre-RSKIP460 rskj parses `output.getScriptPubKey().getProgram()` (which throws
+`ScriptException` on a non-standard scriptPubKey); post-RSKIP460 it reads raw
+`getScriptBytes()`. For a well-formed witness-commitment output the two are
+byte-identical, and RSKIP460 is not active over the current sync range.
+
+**rustock:** `register_btc_coinbase_transaction` (`tx.rs`) now deserializes the
+coinbase tx, calls the new `find_witness_commitment` helper (mirrors the reversed
+output scan + offset-6 extraction), hashes `reversed(witness_merkle_root) ‖
+witness_reserved_value`, and `return Err(PrecompileError::other(...))` (a method
+throw → §50 wrapper → VMException) when the commitment is absent or unequal;
+otherwise it stores. Tests
+`register_btc_coinbase_witness_commitment_positive` / `_negative` /
+`find_witness_commitment_takes_last` use the exact coinbase tx and witness root
+from rskj `BridgeSupportTest.registerBtcCoinbaseTransaction`.
+
 ## §52 commitFederation: ERP federation redeem script (RSKIP201/284/293/353)
 
 **rskj behavior.** Once RSKIP201 (iris300) is active, `commitFederation`
@@ -3111,3 +3171,68 @@ rskj sources: `co.rsk.peg.BridgeSupport.processConfirmedPegouts`,
 - rskj sync: `../rskj/rskj-core/src/main/java/co/rsk/net/sync/`
 - RSKIP-351: Compressed block header format
 - RLPx spec: https://github.com/ethereum/devp2p/blob/master/rlpx.md
+
+## Flyover (RSKIP176) peg-in: RSKIP293 retiring-federation path (hop400)
+
+rskj `BridgeSupport.registerFlyoverBtcTransaction`
+(`../rskj/rskj-core/src/main/java/co/rsk/peg/BridgeSupport.java:2712-2899`) builds
+the flyover federation information for the ACTIVE federation always, and — when
+RSKIP293 is active AND a retiring federation exists — ALSO for the RETIRING
+federation (`createFlyoverFederationInformation(hash, retiringFed)`,
+lines 2786-2801, 2975-2989). The retiring fed's flyover redeem is
+`PUSH(derivationHash) OP_DROP <retiringFed.getRedeemScript()>` — i.e. the
+FORMAT-AWARE redeem (an ERP retiring fed gets its ERP redeem), and the output
+script is a plain P2SH for every federation format except P2SH-P2WSH-ERP
+(`PegUtils.getFlyoverFederationOutputScript`, `PegUtils.java:350-356`).
+
+Consensus-load-bearing details rustock matches in
+`crates/execution/src/bridge/peg.rs` `register_fast_bridge_btc_transaction`:
+
+- **Value gate over BOTH feds.** `validateFlyoverPeginValue` /
+  `getAmountSentToAddresses` (`BridgeUtils.java:148-214`) sum the outputs paying
+  ANY flyover address (active + retiring under RSKIP293). A zero total returns
+  `-304` (`UNPROCESSABLE_TX_VALUE_ZERO_ERROR`). Under RSKIP293 it then rejects
+  the tx with `-305` (`UNPROCESSABLE_TX_UTXO_AMOUNT_SENT_BELOW_MINIMUM_ERROR`) if
+  ANY flyover UTXO is strictly below `getMinimumPeginTxValue`
+  (`PegUtils.allUTXOsToFedAreAboveMinimumPeginValue` → pre-RSKIP379
+  `PegUtilsLegacy.isAnyUTXOAmountBelowMinimum`, `PegUtilsLegacy.java:362-371` —
+  the path that applies at hop400, since RSKIP379/fingerroot500 is later). An
+  EMPTY flyover-output set is NOT below minimum (`anyMatch` over an empty stream
+  is false), but the separate total==0 gate (`-304`) covers a no-output tx.
+- **UTXO registration.** Active flyover UTXOs go to the active federation set
+  (`getActiveFederationBtcUTXOs`); retiring flyover UTXOs go to the retiring
+  (OLD) set (`getRetiringFederationBtcUTXOs` →
+  `FederationSupportImpl.java:296-302` → `OLD_FEDERATION_BTC_UTXOS_KEY`). rskj
+  only persists the retiring data when `utxosForRetiringFed` is NON-empty
+  (`BridgeSupport.java:2868-2891`); rustock guards the retiring branch the same
+  way (`btc_tx.output.iter().any(|o| o.script_pubkey == retiring_flyover_script)`).
+- **Flyover federation information storage.** Both active and retiring use the
+  SAME key scheme: `setFlyoverFederationInformation` /
+  `setFlyoverRetiringFederationInformation` both call
+  `saveFlyoverFederationInformation` keyed by `fastBridgeFederationInformation-`
+  + hex(ITS flyover-redeem hash160) (`BridgeStorageProvider.java:461-499`,
+  `:826`). rustock reuses `set_flyover_federation_information` for both, passing
+  the retiring fed's own flyover P2SH hash.
+- **markFlyoverDerivationHashAsUsed twice.** Both
+  `saveFlyoverActiveFederationDataInStorage` and
+  `saveFlyoverRetiringFederationDataInStorage` call
+  `markFlyoverDerivationHashAsUsed(btcTxHashWithoutWitness, derivationHash)`
+  (`BridgeSupport.java:3020-3040`). It is idempotent (writes a single TRUE byte
+  under the same key), but rustock issues the call in both branches to mirror
+  rskj exactly.
+- **Locking-cap rejection refund spans BOTH feds.**
+  `generateFlyoverRejectionReleaseWithWalletProvider` builds ONE empty-wallet
+  refund over a `FlyoverCompatibleBtcWalletWithMultipleScripts` containing both
+  flyover feds (`BridgeSupport.java:2825-2845, 2991-3011`), so each input is
+  signed/sized with its OWN flyover redeem. rustock resolves per-input redeems
+  and falls back to the shared single-redeem `release_tx::build_empty_wallet_to`
+  when uniform, else `build_flyover_empty_wallet_multi` (a per-input-redeem
+  mirror of bitcoinj `buildEmptyWalletTo`).
+
+NOTE (out of scope, latent): the ACTIVE-fed flyover redeem in rustock is still
+built from the STANDARD multisig redeem (`build_federation_redeem_script`),
+matching the iris-era (RSKIP176) standard federation but NOT
+`federation.getRedeemScript()` for an ERP active fed. The retiring path added
+here uses the format-aware redeem (`retiring_federation_keys_and_redeem`). If/when
+the active fed is ERP at a flyover peg-in, the active path would need the same
+format-aware redeem. Logged for follow-up.
