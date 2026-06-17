@@ -246,12 +246,35 @@ pub fn register_btc_coinbase_transaction<CTX: crate::RskContextTr>(
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     }
 
-    // Validate witness commitment
-    // The commitment is SHA256d(witnessMerkleRoot || witnessReservedValue)
+    // rskj verifies the tx parses and is internally consistent
+    // (`btcTx.verify()`, BridgeSupport l.2557-2558). A parse failure throws.
+    let btc_tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&btc_tx_data)
+        .map_err(|_| PrecompileError::other("registerBtcCoinbaseTransaction: invalid btc tx"))?;
+
+    // Validate the witness commitment (rskj `validateWitnessInformation`,
+    // BridgeSupport l.2568-2587). The commitment embedded in the coinbase tx
+    // must equal SHA256d(witnessMerkleRoot.getReversedBytes() || witnessReservedValue).
+    // The ABI arg is the witness merkle root in INTERNAL byte order (bitcoinj
+    // `Sha256Hash.wrap`), so it must be reversed to display order before hashing.
     let mut commitment_data = [0u8; 64];
     commitment_data[..32].copy_from_slice(&witness_merkle_root);
+    commitment_data[..32].reverse();
     commitment_data[32..].copy_from_slice(&witness_reserved_value);
-    let _witness_commitment = sha256d::Hash::hash(&commitment_data);
+    let calculated_commitment = *sha256d::Hash::hash(&commitment_data).as_byte_array();
+
+    // If the embedded commitment is missing or does not match, rskj throws
+    // `BridgeIllegalArgumentException` (BridgeSupport l.2576-2584), which
+    // `Bridge.execute` wraps in a `VMException` — the call FAILS (no store),
+    // unlike the no-op `return` paths above. A `PrecompileError::other` here is
+    // translated by the bridge dispatch into the same VMException gas semantics.
+    match find_witness_commitment(&btc_tx) {
+        Some(expected) if expected == calculated_commitment => {}
+        _ => {
+            return Err(PrecompileError::other(
+                "registerBtcCoinbaseTransaction: witness commitment does not match",
+            ));
+        }
+    }
 
     // Store coinbase information keyed by block hash
     set_coinbase_information(ctx, &block_hash, &witness_merkle_root);
@@ -381,6 +404,39 @@ pub fn legacy_btc_txid(tx: &bitcoin::Transaction) -> [u8; 32] {
     *tx.compute_txid().to_raw_hash().as_byte_array()
 }
 
+/// Witness-commitment header (BIP141), rskj `BitcoinUtils.WITNESS_COMMITMENT_HEADER`.
+const WITNESS_COMMITMENT_HEADER: [u8; 4] = [0xaa, 0x21, 0xa9, 0xed];
+/// `OP_RETURN` opcode.
+const OP_RETURN: u8 = 0x6a;
+/// 4-byte header + 32-byte commitment hash (rskj `WITNESS_COMMITMENT_LENGTH`).
+const WITNESS_COMMITMENT_LENGTH: u8 = 36;
+/// Minimum scriptPubKey size: `OP_RETURN` + push-length byte + 36-byte payload
+/// (rskj `BitcoinUtils.MINIMUM_WITNESS_COMMITMENT_SIZE`).
+const MINIMUM_WITNESS_COMMITMENT_SIZE: usize = 38;
+
+/// Find the witness commitment hash embedded in a coinbase transaction's
+/// outputs, mirroring rskj `BitcoinUtils.findWitnessCommitment`
+/// (rskj-core .../peg/bitcoin/BitcoinUtils.java l.300-357).
+///
+/// The commitment lives in an output whose scriptPubKey is
+/// `OP_RETURN <push 36> aa21a9ed <32-byte commitment>`. If several such
+/// outputs exist, BIP141 takes the LAST one, so rskj iterates the outputs
+/// reversed and returns the first match. Returns the 32-byte commitment in
+/// internal byte order (bitcoinj `Sha256Hash.wrap`). Pre-RSKIP460 rskj parses
+/// `getScriptPubKey().getProgram()`; for a well-formed commitment output that
+/// is byte-identical to the raw script bytes used here. RSKIP460 is not active
+/// over the current sync range.
+fn find_witness_commitment(tx: &bitcoin::Transaction) -> Option<[u8; 32]> {
+    tx.output.iter().rev().find_map(|out| {
+        let spk = out.script_pubkey.as_bytes();
+        (spk.len() >= MINIMUM_WITNESS_COMMITMENT_SIZE
+            && spk[0] == OP_RETURN
+            && spk[1] == WITNESS_COMMITMENT_LENGTH
+            && spk[2..6] == WITNESS_COMMITMENT_HEADER)
+            .then(|| spk[6..MINIMUM_WITNESS_COMMITMENT_SIZE].try_into().unwrap())
+    })
+}
+
 fn read_abi_dynamic_bytes(args: &[u8], offset: usize) -> Result<Vec<u8>, PrecompileError> {
     if offset + 32 > args.len() {
         return Err(PrecompileError::other("ABI: offset out of bounds"));
@@ -501,5 +557,119 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(key, expected, "coinbase storage key must match rskj (no hash reversal)");
+    }
+
+    /// Ground truth ported from rskj `BridgeSupportTest.registerBtcCoinbaseTransaction`
+    /// (rskj-core .../peg/BridgeSupportTest.java l.6597-6681). The coinbase tx below
+    /// carries a witness commitment in its zero-value OP_RETURN output:
+    /// `6a24 aa21a9ed <commitment>`. rskj asserts
+    /// `Sha256Hash.twiceOf(witnessRoot.getReversedBytes(), witnessReservedValue) == witCom`,
+    /// then stores the coinbase info. This proves both the extraction rule and the
+    /// witnessMerkleRoot reversal — and guards against rejecting valid registrations.
+    #[test]
+    fn register_btc_coinbase_witness_commitment_positive() {
+        // The exact coinbase tx rawTx from the rskj test (SegWit-serialized).
+        let raw_tx = hex::decode(
+            "020000000001010000000000000000000000000000000000000000000000000000000000000000ff\
+             ffffff0502cc000101ffffffff029c070395000000002321036d6b5bc8c0e902f296b5bdf3dfd4b6\
+             f095d8d0987818a557e1766ea25c664524ac0000000000000000266a24aa21a9edfeb3b9170ae765\
+             cc6586edd67229eaa8bc19f9674d64cb10ee8a205f4ccf0bc60120000000000000000000000000000\
+             000000000000000000000000000000000000000000000",
+        )
+        .unwrap();
+        let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&raw_tx).unwrap();
+
+        // The embedded commitment (32 bytes after the aa21a9ed header), internal order.
+        let expected = find_witness_commitment(&tx).expect("coinbase has a witness commitment");
+        assert_eq!(
+            to_hex(&expected),
+            "feb3b9170ae765cc6586edd67229eaa8bc19f9674d64cb10ee8a205f4ccf0bc6"
+        );
+
+        // witnessMerkleRoot ABI arg (INTERNAL byte order, bitcoinj Sha256Hash.wrap):
+        // = MerkleTreeUtils.combineLeftRight(ZERO_HASH, secondHashTx) from the rskj test.
+        let witness_merkle_root: [u8; 32] =
+            hex::decode("613cb22535df8d9443fe94b66d807cd60312f982e305e25e825b00e6f429799f")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        // witnessReservedValue = the input-0 witness push (32 zero bytes).
+        let witness_reserved_value = [0u8; 32];
+
+        // The fix: hash reversed(witnessMerkleRoot) || witnessReservedValue.
+        let mut commitment_data = [0u8; 64];
+        commitment_data[..32].copy_from_slice(&witness_merkle_root);
+        commitment_data[..32].reverse();
+        commitment_data[32..].copy_from_slice(&witness_reserved_value);
+        let calculated = *sha256d::Hash::hash(&commitment_data).as_byte_array();
+
+        assert_eq!(calculated, expected, "valid commitment must match -> info IS stored");
+    }
+
+    /// Negative case: a witnessMerkleRoot that does not produce the embedded
+    /// commitment must NOT match — rskj throws (no store).
+    #[test]
+    fn register_btc_coinbase_witness_commitment_negative() {
+        let raw_tx = hex::decode(
+            "020000000001010000000000000000000000000000000000000000000000000000000000000000ff\
+             ffffff0502cc000101ffffffff029c070395000000002321036d6b5bc8c0e902f296b5bdf3dfd4b6\
+             f095d8d0987818a557e1766ea25c664524ac0000000000000000266a24aa21a9edfeb3b9170ae765\
+             cc6586edd67229eaa8bc19f9674d64cb10ee8a205f4ccf0bc60120000000000000000000000000000\
+             000000000000000000000000000000000000000000000",
+        )
+        .unwrap();
+        let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&raw_tx).unwrap();
+        let expected = find_witness_commitment(&tx).unwrap();
+
+        // Tweak the last byte of the witness merkle root -> commitment must differ.
+        let mut witness_merkle_root: [u8; 32] =
+            hex::decode("613cb22535df8d9443fe94b66d807cd60312f982e305e25e825b00e6f429799f")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        witness_merkle_root[31] ^= 0x01;
+
+        let mut commitment_data = [0u8; 64];
+        commitment_data[..32].copy_from_slice(&witness_merkle_root);
+        commitment_data[..32].reverse();
+        let calculated = *sha256d::Hash::hash(&commitment_data).as_byte_array();
+
+        assert_ne!(calculated, expected, "mismatching commitment must be rejected");
+    }
+
+    /// `find_witness_commitment` must take the LAST matching output (BIP141 / rskj
+    /// `findWitnessCommitment` iterates outputs reversed) and ignore non-commitment
+    /// outputs.
+    #[test]
+    fn find_witness_commitment_takes_last() {
+        use bitcoin::{ScriptBuf, Sequence, TxIn, TxOut, Witness, Amount, OutPoint};
+        use bitcoin::transaction::Version;
+        use bitcoin::absolute::LockTime;
+
+        let commitment_a = [0x11u8; 32];
+        let commitment_b = [0x22u8; 32];
+        let mk = |c: &[u8; 32]| {
+            let mut spk = vec![OP_RETURN, WITNESS_COMMITMENT_LENGTH];
+            spk.extend_from_slice(&WITNESS_COMMITMENT_HEADER);
+            spk.extend_from_slice(c);
+            TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from_bytes(spk) }
+        };
+        let tx = bitcoin::Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![
+                // a normal payment output (no commitment)
+                TxOut { value: Amount::from_sat(1), script_pubkey: ScriptBuf::from_bytes(vec![0x76, 0xa9]) },
+                mk(&commitment_a),
+                mk(&commitment_b),
+            ],
+        };
+        assert_eq!(find_witness_commitment(&tx), Some(commitment_b));
     }
 }
