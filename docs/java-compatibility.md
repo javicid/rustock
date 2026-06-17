@@ -2987,6 +2987,45 @@ isValidPegInTx,isMigrationTx,isPegOutTx}`, `co.rsk.peg.PegUtils.getTransactionTy
 `co.rsk.peg.federation.FederationStorageProviderImpl.getLastRetiredFederationP2SHScript`,
 `co.rsk.peg.federation.FederationSupportImpl.saveLastRetiredFederationScript`.
 
+### Amount-0 peg-in: empty live-fed output set is a valid peg-in (#5,171,600)
+
+`PegUtilsLegacy.isValidPegInTx` decides the minimum-value gate with
+`isAnyUTXOAmountBelowMinimum` once **RSKIP293** is active (before it, the legacy
+`valueSentToMe.isLessThan(minimum)` total comparison). `isAnyUTXOAmountBelowMinimum`
+is `btcTx.getWalletOutputs(wallet).stream().anyMatch(o -> o.getValue() < min)` —
+and `anyMatch` over an **empty** stream is `false`. So a tx whose outputs pay
+**no live federation** is *not* below minimum, `isValidPegInTx` returns `true`,
+and `getTransactionType` classifies it `PEGIN`. `registerBtcTransaction` →
+`legacyRegisterPegin` → `processPegInVersionLegacy` then runs with
+`computeTotalAmountSent == 0`: `executePegIn` calls `transferTo(dest, 0)` (which
+**creates and persists** the destination account — RSK keeps empty touched
+accounts, no EIP-161 cleanup), logs `pegin_btc(receiver, amount=0,
+protocolVersion=0)`, and `registerNewUtxos` marks the btc tx processed
+(`btcTxHashAP-<txid>` = block height). Pre-RSKIP293 a 0 total is below minimum, so
+the same tx is `UNKNOWN` and ignored.
+
+This surfaces at mainnet **#5,171,600**: tx[0] (`updateCollections`) completes the
+funds-migration window and clears the retiring federation (`85aaffda…` becomes
+`lastRetired`); tx[2] (`registerBtcTransaction`, btc tx `d0b25a69…`) then pays
+only that now-retired federation 100 000 sat. With the retiring fed gone the
+live-fed output set is empty → amount-0 peg-in: `pegin_btc(receiver `06adf228…`,
+amount 0)`, account `06adf228…` materialized with balance 0, txid marked
+processed.
+
+rustock previously short-circuited `if total_value == 0 { return }` (ignored) and
+gated on the *total* (`total_value < min`). It now mirrors rskj
+(`peg.rs::pegin_below_minimum`): per-UTXO under RSKIP293, total before it, with an
+empty set not below minimum; and an amount-0 peg-in materializes the destination
+via `load_account` + `touch_account` (both the legacy and v1 credit paths).
+Verified: #5,171,600 replays to state root `0x49eb6920…` and receipts root
+`0xf27f4e5d…`, and #5,171,600..#5,172,000 all match. Test
+`empty_live_outputs_are_not_below_minimum_under_rskip293`.
+
+rskj sources: `co.rsk.peg.PegUtilsLegacy.{isValidPegInTx,isAnyUTXOAmountBelowMinimum}`,
+`co.rsk.peg.BridgeSupport.{registerBtcTransaction,registerPegIn,legacyRegisterPegin,
+processPegInVersionLegacy,executePegIn,registerNewUtxos,transferTo}`,
+`co.rsk.peg.BridgeStorageProvider.getStorageKeyForBtcTxHashAlreadyProcessed`.
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`

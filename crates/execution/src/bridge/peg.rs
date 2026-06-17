@@ -79,6 +79,21 @@ fn should_mark_rejected_pegin_as_processed(cfg: &RskHardforkConfig, block_number
     cfg.has_rskip459(block_number) && !cfg.has_rskip551(block_number)
 }
 
+/// rskj `PegUtilsLegacy.isValidPegInTx` minimum gate over the live-federations
+/// outputs. Under RSKIP293 each UTXO must be at least `min`
+/// (`isAnyUTXOAmountBelowMinimum`); before it, the *total* sent must be
+/// (`valueSentToMe.isLessThan`). An EMPTY set of live-fed outputs is not below
+/// minimum under RSKIP293 (`anyMatch` over an empty stream is false), so a tx
+/// that pays no live federation is still a valid (amount-0) peg-in; pre-RSKIP293
+/// a 0 total is below minimum and is not a peg-in.
+fn pegin_below_minimum(live_output_values: &[u64], min: u64, rskip293: bool) -> bool {
+    if rskip293 {
+        live_output_values.iter().any(|v| *v < min)
+    } else {
+        live_output_values.iter().sum::<u64>() < min
+    }
+}
+
 pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
@@ -342,21 +357,29 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     let pays_live_federation = |script: &bitcoin::ScriptBuf| {
         *script == fed_script || retiring.as_ref().is_some_and(|(_, rs)| *script == *rs)
     };
-    let total_value: u64 = btc_tx
+    let live_output_values: Vec<u64> = btc_tx
         .output
         .iter()
         .filter(|o| pays_live_federation(&o.script_pubkey))
         .map(|o| o.value.to_sat())
-        .sum();
-    if total_value == 0 {
-        // Neither a peg-in nor a peg-out for the active federation: ignore
-        // without marking as processed (rskj logs and returns).
-        return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
-    }
+        .collect();
+    let total_value: u64 = live_output_values.iter().sum();
 
-    // Enforce minimum peg-in value (legacy minimum until RSKIP219,
-    // strictly-below comparison per PegUtilsLegacy.isValidPegInTx).
-    if total_value < min_pegin {
+    // rskj PegUtilsLegacy.isValidPegInTx minimum gate: under RSKIP293 it checks
+    // EACH UTXO (isAnyUTXOAmountBelowMinimum), otherwise the total amount sent
+    // (valueSentToMe.isLessThan). Crucially, an EMPTY live-output set is not
+    // "below minimum" under RSKIP293 (anyMatch over an empty stream is false),
+    // so a tx that pays no live federation (e.g. only a now-retired one, once
+    // the retiring federation has been cleared earlier in the block) is still a
+    // valid peg-in — processed with amount 0 (pegin_btc amount=0, destination
+    // account created). Pre-RSKIP293 a 0 total is below minimum → not a peg-in.
+    let below_min =
+        pegin_below_minimum(&live_output_values, min_pegin, hardfork_cfg.has_rskip293(rsk_height));
+    if below_min {
+        // Not a valid peg-in: rskj getTransactionType returns UNKNOWN here (the
+        // tx is neither a migration nor a peg-out), so registerBtcTransaction
+        // ignores it. The RSKIP459+ "mark rejected as processed" behavior lives
+        // in the post-RSKIP379 evaluatePegin flow, folded in here for parity.
         if should_mark_rejected_pegin_as_processed(hardfork_cfg, rsk_height) {
             set_btc_tx_processed(ctx, &legacy_txid, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
         }
@@ -428,6 +451,11 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
         let dest = RskAddress::from(instr.rsk_destination);
         if !rbtc_amount.is_zero() {
             let _ = ctx.journal_mut().transfer(BRIDGE_ADDR, dest, rbtc_amount);
+        } else {
+            // transferTo(dest, 0) still creates+persists the account (RSK keeps
+            // empty touched accounts — see the legacy path below).
+            let _ = ctx.journal_mut().load_account(dest);
+            ctx.journal_mut().touch_account(dest);
         }
         // RSKIP170 is required for v1, so pegin_btc (protocolVersion = 1).
         super::events::log_pegin_btc(ctx, dest, &btc_txid_event_bytes(&btc_tx), total_value, 1);
@@ -520,6 +548,13 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     if let Some(dest) = rsk_destination {
         if !rbtc_amount.is_zero() {
             let _ = ctx.journal_mut().transfer(BRIDGE_ADDR, dest, rbtc_amount);
+        } else {
+            // rskj executePegIn always calls transferTo(dest, amount); a 0-value
+            // transfer still creates and persists the destination account (RSK
+            // keeps empty touched accounts — no EIP-161 cleanup). An amount-0
+            // peg-in therefore materializes the destination with balance 0.
+            let _ = ctx.journal_mut().load_account(dest);
+            ctx.journal_mut().touch_account(dest);
         }
 
         // Peg-in events: lock_btc from RSKIP146, pegin_btc from RSKIP170
@@ -3320,6 +3355,32 @@ pub fn get_estimated_fees_for_pegout_amount<CTX: crate::RskContextTr>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression for mainnet #5,171,600: once the retiring federation is
+    /// cleared earlier in the block, a btc tx that pays only the now-retired
+    /// federation leaves an EMPTY set of live-federation outputs. rskj's
+    /// `isAnyUTXOAmountBelowMinimum` (RSKIP293) is `false` over that empty set,
+    /// so the tx is a valid amount-0 peg-in (it emits pegin_btc(amount=0),
+    /// creates the destination account and is marked processed) rather than
+    /// being ignored. Pre-RSKIP293 the 0 total is below minimum → not a peg-in.
+    #[test]
+    fn empty_live_outputs_are_not_below_minimum_under_rskip293() {
+        let min = 500_000;
+        // RSKIP293: per-UTXO. Empty set → not below minimum (valid amount-0 peg-in).
+        assert!(!pegin_below_minimum(&[], min, true));
+        // A single below-minimum UTXO → below minimum (rejected).
+        assert!(pegin_below_minimum(&[100_000], min, true));
+        // Any below-minimum UTXO fails even if the total clears the minimum.
+        assert!(pegin_below_minimum(&[100_000, 600_000], min, true));
+        // All UTXOs at/above the minimum → valid.
+        assert!(!pegin_below_minimum(&[500_000, 600_000], min, true));
+
+        // Pre-RSKIP293: total comparison. Empty set (0 total) IS below minimum.
+        assert!(pegin_below_minimum(&[], min, false));
+        // A mix below the minimum total is below; one clearing it is not.
+        assert!(pegin_below_minimum(&[100_000, 300_000], min, false));
+        assert!(!pegin_below_minimum(&[100_000, 600_000], min, false));
+    }
 
     /// Regression for mainnet #2,448,984: a federator whose key is NOT in an
     /// input's redeem script (a NEW-federation member signing the migration
