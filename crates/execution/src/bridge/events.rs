@@ -322,6 +322,28 @@ pub fn log_release_requested<CTX: crate::RskContextTr>(
     );
 }
 
+/// `pegout_confirmed(bytes32 indexed btcTxHash, uint256
+/// pegoutCreationRskBlockNumber)` — rskj `logPegoutConfirmed` (RSKIP326,
+/// fingerroot500). Fired by `processConfirmedPegouts` when a peg-out with
+/// enough BTC confirmations is promoted into the waiting-for-signatures set.
+/// `btcTxHash` is the confirmed pegout BTC tx's `Sha256Hash.getBytes()`
+/// (big-endian display order); the data is the RSK block number at which the
+/// pegout was created.
+pub fn log_pegout_confirmed<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    btc_tx_hash: &[u8; 32],
+    pegout_creation_rsk_block_number: u64,
+) {
+    emit_topics(
+        ctx,
+        vec![
+            solidity_topic("pegout_confirmed(bytes32,uint256)"),
+            B256::from_slice(btc_tx_hash),
+        ],
+        u256_word(alloy_primitives::U256::from(pegout_creation_rsk_block_number)).to_vec(),
+    );
+}
+
 /// `batch_pegout_created(bytes32 indexed btcTxHash, bytes releaseRskTxHashes)`
 /// — rskj `logBatchPegoutCreated` (RSKIP271, peg-out batching). Fired by
 /// `processPegoutsInBatch` when the whole release-request queue is settled into
@@ -739,6 +761,34 @@ mod tests {
         assert_eq!(
             hex::encode(address_word(sender)),
             "0000000000000000000000007b197517908e9a434c0c69e8d42e8b74f8b86992"
+        );
+    }
+
+    /// Groundtruth from mainnet #5,469,495 tx 1 receipt (rskj snapshot receipts
+    /// column): the first fingerroot500 block whose updateCollections promotes a
+    /// confirmed pegout emits `pegout_confirmed` (RSKIP326). The indexed btcTxHash
+    /// is the confirmed pegout BTC tx's Sha256Hash.getBytes() (big-endian) and the
+    /// data is the pegout creation RSK block number (5,465,490 = 0x536592).
+    #[test]
+    fn pegout_confirmed_matches_mainnet_5469495() {
+        use alloy_primitives::hex;
+        assert_eq!(
+            hex::encode(solidity_topic("pegout_confirmed(bytes32,uint256)")),
+            "c287f602476eeef8a547a3b82e79045c827c51362ff153f728b6d839bad099ef"
+        );
+        let btc_tx_hash: [u8; 32] = hex::decode(
+            "fd5bc7e221a80936431d4835d09bb0dac1953ed94ce5a34e74cc822f83a50bb5",
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+        assert_eq!(
+            hex::encode(B256::from_slice(&btc_tx_hash)),
+            "fd5bc7e221a80936431d4835d09bb0dac1953ed94ce5a34e74cc822f83a50bb5"
+        );
+        assert_eq!(
+            hex::encode(u256_word(alloy_primitives::U256::from(5_465_490u64))),
+            "0000000000000000000000000000000000000000000000000000000000536592"
         );
     }
 

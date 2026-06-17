@@ -3026,6 +3026,43 @@ rskj sources: `co.rsk.peg.PegUtilsLegacy.{isValidPegInTx,isAnyUTXOAmountBelowMin
 processPegInVersionLegacy,executePegIn,registerNewUtxos,transferTo}`,
 `co.rsk.peg.BridgeStorageProvider.getStorageKeyForBtcTxHashAlreadyProcessed`.
 
+### RSKIP326: promoting a confirmed peg-out logs `pegout_confirmed` (#5,469,495)
+
+`BridgeSupport.processConfirmedPegouts` (`BridgeSupport.java` l.1588-1620) takes
+the next peg-out with enough BTC confirmations out of
+`pegoutsWaitingForConfirmations`, inserts it into `pegoutsWaitingForSignatures`,
+and — **only when `activations.isActive(ConsensusRule.RSKIP326)`** — emits
+`eventLogger.logPegoutConfirmed(confirmedPegout.getBtcTransaction().getHash(),
+confirmedPegout.getPegoutCreationRskBlockNumber())`. RSKIP326 activates at
+**fingerroot500** (`reference.conf`: `rskip326 = fingerroot500`, mainnet
+#5,468,000). The event (`BridgeEvents.PEGOUT_CONFIRMED`) is
+`pegout_confirmed(bytes32 indexed btcTxHash, uint256
+pegoutCreationRskBlockNumber)`: topic0 =
+`keccak256("pegout_confirmed(bytes32,uint256)")` =
+`0xc287f602476eeef8a547a3b82e79045c827c51362ff153f728b6d839bad099ef`, topic1 =
+`btcTxHash.getBytes()` (the confirmed pegout BTC tx's `Sha256Hash`, big-endian
+display order), data = the RSK block number at which the pegout was created
+(`BridgeEventLoggerImpl.logPegoutConfirmed`, `BridgeEventLoggerImpl.java`
+l.290-301).
+
+This surfaces at mainnet **#5,469,495**, the first fingerroot500 block whose
+`updateCollections` (tx[1], Bridge `0x…01000006`) promotes a confirmed pegout
+(created at #5,465,490 = `0x536592`). rskj's tx[1] receipt has **two** logs —
+`release_request_received` then `pegout_confirmed` — but rustock only emitted the
+first, so the receipts root diverged (state root matched, since promotion state
+is unchanged). rustock now mirrors rskj: after inserting into the
+waiting-for-signatures set, `peg.rs::process_confirmed_pegouts` emits
+`log_pegout_confirmed` (`events.rs`) when `has_rskip326(block_number)` holds. The
+btcTxHash uses `btc_txid_event_bytes` (display-order `getHash()`) over the entry's
+deserialized `btc_tx_raw`. Verified: #5,469,495 replays to receipts root
+`0xb90b67bb…` (== header) with state root unchanged `0xd97a4083…`. Test
+`pegout_confirmed_matches_mainnet_5469495`.
+
+rskj sources: `co.rsk.peg.BridgeSupport.processConfirmedPegouts`,
+`co.rsk.peg.utils.BridgeEventLoggerImpl.logPegoutConfirmed`,
+`co.rsk.peg.BridgeEvents.PEGOUT_CONFIRMED`,
+`org.ethereum.config.blockchain.upgrades.ConsensusRule.RSKIP326`.
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`

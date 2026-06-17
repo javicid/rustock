@@ -1891,6 +1891,19 @@ pub fn update_collections<CTX: crate::RskContextTr>(
             );
             store_pegout_confirmation_set(ctx, &waiting, use_tx_hash);
 
+            // rskj BridgeSupport.processConfirmedPegouts l.1617 logs
+            // pegout_confirmed for the promoted entry (RSKIP326, fingerroot500).
+            // Capture the event inputs before `btc_tx_raw` is moved into the WFS.
+            let pegout_confirmed = hardfork_cfg.has_rskip326(block_number).then(|| {
+                (
+                    btc_txid_event_bytes(
+                        &deserialize::<BtcTransaction>(&entry.btc_tx_raw)
+                            .expect("confirmed pegout btc tx deserializes"),
+                    ),
+                    entry.rsk_block_height,
+                )
+            });
+
             // rskj getPegoutWaitingForSignatureKey:
             // - RSKIP375+: the pegout creation RSK tx hash
             // - RSKIP146..RSKIP176: creation hash, falling back to this tx
@@ -1909,6 +1922,10 @@ pub fn update_collections<CTX: crate::RskContextTr>(
             wfs.insert(rsk_hash, entry.btc_tx_raw);
             let updated_wfs = serialize_rsk_txs_waiting_for_signatures(&wfs);
             bridge_store_bytes(ctx, wfs_key, &updated_wfs);
+
+            if let Some((btc_tx_hash, rsk_block_height)) = pegout_confirmed {
+                super::events::log_pegout_confirmed(ctx, &btc_tx_hash, rsk_block_height);
+            }
         }
     }
 
