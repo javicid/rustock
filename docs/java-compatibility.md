@@ -3229,10 +3229,18 @@ Consensus-load-bearing details rustock matches in
   when uniform, else `build_flyover_empty_wallet_multi` (a per-input-redeem
   mirror of bitcoinj `buildEmptyWalletTo`).
 
-NOTE (out of scope, latent): the ACTIVE-fed flyover redeem in rustock is still
-built from the STANDARD multisig redeem (`build_federation_redeem_script`),
-matching the iris-era (RSKIP176) standard federation but NOT
-`federation.getRedeemScript()` for an ERP active fed. The retiring path added
-here uses the format-aware redeem (`retiring_federation_keys_and_redeem`). If/when
-the active fed is ERP at a flyover peg-in, the active path would need the same
-format-aware redeem. Logged for follow-up.
+- **Active-fed flyover redeem is FORMAT-AWARE (fixed at #5,831,167).**
+  `createFlyoverFederationInformation(hash)` derives the active flyover P2SH from
+  `getActiveFederation().getRedeemScript()` (`BridgeSupport.java:2971-2989`), which
+  follows the fed's STORED format version. At fingerroot500 the active fed is a
+  P2SH-ERP federation (RSKIP353), so the flyover redeem must wrap the ERP redeem,
+  not a plain multisig. rustock previously built the active flyover redeem with
+  `build_federation_redeem_script` (standard multisig); the resulting P2SH
+  `5f4fb7…` did not match the address the BTC tx paid (`69206b97…`), so
+  `getAmountSentToAddresses` summed 0, `registerFastBridgeBtcTransaction` returned
+  `UNPROCESSABLE_VALUE_ZERO` (-304) instead of the locked amount, and the calling
+  LiquidityBridgeContract took the failure branch — over-charging 6,817 gas
+  (216,145 vs the header's 209,328). Fixed by switching the active path to
+  `active_federation_keys_and_redeem` (format-aware, the same builder the retiring
+  path already used). rustock `bridge/peg.rs::register_fast_bridge_btc_transaction`;
+  regression `flyover_active_p2sh_uses_erp_redeem_5831167`.

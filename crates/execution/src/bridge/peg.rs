@@ -1110,9 +1110,12 @@ pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
 
     // createFlyoverFederationInformation for the ACTIVE federation: build the
     // flyover redeem script (PUSH(hash) OP_DROP <fedRedeem>) and its P2SH.
-    let federation_keys = federation_keys_or_genesis(ctx, config, hardfork_cfg, block_number);
-    let threshold = (federation_keys.len() / 2) + 1;
-    let fed_redeem = build_federation_redeem_script(&federation_keys, threshold);
+    // rskj `getActiveFederation().getRedeemScript()` is format-aware: a P2SH-ERP
+    // federation (RSKIP353, active at fingerroot500) yields its ERP redeem, not a
+    // plain multisig — so the flyover P2SH must wrap the ERP redeem to match the
+    // address the BTC tx actually paid (mainnet #5,831,167).
+    let (_active_keys, fed_redeem) =
+        active_federation_keys_and_redeem(ctx, config, hardfork_cfg, block_number);
     let fed_p2sh_hash = redeem_script_hash160(&fed_redeem);
     let flyover_redeem = flyover_redeem_script(&flyover_hash, &fed_redeem);
     let flyover_p2sh_hash = redeem_script_hash160(&flyover_redeem);
@@ -4520,6 +4523,62 @@ mod tests {
             to_hex(&p2sh_hash),
             "18fc3b52a5b7d5277f41b9765719b45bfa427730",
             "flyover P2SH hash160 must match rskj"
+        );
+    }
+
+    /// Regression for mainnet #5,831,167 (registerFastBridgeBtcTransaction,
+    /// fingerroot500): rskj's `createFlyoverFederationInformation` derives the
+    /// active flyover P2SH from `getActiveFederation().getRedeemScript()`, which
+    /// is FORMAT-AWARE — at fingerroot500 the active fed is a P2SH-ERP federation
+    /// (RSKIP353), so the flyover redeem must wrap the ERP redeem. rustock
+    /// previously built a PLAIN multisig redeem here, producing the wrong P2SH;
+    /// the BTC tx's flyover output then matched nothing, the bridge returned
+    /// UNPROCESSABLE_VALUE_ZERO (-304) instead of the locked amount, and the
+    /// LiquidityBridgeContract took the wrong branch — overcharging gas by 6,817
+    /// (216,145 vs the header's 209,328).
+    #[test]
+    fn flyover_active_p2sh_uses_erp_redeem_5831167() {
+        // The real ERP active-federation redeem at #5,831,167 (captured from the
+        // format-aware builder) and the block's flyover derivation hash.
+        let flyover_hash: [u8; 32] = hex_to_bytes(
+            "5f157f6ea6385bfdc191321bda7fd285d4df84c499d9fef7660de63af590cf80",
+        )
+        .try_into()
+        .unwrap();
+        let erp_fed_redeem = hex_to_bytes(
+            "645521020ace50bab1230f8002a0bfe619482af74b338cc9e4c956add228df47e6adae1c21025093f439fb8006fd29ab56605ffec9cdc840d16d2361004e1337a2f86d8bd2db21026b472f7d59d201ff1f540f111b6eb329e071c30a9d23e3d2bcd128fe73dc254c210275d473555de2733c47125f9702b0f870df1d817379f5587f09b6c40ed2c6c9492102a95f095d0ce8cb3b9bf70cc837e3ebe1d107959b1fa3f9b2d8f33446f9c8cbdb2103250c11be0561b1d7ae168b1f59e39cbc1fd1ba3cf4d2140c1a365b2723a2bf9321034851379ec6b8a701bd3eef8a0e2b119abb4bdde7532a3d6bcbff291b0daf3f252103b58a5da144f5abab2e03e414ad044b732300de52fa25c672a7f7b358887719062103e05bf6002b62651378b1954820539c36ca405cbb778c225395dd9ebff678029959ae670350cd00b275532102370a9838e4d15708ad14a104ee5606b36caaaaf739d833e67770ce9fd9b3ec80210257c293086c4d4fe8943deda5f890a37d11bebd140e220faa76258a41d077b4d42103c2660a46aa73078ee6016dee953488566426cf55fc8011edd0085634d75395f92103cd3e383ec6e12719a6c69515e5559bcbe037d0aa24c187e1e26ce932e22ad7b354ae68",
+        );
+
+        // Format-aware (ERP) redeem → the P2SH hash160 the BTC tx actually paid.
+        let flyover_redeem = flyover_redeem_script(&flyover_hash, &erp_fed_redeem);
+        assert_eq!(
+            to_hex(&redeem_script_hash160(&flyover_redeem)),
+            "69206b978af5523129667292dae54f464170256a",
+            "active flyover P2SH must derive from the ERP redeem"
+        );
+
+        // The plain-multisig redeem over the SAME keys yields a DIFFERENT P2SH —
+        // the bug that made the flyover output match nothing.
+        let keys: Vec<[u8; 33]> = [
+            "020ace50bab1230f8002a0bfe619482af74b338cc9e4c956add228df47e6adae1c",
+            "025093f439fb8006fd29ab56605ffec9cdc840d16d2361004e1337a2f86d8bd2db",
+            "026b472f7d59d201ff1f540f111b6eb329e071c30a9d23e3d2bcd128fe73dc254c",
+            "0275d473555de2733c47125f9702b0f870df1d817379f5587f09b6c40ed2c6c949",
+            "02a95f095d0ce8cb3b9bf70cc837e3ebe1d107959b1fa3f9b2d8f33446f9c8cbdb",
+            "03250c11be0561b1d7ae168b1f59e39cbc1fd1ba3cf4d2140c1a365b2723a2bf93",
+            "034851379ec6b8a701bd3eef8a0e2b119abb4bdde7532a3d6bcbff291b0daf3f25",
+            "03b58a5da144f5abab2e03e414ad044b732300de52fa25c672a7f7b35888771906",
+            "03e05bf6002b62651378b1954820539c36ca405cbb778c225395dd9ebff6780299",
+        ]
+        .iter()
+        .map(|h| hex_to_bytes(h).try_into().unwrap())
+        .collect();
+        let plain_redeem = build_federation_redeem_script(&keys, keys.len() / 2 + 1);
+        let plain_p2sh = redeem_script_hash160(&flyover_redeem_script(&flyover_hash, &plain_redeem));
+        assert_ne!(
+            to_hex(&plain_p2sh),
+            "69206b978af5523129667292dae54f464170256a",
+            "plain multisig must NOT match the ERP flyover P2SH"
         );
     }
 
