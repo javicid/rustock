@@ -3165,6 +3165,59 @@ rskj sources: `co.rsk.peg.BridgeSupport.processConfirmedPegouts`,
 `co.rsk.peg.BridgeEvents.PEGOUT_CONFIRMED`,
 `org.ethereum.config.blockchain.upgrades.ConsensusRule.RSKIP326`.
 
+### Peg-out fee-minimum sizing: RSKIP271 size formula + active-federation redeem (#5,927,135)
+
+`BridgeSupport.requestRelease` (`BridgeSupport.java` l.954-1011) rejects a
+peg-out below `max(minimumPegoutTxValue, requireFundsForFee)`, where
+`requireFundsForFee = feePerKB * getRegularPegoutTxSize(activations,
+getActiveFederation()) / 1000`, grown by
+`minimumPegoutValuePercentageToReceiveAfterFee`. Two consensus-critical inputs to
+that size estimate were wrong in rustock:
+
+1. **RSKIP271 changed the size formula.** `BridgeUtils.getRegularPegoutTxSize`
+   (`BridgeUtils.java` l.625-672) dispatches on `RSKIP271`: pre-271 it uses
+   `BridgeUtilsLegacy.calculatePegoutTxSize` (an analytic script-sig-chunk
+   approximation); post-271 it uses `calculateLegacyTxSize`, the **exact**
+   `BtcTransaction.bitcoinSerialize()` length of a 2-in/2-out legacy tx whose
+   inputs carry the redeem script as their scriptSig and whose outputs are the
+   23-byte P2SH-to-federation script, plus `numberOfSignaturesRequired *
+   inputsCount * 72`. (Mainnet federations are never segwit at the heights
+   rustock handles, so only the legacy branch applies.) rustock only ever
+   implemented the pre-271 path, so it computed a *smaller* size — hence a
+   smaller fee minimum.
+2. **The redeem script must be the ACTIVE federation's actual (ERP) redeem.**
+   rskj passes `getActiveFederation()`, whose `getRedeemScript()` is
+   format-aware; post-fingerroot500 the active federation is a P2SH-ERP
+   federation with a much larger redeem than a plain N-of-M multisig. rustock was
+   rebuilding a plain multisig redeem from the keys, again undersizing.
+
+Net effect at mainnet **#5,927,135** (fingerroot500 active, RSKIP271 long
+active): tx[0] is a 459,876-satoshi peg-out. rskj's correct
+`requireFundsForFee` exceeds 459,876, so the value is **below** the minimum and
+rskj rejects it with `FEE_ABOVE_VALUE` — refunding the (satoshi-truncated) value
+to the sender, emitting `release_request_rejected`, and leaving
+`releaseRequestQueueWithTxHash` empty (`0xc0`). rustock's undersized estimate put
+the minimum below 459,876, so it *accepted* the peg-out: it enqueued the request,
+emitted `release_request_received`, and kept the value in the Bridge. That
+diverged three leaves (sender balance, Bridge balance, the release queue) plus
+the receipts root.
+
+Fix (`peg.rs`): `regular_pegout_tx_size` now takes the redeem script + required
+signatures + the `RSKIP271` flag and emits the exact post-271
+`bitcoinSerialize()` length (legacy branch); `require_funds_for_fee` threads
+those through; `release_btc` sources the redeem from
+`active_federation_keys_and_redeem` (format-aware, == rskj
+`getActiveFederation().getRedeemScript()`). Verified: #5,927,135 replays to state
+root `0xd3dedc66…` and receipts root `0x9f865614…` (both == header), zero
+diverging leaves. Ground truth ported in `regular_pegout_tx_size_matches_rskj`
+(rskj `BridgeUtilsTest.testCalculatePegoutTxSize_2Inputs_2Outputs` = 2058 bytes).
+
+rskj sources: `co.rsk.peg.BridgeSupport.requestRelease`,
+`co.rsk.peg.BridgeUtils.getRegularPegoutTxSize` /
+`calculatePegoutTxSize` / `calculateLegacyTxSize`,
+`co.rsk.peg.BridgeUtilsLegacy.calculatePegoutTxSize`,
+`org.ethereum.config.blockchain.upgrades.ConsensusRule.RSKIP271`.
+
 ## References
 
 - rskj source: `../rskj/rskj-core/src/main/java/org/ethereum/net/rlpx/`
