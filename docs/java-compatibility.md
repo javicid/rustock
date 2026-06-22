@@ -3413,3 +3413,55 @@ SSTORE gas_params pin). Tests:
 activation boundary) and the updated `test_cfg_env_gas_params_follow_spec`.
 Verified by replaying #6,223,700: tx[0..3] gasUsed 57073/56232/123038/0 match the
 canonical receipts, total 236,343 == header, state and receipts roots match.
+
+## §54 RSKIP415: the `add_signature` event's `federatorRskAddress` topic derives from the federation member's RSK key, not its BTC key (arrowhead600, #6,223,700)
+
+**Symptom**: full-mainnet sync halted at **#6,223,704** with a receipts-root
+mismatch while the state root and total gas matched exactly. The first
+`addSignature` Bridge call after arrowhead600 (#6,223,700) produced an
+`add_signature(bytes32 indexed releaseRskTxHash, address indexed
+federatorRskAddress, bytes federatorBtcPublicKey)` log whose second topic
+diverged: rustock emitted `0xa50367d690e4bf2707398c62d71d4878c356290f`, the
+canonical receipt had `0xb6ffeeaa2eecaaf865d5539b85976d5892f59ab5`.
+
+**rskj behavior**: `BridgeEventLoggerImpl.logAddSignature` resolves the federator
+RSK address via `getFederatorRskPublicKey(member)`:
+
+```java
+private ECKey getFederatorRskPublicKey(FederationMember m) {
+    if (!shouldUseRskPublicKey()) {                       // pre-RSKIP415
+        return ECKey.fromPublicOnly(m.getBtcPublicKey().getPubKey());
+    }
+    return m.getRskPublicKey();                            // post-RSKIP415
+}
+private boolean shouldUseRskPublicKey() {
+    return activations.isActive(ConsensusRule.RSKIP415);
+}
+```
+
+Before RSKIP415 the topic address is keccak(uncompressed BTC pubkey)[12..];
+after, it is keccak(uncompressed **RSK** pubkey)[12..]. A `FederationMember`
+carries distinct btc/rsk/mst keys (RSKIP123 multikey format), so for members
+whose RSK key differs from their BTC key the two addresses differ. The event
+*data* (the federator BTC public key) is unchanged across the fork. RSKIP415 is
+gated at `arrowhead600` in `reference.conf` (`rskip415 = arrowhead600`), which is
+why the divergence appears 4 blocks after activation, at the first post-fork
+`addSignature`.
+
+**rskj source**: `co.rsk.peg.utils.BridgeEventLoggerImpl#getFederatorRskPublicKey`
+/ `#logAddSignatureInSolidityFormat`, `co.rsk.peg.BridgeEvents.ADD_SIGNATURE`,
+`org.ethereum.config.blockchain.upgrades.ConsensusRule.RSKIP415`,
+`reference.conf` (`rskip415 = arrowhead600`).
+
+**rustock**: `crates/execution/src/hardfork.rs` (`has_rskip415` → Arrowhead600);
+`crates/execution/src/bridge/peg.rs` (`add_signature` precompile: new helper
+`federator_rsk_key_for_btc` looks up the signing member in the active then
+retiring federation and returns its stored RSK key; the emission picks the RSK
+key when `has_rskip415` and the BTC key otherwise — legacy single-key members
+have rsk == btc, so pre-fork behavior is unchanged). The event *data* always
+carries the BTC public key. Test:
+`bridge::federation::tests::rskip415_add_signature_federator_address_groundtruth_6223704`
+(BTC key 02a95f…c8cbdb → 0xa50367… ≠ canonical 0xb6ffeeaa…). Verified by
+replaying #6,223,704: receipts root now matches
+`0xca1927a8…817c58` and state root still matches `0xe82eca71…45aa9`; blocks
+#6,223,704–#6,223,707 replay clean.

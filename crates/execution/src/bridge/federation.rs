@@ -261,6 +261,36 @@ mod tests {
         assert_eq!(rlp_decode_uint(&rlp_encode_u64(2000)).to::<u64>(), 2000);
     }
 
+    /// RSKIP415 (arrowhead600) ground truth from mainnet block #6,223,704
+    /// tx[2] (an `addSignature` call to the Bridge). The `add_signature` event's
+    /// `federatorRskAddress` topic switched from the federator's BTC-key-derived
+    /// address to its RSK-key-derived address:
+    ///   - BTC pubkey 02a95f...c8cbdb -> 0xa50367d690e4bf2707398c62d71d4878c356290f
+    ///     (the value rustock logged PRE-fix, i.e. the pre-RSKIP415 topic).
+    ///   - canonical post-415 topic = 0xb6ffeeaa2eecaaf865d5539b85976d5892f59ab5
+    ///     (derived from that member's distinct RSK public key).
+    /// The two MUST differ, which is exactly why the receipts root forked four
+    /// blocks after arrowhead600 (#6,223,700). rskj
+    /// `BridgeEventLoggerImpl.getFederatorRskPublicKey` (ConsensusRule.RSKIP415).
+    #[test]
+    fn rskip415_add_signature_federator_address_groundtruth_6223704() {
+        use alloy_primitives::{hex, Address};
+        let btc_key =
+            hex::decode("02a95f095d0ce8cb3b9bf70cc837e3ebe1d107959b1fa3f9b2d8f33446f9c8cbdb")
+                .unwrap();
+        // Pre-RSKIP415 address (from the BTC public key).
+        let pre415 = rsk_address_from_public_key(&btc_key).unwrap();
+        assert_eq!(
+            pre415,
+            "0xa50367d690e4bf2707398c62d71d4878c356290f".parse::<Address>().unwrap(),
+            "pre-RSKIP415 topic derives from the federator BTC key"
+        );
+        // The canonical post-415 topic (from the member's RSK key) is different.
+        let post415: Address =
+            "0xb6ffeeaa2eecaaf865d5539b85976d5892f59ab5".parse().unwrap();
+        assert_ne!(pre415, post415, "RSKIP415 changes the federatorRskAddress topic");
+    }
+
     #[test]
     fn federation_threshold() {
         let members: Vec<FederationMember> = (0..5)

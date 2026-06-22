@@ -2478,6 +2478,41 @@ pub(crate) fn federation_keys_or_genesis<CTX: crate::RskContextTr>(
     }
 }
 
+/// The RSK public key of the federation member whose BTC public key is
+/// `btc_key`, searching the active federation first and then the retiring one
+/// (rskj `BridgeSupport.getFederationMember` via `getFederationFromPublicKey`).
+/// For legacy single-key members rsk == btc, so this returns `btc_key` itself.
+/// `None` when no federation member matches.
+fn federator_rsk_key_for_btc<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    config: &BridgeConstants,
+    hardfork_cfg: &RskHardforkConfig,
+    block_number: u64,
+    btc_key: &[u8; 33],
+) -> Option<[u8; 33]> {
+    let new = super::federation::load_stored_federation(ctx, NEW_FEDERATION_KEY);
+    let old = super::federation::load_stored_federation(ctx, OLD_FEDERATION_KEY);
+    let age = super::governance::federation_activation_age(config, hardfork_cfg, block_number);
+    // Active federation: new once it reaches activation age, otherwise old.
+    let (active, retiring) = match (&new, &old) {
+        (Some(n), Some(o)) => {
+            if block_number >= n.creation_block + age {
+                (Some(n), Some(o))
+            } else {
+                (Some(o), None)
+            }
+        }
+        (Some(n), None) => (Some(n), None),
+        (None, _) => (None, None),
+    };
+    for fed in [active, retiring].into_iter().flatten() {
+        if let Some(m) = fed.members.iter().find(|m| &m.btc == btc_key) {
+            return Some(m.rsk);
+        }
+    }
+    None
+}
+
 /// Which UTXO storage set backs the ACTIVE federation: after a commit and
 /// until activation the active federation IS the old one, whose UTXOs were
 /// moved to oldFederationBtcUTXOs (rskj getActiveFederationBtcUTXOs).
@@ -2733,6 +2768,17 @@ pub fn add_signature<CTX: crate::RskContextTr>(
     // legacy single-topic before RSKIP146 and Solidity afterwards.
     let legacy_events = !hardfork_cfg.has_rskip146(block_number);
     let log_only_when_applied = hardfork_cfg.has_rskip326(block_number);
+    // rskj `BridgeEventLoggerImpl.getFederatorRskPublicKey`: the add_signature
+    // event's federatorRskAddress topic derives from the member's BTC public
+    // key before RSKIP415 (arrowhead600) and from its RSK public key after.
+    // For legacy single-key members the two keys are identical.
+    let federator_addr_key: Vec<u8> = if hardfork_cfg.has_rskip415(block_number) {
+        federator_rsk_key_for_btc(ctx, config, hardfork_cfg, block_number, &compressed_key)
+            .map(|k| k.to_vec())
+            .unwrap_or_else(|| fed_key.clone())
+    } else {
+        fed_key.clone()
+    };
     let emit_add_signature = |ctx: &mut CTX, btc_tx: &BtcTransaction| {
         if legacy_events {
             let txid = btc_tx.compute_txid().to_string();
@@ -2742,11 +2788,9 @@ pub fn add_signature<CTX: crate::RskContextTr>(
                 &pubkey_hash160(&compressed_key),
                 &rsk_tx_hash,
             );
-        } else {
-            // Pre-RSKIP415 the federator's RSK address derives from its BTC key.
-            if let Some(addr) = super::federation::rsk_address_from_public_key(&fed_key) {
-                super::events::log_solidity_add_signature(ctx, &rsk_tx_hash, addr, &fed_key);
-            }
+        } else if let Some(addr) = super::federation::rsk_address_from_public_key(&federator_addr_key) {
+            // Topic = federatorRskAddress; data = the BTC public key (always).
+            super::events::log_solidity_add_signature(ctx, &rsk_tx_hash, addr, &fed_key);
         }
     };
     if !log_only_when_applied {

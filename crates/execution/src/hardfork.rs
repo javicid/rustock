@@ -372,6 +372,13 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Arrowhead631
     }
 
+    /// RSKIP415: the `add_signature` event's `federatorRskAddress` topic is
+    /// derived from the federation member's RSK public key instead of its BTC
+    /// public key (Arrowhead600). rskj `BridgeEventLoggerImpl.getFederatorRskPublicKey`.
+    pub fn has_rskip415(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Arrowhead600
+    }
+
     /// RSKIP170: pegin_btc event replaces lock_btc (Iris300).
     pub fn has_rskip170(&self, block_number: u64) -> bool {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Iris300
