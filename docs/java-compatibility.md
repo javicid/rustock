@@ -3297,3 +3297,57 @@ Consensus-load-bearing details rustock matches in
   `active_federation_keys_and_redeem` (format-aware, the same builder the retiring
   path already used). rustock `bridge/peg.rs::register_fast_bridge_btc_transaction`;
   regression `flyover_active_p2sh_uses_erp_redeem_5831167`.
+
+---
+
+## 52. Flyover response codes are FULL 256-bit two's-complement int256 (and the 21-byte address gate)
+
+`registerFastBridgeBtcTransaction` returns a signed `int256` "flyover response
+code" (rskj `FlyoverTxResponseCodes`: REFUNDED_USER -100, REFUNDED_LP -200,
+UNPROCESSABLE_* -300..-305, GENERIC_ERROR -900) or, on success, the locked
+amount in wei. rskj returns `BigInteger.valueOf(code)`, which the ABI encoder
+serializes as a **full 256-bit two's-complement** word — every negative code
+has all 31 high bytes `0xff` (e.g. -900 = `0xffff…fc7c`, 64 hex digits).
+
+**The bug (mainnet #5,967,453).** rustock's `flyover_code_output` computed
+`U256::from(code as i128 as u128)`. For a negative code `code as i128 as u128`
+is the **128-bit** two's complement (`2^128 - |code|`), which `U256::from` then
+**zero-extends** to 256 bits — so -900 became `0x0000…0000fffffffffffffffffffffffffffffc7c`
+(only 32 trailing f's), i.e. `2^128 - 900`, not `2^256 - 900`. The calling
+LiquidityBridgeContract detects GENERIC_ERROR with `bridgeResponse + 900 == 0`:
+with the correct value `(2^256-900)+900` wraps at bit 256 to `0`; with the buggy
+value `(2^128-900)+900 = 2^128` (non-zero), so the LBC took the wrong JUMPI
+branch, did NOT revert, and ran an extra 51,580 gas (computed 194,449 vs header
+142,869). Fixed by building the full 256-bit two's complement
+(`U256::ZERO.wrapping_sub(U256::from(code.unsigned_abs()))` for negatives).
+
+**Coupled gate: the 21-byte BTC-address length check.** For this block to reach
+GENERIC_ERROR in the first place, rustock also had to reject the malformed input
+the way rskj does. rskj parses the two BTC addresses in the **ABI layer**
+(`Bridge.registerFlyoverBtcTransaction`, `Bridge.java:1359-1399`) via
+`BridgeUtils.deserializeBtcAddressWithVersion` — **before**
+`bridgeSupport.registerFlyoverBtcTransaction`'s isContractTx/sender/validations
+checks — inside a `try/catch(Exception)` that returns `GENERIC_ERROR`. Post-RSKIP284
+(hop400) that deserializer REQUIRES exactly 21 bytes (`[version || 20-byte
+hash160]`, `BridgeUtils.java:603-623`) and throws `BridgeIllegalArgumentException:
+Invalid address, expected 21 bytes long array` otherwise; pre-RSKIP284 the legacy
+path (`BridgeUtilsLegacy.deserializeBtcAddressWithVersionLegacy`) only needs ≥21
+bytes (a shorter array throws `ArrayIndexOutOfBoundsException` in its `arraycopy`).
+The block's `userRefundAddress` arg was **33 bytes**, so rskj returned GENERIC_ERROR
+(-900); rustock's lenient parser proceeded to the confirmations check and returned
+UNPROCESSABLE_VALIDATIONS (-303). Even with the encoding fix, -303 (`+900 = 597`,
+nonzero) would still mis-branch the LBC — both fixes are required.
+
+**rskj source**: `co.rsk.peg.Bridge#registerFlyoverBtcTransaction`
+(arg parse + `try/catch → FlyoverTxResponseCodes.GENERIC_ERROR`),
+`co.rsk.peg.BridgeUtils#deserializeBtcAddressWithVersion` (21-byte gate),
+`co.rsk.peg.BridgeUtilsLegacy#deserializeBtcAddressWithVersionLegacy` (≥21
+legacy), `co.rsk.peg.FlyoverTxResponseCodes`.
+
+**rustock**: `crates/execution/src/bridge/peg.rs` — `flyover_code_output`
+(full-256-bit encoding) and the address-length gate in
+`register_fast_bridge_btc_transaction` (placed right after ABI parse, before the
+call-depth/caller checks, gated on `has_rskip284`). Test:
+`flyover_code_output_full_256bit_twos_complement`. Verified by replaying
+#5,967,453: tx[0] reverts (status=false) at gasUsed 142,869, state and receipts
+roots match the header.

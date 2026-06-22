@@ -930,8 +930,19 @@ mod flyover_codes {
 
 /// ABI-encode a signed int256 response code as 32 big-endian bytes (two's
 /// complement), matching rskj `BigInteger.valueOf(code)` Solidity encoding.
+/// The value must be sign-extended to the FULL 256 bits: a negative code is
+/// `2^256 - |code|` (all high bytes 0xff), not merely 128-bit-wide — otherwise
+/// a caller that adds back the code (e.g. the LBC `value + 900 == 0` check)
+/// overflows at bit 128 instead of wrapping at bit 256 and branches wrongly
+/// (mainnet #5,967,453: GENERIC_ERROR -900 mis-encoded as `2^128-900`).
 fn flyover_code_output(code: i64) -> Bytes {
-    Bytes::copy_from_slice(&U256::from(code as i128 as u128).to_be_bytes::<32>())
+    let value = if code < 0 {
+        // Full 256-bit two's complement: 2^256 - |code|.
+        U256::ZERO.wrapping_sub(U256::from(code.unsigned_abs()))
+    } else {
+        U256::from(code as u64)
+    };
+    Bytes::copy_from_slice(&value.to_be_bytes::<32>())
 }
 
 /// rskj `PegUtils.getFlyoverDerivationHash`:
@@ -1018,6 +1029,25 @@ pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
     else {
         return ok(flyover_code_output(flyover_codes::GENERIC_ERROR));
     };
+
+    // rskj parses BOTH BTC addresses in the ABI layer (`Bridge.registerFlyover-
+    // BtcTransaction`) via `BridgeUtils.deserializeBtcAddressWithVersion`, wrapped
+    // in a try/catch that returns GENERIC_ERROR on ANY exception — and this runs
+    // BEFORE `bridgeSupport.registerFlyoverBtcTransaction`'s isContractTx/sender
+    // checks. Post-RSKIP284 (hop400) the deserializer REQUIRES exactly 21 bytes
+    // (`[version || 20-byte hash160]`), throwing `BridgeIllegalArgumentException`
+    // otherwise; pre-RSKIP284 the legacy path only needs ≥21 bytes (a shorter
+    // array throws `ArrayIndexOutOfBoundsException` in its `arraycopy`). Either
+    // way a bad-length address yields GENERIC_ERROR. The userRefund address is
+    // parsed first, the LP address second (mainnet #5,967,453: a 33-byte
+    // userRefund address makes rskj return GENERIC_ERROR, not a validations code).
+    let rskip284 = hardfork_cfg.has_rskip284(rsk_height_of(ctx));
+    let address_len_ok = |bytes: &[u8]| -> bool {
+        if rskip284 { bytes.len() == 21 } else { bytes.len() >= 21 }
+    };
+    if !address_len_ok(&user_refund_addr) || !address_len_ok(&lp_btc_addr) {
+        return ok(flyover_code_output(flyover_codes::GENERIC_ERROR));
+    }
 
     // rskj `isContractTx`: the rskTx must be an InternalTransaction (the Bridge
     // was reached via a contract CALL), i.e. call depth > 1.
@@ -3604,6 +3634,44 @@ pub fn get_estimated_fees_for_pegout_amount<CTX: crate::RskContextTr>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression for mainnet #5,967,453: a flyover negative response code must
+    /// be ABI-encoded as a FULL 256-bit two's-complement int256 (rskj
+    /// `BigInteger.valueOf(code)`), not a 128-bit-wide value zero-extended to
+    /// 256 bits. The LBC contract checks `bridgeResponse + 900 == 0` to detect
+    /// GENERIC_ERROR (-900); the old `code as i128 as u128` produced `2^128-900`,
+    /// so adding 900 overflowed at bit 128 to `2^128` (non-zero) instead of
+    /// wrapping at bit 256 to 0 — flipping a JUMPI and over-charging 51,580 gas
+    /// (computed 194,449 vs header 142,869).
+    #[test]
+    fn flyover_code_output_full_256bit_twos_complement() {
+        // -900 = 0xffff...fc7c with ALL 31 high bytes 0xff (64 hex f's).
+        let out = flyover_code_output(flyover_codes::GENERIC_ERROR);
+        let expected = "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffc7c";
+        assert_eq!(alloy_primitives::hex::encode(&out), expected);
+
+        // The contract's check: response + 900 == 0 (mod 2^256).
+        let v = U256::from_be_slice(&out);
+        assert_eq!(v.wrapping_add(U256::from(900u64)), U256::ZERO);
+
+        // Every negative flyover code round-trips: value + |code| == 0 (mod 2^256).
+        for code in [
+            flyover_codes::REFUNDED_USER,
+            flyover_codes::REFUNDED_LP,
+            flyover_codes::UNPROCESSABLE_NOT_CONTRACT,
+            flyover_codes::UNPROCESSABLE_VALIDATIONS,
+            flyover_codes::GENERIC_ERROR,
+        ] {
+            let v = U256::from_be_slice(&flyover_code_output(code));
+            assert_eq!(v.wrapping_add(U256::from(code.unsigned_abs())), U256::ZERO);
+            // High byte is 0xff (sign-extended across the whole word).
+            assert_eq!(flyover_code_output(code)[0], 0xff);
+        }
+
+        // A non-negative locked-amount code encodes as a plain big-endian uint.
+        assert_eq!(U256::from_be_slice(&flyover_code_output(0)), U256::ZERO);
+        assert_eq!(U256::from_be_slice(&flyover_code_output(123_456)), U256::from(123_456u64));
+    }
 
     /// Regression for mainnet #5,171,600: once the retiring federation is
     /// cleared earlier in the block, a btc tx that pays only the now-retired
