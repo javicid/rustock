@@ -2460,7 +2460,14 @@ pub(crate) fn federation_keys_or_genesis<CTX: crate::RskContextTr>(
     config: &BridgeConstants,
     hardfork_cfg: &RskHardforkConfig,
     block_number: u64,
+    want_rsk: bool,
 ) -> Vec<[u8; 33]> {
+    // `want_rsk` selects the member's RSK public key instead of its BTC key
+    // (RSKIP415 REMASC payout). Genesis-fallback members are single-key, so
+    // their RSK key equals their BTC key.
+    let keys = |f: &super::federation::StoredFederation| {
+        if want_rsk { f.rsk_keys() } else { f.btc_keys() }
+    };
     let new = super::federation::load_stored_federation(ctx, NEW_FEDERATION_KEY);
     let old = super::federation::load_stored_federation(ctx, OLD_FEDERATION_KEY);
     let age =
@@ -2468,12 +2475,12 @@ pub(crate) fn federation_keys_or_genesis<CTX: crate::RskContextTr>(
     match (new, old) {
         (Some(n), Some(o)) => {
             if block_number >= n.creation_block + age {
-                n.btc_keys()
+                keys(&n)
             } else {
-                o.btc_keys()
+                keys(&o)
             }
         }
-        (Some(n), None) => n.btc_keys(),
+        (Some(n), None) => keys(&n),
         (None, _) => genesis_federation_keys(config),
     }
 }
@@ -2745,7 +2752,7 @@ pub fn add_signature<CTX: crate::RskContextTr>(
     // Membership check against the active federation (genesis fallback).
     // TODO(rustock): rskj also accepts retiring-federation members.
     let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
-    let federation_keys = federation_keys_or_genesis(ctx, config, hardfork_cfg, block_number);
+    let federation_keys = federation_keys_or_genesis(ctx, config, hardfork_cfg, block_number, false);
     if federation_keys.is_empty() {
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     }

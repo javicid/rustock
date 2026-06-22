@@ -291,6 +291,34 @@ mod tests {
         assert_ne!(pre415, post415, "RSKIP415 changes the federatorRskAddress topic");
     }
 
+    /// RSKIP415 (arrowhead600) also changes REMASC's federation payout: rskj
+    /// `RemascFederationProvider.getFederatorAddress` derives each federator's
+    /// RSK address from its RSK public key instead of its BTC key once active
+    /// (#6,223,708 was the first divergence). `rsk_keys()` must return the
+    /// member's RSK field; legacy single-key (pre-RSKIP123) members carry
+    /// rsk == btc, so the pre-fork payout (and the want_rsk=false path) is
+    /// byte-identical.
+    #[test]
+    fn rsk_keys_selects_rsk_field_and_legacy_equals_btc() {
+        let multikey = StoredFederation {
+            members: vec![StoredMember { btc: [0x02; 33], rsk: [0x03; 33], mst: [0x04; 33] }],
+            creation_time_millis: 0,
+            creation_block: 0,
+        };
+        assert_eq!(multikey.rsk_keys(), vec![[0x03; 33]], "rsk_keys returns the RSK field");
+        assert_eq!(multikey.btc_keys(), vec![[0x02; 33]], "btc_keys returns the BTC field");
+        assert_ne!(multikey.rsk_keys(), multikey.btc_keys());
+
+        // Legacy single-key member: rsk == btc, so both accessors agree and the
+        // RSKIP415 switch is a no-op for it.
+        let legacy = StoredFederation {
+            members: vec![StoredMember::from_btc([0x07; 33])],
+            creation_time_millis: 0,
+            creation_block: 0,
+        };
+        assert_eq!(legacy.rsk_keys(), legacy.btc_keys(), "legacy member rsk == btc");
+    }
+
     #[test]
     fn federation_threshold() {
         let members: Vec<FederationMember> = (0..5)
@@ -403,6 +431,14 @@ pub struct StoredFederation {
 impl StoredFederation {
     pub fn btc_keys(&self) -> Vec<[u8; 33]> {
         self.members.iter().map(|m| m.btc).collect()
+    }
+
+    /// The RSK public key of each member, in federation order. For legacy
+    /// single-key (pre-RSKIP123) federations `rsk == btc`; for multikey
+    /// federations it is the stored RSK key. Matches rskj
+    /// `FederationMember.getPublicKey(KeyType.RSK)`.
+    pub fn rsk_keys(&self) -> Vec<[u8; 33]> {
+        self.members.iter().map(|m| m.rsk).collect()
     }
 }
 

@@ -3465,3 +3465,50 @@ carries the BTC public key. Test:
 replaying #6,223,704: receipts root now matches
 `0xca1927a8…817c58` and state root still matches `0xe82eca71…45aa9`; blocks
 #6,223,704–#6,223,707 replay clean.
+
+## §55 RSKIP415: REMASC's federation payout pays each federator's RSK-key address, not its BTC-key address (arrowhead600, #6,223,708)
+
+**Symptom**: with §54 fixed, the next divergence was a **state-root** mismatch at
+**#6,223,708** (gas 0, receipts matched) — a near-empty block whose only state
+change was REMASC's per-block federation fee payout. The fees were credited to
+the wrong RSK addresses.
+
+**rskj behavior**: REMASC distributes the federation's cut across federator RSK
+addresses obtained from `RemascFederationProvider.getFederatorAddress(n)`, which —
+exactly like §54 — switches key type on RSKIP415:
+
+```java
+public RskAddress getFederatorAddress(int n) {
+    if (!activations.isActive(ConsensusRule.RSKIP415)) {
+        return getRskAddressFromBtcKey(n);   // keccak(uncompressed BTC pubkey)
+    }
+    return getRskAddressFromRskKey(n);       // keccak(uncompressed RSK pubkey)
+}
+```
+
+The activation is gated on the **execution** block, not the matured/processing
+block REMASC rewards: `Remasc.activations = activationConfig.forBlock(execution
+Block.getNumber())` (`Remasc.java:89`), and that `ForBlock` is what the
+`RemascFederationProvider` consults. The *which* federation is still resolved at
+the processing (matured) height. For members whose RSK key differs from their BTC
+key, the payout addresses change at the fork.
+
+**rskj source**: `co.rsk.remasc.RemascFederationProvider#getFederatorAddress` /
+`#getRskAddressFromBtcKey` / `#getRskAddressFromRskKey`,
+`co.rsk.remasc.Remasc` (`activations = activationConfig.forBlock(executionBlock
+.getNumber())`, `payToFederation`), `ConsensusRule.RSKIP415`,
+`reference.conf` (`rskip415 = arrowhead600`).
+
+**rustock**: `crates/execution/src/bridge/federation.rs` (`StoredFederation::
+rsk_keys()` — the RSK field of each member; legacy single-key members have
+rsk == btc); `crates/execution/src/bridge/peg.rs` (`federation_keys_or_genesis`
+gains a `want_rsk` flag selecting `rsk_keys()` vs `btc_keys()`);
+`crates/execution/src/remasc.rs` (`federation_rsk_addresses` /
+`pay_to_federation` thread the **execution** block number `current_number` and
+pass `has_rskip415(current_number)` as `want_rsk`, while the federation is still
+resolved at `processing_block_number`). The `add_signature` membership check (§54
+path) passes `want_rsk = false` — it only needs the BTC keys. Test:
+`bridge::federation::tests::rsk_keys_selects_rsk_field_and_legacy_equals_btc`.
+Verified by replaying #6,223,708: state root now matches
+`0x6a4ed424…f3fb8f`; blocks #6,223,704–#6,223,776 replay clean (next blocker at
+#6,223,777, unrelated).

@@ -410,16 +410,24 @@ fn federation_rsk_addresses<CTX: crate::RskContextTr>(
     bridge_config: &crate::bridge::constants::BridgeConstants,
     hardfork_cfg: &crate::hardfork::RskHardforkConfig,
     processing_block_number: u64,
+    current_number: u64,
 ) -> Vec<Address> {
     // The Bridge account may be cold outside revm's transact flow; journal
     // storage reads require the account to be loaded.
     use revm::context_interface::JournalTr;
     let _ = ctx.journal_mut().load_account(crate::precompiles::BRIDGE_ADDR);
+    // RSKIP415 (arrowhead600): rskj's `RemascFederationProvider.getFederatorAddress`
+    // switches from `getRskAddressFromBtcKey` to `getRskAddressFromRskKey`, i.e. it
+    // derives the federator RSK address from the member's RSK public key instead of
+    // its BTC public key. The activation is gated on the EXECUTION block number
+    // (rskj `Remasc.activations = forBlock(executionBlock.getNumber())`), not the
+    // processing/matured block.
     let stored = crate::bridge::peg::federation_keys_or_genesis(
         ctx,
         bridge_config,
         hardfork_cfg,
         processing_block_number,
+        hardfork_cfg.has_rskip415(current_number),
     );
     let _ = config;
     stored
@@ -457,6 +465,7 @@ fn pay_to_federation<CTX: crate::RskContextTr>(
         bridge_config,
         hardfork_cfg,
         processing_block_number,
+        current_number,
     );
     if federators.is_empty() {
         remasc_sstore(ctx, fed_key, pay_total);
