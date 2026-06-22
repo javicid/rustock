@@ -3616,3 +3616,33 @@ parse failure (empty result), matching that behavior.
 `read_dynamic_bytes` use checked `usize::try_from`). Tests:
 `bridge::tests::parse_bytes_array_rejects_oversized_count_without_panic`,
 `bridge::tests::read_dynamic_bytes_rejects_oversized_length`.
+
+## Bridge federation-only authorization (`activeAndRetiringFederationOnly`)
+
+`updateCollections` (always) and `receiveHeaders` (when not public, i.e.
+post-RSKIP200 — `receiveHeadersIsPublic = RSKIP124 && !RSKIP200`) wrap their
+executor in `Bridge.activeAndRetiringFederationOnly`, which throws a
+`VMException` unless the call's sender is a member of the **active or retiring**
+federation (`BridgeUtils.isFromFederateMember`, comparing the sender's RSK
+address against each member's `getRskPublicKey().getAddress()`). The "sender"
+is the immediate caller of the Bridge precompile (rskj builds the precompile's
+`internalTx` with `senderAddress = getOwnerRskAddress()`), so a **relay contract
+forwarding the call is checked by its own address**, not the original EOA. On
+rejection, `Program.executePrecompiledAndHandleError` rolls back (no state
+change, no events) and the CALL returns 0 while charging the full `requiredGas`.
+
+rustock had no such check, so a non-federation caller's `updateCollections` ran
+and emitted the `update_collections` event. Mainnet **#6,223,774 tx[1]**
+(relay `0x82494fb1…449d9`, not a federation member) must emit **zero** logs.
+
+**rskj source**: `co.rsk.peg.Bridge#activeAndRetiringFederationOnly`,
+`#validateCallMessageType`; `co.rsk.peg.BridgeMethods.UPDATE_COLLECTIONS` /
+`.RECEIVE_HEADERS`; `BridgeUtils#isFromFederateMember`;
+`Program#callToPrecompiledAddress` (internalTx sender = owner).
+**rustock**: `crates/execution/src/bridge/mod.rs` (`execute_method`
+federation-only gate), `crates/execution/src/bridge/peg.rs`
+(`is_sender_active_or_retiring_fed_member`),
+`crates/execution/src/hardfork.rs` (`has_rskip200`). Tests:
+`executor::tests::update_collections_burns_dusty_change_surplus` (member),
+`executor::tests::update_collections_rejected_for_non_federation_sender`.
+

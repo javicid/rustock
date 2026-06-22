@@ -6452,7 +6452,13 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
         let store = Arc::new(MemoryTrieStore::new());
         let root = TrieNode::empty();
 
-        let sender = Address::repeat_byte(0xAA);
+        // updateCollections is federation-only (rskj activeAndRetiringFederationOnly):
+        // the sender must be a member of the active federation, so derive it from
+        // the federation member's RSK key seeded below.
+        let fed_pubkey_hex = "020ace50bab1230f8002a0bfe619482af74b338cc9e4c956add228df47e6adae1c";
+        let sender = rsk_address_from_pubkey_hex(fed_pubkey_hex).unwrap();
+        let fed_pubkey: [u8; 33] =
+            alloy_primitives::hex::decode(fed_pubkey_hex).unwrap().try_into().unwrap();
         let one_rbtc = U256::from(10u64).pow(U256::from(18));
         let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
         let root = put_account(
@@ -6492,6 +6498,14 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
             &root,
             crate::bridge::storage::NEW_FEDERATION_BTC_UTXOS_KEY,
             &crate::bridge::storage::serialize_utxo_list(&[utxo]),
+        );
+        // Seed the active federation with a single member whose RSK key (== BTC
+        // key in the legacy single-key format) derives `sender`, so the
+        // federation-only updateCollections authorization passes.
+        let root = put_cell(
+            &root,
+            crate::bridge::storage::NEW_FEDERATION_KEY,
+            &crate::bridge::federation::serialize_federation_only_btc_keys(&[fed_pubkey], 0, 0),
         );
 
         let block_store =
@@ -6535,6 +6549,86 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
             .map(|a| a.info.balance)
             .unwrap_or_default();
         assert_eq!(bridge_balance, one_rbtc - burned, "burn debits the Bridge");
+    }
+
+    /// rskj `Bridge.activeAndRetiringFederationOnly`: a non-federation sender's
+    /// updateCollections is rejected (VMException) — the method body never runs,
+    /// so no pegout processing / dusty-change burn happens (mainnet #6,223,774
+    /// tx[1]: relay 0x82494fb1 is not a federation member). Same seeded state as
+    /// the positive test but WITHOUT a federation, so the sender cannot match.
+    #[test]
+    fn update_collections_rejected_for_non_federation_sender() {
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+
+        let sender = Address::repeat_byte(0xAA); // not a federation member
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+        let root = put_account(&root, store.as_ref(), &crate::precompiles::BRIDGE_ADDR, 0, one_rbtc);
+
+        let put_cell = |root: &TrieNode, name: &str, value: &[u8]| {
+            let slot = B256::from(crate::bridge::storage::bridge_storage_key(name));
+            let key = rustock_trie::storage_key(&crate::precompiles::BRIDGE_ADDR, &slot);
+            root.put(&rustock_trie::TrieKeySlice::from_key(&key), value, store.as_ref())
+        };
+        let request = crate::bridge::peg::ReleaseRequest {
+            btc_dest_hash160: [0x11; 20],
+            amount_satoshis: 100_000_000,
+            rsk_tx_hash: Some([0xab; 32]),
+        };
+        let root = put_cell(
+            &root,
+            crate::bridge::storage::RELEASE_REQUEST_QUEUE_WITH_TXHASH_KEY,
+            &crate::bridge::peg::serialize_release_queue_with_hash(&[request]),
+        );
+        let utxo = crate::bridge::storage::BridgeUtxo {
+            tx_hash: [0x07; 32],
+            vout: 0,
+            value_satoshis: 100_000_100,
+            height: 0,
+            script: vec![],
+            coinbase: false,
+        };
+        let root = put_cell(
+            &root,
+            crate::bridge::storage::NEW_FEDERATION_BTC_UTXOS_KEY,
+            &crate::bridge::storage::serialize_utxo_list(&[utxo]),
+        );
+
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(1_000_000),
+            to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::copy_from_slice(&alloy_primitives::keccak256(b"updateCollections()")[..4]),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+
+        let header = dummy_header(3_103_055);
+        let result = executor
+            .execute_block(&header, &[(tx, sender)], &root, store.clone())
+            .expect("block executes");
+
+        // The dusty-change burn must NOT happen: updateCollections was rejected.
+        let burn_addr = Address::repeat_byte(0xff);
+        let burn_balance = result
+            .state_changes
+            .get(&burn_addr)
+            .map(|a| a.info.balance)
+            .unwrap_or_default();
+        assert_eq!(burn_balance, U256::ZERO, "rejected updateCollections must not burn");
+        // No update_collections event emitted.
+        assert!(
+            result.tx_results[0].logs.is_empty(),
+            "rejected updateCollections must not emit the update_collections event"
+        );
     }
 
     /// Seed a contract account in the trie with code, the rskj setupContract

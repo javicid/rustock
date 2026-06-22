@@ -2614,6 +2614,65 @@ pub(crate) fn retiring_federation_keys<CTX: crate::RskContextTr>(
     }
 }
 
+/// rskj `BridgeUtils.isFromFederateMember(rskTx, federation)`: true when the
+/// call's sender RSK address matches the RSK public-key address of any member
+/// of the ACTIVE or RETIRING federation. This is the authorization enforced by
+/// `Bridge.activeAndRetiringFederationOnly` for `updateCollections` (always)
+/// and `receiveHeaders` (post-RSKIP200). `sender` is the immediate caller of
+/// the Bridge precompile (= rskj's internalTx sender = `getOwnerRskAddress`),
+/// so a relay contract forwarding the call is checked, not the original EOA.
+pub(crate) fn is_sender_active_or_retiring_fed_member<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    config: &BridgeConstants,
+    hardfork_cfg: &RskHardforkConfig,
+    block_number: u64,
+    sender: alloy_primitives::Address,
+) -> bool {
+    use super::federation::{rsk_address_from_public_key, StoredFederation};
+
+    let new = super::federation::load_stored_federation(ctx, NEW_FEDERATION_KEY);
+    let old = super::federation::load_stored_federation(ctx, OLD_FEDERATION_KEY);
+    let age = super::governance::federation_activation_age(config, hardfork_cfg, block_number);
+
+    // getActiveFederation / getRetiringFederation: the new federation is active
+    // once it reaches activation age, with the old one retiring; before that the
+    // old federation is still active and there is no retiring federation.
+    let (active, retiring): (Option<StoredFederation>, Option<StoredFederation>) =
+        match (new, old) {
+            (Some(n), Some(o)) => {
+                if block_number >= n.creation_block + age {
+                    (Some(n), Some(o))
+                } else {
+                    (Some(o), None)
+                }
+            }
+            (Some(n), None) => (Some(n), None),
+            (None, _) => (None, None),
+        };
+
+    let member_match = |fed: &StoredFederation| {
+        fed.members.iter().any(|m| {
+            rsk_address_from_public_key(&m.rsk) == Some(sender)
+        })
+    };
+
+    if active.as_ref().map(member_match).unwrap_or(false) {
+        return true;
+    }
+    if retiring.as_ref().map(member_match).unwrap_or(false) {
+        return true;
+    }
+
+    // No stored federation yet → genesis federation. Genesis members are
+    // single-key (rsk == btc), so match the sender against each genesis BTC key.
+    if active.is_none() {
+        return genesis_federation_keys(config)
+            .iter()
+            .any(|k| rsk_address_from_public_key(k) == Some(sender));
+    }
+    false
+}
+
 pub(crate) fn genesis_federation_keys(config: &BridgeConstants) -> Vec<[u8; 33]> {
     // rskj Federation sorts members by compressed BTC public key.
     let mut keys: Vec<[u8; 33]> = config

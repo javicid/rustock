@@ -538,6 +538,35 @@ fn execute_method<CTX: crate::RskContextTr>(
     call_depth: usize,
 ) -> Result<PrecompileOutput, PrecompileError> {
 
+    // rskj `Bridge.activeAndRetiringFederationOnly` authorization. The executor
+    // for `updateCollections` (always) and `receiveHeaders` (when not public,
+    // i.e. post-RSKIP200) throws a `VMException` when the call's sender is not a
+    // member of the active or retiring federation. Bridge.execute wraps that in
+    // a VMException which `executePrecompiledAndHandleError` turns into a
+    // rollback + stackPushZero (the call returns 0 / empty data) while still
+    // charging the full `requiredGas`. A relay contract forwarding the call is
+    // checked by its own address, so a non-federation caller is rejected with no
+    // state change and no event (mainnet #6,223,774 tx[1]: updateCollections via
+    // relay 0x82494fb1 must NOT emit the update_collections log).
+    let federation_only = match method_name {
+        "updateCollections" => true,
+        // receiveHeadersIsPublic() = RSKIP124 && !RSKIP200; restricted otherwise.
+        "receiveHeaders" => {
+            let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+            !(hardfork_cfg.has_rskip124(block_number) && !hardfork_cfg.has_rskip200(block_number))
+        }
+        _ => false,
+    };
+    if federation_only {
+        let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+        if !peg::is_sender_active_or_retiring_fed_member(ctx, config, hardfork_cfg, block_number, caller) {
+            // BridgeIllegalArgumentException-equivalent: a non-OOG throw the
+            // execute_bridge wrapper maps to the depth-aware bridge-throw marker
+            // (rollback + only requiredGas spent).
+            return Err(PrecompileError::other("Bridge: sender is not a federation member"));
+        }
+    }
+
     match method_name {
         // Phase 2: BTC header chain
         "receiveHeader" => btc_chain::receive_header(ctx, args, gas_cost, config, use_v2, hardfork_cfg),

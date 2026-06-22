@@ -251,6 +251,12 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Iris300
     }
 
+    /// RSKIP200: singular `receiveHeader` + `receiveHeaders` becomes
+    /// federation-only (`receiveHeadersIsPublic` flips false) (Iris300).
+    pub fn has_rskip200(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Iris300
+    }
+
     /// RSKIP134: per-hash processed-peg-in entries replace the single
     /// btcTxHashesAP map (Papyrus200).
     pub fn has_rskip134(&self, block_number: u64) -> bool {
