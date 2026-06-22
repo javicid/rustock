@@ -26,12 +26,15 @@ use super::btc_store::{
 use super::constants::BridgeConstants;
 use crate::hardfork::RskHardforkConfig;
 
-// Error codes
-const SUCCESS: i64 = 1;
-const ERR_ALREADY_KNOWN: i64 = -1;
-const ERR_TOO_SOON: i64 = -2;
+// receiveHeader result codes — must match rskj BridgeSupport exactly
+// (BridgeSupport.java:96-100). A from-scratch client that picked its own
+// codes (e.g. SUCCESS=1) would fork because callers branch on these values.
+const SUCCESS: i64 = 0;
+const ERR_TOO_SOON: i64 = -1;
+const ERR_BLOCK_TOO_OLD: i64 = -2;
 const ERR_PREV_NOT_FOUND: i64 = -3;
-const ERR_INVALID_POW: i64 = -5;
+const ERR_ALREADY_KNOWN: i64 = -4;
+const ERR_UNEXPECTED_EXCEPTION: i64 = -99;
 
 /// Process a single BTC header submitted via `receiveHeader(bytes)`.
 ///
@@ -57,18 +60,9 @@ pub fn receive_header<CTX: crate::RskContextTr>(
         PrecompileError::other("receiveHeader: invalid ABI encoding")
     })?;
 
-    // Rate limiting
-    let last_timestamp =
-        super::storage::bridge_load_timestamp(ctx, super::storage::RECEIVE_HEADERS_TIMESTAMP_KEY);
-    let current_timestamp = ctx.block().timestamp();
-
-    if config.min_seconds_between_calls_receive_header > 0
-        && current_timestamp < last_timestamp + config.min_seconds_between_calls_receive_header
-    {
-        return Ok(encode_int_result(gas_cost, ERR_TOO_SOON));
-    }
-
-    // Deserialize BTC header (80 bytes)
+    // Deserialize BTC header (80 bytes). rskj has already parsed the header
+    // (Bridge.receiveHeader takes a BtcBlock) by this point, so the order of
+    // checks below mirrors BridgeSupport.receiveHeader (BridgeSupport.java:227).
     if header_bytes.len() < 80 {
         return Err(PrecompileError::other("receiveHeader: header too short"));
     }
@@ -78,27 +72,54 @@ pub fn receive_header<CTX: crate::RskContextTr>(
 
     let block_hash = btc_header.block_hash();
 
-    // Check if already known
+    // 1. Already saved? (rskj checks this FIRST, before the time window.)
     if get_stored_block(ctx, &block_hash).is_some() {
         return Ok(encode_int_result(gas_cost, ERR_ALREADY_KNOWN));
     }
 
-    // Check PoW
-    if !check_proof_of_work(&btc_header) {
-        return Ok(encode_int_result(gas_cost, ERR_INVALID_POW));
+    // 2. Called too soon (RSKIP200 rate limit).
+    let last_timestamp =
+        super::storage::bridge_load_timestamp(ctx, super::storage::RECEIVE_HEADERS_TIMESTAMP_KEY);
+    let current_timestamp = ctx.block().timestamp();
+    if config.min_seconds_between_calls_receive_header > 0
+        && current_timestamp < last_timestamp + config.min_seconds_between_calls_receive_header
+    {
+        return Ok(encode_int_result(gas_cost, ERR_TOO_SOON));
     }
 
-    // Find parent
-    let parent = get_stored_block(ctx, &btc_header.prev_blockhash);
-    let parent = match parent {
+    // 3. Parent (previous block) must be known.
+    let parent = match get_stored_block(ctx, &btc_header.prev_blockhash) {
         Some(p) => p,
         None => return Ok(encode_int_result(gas_cost, ERR_PREV_NOT_FOUND)),
     };
 
+    let new_height = parent.height + 1;
+
+    // 4. Too old: bestChainHeight - newHeight > maxDepthBlockchainAccepted.
+    let best_height = load_chain_head(ctx).map(|h| h.height).unwrap_or(0);
+    if (best_height as i64) - (new_height as i64) > config.max_depth_blockchain_accepted as i64 {
+        return Ok(encode_int_result(gas_cost, ERR_BLOCK_TOO_OLD));
+    }
+
+    // 5. cannotProcessNextBlock: the bitcoinj 12-byte chainwork overflow guard
+    // (BridgeSupport.cannotProcessNextBlock). Same gate as receiveHeaders.
+    let is_mainnet = matches!(config.btc_network, super::constants::BtcNetwork::Mainnet);
+    if new_height >= config.block_with_too_much_chain_work_height
+        && is_mainnet
+        && !hardfork_cfg.has_rskip434(block_number)
+    {
+        return Ok(encode_int_result(gas_cost, ERR_UNEXPECTED_EXCEPTION));
+    }
+
+    // 6. btcBlockChain.add(header) — bitcoinj throws on bad PoW or any other
+    // error, which rskj catches and maps to UNEXPECTED_EXCEPTION.
+    if !check_proof_of_work(&btc_header) {
+        return Ok(encode_int_result(gas_cost, ERR_UNEXPECTED_EXCEPTION));
+    }
+
     // Compute chain work
     let work = compute_work(btc_header.bits);
     let new_chain_work = parent.chain_work.wrapping_add(work);
-    let new_height = parent.height + 1;
 
     let stored = StoredBlock::new(btc_header, new_height, new_chain_work);
 
@@ -374,8 +395,6 @@ pub fn receive_headers<CTX: crate::RskContextTr>(
     let max_headers = config.max_btc_headers_per_rsk_block as usize;
     let count = headers.len().min(max_headers);
 
-    let mut processed = 0i64;
-
     for header_bytes in headers.iter().take(count) {
         if header_bytes.len() < 80 {
             continue;
@@ -420,11 +439,16 @@ pub fn receive_headers<CTX: crate::RskContextTr>(
 
         let stored = StoredBlock::new(btc_header, new_height, new_chain_work);
         connect_block(ctx, &stored, &parent, use_v2, rskip199);
-
-        processed += 1;
     }
 
-    Ok(encode_int_result(gas_cost, processed))
+    // rskj `receiveHeaders` is a VOID method (BridgeMethods.RECEIVE_HEADERS
+    // declares no output, Bridge::receiveHeaders is BridgeMethodExecutorVoid).
+    // Bridge.execute therefore returns the void value — `null` before RSKIP417
+    // and EMPTY_BYTE_ARRAY afterwards (Bridge.calculateVoidReturnValue) — both
+    // of which give the caller RETURNDATASIZE 0. Returning a 32-byte int here
+    // makes a calling contract decode 32 bytes where rskj sees 0, forking the
+    // execution (mainnet #6,223,768 tx[0]: relay 0x82494fb1 OOGs vs success).
+    Ok(PrecompileOutput::new(gas_cost, Bytes::new()))
 }
 
 // ---------------------------------------------------------------------------
@@ -818,5 +842,20 @@ mod tests {
         let btc_hash = b256_to_bitcoin_hash(&hash_bytes);
         let back = bitcoin_hash_to_b256(&btc_hash);
         assert_eq!(back, hash_bytes);
+    }
+
+    /// Ground truth: rskj `BridgeSupport` receiveHeader result codes
+    /// (BridgeSupport.java:96-100 + the `return 0;` success). A from-scratch
+    /// client that picked different values (rustock previously used SUCCESS=1,
+    /// TOO_SOON=-2, ALREADY_KNOWN=-1, a bogus INVALID_POW=-5) forks because the
+    /// calling contract branches on these integers (mainnet #6,223,768 tx[0]).
+    #[test]
+    fn receive_header_result_codes_match_rskj() {
+        assert_eq!(SUCCESS, 0); // return 0
+        assert_eq!(ERR_TOO_SOON, -1); // RECEIVE_HEADER_CALLED_TOO_SOON
+        assert_eq!(ERR_BLOCK_TOO_OLD, -2); // RECEIVE_HEADER_BLOCK_TOO_OLD
+        assert_eq!(ERR_PREV_NOT_FOUND, -3); // RECEIVE_HEADER_CANT_FOUND_PREVIOUS_BLOCK
+        assert_eq!(ERR_ALREADY_KNOWN, -4); // RECEIVE_HEADER_BLOCK_PREVIOUSLY_SAVED
+        assert_eq!(ERR_UNEXPECTED_EXCEPTION, -99); // RECEIVE_HEADER_UNEXPECTED_EXCEPTION
     }
 }

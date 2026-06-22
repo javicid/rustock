@@ -3557,3 +3557,46 @@ takes the caller-computed `gas_cost` instead of hardcoding 10_600);
 `bridge::tests::receive_header_gas_includes_data_cost`. Verified by replaying
 #6,223,762: tx[2] gasUsed = 35_556, state root and receipts root both match
 `0x06bf9670…6dd5` / `0x7562cb6f…72dc`.
+
+## Bridge `receiveHeaders` is a void method — empty return data (RSKIP417 era)
+
+`receiveHeaders(bytes[])` is declared with **no outputs**
+(`BridgeMethods.RECEIVE_HEADERS` output array is `{}`, executor is
+`BridgeMethodExecutorVoid`). `Bridge.execute` therefore returns the *void
+value* — `null` before RSKIP417 and `EMPTY_BYTE_ARRAY` after
+(`Bridge.calculateVoidReturnValue` / `shouldReturnNullOnVoidMethods =
+!RSKIP417`). Both give the caller `RETURNDATASIZE == 0`
+(`Program.getReturnDataBufferSizeI` maps null → 0).
+
+rustock's `receive_headers` returned a 32-byte ABI int (the processed-header
+count). A calling contract that ABI-decodes the return then sees 32 bytes
+where rskj sees 0, taking a different code path. Mainnet **#6,223,768 tx[0]**
+(relay `0x82494fb1…449d9` forwards `receiveHeaders`) OOG'd in rustock vs
+SUCCESS in rskj because of the extra returned word.
+
+**rskj source**: `co.rsk.peg.BridgeMethods.RECEIVE_HEADERS` (void),
+`co.rsk.peg.Bridge#execute` / `#calculateVoidReturnValue` (Bridge.java:417-486),
+`Program#getReturnDataBufferSizeI` (returns 0 for null).
+**rustock**: `crates/execution/src/bridge/btc_chain.rs` (`receive_headers`
+returns `Bytes::new()`).
+
+## Bridge `receiveHeader` result codes must match rskj exactly
+
+rskj `BridgeSupport.receiveHeader` returns specific integers a caller branches
+on: success `0`, `RECEIVE_HEADER_CALLED_TOO_SOON = -1`,
+`RECEIVE_HEADER_BLOCK_TOO_OLD = -2`,
+`RECEIVE_HEADER_CANT_FOUND_PREVIOUS_BLOCK = -3`,
+`RECEIVE_HEADER_BLOCK_PREVIOUSLY_SAVED = -4`,
+`RECEIVE_HEADER_UNEXPECTED_EXCEPTION = -99` (BridgeSupport.java:96-100, 227-270).
+rustock previously used a different, incompatible set (`SUCCESS = 1`,
+`ALREADY_KNOWN = -1`, `TOO_SOON = -2`, a fabricated `INVALID_POW = -5`) and was
+missing the block-too-old (`maxDepthBlockchainAccepted`) and
+`cannotProcessNextBlock` checks. The check order also differs: rskj tests
+already-saved **before** the time window.
+
+**rskj source**: `co.rsk.peg.BridgeSupport#receiveHeader` /
+`#cannotProcessNextBlock` (BridgeSupport.java:227-279).
+**rustock**: `crates/execution/src/bridge/btc_chain.rs` (`receive_header`
+constants + reordered checks). Test:
+`bridge::tests::receive_header_result_codes_match_rskj`.
+
