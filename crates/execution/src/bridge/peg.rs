@@ -2657,10 +2657,19 @@ pub fn add_signature<CTX: crate::RskContextTr>(
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     }
 
-    // ABI layout: bytes federatorPublicKey, bytes[] signatures, bytes rskTxHash
-    let fed_key_offset = U256::from_be_slice(&args[0..32]).to::<usize>();
-    let sigs_offset = U256::from_be_slice(&args[32..64]).to::<usize>();
-    let rsk_hash_offset = U256::from_be_slice(&args[64..96]).to::<usize>();
+    // ABI layout: bytes federatorPublicKey, bytes[] signatures, bytes rskTxHash.
+    // An out-of-range (oversized) ABI offset cannot index this calldata; treat
+    // it as a parse failure (empty output) rather than panicking — rskj's
+    // Solidity decoder likewise rejects such inputs. Mainnet #6,223,783 tx[3]
+    // forwards malformed calldata whose `signatures` offset points into the
+    // middle of the federator key, yielding an absurd array count.
+    let (Ok(fed_key_offset), Ok(sigs_offset), Ok(rsk_hash_offset)) = (
+        usize::try_from(U256::from_be_slice(&args[0..32])),
+        usize::try_from(U256::from_be_slice(&args[32..64])),
+        usize::try_from(U256::from_be_slice(&args[64..96])),
+    ) else {
+        return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
+    };
 
     // Parse federator public key
     let fed_key = match read_dynamic_bytes(args, fed_key_offset) {
@@ -3538,7 +3547,15 @@ fn parse_bytes_array(args: &[u8], array_offset: usize) -> Vec<Vec<u8>> {
     if array_offset + 32 > args.len() {
         return Vec::new();
     }
-    let count = U256::from_be_slice(&args[array_offset..array_offset + 32]).to::<usize>();
+    // Any ABI length/offset that does not fit in a usize is necessarily out of
+    // range for this calldata, so treat it as unparseable (an empty/short
+    // result) rather than panicking — rskj's Solidity decoder likewise rejects
+    // such inputs (the count guard runs after the read, so the conversion must
+    // never overflow). Mainnet #6,223,783 tx[3] feeds a count of ~uint256::MAX.
+    let Ok(count) = usize::try_from(U256::from_be_slice(&args[array_offset..array_offset + 32]))
+    else {
+        return Vec::new();
+    };
     if count == 0 || count > 1000 {
         return Vec::new();
     }
@@ -3551,12 +3568,19 @@ fn parse_bytes_array(args: &[u8], array_offset: usize) -> Vec<Vec<u8>> {
         if off_pos + 32 > args.len() {
             break;
         }
-        let elem_rel_offset = U256::from_be_slice(&args[off_pos..off_pos + 32]).to::<usize>();
+        let Ok(elem_rel_offset) =
+            usize::try_from(U256::from_be_slice(&args[off_pos..off_pos + 32]))
+        else {
+            break;
+        };
         let elem_abs = offsets_start + elem_rel_offset;
         if elem_abs + 32 > args.len() {
             break;
         }
-        let elem_len = U256::from_be_slice(&args[elem_abs..elem_abs + 32]).to::<usize>();
+        let Ok(elem_len) = usize::try_from(U256::from_be_slice(&args[elem_abs..elem_abs + 32]))
+        else {
+            break;
+        };
         let data_start = elem_abs + 32;
         if data_start + elem_len > args.len() {
             break;
@@ -3580,7 +3604,11 @@ fn read_dynamic_bytes(args: &[u8], offset: usize) -> Result<Vec<u8>, PrecompileE
     if offset + 32 > args.len() {
         return Err(PrecompileError::other("ABI: offset out of bounds"));
     }
-    let len = U256::from_be_slice(&args[offset..offset + 32]).to::<usize>();
+    // An oversized length can never fit this calldata: reject it (rskj's
+    // decoder does the same) instead of panicking on the usize conversion.
+    let Ok(len) = usize::try_from(U256::from_be_slice(&args[offset..offset + 32])) else {
+        return Err(PrecompileError::other("ABI: length out of bounds"));
+    };
     let data_start = offset + 32;
     if data_start + len > args.len() {
         return Err(PrecompileError::other("ABI: data out of bounds"));
@@ -4994,5 +5022,32 @@ mod tests {
             to_hex(&config.old_federation_address_hash160),
             "279d4b44e8cf5e3f04c0ea21c78f1a0ecaa4cd9f"
         );
+    }
+
+    /// Regression: an ABI `bytes[]` whose declared count does not fit in a
+    /// usize must be rejected (empty result), never panic on the U256->usize
+    /// conversion. Mainnet #6,223,783 tx[3] forwarded malformed addSignature
+    /// calldata whose `signatures` offset landed mid-key, yielding an absurd
+    /// (~uint256::MAX) array count.
+    #[test]
+    fn parse_bytes_array_rejects_oversized_count_without_panic() {
+        // 32-byte count word = uint256::MAX (left of any plausible calldata).
+        let args = vec![0xFFu8; 32];
+        assert!(parse_bytes_array(&args, 0).is_empty());
+
+        // A within-range but too-large count (> 1000 guard) is also rejected.
+        let mut big = [0u8; 32];
+        big[31] = 0xFF; // 255 is fine; bump to exceed 1000:
+        let mut over = [0u8; 32];
+        over[30] = 0x10; // 0x1000 = 4096 > 1000
+        assert!(parse_bytes_array(&over, 0).is_empty());
+    }
+
+    /// Regression: `read_dynamic_bytes` must reject an oversized ABI length
+    /// rather than panic converting it to usize (same malformed-calldata path).
+    #[test]
+    fn read_dynamic_bytes_rejects_oversized_length() {
+        let args = vec![0xFFu8; 64]; // offset 0 -> length word = uint256::MAX
+        assert!(read_dynamic_bytes(&args, 0).is_err());
     }
 }

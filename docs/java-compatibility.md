@@ -3600,3 +3600,19 @@ already-saved **before** the time window.
 constants + reordered checks). Test:
 `bridge::tests::receive_header_result_codes_match_rskj`.
 
+
+## Bridge ABI `bytes[]` / dynamic-bytes decoding must not panic on bad input
+
+A malformed Bridge call can supply ABI offsets/lengths that don't fit in a
+`usize`. rustock's `parse_bytes_array` and `read_dynamic_bytes`
+(`crates/execution/src/bridge/peg.rs`) used `U256::to::<usize>()`, which panics
+on overflow. Mainnet **#6,223,783 tx[3]** forwards malformed `addSignature`
+calldata whose `signatures` array offset lands in the middle of the federator
+key, yielding a `~uint256::MAX` element count → panic. rskj's Solidity decoder
+rejects such inputs gracefully; rustock now treats any out-of-range length as a
+parse failure (empty result), matching that behavior.
+
+**rustock**: `crates/execution/src/bridge/peg.rs` (`parse_bytes_array` and
+`read_dynamic_bytes` use checked `usize::try_from`). Tests:
+`bridge::tests::parse_bytes_array_rejects_oversized_count_without_panic`,
+`bridge::tests::read_dynamic_bytes_rejects_oversized_length`.
