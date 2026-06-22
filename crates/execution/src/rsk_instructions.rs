@@ -36,6 +36,12 @@ const CALL_STATIC_GAS: u64 = 700;
 /// rskj `GasCost.EXT_CODE_SIZE` (== revm's pre-Berlin EXTCODESIZE), EIP-150.
 const EXT_CODE_SIZE_GAS: u64 = 700;
 
+/// rskj `GasCost.SLOAD`: fork-independent (RSK never took EIP-1884's 800).
+const SLOAD_GAS: u64 = 200;
+
+/// rskj `GasCost.BALANCE`: fork-independent (RSK never took EIP-1884's 700).
+const BALANCE_GAS: u64 = 400;
+
 /// rskj `GasCost.SUICIDE`: static cost of SELFDESTRUCT (EIP-150 onward, which
 /// is always active for RSK eras). Mirrors revm's TANGERINE+ static gas.
 const SUICIDE_STATIC_GAS: u64 = 5000;
@@ -68,6 +74,7 @@ pub fn install<WIRE, HOST>(
     instructions: &mut EthInstructions<WIRE, HOST>,
     extcodehash_enabled: bool,
     istanbul_opcodes_enabled: bool,
+    push0_enabled: bool,
     extcodesize_max_precompiles: &[Address],
     extcodehash_precompiles: &[Address],
     real_coinbase: Address,
@@ -75,6 +82,16 @@ pub fn install<WIRE, HOST>(
     WIRE: InterpreterTypes,
     HOST: Host,
 {
+    // RSKIP398 (arrowhead600): PUSH0 (0x5f, rskj `OpCode.PUSH0` BASE_TIER = 2 gas)
+    // pushes a zero word. rskj enables it at arrowhead600 but rustock maps that to
+    // ISTANBUL (for RSKIP400 calldata), where revm's stock PUSH0 halts NotActivated
+    // (it gates on SHANGHAI). Install an unchecked PUSH0 from arrowhead600 onward.
+    if push0_enabled {
+        instructions.insert_instruction(
+            opcode::PUSH0,
+            Instruction::new(rsk_push0::<WIRE, HOST>, 2),
+        );
+    }
     if !extcodehash_enabled {
         instructions.insert_instruction(
             opcode::EXTCODEHASH,
@@ -116,6 +133,42 @@ pub fn install<WIRE, HOST>(
             Instruction::new(invalid_opcode::<WIRE, HOST>, 0),
         );
     }
+    // rskj's `GasCost` constants are fork-independent (`static final`), so RSK
+    // never adopted EIP-1884's Istanbul repricing of SLOAD (200→800) and BALANCE
+    // (400→700). Arrowhead600+ maps to revm's ISTANBUL (for the RSKIP400 calldata
+    // reduction, which is keyed off the SpecId), so revm's default table would
+    // charge the bumped Istanbul prices. Pin both back to rskj's `GasCost.SLOAD`
+    // (200) and `GasCost.BALANCE` (400). Pre-Istanbul specs already use these
+    // values, so the override is a no-op there; at SHANGHAI (lovell700+) it also
+    // corrects the same EIP-1884 over-charge. The instruction bodies are revm's
+    // own pre-Berlin SLOAD/BALANCE (RSK never reaches Berlin), which charge
+    // everything via the static gas we set here. (Mainnet #6,223,700.)
+    instructions.insert_instruction(
+        opcode::SLOAD,
+        Instruction::new(
+            revm::interpreter::instructions::host::sload::<WIRE, HOST>,
+            SLOAD_GAS,
+        ),
+    );
+    instructions.insert_instruction(
+        opcode::BALANCE,
+        Instruction::new(
+            revm::interpreter::instructions::host::balance::<WIRE, HOST>,
+            BALANCE_GAS,
+        ),
+    );
+
+    // rskj `VM.doSSTORE` keeps Petersburg metering forever (SET=20000,
+    // RESET=CLEAR=5000, REFUND=15000) and has no EIP-2200 reentrancy sentry. Under
+    // the ISTANBUL/SHANGHAI specs revm's stock SSTORE applies EIP-2200 net metering
+    // and the `gasleft <= stipend` sentry — both consensus divergences for RSK. Use
+    // a Petersburg-semantics SSTORE (the gas_params it reads are pinned to rskj's
+    // values in make_cfg_env). Static gas 0 here: the cost is charged inside.
+    instructions.insert_instruction(
+        opcode::SSTORE,
+        Instruction::new(rsk_sstore::<WIRE, HOST>, 0),
+    );
+
     // RSKIP90: EXTCODESIZE of an active precompile reports 2^256-1.
     EXTCODESIZE_MAX_PRECOMPILES
         .with(|p| *p.borrow_mut() = extcodesize_max_precompiles.to_vec());
@@ -271,6 +324,17 @@ fn rsk_chainid<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
 ) {
     if !context.interpreter.stack.push(context.host.chain_id()) {
+        context.interpreter.halt_overflow();
+    }
+}
+
+/// PUSH0 (RSKIP398, arrowhead600) without revm's SHANGHAI spec check: pushes a
+/// zero word. rskj `VM.doPUSH0`. Static gas (2, BASE_TIER) is charged by the
+/// instruction table entry installed in `install`.
+fn rsk_push0<WIRE: InterpreterTypes, H: Host + ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+) {
+    if !context.interpreter.stack.push(U256::ZERO) {
         context.interpreter.halt_overflow();
     }
 }
@@ -649,6 +713,59 @@ pub fn rsk_selfdestruct<WIRE: InterpreterTypes, H: Host + ?Sized>(
     }
 
     context.interpreter.halt(InstructionResult::SelfDestruct);
+}
+
+/// SSTORE with rskj's fork-independent Petersburg metering (`VM.doSSTORE`).
+///
+/// RSK never adopted EIP-2200: there is no `gasleft <= stipend` reentrancy
+/// sentry, and the dynamic cost/refund use the pre-Istanbul rules — present-zero
+/// → non-zero charges SET, every other write charges RESET, and clearing a
+/// non-zero slot to zero refunds CLEAR. The required gas_params are pinned to
+/// rskj's `GasCost` values (SET=20000 split as static 5000 + 15000, RESET=5000
+/// + 0, REFUND=15000) in `make_cfg_env`. This mirrors revm's `host::sstore`
+/// with the ISTANBUL branches forced off. (Mainnet #6,223,700, arrowhead600.)
+fn rsk_sstore<WIRE: InterpreterTypes, H: Host + ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+) {
+    if context.interpreter.runtime_flag.is_static() {
+        context
+            .interpreter
+            .halt(InstructionResult::StateChangeDuringStaticCall);
+        return;
+    }
+    let Some([index, value]) = context.interpreter.stack.popn() else {
+        context.interpreter.halt_underflow();
+        return;
+    };
+
+    // Static SSTORE cost (rskj `GasCost.RESET_SSTORE`/`CLEAR_SSTORE` = 5000),
+    // charged before the store, matching revm's `host::sstore` ordering.
+    let static_gas = context.host.gas_params().sstore_static_gas();
+    if !context.interpreter.gas.record_cost(static_gas) {
+        context.interpreter.halt_oog();
+        return;
+    }
+
+    let target = context.interpreter.input.target_address();
+    let Some(state_load) = context.host.sstore(target, index, value) else {
+        context.interpreter.halt_fatal();
+        return;
+    };
+
+    // Pre-Istanbul (Petersburg) dynamic cost: `is_istanbul = false`.
+    let dynamic = context
+        .host
+        .gas_params()
+        .sstore_dynamic_gas(false, &state_load.data, state_load.is_cold);
+    if !context.interpreter.gas.record_cost(dynamic) {
+        context.interpreter.halt_oog();
+        return;
+    }
+
+    context
+        .interpreter
+        .gas
+        .record_refund(context.host.gas_params().sstore_refund(false, &state_load.data));
 }
 
 /// CALLCODE with rskj gas semantics (no new-account charge).

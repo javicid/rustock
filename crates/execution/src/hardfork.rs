@@ -171,6 +171,14 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Arrowhead600
     }
 
+    /// Whether the PUSH0 opcode (0x5f) is available (RSKIP398, Arrowhead600).
+    /// rskj enables PUSH0 at arrowhead600, NOT at the Shanghai-equivalent
+    /// lovell700; revm only bundles PUSH0 into SHANGHAI, so arrowhead600..
+    /// lovell700 needs it installed explicitly (see rsk_instructions::install).
+    pub fn has_push0(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Arrowhead600
+    }
+
     /// Whether initcode metering is active (RSKIP438, Lovell700).
     pub fn has_initcode_metering(&self, block_number: u64) -> bool {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Lovell700
@@ -503,6 +511,15 @@ fn upgrade_to_spec_id(upgrade: RskNetworkUpgrade) -> SpecId {
         | RskNetworkUpgrade::Hop400
         | RskNetworkUpgrade::Fingerroot500 => SpecId::PETERSBURG,
 
+        // Arrowhead600 maps to ISTANBUL for the ONE Istanbul change RSK adopted —
+        // RSKIP400 (EIP-2028: non-zero calldata 68→16), which revm's intrinsic
+        // gas (`calculate_initial_tx_gas_for_tx`) keys off the SpecId. RSK did NOT
+        // adopt the rest of Istanbul's EVM gas repricings: its `GasCost` constants
+        // are fork-independent, so SLOAD stays 200 (EIP-1884 would be 800), BALANCE
+        // 400 (700), EXTCODEHASH 400 (700), and SSTORE keeps Petersburg metering
+        // (no EIP-2200 net metering / reentrancy sentry). Those four are pinned
+        // back to their rskj values in `rsk_instructions::install` so only the
+        // calldata reduction survives the ISTANBUL mapping.
         RskNetworkUpgrade::Arrowhead600
         | RskNetworkUpgrade::Arrowhead631 => SpecId::ISTANBUL,
 
@@ -551,6 +568,15 @@ mod tests {
         assert_eq!(cfg.spec_id(6_223_700), SpecId::ISTANBUL);
         assert!(cfg.has_reduced_calldata_cost(6_223_700));
         assert!(!cfg.has_reduced_calldata_cost(6_223_699));
+    }
+
+    #[test]
+    fn test_mainnet_push0_activates_at_arrowhead600() {
+        // RSKIP398: rskj enables PUSH0 at arrowhead600, NOT at lovell700.
+        let cfg = RskHardforkConfig::mainnet();
+        assert!(!cfg.has_push0(6_223_699));
+        assert!(cfg.has_push0(6_223_700));
+        assert!(cfg.has_push0(7_338_024)); // still on at lovell700+
     }
 
     #[test]

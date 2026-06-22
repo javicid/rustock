@@ -145,6 +145,7 @@ impl RskExecutor {
             &mut evm.instruction,
             self.hardfork_cfg.has_rskip140(header.number),
             self.hardfork_cfg.has_chainid(header.number),
+            self.hardfork_cfg.has_push0(header.number),
             &extcodesize_max_precompiles,
             &extcodehash_precompiles,
             header.beneficiary,
@@ -248,6 +249,7 @@ impl RskExecutor {
             &mut evm.instruction,
             self.hardfork_cfg.has_rskip140(header.number),
             self.hardfork_cfg.has_chainid(header.number),
+            self.hardfork_cfg.has_push0(header.number),
             &extcodesize_max_precompiles,
             &extcodehash_precompiles,
             header.beneficiary,
@@ -713,6 +715,23 @@ fn make_cfg_env(spec_id: SpecId, chain_id: u64, eip3541_active: bool) -> CfgEnv 
         revm::context_interface::cfg::GasId::call_stipend_reduction(),
         u64::MAX,
     )]);
+    // rskj's SSTORE costs are fork-independent Petersburg-style values
+    // (`GasCost.SET_SSTORE`=20000, `CLEAR_SSTORE`=`RESET_SSTORE`=5000,
+    // `REFUND_SSTORE`=15000) — RSK never adopted EIP-2200 net metering. Under the
+    // ISTANBUL/SHANGHAI specs (arrowhead600+) revm's table rewrites these to the
+    // Istanbul net-metering split (static 800, etc.), so pin them back. These
+    // equal the Petersburg defaults, so the override is a no-op pre-arrowhead.
+    // The custom `rsk_sstore` (rsk_instructions) consumes them with Petersburg
+    // (`is_istanbul=false`) semantics and skips the EIP-2200 reentrancy sentry.
+    use revm::context_interface::cfg::GasId;
+    cfg.gas_params.override_gas([
+        (GasId::sstore_static(), 5_000),
+        (GasId::sstore_set_without_load_cost(), 15_000),
+        (GasId::sstore_reset_without_cold_load_cost(), 0),
+        (GasId::sstore_set_refund(), 15_000),
+        (GasId::sstore_reset_refund(), 0),
+        (GasId::sstore_clearing_slot_refund(), 15_000),
+    ]);
     cfg.limit_contract_code_size = Some(0x6000);
     // RSKIP544 (Vetiver900): rskj only rejects new contract code starting
     // with 0xEF from vetiver900, while revm bundles EIP-3541 into LONDON+.
@@ -832,8 +851,11 @@ mod tests {
 
     /// Regression for mainnet block #1713 (gas used mismatch 26656 vs 24556):
     /// cfg.spec alone leaves the latest-fork gas table in place; the params
-    /// must be derived per spec. Pre-Istanbul SSTORE: the 5000 reset cost is
-    /// fully carried by the static charge.
+    /// must be derived per spec. RSK uses Petersburg-style SSTORE metering at
+    /// EVERY fork (rskj's `GasCost` constants are fork-independent), so
+    /// make_cfg_env pins SSTORE to the rskj values regardless of SpecId — the
+    /// 5000 reset cost is fully carried by the static charge and the EIP-2200
+    /// net-metering split (static 800) is overridden away.
     #[test]
     fn test_cfg_env_gas_params_follow_spec() {
         let byz = make_cfg_env(SpecId::BYZANTIUM, 30, false);
@@ -841,10 +863,12 @@ mod tests {
         assert_eq!(byz.gas_params.sstore_reset_without_cold_load_cost(), 0);
         assert_eq!(byz.gas_params.sstore_set_without_load_cost(), 15_000);
 
-        // Istanbul-mapped heights use EIP-2200 metering (static = 800).
+        // Istanbul/Shanghai (arrowhead600+) keep the SAME rskj Petersburg SSTORE
+        // metering: EIP-2200's static=800 split is pinned back to 5000 / 0.
         let ist = make_cfg_env(SpecId::ISTANBUL, 30, false);
-        assert_eq!(ist.gas_params.sstore_static_gas(), 800);
-        assert_eq!(ist.gas_params.sstore_reset_without_cold_load_cost(), 4_200);
+        assert_eq!(ist.gas_params.sstore_static_gas(), 5000);
+        assert_eq!(ist.gas_params.sstore_reset_without_cold_load_cost(), 0);
+        assert_eq!(ist.gas_params.sstore_set_without_load_cost(), 15_000);
     }
 
     /// rskj `TransactionExecutor.create()`: a CREATE *transaction* carrying
@@ -2922,6 +2946,120 @@ mod tests {
         assert!(result.success);
         // Pre-Istanbul: intrinsic gas = 21000 + 68*1 = 21068
         assert_eq!(result.gas_used, 21_068, "intrinsic gas = 21000 + 68*1");
+    }
+
+    /// Regression for mainnet #6,223,700 (the arrowhead600 activation block;
+    /// gas mismatch header=236343 vs computed=287919). RSKIP400 (Arrowhead600)
+    /// reduces the non-zero calldata byte cost from 68 to 16 (EIP-2028). revm's
+    /// intrinsic gas keys off the SpecId, so arrowhead600 maps to ISTANBUL to
+    /// pick up the calldata reduction; the other Istanbul gas repricings RSK
+    /// never adopted (EIP-1884 SLOAD/BALANCE/EXTCODEHASH) are pinned back to
+    /// rskj values in `rsk_instructions::install`. This test pins the FIRST
+    /// arrowhead600 block exactly: at #6,223,700 calldata is 16/byte; one block
+    /// earlier 68.
+    #[test]
+    fn test_rskip400_calldata_reduction_at_arrowhead_activation() {
+        let mainnet = RskHardforkConfig::mainnet();
+        assert_eq!(mainnet.spec_id(6_223_699), SpecId::PETERSBURG);
+        assert_eq!(mainnet.spec_id(6_223_700), SpecId::ISTANBUL);
+
+        let run = |number: u64| -> u64 {
+            let store = Arc::new(MemoryTrieStore::new());
+            let root = TrieNode::empty();
+            let sender = Address::repeat_byte(0xCC);
+            let recipient = Address::repeat_byte(0xDD);
+            let one_rbtc = U256::from(10u64).pow(U256::from(18));
+            let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            let mut header = dummy_header(number);
+            header.gas_limit = U256::from(6_800_000);
+            // 3 non-zero calldata bytes (no zeros): 68*3=204 pre, 16*3=48 post.
+            let tx = rustock_core::Transaction {
+                nonce: 0,
+                gas_price: U256::from(0),
+                gas_limit: U256::from(30_000),
+                to: Bytes::copy_from_slice(recipient.as_slice()),
+                value: U256::ZERO,
+                input: Bytes::from(vec![0x11, 0x22, 0x33]),
+                v: 0,
+                r: U256::ZERO,
+                s: U256::ZERO,
+                cached_rlp: None,
+            };
+            let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+            executor.execute_tx(&header, &tx, sender, &root, store).unwrap().gas_used
+        };
+
+        // One block before activation: 21000 + 68*3 = 21204.
+        assert_eq!(run(6_223_699), 21_204, "pre-RSKIP400: 68 gas/non-zero byte");
+        // Activation block: 21000 + 16*3 = 21048.
+        assert_eq!(run(6_223_700), 21_048, "RSKIP400 active: 16 gas/non-zero byte");
+    }
+
+    /// RSKIP398 (arrowhead600): the PUSH0 opcode (0x5f) becomes valid at
+    /// arrowhead600, NOT at the Shanghai-equivalent lovell700. rustock maps
+    /// arrowhead600 to revm's ISTANBUL (which lacks PUSH0), so without an explicit
+    /// install a PUSH0 would halt NotActivated and consume the frame's whole gas
+    /// — a consensus fork vs rskj, which executes it (push 0, 2 gas). Deploy a
+    /// contract whose runtime is `PUSH0 PUSH1 0 SSTORE STOP` and call it: at
+    /// arrowhead600 it succeeds, one block earlier (fingerroot500/PETERSBURG) the
+    /// PUSH0 is an invalid opcode that fails the call.
+    #[test]
+    fn test_push0_activates_at_arrowhead600() {
+        // Runtime: PUSH0; PUSH1 0; SSTORE; STOP  (store 0 at slot 0)
+        let runtime: Vec<u8> = vec![0x5f, 0x60, 0x00, 0x55, 0x00];
+        // Init: CODECOPY the 5-byte runtime and RETURN it.
+        // PUSH1 5; PUSH1 0x0c; PUSH1 0; CODECOPY; PUSH1 5; PUSH1 0; RETURN
+        let mut init = vec![
+            0x60, 0x05, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, 0x05, 0x60, 0x00, 0xf3,
+        ];
+        init.extend_from_slice(&runtime);
+
+        let run = |number: u64| -> bool {
+            let store = Arc::new(MemoryTrieStore::new());
+            let root = TrieNode::empty();
+            let sender = Address::repeat_byte(0x5F);
+            let one_rbtc = U256::from(10u64).pow(U256::from(18));
+            let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+            let deploy = rustock_core::Transaction {
+                nonce: 0,
+                gas_price: U256::from(0),
+                gas_limit: U256::from(1_000_000),
+                to: Bytes::new(),
+                value: U256::ZERO,
+                input: Bytes::from(init.clone()),
+                v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+            };
+            let r1 = executor
+                .execute_block(&dummy_header(number), &[(deploy, sender)], &root, store.clone())
+                .expect("deploy block");
+            assert!(r1.tx_results[0].success, "deploy (no PUSH0 in init) always succeeds");
+            let deployed = sender.create(0);
+            let root2 = crate::state::apply_state_changes(
+                &root, store.as_ref(), &r1.state_changes, &r1.markers,
+            );
+            let call = rustock_core::Transaction {
+                nonce: 1,
+                gas_price: U256::from(0),
+                gas_limit: U256::from(1_000_000),
+                to: Bytes::copy_from_slice(deployed.as_slice()),
+                value: U256::ZERO,
+                input: Bytes::new(),
+                v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+            };
+            executor
+                .execute_block(&dummy_header(number), &[(call, sender)], &root2, store)
+                .expect("call block")
+                .tx_results[0]
+                .success
+        };
+
+        assert!(!run(6_223_699), "PUSH0 invalid pre-arrowhead600 (call fails)");
+        assert!(run(6_223_700), "PUSH0 valid at arrowhead600 (call succeeds)");
     }
 
     /// Ported from rskj InitcodeCostCalculatorTest.

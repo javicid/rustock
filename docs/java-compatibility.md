@@ -3351,3 +3351,65 @@ call-depth/caller checks, gated on `has_rskip284`). Test:
 `flyover_code_output_full_256bit_twos_complement`. Verified by replaying
 #5,967,453: tx[0] reverts (status=false) at gasUsed 142,869, state and receipts
 roots match the header.
+
+---
+
+## 53. Arrowhead600 takes ONLY EIP-2028 from Istanbul — SLOAD/BALANCE/EXTCODEHASH/SSTORE keep Petersburg prices
+
+RSK activates EVM features per-RSKIP, not by importing whole Ethereum forks. At
+arrowhead600 (mainnet #6,223,700) the only EVM gas change is **RSKIP400** =
+EIP-2028: non-zero calldata byte cost drops from 68 to 16
+(`Transaction.getTxNonZeroDataCost` → `GasCost.TX_NO_ZERO_DATA_EIP2028`, gated on
+`ConsensusRule.RSKIP400`). RSK did **not** adopt the rest of Istanbul:
+
+- **EIP-1884** repricing — rskj `GasCost` is a class of `static final` constants,
+  fork-independent: `SLOAD = 200` (Istanbul would be 800), `BALANCE = 400` (700),
+  `EXT_CODE_HASH = 400` (700). They never change across forks.
+- **EIP-2200** SSTORE net gas metering — rskj `VM.doSSTORE` keeps the Petersburg
+  rules forever: `oldValue == null && new != 0` → `SET_SSTORE` (20000);
+  `old != null && new == 0` → `CLEAR_SSTORE` (5000) + `REFUND_SSTORE` (15000)
+  refund; otherwise → `RESET_SSTORE` (5000). There is **no** `gasleft <= 2300`
+  reentrancy sentry.
+
+**The bug (mainnet #6,223,700, the arrowhead600 activation block).** rustock
+mapped arrowhead600 → revm `SpecId::ISTANBUL`, which is correct for the calldata
+intrinsic (revm keys `calculate_initial_tx_gas_for_tx` off the SpecId) but ALSO
+pulls in EIP-1884 (SLOAD 800, BALANCE 700) and EIP-2200 SSTORE metering + the
+reentrancy sentry. The block over-charged by +51,576 gas: tx[2] (an SLOAD-heavy
+contract call) was charged 800/SLOAD instead of 200 and ran out of gas where
+rskj succeeded, and the full block intrinsic was still 68/byte because the
+calldata reduction had been wired through a `gas_params` override that revm's
+intrinsic path ignores. Computed 287,919 vs header 236,343.
+
+**The fix.** Keep arrowhead600 (and arrowhead631) mapped to `ISTANBUL` so the
+RSKIP400 calldata reduction lands in revm's intrinsic, then pin the
+Istanbul EVM-gas changes RSK never took back to rskj's values:
+
+- `rsk_instructions::install` re-points **SLOAD** to revm's pre-Berlin
+  `host::sload` with static gas **200** and **BALANCE** to `host::balance` with
+  static gas **400** (EXTCODEHASH was already pinned to 400). These are no-ops
+  pre-arrowhead (PETERSBURG already prices them so) and ALSO fix lovell700+
+  (SHANGHAI), which has the same EIP-1884 over-charge.
+- A custom **`rsk_sstore`** instruction replicates `VM.doSSTORE`: it skips the
+  EIP-2200 reentrancy sentry and calls revm's `sstore_dynamic_gas` /
+  `sstore_refund` with `is_istanbul = false` (whose branch is byte-for-byte the
+  Petersburg metering). `make_cfg_env` pins the SSTORE `gas_params`
+  (`sstore_static` 5000, `sstore_set_without_load_cost` 15000,
+  `sstore_reset_without_cold_load_cost` 0, refunds 15000/0) so the ISTANBUL/
+  SHANGHAI table's net-metering split (static 800, …) is overridden away.
+
+**rskj source**: `org.ethereum.vm.GasCost` (`SLOAD`, `BALANCE`, `EXT_CODE_HASH`,
+`SET_SSTORE`/`CLEAR_SSTORE`/`RESET_SSTORE`/`REFUND_SSTORE`,
+`TX_NO_ZERO_DATA_EIP2028`), `org.ethereum.vm.VM#doSSTORE` (Petersburg metering,
+no sentry), `org.ethereum.core.Transaction#getTxNonZeroDataCost` (RSKIP400),
+`reference.conf` (`rskip400 = arrowhead600`).
+
+**rustock**: `crates/execution/src/hardfork.rs` (`upgrade_to_spec_id`:
+Arrowhead600/631 → ISTANBUL, with the rationale comment),
+`crates/execution/src/rsk_instructions.rs` (`install` SLOAD/BALANCE static-gas
+overrides + `rsk_sstore`), `crates/execution/src/executor.rs` (`make_cfg_env`
+SSTORE gas_params pin). Tests:
+`test_rskip400_calldata_reduction_at_arrowhead_activation` (16 vs 68/byte at the
+activation boundary) and the updated `test_cfg_env_gas_params_follow_spec`.
+Verified by replaying #6,223,700: tx[0..3] gasUsed 57073/56232/123038/0 match the
+canonical receipts, total 236,343 == header, state and receipts roots match.
