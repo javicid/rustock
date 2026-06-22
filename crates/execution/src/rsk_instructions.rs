@@ -423,7 +423,7 @@ thread_local! {
 fn traced_all<WIRE: InterpreterTypes, HOST: Host>(
     context: InstructionContext<'_, HOST, WIRE>,
 ) {
-    use revm::interpreter::interpreter_types::{Jumps, LegacyBytecode};
+    use revm::interpreter::interpreter_types::{InputsTr, Jumps, LegacyBytecode};
     let pc = context.interpreter.bytecode.pc().saturating_sub(1);
     // step() already advanced pc by 1, so the executing opcode is at pc-1.
     let op = context
@@ -434,11 +434,13 @@ fn traced_all<WIRE: InterpreterTypes, HOST: Host>(
         .copied()
         .unwrap_or(opcode::STOP);
     tracing::debug!(
-        "OPTRACE pc={pc:04x} op={:02x} {} gas={}",
+        "OPTRACE addr={} pc={pc:04x} op={:02x} {} gas={}",
+        context.interpreter.input.target_address(),
         op,
         revm::bytecode::opcode::OpCode::new(op).map(|o| o.as_str()).unwrap_or("?"),
         context.interpreter.gas.remaining(),
     );
+    // NOTE: addr= field added for the per-opcode trace oracle (rskj diff).
     match op {
         opcode::EXTCODESIZE => rsk_extcodesize(context),
         opcode::CALL => rsk_call(context),

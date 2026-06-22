@@ -1125,6 +1125,18 @@ impl RskPrecompileProvider {
                 result.result = InstructionResult::Revert;
                 return Ok(Some(result));
             }
+            // Internal (depth>1) Bridge call with insufficient gas: rskj
+            // `Program.callToPrecompiledAddress` does `refundGas(0);
+            // stackPushZero(); rollback()` — consume ALL forwarded gas, the
+            // CALL fails (pushes zero) and the caller CONTINUES (it is not a
+            // propagating OOG). Map to a plain CALL revert with the forwarded
+            // gas fully spent. (Program.java:1567-1573)
+            if let Some(consumed) = crate::bridge::insufficient_gas_consumed(e) {
+                let underflow = result.gas.record_cost(consumed);
+                assert!(underflow, "consumed gas is the forwarded gas_limit");
+                result.result = InstructionResult::Revert;
+                return Ok(Some(result));
+            }
         }
 
         match exec_result {

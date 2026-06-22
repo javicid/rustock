@@ -3646,3 +3646,50 @@ federation-only gate), `crates/execution/src/bridge/peg.rs`
 `executor::tests::update_collections_burns_dusty_change_surplus` (member),
 `executor::tests::update_collections_rejected_for_non_federation_sender`.
 
+
+## §59 Bridge parseData ABI-decodes all args: a malformed payload is a parse failure (#6,223,797)
+
+rskj computes a Bridge call's `requiredGas` in `Bridge.getGasForData`
+(Bridge.java:303-322): it calls `parseData(data)`, which ABI-**decodes every
+argument** via `CallTransaction.Function.decode` (CallTransaction.java:409) and,
+on **any decode exception**, returns `null` (Bridge.java:344-347). A `null`
+parse result is charged the flat `RELEASE_BTC` cost — **23_000, with no
+`data.length*2` term** — and `Bridge.execute` turns it into a
+`BridgeIllegalArgumentException` throw (post-RSKIP88). The Solidity decoders
+throw whenever a read runs past the payload: `Utils.safeCopyOfRange` /
+`validateArrayAllegedSize` raise when `data.length < offset + size`
+(`SolidityType.java`, `Utils.java`), `IntType.decodeInt` special-cases an empty
+payload as `0`, and offsets/lengths come from `BigInteger.intValue()`
+(low-32-bit signed).
+
+**Consensus-critical implementation quirk.** A client that parses each
+argument lazily inside its method handler — and computes gas from the matched
+method's own cost — never observes the decode failure: it charges the full
+method cost (with the per-byte data term) instead of the flat 23_000, and
+executes the method instead of throwing. Mainnet **#6,223,797 tx[3]** exposes
+this: a relay (`0x8dd4b03b…`) forwards `receiveHeaders(bytes[])` whose `bytes[]`
+head offset is `0xa0` (160) into a 60-byte argument tail. rskj's decode throws
+→ parse failure → `requiredGas = 23_000` → the internal CALL consumes 23_000
+(refunding the surplus, leaving the relay 87 gas to finish its post-call path
+and RETURN successfully). rustock matched the selector to `receiveHeaders`,
+computed `25_000 + 2*64 = 25_128`, found `25_128 > 23_087` forwarded, and
+treated it as out-of-gas — the relay OOG'd (tx status flipped true→false),
+forking the receipts root.
+
+**rustock**: `crates/execution/src/bridge/mod.rs` — `abi_args_decode_ok`
+replicates rskj's decoder bound checks (`abi_decode_int` / `abi_decode_value_ok`
+mirror `IntType.decodeInt` / `safeCopyOfRange` / `DynamicArrayType.decode` /
+`BytesType.decode`); `execute_bridge` adds a `.filter(|m| abi_args_decode_ok(…))`
+so a matched-but-undecodable method falls into the parse-failure branch, and
+that branch's internal-call (depth>1) arm now returns the
+`INTERNAL_BRIDGE_THROW_MARKER` carrying the flat 23_000 (consume `requiredGas`,
+push zero, refund the surplus, caller continues) instead of consuming all the
+forwarded gas. The depth-1 arm keeps the invisible-exception semantics. Also
+relevant: the Bridge insufficient-gas path (`requiredGas > forwarded`, §-this)
+now mirrors rskj `Program.callToPrecompiledAddress` (Program.java:1567-1573):
+for an internal call it pushes zero and the caller continues
+(`INSUFFICIENT_GAS_MARKER`) rather than propagating OOG. Tests:
+`bridge::tests::abi_decode_rejects_out_of_bounds_array_offset`,
+`bridge::tests::abi_decode_accepts_wellformed_array`. Verified by replaying
+#6,223,797: tx[3] status=true, state and receipts roots match; exec-head→
+#6,223,811 replays clean.

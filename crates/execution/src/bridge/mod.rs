@@ -47,6 +47,167 @@ fn compute_selector(sig: &str) -> [u8; 4] {
 }
 
 // ---------------------------------------------------------------------------
+// ABI argument validation (rskj `CallTransaction.Function.decode` / parseData)
+// ---------------------------------------------------------------------------
+//
+// rskj's `Bridge.parseData` ABI-decodes ALL of a method's arguments up front
+// (CallTransaction.java:409). Any decode exception (an out-of-bounds dynamic
+// offset/length, a payload shorter than the head) makes `parseData` return
+// null (Bridge.java:344-347), which `getGasForData` then charges as the flat
+// RELEASE_BTC parse-failure cost (23_000, no per-byte data cost) and which
+// `execute()` turns into a `BridgeIllegalArgumentException` throw. A from-
+// scratch client that parses arguments lazily (only inside the method handler)
+// would instead charge the matched method's full cost and fork the chain —
+// mainnet #6,223,797 tx[3] forwards `receiveHeaders(bytes[])` with a `bytes[]`
+// offset of 0xa0 into a 60-byte argument payload, so rskj's decode throws.
+//
+// `abi_args_decode_ok` mirrors the bound checks rskj's `SolidityType` decoders
+// perform (`Utils.safeCopyOfRange`/`validateArrayAllegedSize` throw when
+// `data.length < offset + size`; `IntType.decodeInt` special-cases an empty
+// payload as 0; offsets/lengths are read via `BigInteger.intValue()`).
+
+#[derive(Clone)]
+enum AbiArgType {
+    /// 32-byte head word read with `IntType.decodeInt` (empty payload → 0):
+    /// int/uint/address/bool.
+    Word,
+    /// 32-byte head word read with `safeCopyOfRange` (no empty special case):
+    /// bytesN.
+    FixedBytes,
+    /// Dynamic `bytes`/`string`.
+    Bytes,
+    /// Dynamic `T[]`.
+    Array(Box<AbiArgType>),
+}
+
+impl AbiArgType {
+    fn is_dynamic(&self) -> bool {
+        matches!(self, AbiArgType::Bytes | AbiArgType::Array(_))
+    }
+}
+
+/// Parse a single Solidity type name (as it appears in a bridge signature).
+fn parse_abi_type(t: &str) -> AbiArgType {
+    let t = t.trim();
+    if let Some(elem) = t.strip_suffix("[]") {
+        return AbiArgType::Array(Box::new(parse_abi_type(elem)));
+    }
+    match t {
+        "bytes" | "string" => AbiArgType::Bytes,
+        _ if t.starts_with("bytes") => AbiArgType::FixedBytes, // bytes1..bytes32
+        _ => AbiArgType::Word, // int*, uint*, address, bool
+    }
+}
+
+/// Extract the argument types from a method signature like `name(a,b,c)`.
+fn parse_signature_args(signature: &str) -> Vec<AbiArgType> {
+    let inner = signature
+        .split_once('(')
+        .and_then(|(_, rest)| rest.strip_suffix(')'))
+        .unwrap_or("");
+    if inner.is_empty() {
+        return Vec::new();
+    }
+    inner.split(',').map(parse_abi_type).collect()
+}
+
+/// rskj `IntType.decodeInt(encoded, offset).intValue()`: an empty payload
+/// decodes to 0 without bounds-checking; otherwise the 32-byte word must fit
+/// (`safeCopyOfRange`) and the result is its low-32-bit signed `intValue()`.
+fn abi_decode_int(args: &[u8], off: usize) -> Option<i64> {
+    if args.is_empty() {
+        return Some(0);
+    }
+    let end = off.checked_add(32)?;
+    if end > args.len() {
+        return None;
+    }
+    let low = u32::from_be_bytes([args[off + 28], args[off + 29], args[off + 30], args[off + 31]]);
+    Some(low as i32 as i64)
+}
+
+/// Validate that `value` (an `int`-decoded offset/length) is usable as a
+/// non-negative index. rskj throws (`Math.addExact`, array bounds) on negatives.
+fn abi_index(value: i64) -> Option<usize> {
+    if value < 0 {
+        None
+    } else {
+        Some(value as usize)
+    }
+}
+
+/// Mirror `SolidityType.decode(encoded, offset)` for one value, returning
+/// `None` exactly where rskj would throw.
+fn abi_decode_value_ok(args: &[u8], off: usize, ty: &AbiArgType) -> Option<()> {
+    match ty {
+        // IntType.decode -> decodeInt (empty payload tolerated).
+        AbiArgType::Word => abi_decode_int(args, off).map(|_| ()),
+        // Bytes32Type.decode -> safeCopyOfRange(encoded, off, 32) (strict).
+        AbiArgType::FixedBytes => {
+            let end = off.checked_add(32)?;
+            (end <= args.len()).then_some(())
+        }
+        // BytesType.decode: len = decodeInt(off); safeCopyOfRange(off+32, len).
+        AbiArgType::Bytes => {
+            let len = abi_index(abi_decode_int(args, off)?)?;
+            let data_off = off.checked_add(32)?;
+            (data_off.checked_add(len)? <= args.len()).then_some(())
+        }
+        // DynamicArrayType.decode.
+        AbiArgType::Array(elem) => {
+            if args.is_empty() {
+                return Some(()); // empty payload → empty array (no throw)
+            }
+            let len = abi_index(abi_decode_int(args, off)?)?;
+            let base = off.checked_add(32)?;
+            // validateArrayAllegedSize(encoded, base, len) — lower bound.
+            if base.checked_add(len)? > args.len() {
+                return None;
+            }
+            let mut elem_off = base;
+            for _ in 0..len {
+                if elem.is_dynamic() {
+                    let dyn_off = abi_index(abi_decode_int(args, elem_off)?)?;
+                    abi_decode_value_ok(args, base.checked_add(dyn_off)?, elem)?;
+                } else {
+                    abi_decode_value_ok(args, elem_off, elem)?;
+                }
+                elem_off = elem_off.checked_add(32)?; // every element head slot is 32 bytes
+            }
+            Some(())
+        }
+    }
+}
+
+/// rskj `CallTransaction.Function.decode(encoded, inputs)` (CallTransaction.java
+/// :409): walk the head, following each dynamic argument's offset, and confirm
+/// every value decodes without an out-of-bounds access. `args` is the calldata
+/// AFTER the 4-byte selector. Returns false where rskj's decode would throw
+/// (→ `parseData` null → flat 23_000 parse-failure cost).
+fn abi_args_decode_ok(args: &[u8], signature: &str) -> bool {
+    let types = parse_signature_args(signature);
+    let mut off = 0usize;
+    for ty in &types {
+        let ok = if ty.is_dynamic() {
+            match abi_decode_int(args, off).and_then(abi_index) {
+                Some(dyn_off) => abi_decode_value_ok(args, dyn_off, ty).is_some(),
+                None => false,
+            }
+        } else {
+            abi_decode_value_ok(args, off, ty).is_some()
+        };
+        if !ok {
+            return false;
+        }
+        match off.checked_add(32) {
+            Some(n) => off = n,
+            None => return false,
+        }
+    }
+    true
+}
+
+// ---------------------------------------------------------------------------
 // BridgeMethod — all 69 methods (32 tx-callable + 37 local-only)
 // ---------------------------------------------------------------------------
 
@@ -336,6 +497,34 @@ pub fn internal_throw_gas(e: &PrecompileError) -> Option<u64> {
     marker_gas(e, INTERNAL_BRIDGE_THROW_MARKER)
 }
 
+/// Marker prefix for the rskj `Program.callToPrecompiledAddress` insufficient-
+/// gas branch: when `requiredGas > msg.getGas()` for an INTERNAL (depth>1)
+/// call, rskj does `refundGas(0); stackPushZero(); track.rollback()` — the
+/// forwarded gas is fully consumed, the CALL fails (returns 0) and the CALLER
+/// CONTINUES; it is NOT a propagating OOG that aborts the caller. The marker
+/// carries the forwarded gas to consume (Program.java:1567-1573).
+pub const INSUFFICIENT_GAS_MARKER: &str = "rskj precompile insufficient gas:";
+
+/// rskj insufficient-gas precompile call (depth>1): returns the forwarded gas
+/// to consume if `e` is the insufficient-gas marker.
+pub fn insufficient_gas_consumed(e: &PrecompileError) -> Option<u64> {
+    marker_gas(e, INSUFFICIENT_GAS_MARKER)
+}
+
+/// Build the insufficient-gas result for a Bridge call whose `requiredGas`
+/// exceeds the forwarded `gas_limit`. For a direct (depth-1) call the
+/// transaction itself runs out of gas (propagating OOG). For an internal call
+/// (a contract CALLing the Bridge) rskj pushes zero and the caller continues,
+/// so the marker carries the forwarded gas for a graceful CALL revert.
+fn insufficient_gas_marker<CTX: crate::RskContextTr>(ctx: &mut CTX, gas_limit: u64) -> PrecompileError {
+    use revm::context_interface::JournalTr;
+    if ctx.journal().depth() > 1 {
+        marker_with_gas(INSUFFICIENT_GAS_MARKER, gas_limit)
+    } else {
+        PrecompileError::OutOfGas
+    }
+}
+
 /// Main entry point for the Bridge precompile.
 ///
 /// Called from `RskPrecompileProvider::run_bridge` with the full EVM context.
@@ -357,7 +546,7 @@ pub fn execute_bridge<CTX: crate::RskContextTr>(
     if input.is_empty() {
         let gas_cost = 23_000u64;
         if gas_limit < gas_cost {
-            return Err(PrecompileError::OutOfGas);
+            return Err(insufficient_gas_marker(ctx, gas_limit));
         }
         return execute_method(ctx, "releaseBtc", &[], gas_cost, config, block_store, use_v2, hardfork_cfg, tx_ctx, caller, call_depth);
     }
@@ -373,11 +562,14 @@ pub fn execute_bridge<CTX: crate::RskContextTr>(
     } else {
         find_bridge_method(&[input[0], input[1], input[2], input[3]])
             .filter(|m| m.enabled.is_enabled(hardfork_cfg, block_number))
+            // rskj `parseData` ABI-decodes the arguments; a malformed payload
+            // (e.g. an out-of-bounds dynamic offset) is a parse failure too.
+            .filter(|m| abi_args_decode_ok(&input[4..], m.signature))
     };
     let Some(method) = parsed else {
         let gas_cost = 23_000u64; // BridgeMethods.RELEASE_BTC cost, no data cost
         if gas_limit < gas_cost {
-            return Err(PrecompileError::OutOfGas);
+            return Err(insufficient_gas_marker(ctx, gas_limit));
         }
         if !hardfork_cfg.has_rskip88(block_number) {
             return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
@@ -399,14 +591,20 @@ pub fn execute_bridge<CTX: crate::RskContextTr>(
             // requiredGas for a parse failure is the flat releaseBtc cost.
             return Err(marker_with_gas(INVISIBLE_EXCEPTION_MARKER, gas_cost));
         }
-        return Err(PrecompileError::other("Bridge: invalid calldata"));
+        // Internal (depth>1) call: rskj `execute()` throws and
+        // `executePrecompiledAndHandleError` consumes only `requiredGas`
+        // (the flat 23_000) before the CALL pushes zero and the caller
+        // continues — the surplus forwarded gas is refunded. (#6,223,797 tx[3]
+        // forwards a malformed `receiveHeaders` and depends on this refund to
+        // finish its post-call path.)
+        return Err(marker_with_gas(INTERNAL_BRIDGE_THROW_MARKER, gas_cost));
     };
 
     let args = &input[4..];
     let gas_cost = bridge_call_gas_cost(ctx, input, config, hardfork_cfg)?;
 
     if gas_limit < gas_cost {
-        return Err(PrecompileError::OutOfGas);
+        return Err(insufficient_gas_marker(ctx, gas_limit));
     }
 
     let result = execute_method(ctx, method.name, args, gas_cost, config, block_store, use_v2, hardfork_cfg, tx_ctx, caller, call_depth);
@@ -718,6 +916,41 @@ mod tests {
     fn known_selector_add_signature() {
         let m = find_bridge_method(&compute_selector("addSignature(bytes,bytes[],bytes)")).unwrap();
         assert_eq!(m.name, "addSignature");
+    }
+
+    /// rskj `parseData` ABI-decodes the arguments; a malformed payload (here a
+    /// `bytes[]` head offset of 0xa0 into a 60-byte argument tail) makes the
+    /// Solidity decoder throw → parse failure (flat 23_000 cost), NOT the
+    /// method's own cost. Groundtruth: mainnet #6,223,797 tx[3] forwards
+    /// exactly this `receiveHeaders(bytes[])` payload to the Bridge.
+    #[test]
+    fn abi_decode_rejects_out_of_bounds_array_offset() {
+        // selector(4) + offset(0xa0) + 28 trailing bytes = 64-byte calldata.
+        let mut input = compute_selector("receiveHeaders(bytes[])").to_vec();
+        let mut word = [0u8; 32];
+        word[31] = 0xa0; // offset 160, well past the 60-byte argument tail
+        input.extend_from_slice(&word);
+        input.extend_from_slice(&[0u8; 28]);
+        assert_eq!(input.len(), 64);
+        assert!(
+            !abi_args_decode_ok(&input[4..], "receiveHeaders(bytes[])"),
+            "out-of-bounds bytes[] offset must fail to decode (rskj parse failure)"
+        );
+    }
+
+    /// A well-formed `receiveHeaders(bytes[])` with one empty header element
+    /// must decode successfully (no false parse failure).
+    #[test]
+    fn abi_decode_accepts_wellformed_array() {
+        // offset=0x20, len=1, element-offset=0x20, element-len=0.
+        let mut a = vec![0u8; 32 * 4];
+        a[31] = 0x20; // offset to array
+        a[63] = 1; // array length 1
+        a[95] = 0x20; // element[0] offset (relative to array base)
+        // a[96..128] = element length 0
+        assert!(abi_args_decode_ok(&a, "receiveHeaders(bytes[])"));
+        // Empty argument tail decodes as an empty array (rskj special case).
+        assert!(abi_args_decode_ok(&[], "receiveHeaders(bytes[])"));
     }
 
     #[test]
