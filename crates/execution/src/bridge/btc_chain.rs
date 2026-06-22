@@ -39,12 +39,15 @@ const ERR_INVALID_POW: i64 = -5;
 pub fn receive_header<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
+    gas_cost: u64,
     config: &BridgeConstants,
     use_v2: bool,
     hardfork_cfg: &RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    let gas_cost = 10_600u64;
-
+    // `gas_cost` is rskj `Bridge.getGasForData` = RECEIVE_HEADER functionCost
+    // (10_600) + `data.length * 2` (Bridge.java:296-321). The data cost must be
+    // included: charging only the bare 10_600 undercharged every receiveHeader
+    // call by `2 * input.len()` (mainnet #6,223,762 tx[2]: 2*164 = 328 gas).
     let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
     let rskip199 = hardfork_cfg.has_rskip199(block_number);
     ensure_btc_chain_seeded(ctx, config, use_v2, rskip199);

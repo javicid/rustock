@@ -3512,3 +3512,48 @@ path) passes `want_rsk = false` — it only needs the BTC keys. Test:
 Verified by replaying #6,223,708: state root now matches
 `0x6a4ed424…f3fb8f`; blocks #6,223,704–#6,223,776 replay clean (next blocker at
 #6,223,777, unrelated).
+
+## Bridge `receiveHeader` gas: must include the `data.length * 2` cost (#6,223,762)
+
+rskj computes the Bridge precompile's `requiredGas` once, in
+`Bridge.getGasForData(data)`, as `functionCost + data.length * 2` for **every**
+parsed method (the per-byte data cost is added uniformly, not per-method):
+
+```java
+// co.rsk.peg.Bridge#getGasForData (Bridge.java:296-321)
+functionCost = bridgeParsedData.bridgeMethod.getCost(this, activations, args);
+int dataCost = data == null ? 0 : data.length * 2;
+totalCost   = functionCost + dataCost;
+```
+
+For `receiveHeader(bytes)` the `functionCost` is the fixed `10_600`
+(`BridgeMethods.RECEIVE_HEADER`), so the precompile cost is
+`10_600 + 2 * data.length`.
+
+**Consensus-critical implementation quirk.** rustock's `execute_bridge`
+correctly pre-computes this total in `bridge_call_gas_cost`
+(`functionCost + 2 * input.len()`) and passes it to `execute_method` as
+`gas_cost`. Every method handler used that `gas_cost` as its
+`PrecompileOutput` gas — **except** `receive_header`, which discarded the
+argument and hardcoded the bare `10_600` function cost, dropping the
+`data.length * 2` term. A from-scratch reading of the per-method cost table
+(which lists `receiveHeader = 10_600`) without applying the uniform per-byte
+add reproduces this exact undercharge.
+
+Mainnet #6,223,762 tx[2] (a CALL to `0x82494f…449d9`, selector `0x89b1b965`,
+which forwards a 164-byte `receiveHeader(bytes)` payload to the Bridge) exposed
+it: rskj charges the precompile `10_600 + 2*164 = 10_928`, rustock charged
+`10_600`, undercharging by **328 gas**. The tx's `gasUsed` was therefore 35_228
+instead of 35_556 (its gas limit), and the 328 × gasPrice fee that should have
+gone to REMASC instead stayed with the sender — forking the state root.
+
+**rskj source**: `co.rsk.peg.Bridge#getGasForData` (Bridge.java:296-321),
+`co.rsk.peg.BridgeMethods.RECEIVE_HEADER` (fixed cost 10_600).
+
+**rustock**: `crates/execution/src/bridge/btc_chain.rs` (`receive_header` now
+takes the caller-computed `gas_cost` instead of hardcoding 10_600);
+`crates/execution/src/bridge/mod.rs` (`execute_method` passes `gas_cost` to
+`receive_header`, matching every other method). Test:
+`bridge::tests::receive_header_gas_includes_data_cost`. Verified by replaying
+#6,223,762: tx[2] gasUsed = 35_556, state root and receipts root both match
+`0x06bf9670…6dd5` / `0x7562cb6f…72dc`.

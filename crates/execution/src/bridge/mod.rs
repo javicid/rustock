@@ -540,7 +540,7 @@ fn execute_method<CTX: crate::RskContextTr>(
 
     match method_name {
         // Phase 2: BTC header chain
-        "receiveHeader" => btc_chain::receive_header(ctx, args, config, use_v2, hardfork_cfg),
+        "receiveHeader" => btc_chain::receive_header(ctx, args, gas_cost, config, use_v2, hardfork_cfg),
         "receiveHeaders" => btc_chain::receive_headers(ctx, args, gas_cost, config, use_v2, hardfork_cfg),
         "getBtcBlockchainBestChainHeight" => btc_chain::get_best_chain_height(ctx, gas_cost),
         "getBtcBlockchainBestBlockHeader" => btc_chain::get_best_block_header(ctx, gas_cost),
@@ -659,6 +659,30 @@ mod tests {
     fn known_selector_receive_header() {
         let m = find_bridge_method(&compute_selector("receiveHeader(bytes)")).unwrap();
         assert_eq!(m.name, "receiveHeader");
+        assert!(matches!(m.gas_cost, BridgeGasCost::Fixed(10600)));
+    }
+
+    /// rskj `Bridge.getGasForData` charges `functionCost + data.length * 2` for
+    /// every parsed method (Bridge.java:296-321). For `receiveHeader` the total
+    /// is `10_600 + 2 * data.len()`, NOT the bare 10_600 function cost.
+    ///
+    /// Groundtruth: mainnet #6,223,762 tx[2] CALLs the Bridge with a 164-byte
+    /// `receiveHeader(bytes)` payload; rskj charges the precompile
+    /// `10_600 + 2*164 = 10_928`. rustock previously hardcoded 10_600 in
+    /// `receive_header`, undercharging by 328 gas and forking the chain.
+    #[test]
+    fn receive_header_gas_includes_data_cost() {
+        let func_cost = match find_bridge_method(&compute_selector("receiveHeader(bytes)"))
+            .unwrap()
+            .gas_cost
+        {
+            BridgeGasCost::Fixed(c) => c,
+            _ => panic!("receiveHeader must be a Fixed cost"),
+        };
+        assert_eq!(func_cost, 10_600);
+        // rskj getGasForData total cost for the #6,223,762 tx[2] payload.
+        let input_len = 164u64;
+        assert_eq!(func_cost + 2 * input_len, 10_928);
     }
 
     #[test]
