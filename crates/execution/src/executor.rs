@@ -451,6 +451,7 @@ impl RskExecutor {
                         &tx_ctx,
                         *sender,
                         1, // a direct top-level tx is depth 1 (not a contract call)
+                        crate::bridge::BridgeCallKind::Call, // a tx is always a plain CALL
                     );
                     match outcome {
                         Ok(out) => {

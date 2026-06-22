@@ -312,6 +312,68 @@ fn method_enabled(name: &str) -> BridgeMethodEnabled {
     }
 }
 
+/// rskj `BridgeMethods` call-type verifier (BridgeMethods.java:1002-1067): the
+/// default for every method is `RESTRICTED_TO_CALL` (only `MsgType.CALL`); the
+/// read-only getters add `ALLOW_STATIC_CALL` (CALL or STATICCALL). NO method
+/// accepts DELEGATECALL or CALLCODE. `Bridge.validateCallMessageType`
+/// (Bridge.java:446) throws when a method is reached via a call type it does
+/// not accept. Returns true if `name` accepts a STATICCALL.
+fn method_allows_static_call(name: &str) -> bool {
+    matches!(
+        name,
+        "getBtcBlockchainBestChainHeight"
+            | "getBtcBlockchainInitialBlockHeight"
+            | "getBtcBlockchainBlockLocator"
+            | "getBtcBlockchainBlockHashAtDepth"
+            | "getBtcTransactionConfirmations"
+            | "getBtcTxHashProcessedHeight"
+            | "getFederationAddress"
+            | "getFederationCreationBlockNumber"
+            | "getFederationCreationTime"
+            | "getFederationSize"
+            | "getFederationThreshold"
+            | "getFederatorPublicKey"
+            | "getFederatorPublicKeyOfType"
+            | "getFeePerKb"
+            | "getLockWhitelistAddress"
+            | "getLockWhitelistEntryByAddress"
+            | "getLockWhitelistSize"
+            | "getMinimumLockTxValue"
+            | "getPendingFederationHash"
+            | "getPendingFederationSize"
+            | "getPendingFederatorPublicKey"
+            | "getPendingFederatorPublicKeyOfType"
+            | "getRetiringFederationAddress"
+            | "getRetiringFederationCreationBlockNumber"
+            | "getRetiringFederationCreationTime"
+            | "getRetiringFederationSize"
+            | "getRetiringFederationThreshold"
+            | "getRetiringFederatorPublicKey"
+            | "getRetiringFederatorPublicKeyOfType"
+            | "getProposedFederationAddress"
+            | "getProposedFederationSize"
+            | "getProposedFederationCreationTime"
+            | "getProposedFederationCreationBlockNumber"
+            | "getProposedFederatorPublicKeyOfType"
+            | "getStateForBtcReleaseClient"
+            | "getStateForSvpClient"
+            | "getStateForDebugging"
+            | "getLockingCap"
+            | "getActivePowpegRedeemScript"
+            | "getActiveFederationCreationBlockHeight"
+            | "isBtcTxHashAlreadyProcessed"
+            | "hasBtcBlockCoinbaseTransactionInformation"
+            | "getBtcBlockchainBestBlockHeader"
+            | "getBtcBlockchainBlockHeaderByHash"
+            | "getBtcBlockchainBlockHeaderByHeight"
+            | "getBtcBlockchainParentBlockHeaderByHash"
+            | "getNextPegoutCreationBlockNumber"
+            | "getQueuedPegoutsCount"
+            | "getEstimatedFeesForNextPegOutEvent"
+            | "getEstimatedFeesForPegOutAmount"
+    )
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum BridgeGasCost {
     Fixed(u64),
@@ -505,6 +567,19 @@ pub fn internal_throw_gas(e: &PrecompileError) -> Option<u64> {
 /// carries the forwarded gas to consume (Program.java:1567-1573).
 pub const INSUFFICIENT_GAS_MARKER: &str = "rskj precompile insufficient gas:";
 
+/// The EVM call type by which the Bridge precompile was reached, mapped from
+/// revm's `CallScheme`. rskj `MessageCall.MsgType` — used by
+/// `validateCallMessageType` to reject call types a method does not accept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BridgeCallKind {
+    /// `CALL` — accepted by every method.
+    Call,
+    /// `STATICCALL` — accepted only by the read-only getters.
+    StaticCall,
+    /// `DELEGATECALL` or `CALLCODE` — accepted by no method.
+    DelegateOrCallCode,
+}
+
 /// rskj insufficient-gas precompile call (depth>1): returns the forwarded gas
 /// to consume if `e` is the insufficient-gas marker.
 pub fn insufficient_gas_consumed(e: &PrecompileError) -> Option<u64> {
@@ -541,6 +616,7 @@ pub fn execute_bridge<CTX: crate::RskContextTr>(
     tx_ctx: &BridgeTxContext,
     caller: alloy_primitives::Address,
     call_depth: usize,
+    call_kind: BridgeCallKind,
 ) -> Result<PrecompileOutput, PrecompileError> {
     // Empty input → releaseBtc (legacy behavior matching rskj)
     if input.is_empty() {
@@ -605,6 +681,25 @@ pub fn execute_bridge<CTX: crate::RskContextTr>(
 
     if gas_limit < gas_cost {
         return Err(insufficient_gas_marker(ctx, gas_limit));
+    }
+
+    // rskj `Bridge.validateCallMessageType` (Bridge.java:446): after the gas is
+    // charged, a method reached via a call type it does not accept throws. The
+    // default is CALL-only; the read getters also accept STATICCALL; no method
+    // accepts DELEGATECALL/CALLCODE. The throw consumes `requiredGas` and the
+    // CALL returns zero (mainnet #6,223,797-adjacent #6,223,812: a relay
+    // DELEGATECALLs receiveHeader, which rskj rejects so RETURNDATASIZE is 0).
+    let accepts_call = match call_kind {
+        BridgeCallKind::Call => true,
+        BridgeCallKind::StaticCall => method_allows_static_call(method.name),
+        BridgeCallKind::DelegateOrCallCode => false,
+    };
+    if !accepts_call {
+        use revm::context_interface::JournalTr;
+        if ctx.journal().depth() == 1 {
+            return Err(marker_with_gas(INVISIBLE_EXCEPTION_MARKER, gas_cost));
+        }
+        return Err(marker_with_gas(INTERNAL_BRIDGE_THROW_MARKER, gas_cost));
     }
 
     let result = execute_method(ctx, method.name, args, gas_cost, config, block_store, use_v2, hardfork_cfg, tx_ctx, caller, call_depth);
@@ -936,6 +1031,22 @@ mod tests {
             !abi_args_decode_ok(&input[4..], "receiveHeaders(bytes[])"),
             "out-of-bounds bytes[] offset must fail to decode (rskj parse failure)"
         );
+    }
+
+    /// rskj `validateCallMessageType`: tx methods are CALL-only, getters also
+    /// accept STATICCALL, and no method accepts DELEGATECALL/CALLCODE. (#6,223,812
+    /// DELEGATECALLs receiveHeader, which rskj rejects.)
+    #[test]
+    fn call_type_acceptance_matches_rskj() {
+        // Tx method: not static-callable.
+        assert!(!method_allows_static_call("receiveHeader"));
+        assert!(!method_allows_static_call("registerBtcTransaction"));
+        assert!(!method_allows_static_call("updateCollections"));
+        assert!(!method_allows_static_call("addSignature"));
+        // Read getters: static-callable.
+        assert!(method_allows_static_call("getFederationAddress"));
+        assert!(method_allows_static_call("getBtcTransactionConfirmations"));
+        assert!(method_allows_static_call("isBtcTxHashAlreadyProcessed"));
     }
 
     /// A well-formed `receiveHeaders(bytes[])` with one empty header element

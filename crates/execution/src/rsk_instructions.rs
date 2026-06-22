@@ -213,6 +213,7 @@ pub fn install<WIRE, HOST>(
     if std::env::var_os("RUSTOCK_TRACE_ALL_OPS").is_some() {
         EXTCODEHASH_ENABLED.with(|f| f.set(extcodehash_enabled));
         ISTANBUL_OPCODES_ENABLED.with(|f| f.set(istanbul_opcodes_enabled));
+        PUSH0_ENABLED.with(|f| f.set(push0_enabled));
         let default_table = revm::interpreter::instructions::instruction_table_gas_changes_spec::<
             WIRE,
             HOST,
@@ -225,6 +226,7 @@ pub fn install<WIRE, HOST>(
                 opcode::EXTCODEHASH if !extcodehash_enabled => 0,
                 opcode::CHAINID if istanbul_opcodes_enabled => 2,
                 opcode::SELFBALANCE if istanbul_opcodes_enabled => 5,
+                opcode::PUSH0 if push0_enabled => 2,
                 _ => default_table[op as usize].static_gas(),
             };
             instructions.insert_instruction(
@@ -416,6 +418,8 @@ thread_local! {
     static EXTCODEHASH_ENABLED: core::cell::Cell<bool> = const { core::cell::Cell::new(true) };
     /// RSKIP151/152 flag for the all-ops tracer's CHAINID/SELFBALANCE dispatch.
     static ISTANBUL_OPCODES_ENABLED: core::cell::Cell<bool> = const { core::cell::Cell::new(true) };
+    /// RSKIP398 flag for the all-ops tracer's PUSH0 dispatch.
+    static PUSH0_ENABLED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
 
 /// All-ops tracer: log pc/opcode/gas (post-static-charge), then dispatch to
@@ -462,6 +466,13 @@ fn traced_all<WIRE: InterpreterTypes, HOST: Host>(
         opcode::SELFBALANCE => {
             if ISTANBUL_OPCODES_ENABLED.with(|f| f.get()) {
                 rsk_selfbalance(context)
+            } else {
+                invalid_opcode(context)
+            }
+        }
+        opcode::PUSH0 => {
+            if PUSH0_ENABLED.with(|f| f.get()) {
+                rsk_push0(context)
             } else {
                 invalid_opcode(context)
             }

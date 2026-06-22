@@ -1074,7 +1074,7 @@ impl RskPrecompileProvider {
         } else if *addr == BLOCK_HEADER_ADDR {
             self.run_block_header(context, &input_bytes, inputs.gas_limit)
         } else if *addr == BRIDGE_ADDR {
-            self.run_bridge(context, &input_bytes, inputs.gas_limit, inputs.caller)
+            self.run_bridge(context, &input_bytes, inputs.gas_limit, inputs.caller, inputs.scheme)
         } else {
             self.run_remasc(context, &input_bytes, inputs.gas_limit)
         };
@@ -1376,8 +1376,17 @@ impl RskPrecompileProvider {
         input: &[u8],
         gas_limit: u64,
         caller: Address,
+        scheme: revm::interpreter::CallScheme,
     ) -> Result<PrecompileOutput, PrecompileError> {
         use revm::context_interface::JournalTr;
+        use revm::interpreter::CallScheme;
+        let call_kind = match scheme {
+            CallScheme::Call => crate::bridge::BridgeCallKind::Call,
+            CallScheme::StaticCall => crate::bridge::BridgeCallKind::StaticCall,
+            CallScheme::DelegateCall | CallScheme::CallCode => {
+                crate::bridge::BridgeCallKind::DelegateOrCallCode
+            }
+        };
         let block_number = context.block().number().to::<u64>();
         let use_v2 = self.hardfork_cfg.has_stored_block_v2(block_number);
         // Call depth as seen by the Bridge precompile: > 1 means the Bridge was
@@ -1398,6 +1407,7 @@ impl RskPrecompileProvider {
             &tx_ctx,
             caller,
             call_depth,
+            call_kind,
         )
     }
 

@@ -3693,3 +3693,37 @@ for an internal call it pushes zero and the caller continues
 `bridge::tests::abi_decode_accepts_wellformed_array`. Verified by replaying
 #6,223,797: tx[3] status=true, state and receipts roots match; exec-head→
 #6,223,811 replays clean.
+
+## §60 Bridge validateCallMessageType: reject DELEGATECALL/CALLCODE (and STATICCALL for tx methods) (#6,223,812)
+
+After charging `requiredGas`, rskj `Bridge.execute` runs `validateCall` →
+`validateCallMessageType` (Bridge.java:446-456), which throws
+`BridgeIllegalArgumentException` when a method is reached via a call type it does
+not accept. Each `BridgeMethods` entry carries a `callTypeVerifier`
+(BridgeMethods.java:1002-1067): the **default is `RESTRICTED_TO_CALL`** (only
+`MsgType.CALL`); the read-only getters add `ALLOW_STATIC_CALL` (CALL or
+STATICCALL). **No method accepts `DELEGATECALL` or `CALLCODE`.** The throw is
+caught by `executePrecompiledAndHandleError`, which consumes the method's
+`requiredGas`, pushes zero (the CALL returns 0) and refunds the surplus.
+
+**Consensus-critical implementation quirk.** A client that simply dispatches the
+matched method regardless of the EVM call type runs it and returns its output,
+so the caller observes a non-empty `RETURNDATASIZE` (and any state changes)
+where rskj observed an empty, failed CALL. Mainnet **#6,223,812 tx[0]**: a relay
+(`0x84e59b00…`) reaches the Bridge via **DELEGATECALL** (`f4`) of
+`receiveHeader`; rskj rejects it (`RETURNDATASIZE == 0`), so the relay takes its
+"call failed" branch and RETURNs successfully. rustock executed `receiveHeader`,
+returned the 32-byte `int256` result, so `RETURNDATASIZE == 32`, the relay took
+the other branch, and tx[0]'s status flipped (true→false), forking the receipts
+root.
+
+**rustock**: `crates/execution/src/bridge/mod.rs` — `BridgeCallKind`
+(Call/StaticCall/DelegateOrCallCode, mapped from revm `CallScheme` in
+`run_bridge`), `method_allows_static_call` (the rskj `ALLOW_STATIC_CALL` getter
+list), and `execute_bridge` rejects an unaccepted call type after computing
+`gas_cost` — depth>1 via `INTERNAL_BRIDGE_THROW_MARKER` (consume `requiredGas`,
+CALL returns 0, refund surplus), depth-1 via the invisible-exception marker. The
+direct-transaction path (`executor.rs`) always passes `BridgeCallKind::Call`.
+Test: `bridge::tests::call_type_acceptance_matches_rskj`. Verified by replaying
+#6,223,812: tx[0] status=true, state and receipts roots match; exec-head→
+#6,223,899 replays clean.
