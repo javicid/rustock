@@ -389,6 +389,53 @@ pub fn log_batch_pegout_created<CTX: crate::RskContextTr>(
     );
 }
 
+/// bitcoinj `VarInt.encode`: 1 byte for < 0xFD, else a 0xFD/0xFE/0xFF tag
+/// followed by 2/4/8 little-endian bytes.
+fn encode_varint(value: u64) -> Vec<u8> {
+    if value < 0xFD {
+        vec![value as u8]
+    } else if value <= 0xFFFF {
+        let mut v = vec![0xFD];
+        v.extend_from_slice(&(value as u16).to_le_bytes());
+        v
+    } else if value <= 0xFFFF_FFFF {
+        let mut v = vec![0xFE];
+        v.extend_from_slice(&(value as u32).to_le_bytes());
+        v
+    } else {
+        let mut v = vec![0xFF];
+        v.extend_from_slice(&value.to_le_bytes());
+        v
+    }
+}
+
+/// `pegout_transaction_created(bytes32 indexed btcTxHash, bytes utxoOutpointValues)`
+/// — rskj `logPegoutTransactionCreated` (RSKIP428, lovell700), fired from
+/// `processReleaseTransactionInfo` inside `settleReleaseRequest` for every
+/// settled release (batched, individual, or migration), right after
+/// `release_requested`. `btcTxHash` is the unsigned BTC tx's `getHash().getBytes()`
+/// (same internal order as `release_requested`). The data is the concatenation of
+/// each spent input's value as a bitcoinj `VarInt` (in input order,
+/// `UtxoUtils.encodeOutpointValues`), ABI-encoded as a single dynamic `bytes`.
+pub fn log_pegout_transaction_created<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    btc_tx_hash: &[u8; 32],
+    outpoint_values_satoshis: &[u64],
+) {
+    let serialized: Vec<u8> = outpoint_values_satoshis
+        .iter()
+        .flat_map(|&v| encode_varint(v))
+        .collect();
+    emit_topics(
+        ctx,
+        vec![
+            solidity_topic("pegout_transaction_created(bytes32,bytes)"),
+            B256::from_slice(btc_tx_hash),
+        ],
+        abi_single_dynamic(&serialized),
+    );
+}
+
 /// `release_request_rejected(address indexed sender, uint256 amount, int256
 /// reason)` — rskj `logReleaseBtcRequestRejected`. The signature is identical in
 /// every era; only the `amount` encoding changes: pre-RSKIP427 (lovell700) it is
@@ -565,6 +612,31 @@ mod tests {
     /// triggered the RSKIP271 batched peg-out): the `batch_pegout_created`
     /// event. topic0 is the event signature, topic1 is the batched BTC tx's
     /// Sha256Hash (big-endian), and the data is the ABI `bytes` holding the two
+    /// RSKIP428 (lovell700) pegout_transaction_created topic0 (groundtruth from
+    /// mainnet #7,338,403 tx[1]) and the bitcoinj VarInt outpoint-value encoding
+    /// (UtxoUtils.encodeOutpointValues).
+    #[test]
+    fn pegout_transaction_created_topic_and_varint_mainnet_7338403() {
+        use alloy_primitives::hex;
+        assert_eq!(
+            solidity_topic("pegout_transaction_created(bytes32,bytes)"),
+            B256::from_slice(
+                &hex::decode("9ee5d520fd5e6eaea3fd2e3ae4e35e9a9c0fb05c9d8f84b507f287da84b5117c")
+                    .unwrap()
+            )
+        );
+        // bitcoinj VarInt boundaries: < 0xFD one byte; 0xFD..=0xFFFF -> 0xFD + 2
+        // LE; up to u32 -> 0xFE + 4 LE; else 0xFF + 8 LE.
+        assert_eq!(encode_varint(0xFC), vec![0xFC]);
+        assert_eq!(encode_varint(0xFD), vec![0xFD, 0xFD, 0x00]);
+        assert_eq!(encode_varint(0xFFFF), vec![0xFD, 0xFF, 0xFF]);
+        assert_eq!(encode_varint(0x1_0000), vec![0xFE, 0x00, 0x00, 0x01, 0x00]);
+        assert_eq!(
+            encode_varint(0x1_0000_0000),
+            vec![0xFF, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00]
+        );
+    }
+
     /// batched requests' 32-byte RSK creation tx hashes concatenated. Verifies
     /// the signature hash and the `serializeRskTxHashes` + ABI-bytes layout
     /// byte-for-byte.

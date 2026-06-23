@@ -2025,6 +2025,18 @@ pub fn update_collections<CTX: crate::RskContextTr>(
                             );
                         }
                     }
+                    // RSKIP428 (lovell700): processReleaseTransactionInfo emits
+                    // pegout_transaction_created right after release_requested,
+                    // listing each spent input's value (in input order).
+                    if hardfork_cfg.has_rskip428(block_number) {
+                        let outpoint_values: Vec<u64> =
+                            built.used_utxos.iter().map(|u| u.value_satoshis).collect();
+                        super::events::log_pegout_transaction_created(
+                            ctx,
+                            &btc_txid_event_bytes(&built.tx),
+                            &outpoint_values,
+                        );
+                    }
                     // rskj BridgeSupport.adjustBalancesIfChangeOutputWasDust
                     // (unconditional since genesis): when a dusty change
                     // output was raised to the non-dust minimum (paid by the
@@ -2525,6 +2537,17 @@ fn process_funds_migration<CTX: crate::RskContextTr>(
                     &tx_ctx.rsk_tx_hash,
                     &btc_txid_event_bytes(&built.tx),
                     amount_migrated,
+                );
+            }
+            // RSKIP428 (lovell700): pegout_transaction_created for the migration
+            // tx too (settleReleaseRequest -> processReleaseTransactionInfo).
+            if hardfork_cfg.has_rskip428(block_number) {
+                let outpoint_values: Vec<u64> =
+                    built.used_utxos.iter().map(|u| u.value_satoshis).collect();
+                super::events::log_pegout_transaction_created(
+                    ctx,
+                    &btc_txid_event_bytes(&built.tx),
+                    &outpoint_values,
                 );
             }
             store_pegout_confirmation_set(ctx, &waiting, use_tx_hash);

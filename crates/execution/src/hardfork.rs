@@ -184,6 +184,12 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Lovell700
     }
 
+    /// RSKIP428 (Lovell700): the Bridge emits `pegout_transaction_created` for
+    /// every settled release (BridgeSupport.processReleaseTransactionInfo).
+    pub fn has_rskip428(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Lovell700
+    }
+
     /// RSKIP445 (Lovell700): the MCOPY opcode (0x5e, EIP-5656). revm gates it on
     /// the CANCUN spec, but lovell700 maps to SHANGHAI, so it is installed
     /// explicitly (see `rsk_instructions::install`).

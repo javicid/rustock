@@ -4090,3 +4090,32 @@ used for PUSH0 at arrowhead600 (§…). The bodies mirror revm's
 itself is revm's journal-backed `Host::tload`/`tstore` (cleared per transaction).
 Tests: `hardfork::tests::test_rskip445_rskip446_mainnet`. Verified: exec-head
 #7,338,134 → replay #7,338,135–#7,339,000 all match state and receipts roots exactly.
+
+## §70 RSKIP428 pegout_transaction_created event (#7,338,403)
+
+RSKIP428 (lovell700) adds a Bridge event emitted for every settled release:
+`pegout_transaction_created(bytes32 indexed btcTxHash, bytes utxoOutpointValues)`
+(topic0 `0x9ee5d520…`). rskj `BridgeSupport.settleReleaseRequest` calls
+`processReleaseTransactionInfo` right after `logReleaseRequested`, so the event lands
+between `release_requested` and (for batches) `batch_pegout_created`
+(BridgeSupport.java:1383,1439-1446). rustock emitted only the surrounding three events,
+so the first post-lovell batched pegout (#7,338,403 tx[1], an updateCollections) had a
+receipts-root mismatch (state matched — logs only).
+
+- `btcTxHash` = the unsigned pegout tx's `getHash().getBytes()` — the same internal
+  byte order as `release_requested` (rustock `btc_txid_event_bytes`).
+- data = ABI dynamic `bytes` whose payload is `UtxoUtils.encodeOutpointValues`: each
+  spent input's value (in input order) as a bitcoinj `VarInt` (1 byte < 0xFD, else a
+  0xFD/0xFE/0xFF tag + 2/4/8 little-endian bytes), concatenated.
+- RSKIP305 (`setReleaseOutpointsValues` storage) is reed800, NOT yet active at
+  lovell700 — so only the event fires here, which is why state matched.
+
+**rustock**: new `bridge::events::log_pegout_transaction_created` (with an
+`encode_varint` helper) is called from the shared pegout `settle` closure (batch +
+individual) and the migration settle path, gated on the new
+`RskHardforkConfig::has_rskip428` (Lovell700), immediately after `release_requested`.
+The rejection-release paths do NOT emit it (rskj `generateRejectionRelease` does not go
+through `settleReleaseRequest`). Tests:
+`bridge::events::tests::pegout_transaction_created_topic_and_varint_mainnet_7338403`.
+Verified: exec-head #7,338,402 → replay #7,338,403–#7,342,000 match state and receipts
+roots exactly; 556 tests pass.
