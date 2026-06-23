@@ -373,13 +373,31 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     // the retiring federation has been cleared earlier in the block) is still a
     // valid peg-in — processed with amount 0 (pegin_btc amount=0, destination
     // account created). Pre-RSKIP293 a 0 total is below minimum → not a peg-in.
-    let below_min =
-        pegin_below_minimum(&live_output_values, min_pegin, hardfork_cfg.has_rskip293(rsk_height));
+    let rskip379 = hardfork_cfg.has_rskip379(rsk_height);
+    // RSKIP379 (Arrowhead600) moves the minimum-value gate to
+    // `PegUtils.allUTXOsToFedAreAboveMinimumPeginValue`, which EXPLICITLY rejects
+    // an empty fed-output set (`if (fedUtxos.isEmpty()) return false;`). So an
+    // empty (or any-below-minimum) set is below minimum — the OPPOSITE of the
+    // pre-379 legacy rule where `anyMatch`/`!isAnyUTXOAmountBelowMinimum` is
+    // vacuously satisfied by an empty set (a valid amount-0 peg-in, #5,171,600).
+    let below_min = if rskip379 {
+        live_output_values.is_empty() || live_output_values.iter().any(|&v| v < min_pegin)
+    } else {
+        pegin_below_minimum(&live_output_values, min_pegin, hardfork_cfg.has_rskip293(rsk_height))
+    };
     if below_min {
-        // Not a valid peg-in: rskj getTransactionType returns UNKNOWN here (the
-        // tx is neither a migration nor a peg-out), so registerBtcTransaction
-        // ignores it. The RSKIP459+ "mark rejected as processed" behavior lives
-        // in the post-RSKIP379 evaluatePegin flow, folded in here for parity.
+        // Pre-RSKIP379: rskj getTransactionType returns UNKNOWN (neither a
+        // migration nor a peg-out), so registerBtcTransaction ignores it silently.
+        // Post-RSKIP379: evaluatePegin returns (NO_REFUND, INVALID_AMOUNT), and
+        // BridgeSupport.handleNonRefundablePegin logs rejected_pegin(INVALID_AMOUNT=5)
+        // then unrefundable_pegin(NonRefundablePeginReason.INVALID_AMOUNT=3); it
+        // marks the tx processed only when shouldMarkRejectedPeginAsProcessed
+        // (RSKIP459 && !RSKIP551 — not yet active at Arrowhead600).
+        if rskip379 {
+            let hash = btc_txid_event_bytes(&btc_tx);
+            super::events::log_rejected_pegin(ctx, &hash, 5);
+            super::events::log_unrefundable_pegin(ctx, &hash, 3);
+        }
         if should_mark_rejected_pegin_as_processed(hardfork_cfg, rsk_height) {
             set_btc_tx_processed(ctx, &legacy_txid, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
         }

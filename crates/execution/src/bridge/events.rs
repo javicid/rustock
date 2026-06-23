@@ -303,6 +303,28 @@ pub fn log_rejected_pegin<CTX: crate::RskContextTr>(
     );
 }
 
+/// `unrefundable_pegin(bytes32 indexed btcTxHash, int256 reason)` — rskj
+/// `logNonRefundablePegin` (RSKIP379, Arrowhead600). Fired alongside
+/// `rejected_pegin` when a rejected peg-in cannot be refunded. `reason` is the
+/// `NonRefundablePeginReason` enum value: INVALID_AMOUNT=3,
+/// LEGACY_PEGIN_UNDETERMINED_SENDER=1, PEGIN_V1_REFUND_ADDRESS_NOT_SET=2,
+/// OUTPUTS_SENT_TO_DIFFERENT_TYPES_OF_FEDS=4. Topic is the legacy txid like
+/// `rejected_pegin`.
+pub fn log_unrefundable_pegin<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    btc_tx_hash: &[u8; 32],
+    reason: u64,
+) {
+    emit_topics(
+        ctx,
+        vec![
+            solidity_topic("unrefundable_pegin(bytes32,int256)"),
+            B256::from_slice(btc_tx_hash),
+        ],
+        u256_word(alloy_primitives::U256::from(reason)).to_vec(),
+    );
+}
+
 /// `release_requested(bytes32 indexed rskTxHash, bytes32 indexed btcTxHash,
 /// uint256 amount)` — fired when a peg-out BTC transaction is created.
 pub fn log_release_requested<CTX: crate::RskContextTr>(
@@ -783,6 +805,30 @@ mod tests {
         assert_eq!(
             hex::encode(u256_word(alloy_primitives::U256::from(1u64))),
             "0000000000000000000000000000000000000000000000000000000000000001"
+        );
+    }
+
+    /// Groundtruth from the mainnet #6,223,964 tx[1] receipt: an amount-0
+    /// (empty-fed-output) peg-in rejected post-RSKIP379 emits both
+    /// `rejected_pegin(INVALID_AMOUNT=5)` and `unrefundable_pegin(INVALID_AMOUNT=3)`.
+    /// The `unrefundable_pegin(bytes32,int256)` topic0 is the second receipt log's
+    /// topic. (`NonRefundablePeginReason.INVALID_AMOUNT=3`.)
+    #[test]
+    fn unrefundable_pegin_topic_and_reasons_mainnet_6223964() {
+        use alloy_primitives::hex;
+        assert_eq!(
+            hex::encode(solidity_topic("unrefundable_pegin(bytes32,int256)")),
+            "35be155c87e408cbbcb753dc12f95fc5a242a29460a3d7189e807e63d7c185a7"
+        );
+        // rejected_pegin reason 5 = RejectedPeginReason.INVALID_AMOUNT.
+        assert_eq!(
+            hex::encode(u256_word(alloy_primitives::U256::from(5u64))),
+            "0000000000000000000000000000000000000000000000000000000000000005"
+        );
+        // unrefundable_pegin reason 3 = NonRefundablePeginReason.INVALID_AMOUNT.
+        assert_eq!(
+            hex::encode(u256_word(alloy_primitives::U256::from(3u64))),
+            "0000000000000000000000000000000000000000000000000000000000000003"
         );
     }
 

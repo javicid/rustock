@@ -426,6 +426,16 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Fingerroot500
     }
 
+    /// RSKIP379 (Arrowhead600): the peg-in evaluation moves to
+    /// `PegUtils.evaluatePegin`. Among other changes it INVERTS the empty
+    /// fed-output edge case of `allUTXOsToFedAreAboveMinimumPeginValue`: an empty
+    /// set is explicitly NOT all-above-minimum (`if (fedUtxos.isEmpty()) return
+    /// false;`), so it is rejected as INVALID_AMOUNT — the opposite of the
+    /// pre-379 legacy `!isAnyUTXOAmountBelowMinimum` (vacuously true on empty).
+    pub fn has_rskip379(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Arrowhead600
+    }
+
     /// RSKIP427: the RSKIP185 peg-out event amounts (release_request_received,
     /// release_request_rejected) switch from satoshis to full wei (Lovell700).
     pub fn has_rskip427(&self, block_number: u64) -> bool {

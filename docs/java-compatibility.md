@@ -3822,3 +3822,49 @@ Verified: #6,223,933 tx[2] (tx value = endowment = 10000 sat) and #6,223,939 tx[
 (tx value 0, endowment 10000 sat) both reject with CALLER_CONTRACT(2), sender =
 contract 0x4309efcc, no refund; exec-head #6,223,932 → #6,223,950 replays clean
 with exact state and receipts roots.
+
+## §63 RSKIP379 inverts the empty-fed-output peg-in: an amount-0 peg-in is rejected as INVALID_AMOUNT (#6,223,964)
+
+**CONSENSUS-CRITICAL IMPLEMENTATION QUIRK.** The minimum-value gate for a peg-in
+flips its empty-set behavior at RSKIP379 (Arrowhead600, mainnet #6,223,700), and the
+flip turns on whether the code is written as `allMatch` (vacuously true on empty) or
+with an explicit `isEmpty()` guard.
+
+- **Pre-RSKIP379** (`PegUtilsLegacy.isValidPegInTx` → `isAnyUTXOAmountBelowMinimum`,
+  RSKIP293): "below minimum" is `btcTx.getWalletOutputs(fedWallet).stream().anyMatch(v <
+  min)`. `anyMatch` over an **empty** stream is `false`, so a tx that pays *no* live
+  federation output is **not** below minimum → a valid amount-0 peg-in (see §… /
+  #5,171,600: `pegin_btc(amount=0)` + `transferTo(dest,0)` creating the destination
+  account + mark processed).
+- **Post-RSKIP379** (`PegUtils.evaluatePegin` → `allUTXOsToFedAreAboveMinimumPeginValue`,
+  PegUtils.java:67): the method **explicitly** special-cases empty —
+  `List<TransactionOutput> fedUtxos = btcTx.getWalletOutputs(fedWallet); if
+  (fedUtxos.isEmpty()) return false;` then `fedUtxos.stream().allMatch(v >= min)`. An
+  empty fed-output set is therefore **not** all-above-minimum, so `!allUTXOs…` is true
+  and `evaluatePegin` returns `(PeginProcessAction.NO_REFUND, INVALID_AMOUNT)`
+  (PegUtils.java:211-213). A from-scratch client that wrote this as a plain
+  `allMatch` (vacuously true on empty) would treat the amount-0 tx as valid and fork.
+
+For the NO_REFUND/INVALID_AMOUNT result, `BridgeSupport.handleNonRefundablePegin`
+(BridgeSupport.java:543) emits **two** Bridge events and credits/creates nothing:
+`eventLogger.logRejectedPegin(btcTx, RejectedPeginReason.INVALID_AMOUNT)` →
+`rejected_pegin(bytes32,int256)` reason **5**, then maps `INVALID_AMOUNT →
+NonRefundablePeginReason.INVALID_AMOUNT` (BridgeSupport.java:562) and
+`eventLogger.logNonRefundablePegin(btcTx, …)` → `unrefundable_pegin(bytes32,int256)`
+reason **3**. The tx is marked processed **only** when
+`shouldMarkRejectedPeginAsProcessed()` = `RSKIP459 && !RSKIP551` (lovell700..vetiver900) —
+so at Arrowhead600 it is **not** marked processed (no `btcTxHashesAlreadyProcessed`
+leaf). `RejectedPeginReason.INVALID_AMOUNT=5`; `NonRefundablePeginReason.INVALID_AMOUNT=3`.
+
+**rustock**: `bridge::peg::register_btc_transaction` now computes `below_min` with
+RSKIP379 semantics (`live_output_values.is_empty() || any(v < min)`) and, when it
+fires post-RSKIP379, emits `log_rejected_pegin(…, 5)` + the new
+`log_unrefundable_pegin(…, 3)` (`bridge::events`), marking processed only via the
+existing `should_mark_rejected_pegin_as_processed` (RSKIP459 && !RSKIP551). Pre-RSKIP379
+the legacy `pegin_below_minimum` path and its silent UNKNOWN-type ignore are unchanged.
+New `RskHardforkConfig::has_rskip379` (>= Arrowhead600). Tests:
+`bridge::events::tests::unrefundable_pegin_topic_and_reasons_mainnet_6223964` (topic0 =
+`0x35be155c…` + reason values). Verified: #6,223,964 tx[1] (empty fed outputs, amount 0)
+emits `rejected_pegin(5)` + `unrefundable_pegin(3)` and writes no destination account /
+no processed marker; exec-head #6,223,963 → #6,223,965 replays clean with exact state
+and receipts roots.
