@@ -757,6 +757,14 @@ fn make_cfg_env(spec_id: SpecId, chain_id: u64, eip3541_active: bool) -> CfgEnv 
         (GasId::cold_account_additional_cost(), 0),
         (GasId::cold_storage_additional_cost(), 0),
         (GasId::cold_storage_cost(), 0),
+        // `warm_storage_read_cost` (100 at Berlin+) is the EIP-2929 warm base.
+        // RSK charges no warm/cold component, and SELFDESTRUCT's cold cost is
+        // `cold_account_additional_cost + warm_storage_read_cost` — with the
+        // former zeroed, a cold SELFDESTRUCT beneficiary would still wrongly cost
+        // 100. Zero it too. Every other consumer (SLOAD/CALL/SSTORE) takes its
+        // base from a statically-overridden gas value, not this, and it is 0 for
+        // specs < BERLIN, so the override is a no-op pre-lovell.
+        (GasId::warm_storage_read_cost(), 0),
     ]);
     cfg.limit_contract_code_size = Some(0x6000);
     // RSKIP544 (Vetiver900): rskj only rejects new contract code starting
@@ -910,6 +918,10 @@ mod tests {
             assert_eq!(cfg.gas_params.cold_account_additional_cost(), 0, "{spec:?}");
             assert_eq!(cfg.gas_params.cold_storage_additional_cost(), 0, "{spec:?}");
             assert_eq!(cfg.gas_params.cold_storage_cost(), 0, "{spec:?}");
+            assert_eq!(cfg.gas_params.warm_storage_read_cost(), 0, "{spec:?}");
+            // SELFDESTRUCT cold-beneficiary cost must be 0 (RSK charges no
+            // warm/cold) — #7,403,649 charged a cold SELFDESTRUCT 100 too much.
+            assert_eq!(cfg.gas_params.selfdestruct_cold_cost(), 0, "{spec:?}");
         }
     }
 

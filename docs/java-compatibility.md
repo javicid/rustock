@@ -4136,3 +4136,22 @@ alongside the SSTORE refund pins. Equals the pre-London default, so a no-op pre-
 Test: `executor::tests::test_cfg_env_selfdestruct_refund_kept`. Verified: exec-head
 #7,388,593 → replay #7,388,594–#7,390,000 match state and receipts roots exactly; 557
 tests pass.
+
+## §72 EIP-2929: also zero warm_storage_read_cost (cold SELFDESTRUCT beneficiary) (#7,403,649)
+
+Follow-up to §68(a). Zeroing the two `cold_*_additional_cost` params removed the
+EIP-2929 surcharge for SLOAD/BALANCE/EXTCODE*/CALL, but SELFDESTRUCT computes its
+cold-beneficiary cost as `selfdestruct_cold_cost() = cold_account_additional_cost +
+warm_storage_read_cost` (revm gas_params). With only the former zeroed, a SELFDESTRUCT
+to a **cold** beneficiary still cost `warm_storage_read_cost` = 100 at SHANGHAI, which
+RSK never charges (`GasCost.SUICIDE` is a flat 5000, plus 25000 only for a brand-new
+beneficiary).
+
+mainnet #7,403,649 tx[2] (a contract-creation whose constructor SELFDESTRUCTs to a cold
+address): rskj gas 37,806, rustock 37,906 (+100). `make_cfg_env` now also zeros
+`GasId::warm_storage_read_cost()`. Every other consumer takes its base from a
+statically-overridden gas value (SLOAD 200, BALANCE 400, CALL static, SSTORE 5000), and
+it is 0 for specs < BERLIN, so this is a no-op pre-lovell. Test extends
+`executor::tests::test_cfg_env_no_eip2929_cold_access_cost` (asserts
+`selfdestruct_cold_cost() == 0`). Verified: exec-head #7,403,648 → replay
+#7,403,649–#7,408,000 match state and receipts roots exactly; 557 tests pass.
