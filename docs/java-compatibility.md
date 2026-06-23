@@ -3868,3 +3868,43 @@ New `RskHardforkConfig::has_rskip379` (>= Arrowhead600). Tests:
 emits `rejected_pegin(5)` + `unrefundable_pegin(3)` and writes no destination account /
 no processed marker; exec-head #6,223,963 → #6,223,965 replays clean with exact state
 and receipts roots.
+
+## §64 RSKIP379 pegout sig-hash index, and the sigHash toString() byte order (#6,226,520)
+
+**CONSENSUS-CRITICAL IMPLEMENTATION QUIRK (byte order).** RSKIP379 (Arrowhead600)
+adds a pegout-transaction index: every time a pegout is created,
+`BridgeSupport.settleReleaseRequest` → `savePegoutTxSigHash(releaseTransaction)`
+(BridgeSupport.java:1381,1407) stores a marker so the pegout's first-input signature
+hash can later be recognized. The index entry is:
+- **Key**: `BridgeStorageProvider.getStorageKeyForPegoutTxSigHash` =
+  `PEGOUT_TX_SIG_HASH.getCompoundKey("-", sigHash.toString())` =
+  `DataWord.fromLongString("pegoutTxSigHash-" + sigHash.toString())` (keccak256).
+- **Value**: `new byte[]{TRUE_VALUE}` = a single `0x01` byte (BridgeStorageProvider.java:588).
+- **sigHash**: `BitcoinUtils.getSigHashForPegoutIndex(pegoutTx)` (BitcoinUtils.java:28) =
+  the first input's **legacy** `hashForSignature(0, redeemScript, SigHash.ALL, false)`
+  over the tx-without-signatures, where `redeemScript` is extracted from input 0
+  (`extractRedeemScriptFromInput`). For a freshly-built pegout the inputs are spent
+  from the active federation, so this is the active fed's redeem script.
+
+The quirk is the **byte order of `sigHash.toString()`**. A BTC txid's
+`getHash().toString()` is bitcoinj `Sha256Hash.wrapReversed(...)` → DISPLAY order
+(reversed). But a `hashForSignature` result is `Sha256Hash.twiceOf(...)`
+(BtcTransaction bytecode offsets 397/722 in bitcoinj-thin 0.14.4-rsk-18) → stored in
+**INTERNAL** order, and `Sha256Hash.toString()` is a plain `HEX.encode(bytes)` with no
+further reversal. So the compound-key identifier is the sigHash in **internal** byte
+order, *not* reversed — the opposite of every txid-keyed Bridge cell. A from-scratch
+client that reused its txid-string helper (reverse-then-hex) here would key the wrong
+slot and fork. Only RSKIP271-era batch pegouts reach this (RSKIP271 ≪ RSKIP379, so when
+RSKIP379 is active the batch path is the only one taken).
+
+**rustock**: `bridge::peg::save_pegout_tx_sig_hash` stores `[0x01]` at
+`compound_key(PEGOUT_TX_SIG_HASH_KEY, "-", to_hex(sig_hash))` — `to_hex` directly, **not**
+`btc_hash_hex_display` (which reverses). The sigHash is
+`release_tx::legacy_sighash_all(&built.tx, 0, redeem_of_input_0)` (rust-bitcoin's
+`legacy_signature_hash`, whose `to_byte_array()` is the same internal order as bitcoinj
+`twiceOf`), computed in the batch path before `settle` consumes the built tx, gated on
+`has_rskip379`. Test:
+`bridge::storage::tests::compound_key_pegout_tx_sig_hash_mainnet_6226520` pins the
+groundtruth (sigHash `1220…2595` → DataWord `0x904714d8…`, and asserts the reversed-hex
+form does NOT match). Verified: exec-head #6,226,519 → #6,226,521 replays clean with
+exact state and receipts roots (the index leaf rustock previously omitted now matches).

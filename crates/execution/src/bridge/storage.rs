@@ -665,6 +665,33 @@ mod tests {
     }
 
     #[test]
+    fn compound_key_pegout_tx_sig_hash_mainnet_6226520() {
+        // rskj BridgeStorageProvider.getStorageKeyForPegoutTxSigHash (RSKIP379)
+        // = PEGOUT_TX_SIG_HASH.getCompoundKey("-", sigHash.toString()). The
+        // sigHash is `hashForSignature` = bitcoinj Sha256Hash.twiceOf, so its
+        // toString() is INTERNAL byte order (NOT reversed like a txid). At
+        // mainnet #6,226,520 the batched pegout's first-input legacy SIGHASH_ALL
+        // was 122057662a8bb0ed963b33153fb865db5c5d87a34aec7ce3aa5f68b5056e2595,
+        // and its unitrie storage slot (the DataWord) was
+        // 0x904714d8846e313b4c1b50bd004db73f0a18c1c1fd6074540174bc04278de29a.
+        let sig_hash_hex = "122057662a8bb0ed963b33153fb865db5c5d87a34aec7ce3aa5f68b5056e2595";
+        let key = compound_key(PEGOUT_TX_SIG_HASH_KEY, "-", sig_hash_hex);
+        assert_eq!(
+            alloy_primitives::hex::encode(key.to_be_bytes::<32>()),
+            "904714d8846e313b4c1b50bd004db73f0a18c1c1fd6074540174bc04278de29a"
+        );
+        // The byte order matters: reversing the sigHash (the txid convention)
+        // would key the wrong slot and fork.
+        let reversed: String = sig_hash_hex
+            .as_bytes()
+            .chunks(2)
+            .rev()
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect();
+        assert_ne!(compound_key(PEGOUT_TX_SIG_HASH_KEY, "-", &reversed), key);
+    }
+
+    #[test]
     fn compound_key_long_hashes() {
         // A compound key with a long identifier should use keccak256
         let long_id = "aabbccdd11223344aabbccdd11223344";

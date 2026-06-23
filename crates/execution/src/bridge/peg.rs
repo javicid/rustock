@@ -1349,6 +1349,19 @@ fn mark_flyover_derivation_hash_used<CTX: crate::RskContextTr>(
     super::storage::bridge_store_raw(ctx, key, Some(vec![1]));
 }
 
+/// rskj `BridgeStorageProvider.setPegoutTxSigHash`/`savePegoutTxSigHashes`
+/// (RSKIP379): index a created pegout by the legacy SIGHASH_ALL of its first
+/// input (`BitcoinUtils.getSigHashForPegoutIndex` → `hashForSignature(0,
+/// redeemScript, ALL, false)`). The key identifier is the sigHash's
+/// `Sha256Hash.toString()`, which for a `hashForSignature` result is bitcoinj
+/// `Sha256Hash.twiceOf` = INTERNAL byte order — NOT reversed, unlike a txid's
+/// `getHash().toString()` (`wrapReversed`). So the hex is taken directly, not
+/// via `btc_hash_hex_display`. Value is a single TRUE byte (`new byte[]{1}`).
+fn save_pegout_tx_sig_hash<CTX: crate::RskContextTr>(ctx: &mut CTX, sig_hash: &[u8; 32]) {
+    let key = compound_key(super::storage::PEGOUT_TX_SIG_HASH_KEY, "-", &to_hex(sig_hash));
+    super::storage::bridge_store_raw(ctx, key, Some(vec![1]));
+}
+
 /// rskj `getStorageKeyForFlyoverHash`:
 /// `fastBridgeHashUsedInBtcTx-` + `Sha256Hash.toString()` (display order) +
 /// `Keccak256.toString()` (forward order).
@@ -2101,6 +2114,18 @@ pub fn update_collections<CTX: crate::RskContextTr>(
                             .iter()
                             .map(|r| r.rsk_tx_hash.unwrap_or(tx_ctx.rsk_tx_hash))
                             .collect();
+                        // RSKIP379: index this pegout by the legacy sighash of
+                        // its first input (BridgeSupport.savePegoutTxSigHash,
+                        // inside settleReleaseRequest). Compute before `settle`
+                        // consumes `built`. When RSKIP379 is active RSKIP271 is
+                        // too, so only this batch path is ever reached.
+                        if hardfork_cfg.has_rskip379(block_number) {
+                            let sig_hash = {
+                                let redeem0 = redeem_for(&built.used_utxos[0]);
+                                super::release_tx::legacy_sighash_all(&built.tx, 0, redeem0)
+                            };
+                            save_pegout_tx_sig_hash(ctx, &sig_hash);
+                        }
                         settle(
                             ctx,
                             built,
