@@ -374,6 +374,26 @@ fn method_allows_static_call(name: &str) -> bool {
     )
 }
 
+/// rskj `Bridge.validateLocalCall` (Bridge.java:431) + `BridgeMethods`
+/// `onlyAllowsLocalCalls`: a method whose permission only allows LOCAL (eth_call)
+/// calls throws `BridgeIllegalArgumentException` when reached by any on-chain
+/// (non-local) call. `getBtcBlockchainBestChainHeight` is local-only only before
+/// RSKIP220 (Iris300); afterwards it is tx-callable
+/// (`getBtcBlockchainBestChainHeightOnlyAllowsLocalCalls`, Bridge.java:700).
+fn method_only_allows_local_calls(
+    permission: BridgePermission,
+    hardfork_cfg: &RskHardforkConfig,
+    block_number: u64,
+) -> bool {
+    match permission {
+        BridgePermission::TransactionCallable => false,
+        BridgePermission::LocalOnly => true,
+        BridgePermission::DynamicRskip220 => {
+            hardfork_cfg.active_upgrade(block_number) < crate::hardfork::RskNetworkUpgrade::Iris300
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum BridgeGasCost {
     Fixed(u64),
@@ -681,6 +701,23 @@ pub fn execute_bridge<CTX: crate::RskContextTr>(
 
     if gas_limit < gas_cost {
         return Err(insufficient_gas_marker(ctx, gas_limit));
+    }
+
+    // rskj `Bridge.validateCall` (Bridge.java:426) runs two gates after the gas
+    // is charged, both throwing `BridgeIllegalArgumentException` → `VMException`
+    // (consume `requiredGas`, CALL returns empty). The first is
+    // `validateLocalCall` (Bridge.java:431): post-RSKIP88, a LOCAL-ONLY method
+    // reached by a non-local call throws. Only `eth_call` is a local call, so
+    // every on-chain CALL/transaction during block execution is non-local — a
+    // local-only getter invoked on-chain always throws here and returns empty
+    // (mainnet #6,223,900: a relay plain-CALLs `getFederationAddress`, which
+    // rskj empties so the relay's RETURNDATASIZE check sees 0).
+    if method_only_allows_local_calls(method.permission, hardfork_cfg, block_number) {
+        use revm::context_interface::JournalTr;
+        if ctx.journal().depth() == 1 {
+            return Err(marker_with_gas(INVISIBLE_EXCEPTION_MARKER, gas_cost));
+        }
+        return Err(marker_with_gas(INTERNAL_BRIDGE_THROW_MARKER, gas_cost));
     }
 
     // rskj `Bridge.validateCallMessageType` (Bridge.java:446): after the gas is
@@ -1047,6 +1084,34 @@ mod tests {
         assert!(method_allows_static_call("getFederationAddress"));
         assert!(method_allows_static_call("getBtcTransactionConfirmations"));
         assert!(method_allows_static_call("isBtcTxHashAlreadyProcessed"));
+    }
+
+    /// rskj `validateLocalCall`: a local-only getter reached by an on-chain call
+    /// throws. During block execution every call is non-local, so a local-only
+    /// method always rejects. `getBtcBlockchainBestChainHeight` flips from
+    /// local-only to tx-callable at RSKIP220 (Iris300). (#6,223,900: a relay
+    /// plain-CALLs `getFederationAddress`, which rskj empties.)
+    #[test]
+    fn local_call_gating_matches_rskj() {
+        let cfg = crate::hardfork::RskHardforkConfig::mainnet();
+        let pre_iris = 3_000_000; // before Iris300 (mainnet #3,614,800)
+        let post_iris = 6_223_900;
+
+        let local = find_bridge_method(&compute_selector("getFederationAddress()")).unwrap();
+        assert!(matches!(local.permission, BridgePermission::LocalOnly));
+        // A local-only getter rejects on-chain at any block.
+        assert!(method_only_allows_local_calls(local.permission, &cfg, post_iris));
+        assert!(method_only_allows_local_calls(local.permission, &cfg, pre_iris));
+
+        // Tx-callable methods are never local-gated.
+        let txm = find_bridge_method(&compute_selector("registerBtcTransaction(bytes,int256,bytes)")).unwrap();
+        assert!(!method_only_allows_local_calls(txm.permission, &cfg, post_iris));
+
+        // getBtcBlockchainBestChainHeight: local-only before Iris300, tx-callable after.
+        let dynm = find_bridge_method(&compute_selector("getBtcBlockchainBestChainHeight()")).unwrap();
+        assert!(matches!(dynm.permission, BridgePermission::DynamicRskip220));
+        assert!(method_only_allows_local_calls(dynm.permission, &cfg, pre_iris));
+        assert!(!method_only_allows_local_calls(dynm.permission, &cfg, post_iris));
     }
 
     /// A well-formed `receiveHeaders(bytes[])` with one empty header element

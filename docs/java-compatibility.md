@@ -3727,3 +3727,51 @@ direct-transaction path (`executor.rs`) always passes `BridgeCallKind::Call`.
 Test: `bridge::tests::call_type_acceptance_matches_rskj`. Verified by replaying
 #6,223,812: tx[0] status=true, state and receipts roots match; exec-head→
 #6,223,899 replays clean.
+
+## §61 Bridge validateLocalCall: a local-only getter rejects any on-chain call (#6,223,900)
+
+rskj `Bridge.execute` runs `validateCall` (Bridge.java:426) which, **before**
+`validateCallMessageType`, runs `validateLocalCall` (Bridge.java:431). Post-RSKIP88,
+when the call is **not a local call** (`!isLocalCall()`) and the method
+`onlyAllowsLocalCalls`, it throws `BridgeIllegalArgumentException`. `isLocalCall()`
+is `rskTx.isLocalCallTransaction()` (Bridge.java:1646) — **true only for the
+synthetic transaction `eth_call` builds**; every transaction and every on-chain
+`CALL`/`STATICCALL` during block execution is non-local. So a **local-only**
+Bridge getter invoked on-chain *always* throws here. The throw is not caught by
+the inner `try` around `executeBridgeMethod` (it sits at Bridge.java:405, outside
+407-414), so it propagates to the outer `catch` → `VMException`, which consumes
+the method's `requiredGas` (`getGasForData` = functionCost + data.length·2) and
+the CALL returns **empty** (`RETURNDATASIZE == 0`).
+
+`BridgeMethods.onlyAllowsLocalCalls` (BridgeMethods.java:1107) is a fixed
+`true`/`false` per method (`fixedPermission`) except
+`getBtcBlockchainBestChainHeight`, whose
+`getBtcBlockchainBestChainHeightOnlyAllowsLocalCalls` (Bridge.java:700) returns
+`!RSKIP220` — local-only before Iris300, tx-callable after.
+
+**Consensus-critical implementation quirk.** A from-scratch client that dispatches
+a getter whenever its selector/ABI/gas check out will *execute* it on-chain and
+return its encoded value, so the caller sees non-empty `RETURNDATASIZE` where rskj
+saw an empty, "failed" CALL — even though **both spend the identical
+`requiredGas`** (the method never runs in rskj, but `requiredGas` is charged
+either way), making the divergence invisible to a gas-only check. Mainnet
+**#6,223,900 tx[4]**: a relay (`0x395911ee…`) plain-`CALL`s
+`getFederationAddress()` (local-only). rskj empties it (`RETURNDATASIZE == 0`), so
+the relay takes its early-return branch and the tx succeeds (`gasUsed 34304`).
+rustock executed the getter and returned 1056 bytes, so the relay took the
+"process return data" branch and ultimately reverted consuming all 34709 gas —
+flipping tx[4] status and forking both roots.
+
+**rustock**: `crates/execution/src/bridge/mod.rs` —
+`method_only_allows_local_calls(permission, hardfork_cfg, block_number)` mirrors
+the rskj permission (LocalOnly → always; DynamicRskip220 → `< Iris300`;
+TransactionCallable → never). `execute_bridge` checks it **after** computing
+`gas_cost` and **before** the `validateCallMessageType` check (rskj's
+`validateCall` order), returning the depth-aware bridge-throw marker (depth>1 →
+`INTERNAL_BRIDGE_THROW_MARKER`, depth-1 → invisible-exception), each recording
+exactly `requiredGas`. Block execution never sets a local-call flag (the only
+`execute_bridge` callers are the direct-tx path in `executor.rs` and internal
+CALLs in `precompiles.rs`); a future `eth_call`-to-Bridge path would need to mark
+the call local. Test: `bridge::tests::local_call_gating_matches_rskj`. Verified by
+replaying #6,223,900: tx[4] status=true gasUsed=34304, state and receipts roots
+match; exec-head #6,223,703 → #6,223,910 replays clean.
