@@ -75,6 +75,8 @@ pub fn install<WIRE, HOST>(
     extcodehash_enabled: bool,
     istanbul_opcodes_enabled: bool,
     push0_enabled: bool,
+    transient_storage_enabled: bool,
+    mcopy_enabled: bool,
     extcodesize_max_precompiles: &[Address],
     extcodehash_precompiles: &[Address],
     real_coinbase: Address,
@@ -82,6 +84,27 @@ pub fn install<WIRE, HOST>(
     WIRE: InterpreterTypes,
     HOST: Host,
 {
+    // RSKIP446 (lovell700): transient storage TLOAD/TSTORE (0x5c/0x5d,
+    // EIP-1153, rskj `GasCost.TLOAD`/`TSTORE` = 100 each). RSKIP445 (lovell700):
+    // MCOPY (0x5e, EIP-5656, VERY_LOW base + per-word copy + memory expansion).
+    // revm gates all three on the CANCUN spec, but lovell700 maps to SHANGHAI,
+    // so install unchecked versions (same pattern as PUSH0 at arrowhead600).
+    if transient_storage_enabled {
+        instructions.insert_instruction(
+            opcode::TLOAD,
+            Instruction::new(rsk_tload::<WIRE, HOST>, 100),
+        );
+        instructions.insert_instruction(
+            opcode::TSTORE,
+            Instruction::new(rsk_tstore::<WIRE, HOST>, 100),
+        );
+    }
+    if mcopy_enabled {
+        instructions.insert_instruction(
+            opcode::MCOPY,
+            Instruction::new(rsk_mcopy::<WIRE, HOST>, 3),
+        );
+    }
     // RSKIP398 (arrowhead600): PUSH0 (0x5f, rskj `OpCode.PUSH0` BASE_TIER = 2 gas)
     // pushes a zero word. rskj enables it at arrowhead600 but rustock maps that to
     // ISTANBUL (for RSKIP400 calldata), where revm's stock PUSH0 halts NotActivated
@@ -339,6 +362,83 @@ fn rsk_push0<WIRE: InterpreterTypes, H: Host + ?Sized>(
     if !context.interpreter.stack.push(U256::ZERO) {
         context.interpreter.halt_overflow();
     }
+}
+
+/// RSKIP446 TLOAD (0x5c, EIP-1153): push the transient-storage value at the
+/// popped key (zero if unset). Flat 100 gas (charged by the static table). Same
+/// body as revm's `host::tload` minus the CANCUN spec gate.
+fn rsk_tload<WIRE: InterpreterTypes, H: Host + ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+) {
+    let Some([key]) = context.interpreter.stack.popn() else {
+        context.interpreter.halt_underflow();
+        return;
+    };
+    let value = context.host.tload(context.interpreter.input.target_address(), key);
+    if !context.interpreter.stack.push(value) {
+        context.interpreter.halt_overflow();
+    }
+}
+
+/// RSKIP446 TSTORE (0x5d, EIP-1153): write value at key in transient storage.
+/// Reverts inside a static call (rskj `doTSTORE` modificationException). Flat
+/// 100 gas. Same body as revm's `host::tstore` minus the CANCUN spec gate.
+fn rsk_tstore<WIRE: InterpreterTypes, H: Host + ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+) {
+    if context.interpreter.runtime_flag.is_static() {
+        context
+            .interpreter
+            .halt(InstructionResult::StateChangeDuringStaticCall);
+        return;
+    }
+    let Some([key, value]) = context.interpreter.stack.popn() else {
+        context.interpreter.halt_underflow();
+        return;
+    };
+    context
+        .host
+        .tstore(context.interpreter.input.target_address(), key, value);
+}
+
+/// RSKIP445 MCOPY (0x5e, EIP-5656): copy `len` bytes within memory from `src`
+/// to `dst`. Cost = VERY_LOW (3, static table) + 3 per word + memory expansion,
+/// matching rskj `doMCOPY` (VERY_LOW + computeMemoryCopyGas). Same body as
+/// revm's `memory::mcopy` minus the CANCUN spec gate.
+fn rsk_mcopy<WIRE: InterpreterTypes, H: Host + ?Sized>(
+    context: InstructionContext<'_, H, WIRE>,
+) {
+    let Some([dst, src, len]) = context.interpreter.stack.popn() else {
+        context.interpreter.halt_underflow();
+        return;
+    };
+    let Ok(len) = usize::try_from(len) else {
+        context.interpreter.halt(InstructionResult::InvalidOperandOOG);
+        return;
+    };
+    if !context
+        .interpreter
+        .gas
+        .record_cost(context.host.gas_params().mcopy_cost(len))
+    {
+        context.interpreter.halt_oog();
+        return;
+    }
+    if len == 0 {
+        return;
+    }
+    let (Ok(dst), Ok(src)) = (usize::try_from(dst), usize::try_from(src)) else {
+        context.interpreter.halt(InstructionResult::InvalidOperandOOG);
+        return;
+    };
+    let gas_params = context.host.gas_params();
+    if !context
+        .interpreter
+        .resize_memory(&gas_params, core::cmp::max(dst, src), len)
+    {
+        return;
+    }
+    context.interpreter.memory.copy(dst, src, len);
 }
 
 /// COINBASE returning rskj's real miner address (`header.getCoinbase()`)

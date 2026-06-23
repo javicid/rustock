@@ -184,6 +184,19 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Lovell700
     }
 
+    /// RSKIP445 (Lovell700): the MCOPY opcode (0x5e, EIP-5656). revm gates it on
+    /// the CANCUN spec, but lovell700 maps to SHANGHAI, so it is installed
+    /// explicitly (see `rsk_instructions::install`).
+    pub fn has_rskip445(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Lovell700
+    }
+
+    /// RSKIP446 (Lovell700): transient storage TLOAD/TSTORE (0x5c/0x5d,
+    /// EIP-1153). Same SHANGHAI-vs-CANCUN gap as MCOPY — installed explicitly.
+    pub fn has_rskip446(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Lovell700
+    }
+
     /// Whether StoredBlock V2 format is active (RSKIP454, Lovell700).
     pub fn has_stored_block_v2(&self, block_number: u64) -> bool {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Lovell700
@@ -676,6 +689,17 @@ mod tests {
         assert!(!cfg.has_rskip376(6_223_699));
         assert!(cfg.has_rskip376(6_223_700));
         assert!(cfg.has_rskip376(7_069_808));
+    }
+
+    /// RSKIP445 (MCOPY) and RSKIP446 (TLOAD/TSTORE) activate at Lovell700
+    /// (mainnet 7_338_024). First mainnet use: #7,338,135 (a TSTORE in tx[11]).
+    #[test]
+    fn test_rskip445_rskip446_mainnet() {
+        let cfg = RskHardforkConfig::mainnet();
+        assert!(!cfg.has_rskip445(7_338_023));
+        assert!(cfg.has_rskip445(7_338_024));
+        assert!(!cfg.has_rskip446(7_338_023));
+        assert!(cfg.has_rskip446(7_338_024));
     }
 
     /// RSKIP185 and RSKIP176 activate at Iris300 (mainnet 3_614_800).

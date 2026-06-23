@@ -4065,3 +4065,28 @@ over-charged. Pre-LONDON specs already pass `false`, so it is identical pre-love
 
 Verified: exec-head #7,338,023 -> replay #7,338,024–#7,338,200 all match state and
 receipts roots exactly; 554 tests pass.
+
+## §69 lovell700 TLOAD/TSTORE/MCOPY opcodes (RSKIP446/445) installed despite the SHANGHAI mapping (#7,338,135)
+
+Companion to §68's spec-mapping trap. RSK adopted EIP-1153 transient storage
+(TLOAD 0x5c / TSTORE 0x5d, RSKIP446) and EIP-5656 (MCOPY 0x5e, RSKIP445) at lovell700.
+These are Ethereum **Cancun** opcodes, but rustock maps lovell700 to SHANGHAI (< CANCUN),
+so revm's stock instruction bodies begin with `check!(CANCUN)` and treat the bytes as
+invalid — halting the frame and consuming all gas. The first mainnet contract to use
+one (a TSTORE in tx[11] of #7,338,135) therefore reverted in rustock while rskj ran it
+to success, forking the receipts root (and would have forked state on any persisted
+write).
+
+rskj gas (fork-independent `GasCost`): `TLOAD = TSTORE = 100`; `MCOPY` = VERY_LOW (3)
+base + `computeMemoryCopyGas` (3 per 32-byte word + memory-expansion), i.e. EIP-1153 /
+EIP-5656 exactly. `doTSTORE` raises a modification exception inside a static call.
+
+**rustock**: `rsk_instructions::install` now installs unchecked `rsk_tload` /
+`rsk_tstore` (static gas 100) and `rsk_mcopy` (static gas 3, body charges
+`mcopy_cost(len)` + `resize_memory`) when the new `has_rskip446` / `has_rskip445`
+(Lovell700) flags are set — the same "install ahead of the revm spec gate" pattern
+used for PUSH0 at arrowhead600 (§…). The bodies mirror revm's
+`host::tload`/`host::tstore`/`memory::mcopy` minus the CANCUN check; transient storage
+itself is revm's journal-backed `Host::tload`/`tstore` (cleared per transaction).
+Tests: `hardfork::tests::test_rskip445_rskip446_mainnet`. Verified: exec-head
+#7,338,134 → replay #7,338,135–#7,339,000 all match state and receipts roots exactly.
