@@ -245,7 +245,7 @@ where
             // would not have touched the buffer (see field docs).
             let mut preserved_return_buffer: Option<Bytes> = None;
 
-            let result = match call_or_result {
+            let mut result = match call_or_result {
                 ItemOrResult::Item(init) => {
                     if *TRACE_FRAMES {
                         trace_frame_init(&init);
@@ -367,6 +367,21 @@ where
                 );
             }
 
+            // rskj `Program.finalizeContractCreation` (the internal CREATE/CREATE2
+            // success path) propagates only `logInfos` and `deleteAccounts` from a
+            // constructor to the parent result — it never propagates `futureRefund`,
+            // unlike the CALL path's full `ProgramResult.merge`. So any gas refund
+            // accrued inside a nested constructor (its own SSTORE clears plus any
+            // refunds its sub-calls merged up) is DISCARDED. The top-level create
+            // *transaction* keeps its refund (TransactionExecutor reads the program's
+            // futureRefund directly), so this only applies to nested creates
+            // (depth > 0). revm propagates the refund unconditionally; drop it here
+            // before it merges into the caller (#6,362,186).
+            if let FrameResult::Create(outcome) = &mut result {
+                if evm.frame_stack().get().depth > 0 {
+                    outcome.result.gas.set_refund(0);
+                }
+            }
             if let Some(result) = evm.frame_return_result(result)? {
                 return Ok(result);
             }

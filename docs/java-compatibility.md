@@ -3908,3 +3908,47 @@ RSKIP379 is active the batch path is the only one taken).
 groundtruth (sigHash `1220…2595` → DataWord `0x904714d8…`, and asserts the reversed-hex
 form does NOT match). Verified: exec-head #6,226,519 → #6,226,521 replays clean with
 exact state and receipts roots (the index leaf rustock previously omitted now matches).
+
+## §65 A nested CREATE/CREATE2 constructor's gas refund is discarded (#6,362,186)
+
+**CONSENSUS-CRITICAL IMPLEMENTATION QUIRK.** rskj propagates a child frame's
+`ProgramResult` to its parent differently for CALL vs CREATE:
+- **CALL** (`Program.callToAddressInner`, Program.java:957) runs
+  `getResult().merge(childResult)`, and `ProgramResult.merge` carries
+  `internalTransactions`, `deleteAccounts`, `logInfos`, **`futureRefund`**, and
+  `deductedRefund`.
+- **CREATE/CREATE2** (`Program.finalizeContractCreation`, Program.java:765 — the
+  success path of the internal create opcode) merges **only**
+  `getResult().addDeleteAccounts(...)` and `getResult().addLogInfos(...)`. It
+  **never** propagates the constructor's `futureRefund`.
+
+So any gas refund accrued inside a constructor — its own `SSTORE` clears
+(`REFUND_SSTORE` = 15000, Petersburg metering, see §…/`rsk_sstore`) plus any
+refunds its sub-calls merged up into the constructor's result — is **silently
+discarded** when the contract is created via the CREATE/CREATE2 opcode. A
+from-scratch client that simply propagated the child frame's refund counter (as
+canonical EVM and revm do) would over-refund and fork. The top-level create
+*transaction* is unaffected: `TransactionExecutor.create` reads the constructor
+program's `futureRefund` directly (the constructor IS the tx's program), so its
+refund counts.
+
+mainnet #6,362,186 tx[3]: a contract is CREATE'd (depth 7) whose constructor sets
+storage slot 0 to an address then clears it back to 0 (a reentrancy-guard /
+transient pattern; the slot was 0 at tx start). revm granted the 15000
+`SSTORE`-clear refund for that nested-create clear; rskj did not — so rustock's
+gasUsed was 1,182,343 vs the header's 1,197,343 (exactly 15000 less). Because
+rskj's `CLEAR_SSTORE` and `RESET_SSTORE` both cost 5000, the misclassification is
+invisible in the per-opcode gas trajectory (the trace stayed in lockstep); only
+the post-execution refund diverged.
+
+**rustock**: `RskHandler::run_exec_loop` (crates/execution/src/rsk_handler.rs), just
+before `frame_return_result` merges a finished frame into its caller, zeroes the
+gas refund of a `FrameResult::Create` whose frame depth is > 0 (a nested create;
+the top-level create tx is depth 0 and keeps its refund) via
+`outcome.result.gas.set_refund(0)`. Revert/halt creates already discard the
+refund, so only the success path matters. Test:
+`executor::tests::nested_create_constructor_refund_is_dropped_rskj` (a factory whose
+nested-CREATE constructor sets-then-clears a slot must cost MORE than a set-only
+constructor — clearing adds 5000 and earns no 15000 refund; without the fix it
+costs ~10000 less). Verified: exec-head #6,362,185 → #6,362,188 replays clean;
+#6,362,186 tx[3] gas_used = 1,197,343 with exact state and receipts roots.

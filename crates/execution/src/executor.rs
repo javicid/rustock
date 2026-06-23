@@ -1293,6 +1293,105 @@ mod tests {
         assert_eq!(slot0.present_value, U256::from(4), "4 >> 0 == 4");
     }
 
+    /// Regression for mainnet #6,362,186 tx[3] (gas 1,197,343 vs 1,182,343,
+    /// +15,000): rskj `Program.finalizeContractCreation` propagates only logInfos
+    /// and deleteAccounts from a constructor to the parent result — NOT
+    /// futureRefund (unlike the CALL path's `ProgramResult.merge`). So a gas
+    /// refund accrued inside a nested CREATE/CREATE2 constructor is DISCARDED.
+    /// A constructor that SETs then CLEARs a storage slot must therefore NOT
+    /// earn the 15,000 SSTORE-clear refund when created via the CREATE opcode:
+    /// compared with a set-only constructor, clearing costs MORE (the extra
+    /// 5,000 CLEAR_SSTORE), not 10,000 less.
+    #[test]
+    fn nested_create_constructor_refund_is_dropped_rskj() {
+        // child init: SET slot0=1, optionally CLEAR it, then RETURN empty code.
+        let child_init = |clear: bool| -> Vec<u8> {
+            let mut c = vec![0x60, 0x01, 0x60, 0x00, 0x55]; // PUSH1 1 PUSH1 0 SSTORE
+            if clear {
+                c.extend_from_slice(&[0x60, 0x00, 0x60, 0x00, 0x55]); // clear slot0
+            }
+            c.extend_from_slice(&[0x60, 0x00, 0x60, 0x00, 0xf3]); // RETURN empty
+            c
+        };
+        // factory runtime: MSTORE the child init (right-aligned), then CREATE it.
+        let factory_runtime = |init: &[u8]| -> Vec<u8> {
+            let n = init.len();
+            assert!((1..=32).contains(&n));
+            let off = (32 - n) as u8;
+            let mut r = vec![0x5f + n as u8]; // PUSH{n}
+            r.extend_from_slice(init);
+            r.extend_from_slice(&[0x60, 0x00, 0x52]); // PUSH1 0 MSTORE
+            r.extend_from_slice(&[0x60, n as u8]); // PUSH1 size
+            r.extend_from_slice(&[0x60, off]); // PUSH1 offset
+            r.extend_from_slice(&[0x60, 0x00, 0xf0, 0x00]); // PUSH1 0 (value) CREATE STOP
+            r
+        };
+        // deploy wrapper: CODECOPY the runtime (after the 12-byte prefix) + RETURN.
+        let deploy_init = |runtime: &[u8]| -> Vec<u8> {
+            let l = runtime.len() as u8;
+            let mut d = vec![
+                0x60, l, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, l, 0x60, 0x00, 0xf3,
+            ];
+            d.extend_from_slice(runtime);
+            d
+        };
+
+        // Run the whole deploy+call sequence and return the call's gas_used.
+        let run = |clear: bool| -> u64 {
+            let store = Arc::new(MemoryTrieStore::new());
+            let root = TrieNode::empty();
+            let sender = Address::repeat_byte(0xAB);
+            let one_rbtc = U256::from(10u64).pow(U256::from(18));
+            let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+
+            let factory = deploy_init(&factory_runtime(&child_init(clear)));
+            let deploy = rustock_core::Transaction {
+                nonce: 0,
+                gas_price: U256::from(0),
+                gas_limit: U256::from(2_000_000),
+                to: Bytes::new(),
+                value: U256::ZERO,
+                input: Bytes::from(factory),
+                v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+            };
+            let r1 = executor
+                .execute_block(&dummy_header(6_362_186), &[(deploy, sender)], &root, store.clone())
+                .expect("deploy block");
+            assert!(r1.tx_results[0].success, "factory deploy failed");
+            let factory_addr = sender.create(0);
+            let root2 = crate::state::apply_state_changes(
+                &root, store.as_ref(), &r1.state_changes, &r1.markers,
+            );
+            let call = rustock_core::Transaction {
+                nonce: 1,
+                gas_price: U256::from(0),
+                gas_limit: U256::from(2_000_000),
+                to: Bytes::copy_from_slice(factory_addr.as_slice()),
+                value: U256::ZERO,
+                input: Bytes::new(),
+                v: 0, r: U256::ZERO, s: U256::ZERO, cached_rlp: None,
+            };
+            let r2 = executor
+                .execute_block(&dummy_header(6_362_187), &[(call, sender)], &root2, store.clone())
+                .expect("call block");
+            assert!(r2.tx_results[0].success, "factory call (CREATE) failed");
+            r2.tx_results[0].gas_used
+        };
+
+        let gas_clear = run(true);
+        let gas_noclear = run(false);
+        // With the nested-create refund dropped, clearing the slot adds the
+        // 5,000 CLEAR_SSTORE cost and earns NO 15,000 refund, so it costs MORE.
+        // (Were the refund wrongly propagated, gas_clear would be ~10,000 LESS.)
+        assert!(
+            gas_clear > gas_noclear,
+            "nested-create constructor clear must not earn a refund: clear={gas_clear} noclear={gas_noclear}"
+        );
+    }
+
     /// Regression for mainnet #3,631,998 tx[1] (gas used 27,540 vs 27,529, +11,
     /// divergent revert branch): rskj `VM.doEXTCODEHASH` (`getCodeHashStandard`)
     /// keys on TRIE EXISTENCE, not EIP-161 emptiness. An account that exists in
