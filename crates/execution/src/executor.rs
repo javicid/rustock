@@ -734,6 +734,21 @@ fn make_cfg_env(spec_id: SpecId, chain_id: u64, eip3541_active: bool) -> CfgEnv 
         (GasId::sstore_reset_refund(), 0),
         (GasId::sstore_clearing_slot_refund(), 15_000),
     ]);
+    // rskj never adopted EIP-2929 (Berlin warm/cold access lists): SLOAD is a
+    // flat 200, BALANCE/EXTCODE*/CALL-family account access a flat 400/static,
+    // with no cold-access surcharge or warm discount, regardless of fork
+    // (`GasCost` is fork-independent). lovell700+ maps to SHANGHAI (>= BERLIN),
+    // where revm's `host::sload`/`berlin_load_account!`/call helpers add a
+    // cold-access surcharge (cold SLOAD +2000, cold account +2500) read from
+    // these gas params. Zero them so the first access to a slot/account costs
+    // the same as a warm one. These params are 0 for every spec < BERLIN, so
+    // this override is a no-op pre-lovell. First observed at the lovell700
+    // activation block #7,338,024 (two cold SLOADs over-charged 2000 each).
+    cfg.gas_params.override_gas([
+        (GasId::cold_account_additional_cost(), 0),
+        (GasId::cold_storage_additional_cost(), 0),
+        (GasId::cold_storage_cost(), 0),
+    ]);
     cfg.limit_contract_code_size = Some(0x6000);
     // RSKIP544 (Vetiver900): rskj only rejects new contract code starting
     // with 0xEF from vetiver900, while revm bundles EIP-3541 into LONDON+.
@@ -871,6 +886,22 @@ mod tests {
         assert_eq!(ist.gas_params.sstore_static_gas(), 5000);
         assert_eq!(ist.gas_params.sstore_reset_without_cold_load_cost(), 0);
         assert_eq!(ist.gas_params.sstore_set_without_load_cost(), 15_000);
+    }
+
+    /// Regression for lovell700 activation block #7,338,024 (gas used mismatch
+    /// 62749 vs 58749): RSK never adopted EIP-2929 warm/cold access lists, so
+    /// SLOAD/BALANCE/EXTCODE*/CALL have no cold-access surcharge at any fork.
+    /// lovell700 maps to SHANGHAI (>= BERLIN), where revm would add the cold
+    /// surcharge read from these gas params, so make_cfg_env zeros them. They
+    /// are already 0 for every spec < BERLIN, so this is a no-op pre-lovell.
+    #[test]
+    fn test_cfg_env_no_eip2929_cold_access_cost() {
+        for spec in [SpecId::ISTANBUL, SpecId::SHANGHAI] {
+            let cfg = make_cfg_env(spec, 30, false);
+            assert_eq!(cfg.gas_params.cold_account_additional_cost(), 0, "{spec:?}");
+            assert_eq!(cfg.gas_params.cold_storage_additional_cost(), 0, "{spec:?}");
+            assert_eq!(cfg.gas_params.cold_storage_cost(), 0, "{spec:?}");
+        }
     }
 
     /// rskj `TransactionExecutor.create()`: a CREATE *transaction* carrying

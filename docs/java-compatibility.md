@@ -4019,3 +4019,49 @@ tx using the legacy sighash of input 0 (`legacy_sighash_all(&built.tx, 0, redeem
 the now-version-2 tx). Tests: `hardfork::tests::test_rskip376_mainnet`. Verified:
 exec-head #7,069,807 → replay #7,069,808–#7,069,820 all match state and receipts roots
 exactly; both migration txids become 7befa0dd…/d2ca62b5… with the two sig-hash leaves present.
+
+## §68 lovell700 maps to SHANGHAI but RSK adopted none of Berlin/London's EVM gas changes (#7,338,024)
+
+rustock maps lovell700+ to revm's SHANGHAI spec (the closest spec carrying PUSH0,
+the only Shanghai EVM feature RSK uses; MCOPY/TLOAD/TSTORE are installed separately).
+But SHANGHAI implies Berlin and London, and revm's instruction/handler bodies gate
+several gas behaviours on `is_enabled_in(BERLIN)` / `is_enabled_in(LONDON)`. RSK's
+`GasCost` is fork-independent and RSK never adopted EIP-2929, EIP-3529, or EIP-1559,
+so three SHANGHAI behaviours had to be neutralised. All three are no-ops for the
+pre-lovell specs (<= ISTANBUL) already validated, since the underlying gas params are
+0 / the spec branch is not taken there — they only change lovell700+. All three first
+surfaced at the lovell700 activation block #7,338,024.
+
+**(a) EIP-2929 warm/cold access (Berlin).** revm's `host::sload`,
+`berlin_load_account!` (BALANCE/EXTCODE*), and the CALL helpers add a cold-access
+surcharge — read from `GasParams::cold_storage_additional_cost()` /
+`cold_account_additional_cost()` — on the first touch of a slot/account when spec >=
+BERLIN. RSK charges a flat SLOAD=200, account access=400/static at every fork, no
+cold surcharge. `make_cfg_env` now zeros `cold_account_additional_cost`,
+`cold_storage_additional_cost`, and `cold_storage_cost`. (These are 0 for every spec
+< BERLIN, so the override is a no-op pre-lovell.) At #7,338,024 two cold SLOADs were
+each over-charged 2000 gas (cold 2200 vs flat 200), inflating tx[0] gas_used 58749 ->
+62749. Test: `executor::tests::test_cfg_env_no_eip2929_cold_access_cost`.
+
+**(b) EIP-1559 base-fee burn (London).** revm's `post_execution::reward_beneficiary`
+pays the beneficiary only the priority fee (`effective_gas_price - basefee`) at LONDON+,
+burning the base fee. RSK has no EIP-1559: the WHOLE `gasUsed * gasPrice` goes to
+REMASC (the block beneficiary). rustock maps RSK's per-block `minimumGasPrice` to
+revm's `basefee`, so revm burned `minimumGasPrice * gasUsed`. `RskHandler::reward_beneficiary`
+now credits the beneficiary the full `effective_gas_price * (gas.spent() - gas.refunded())`
+in the normal path (no base-fee subtraction); pre-LONDON specs already did exactly
+this, so it is identical pre-lovell. At #7,338,024 REMASC was short by basefee
+23696000 * gasUsed 58749 = 1,392,116,304,000 wei (the only diverging state leaf once
+gas was fixed).
+
+**(c) EIP-3529 refund reduction (London) — latent.** revm's `post_execution::refund`
+caps the gas refund at `gas_used/5` and uses the reduced 4800 SSTORE-clear refund at
+LONDON+. RSK keeps the Frontier `gas_used/2` cap and the 15000 clear refund forever.
+`RskHandler::refund` now always calls `set_final_refund(false)` (the /2 cap); the
+15000 clear refund is already pinned in `make_cfg_env`. This did not bite #7,338,024
+(its tx accrued no refund) but is the same root cause, fixed proactively: a tx whose
+SSTORE-clear refund exceeds gas_used/5 but not gas_used/2 would otherwise be
+over-charged. Pre-LONDON specs already pass `false`, so it is identical pre-lovell.
+
+Verified: exec-head #7,338,023 -> replay #7,338,024–#7,338,200 all match state and
+receipts roots exactly; 554 tests pass.

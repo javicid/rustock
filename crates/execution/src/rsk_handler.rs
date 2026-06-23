@@ -193,15 +193,31 @@ where
         evm: &mut Self::Evm,
         exec_result: &mut FrameResult,
     ) -> Result<(), Self::Error> {
-        if !self.invisible_exception.load(Ordering::Relaxed) {
-            return revm::handler::post_execution::reward_beneficiary(
-                evm.ctx(),
-                exec_result.gas(),
-            )
-            .map_err(From::from);
-        }
         use revm::context_interface::journaled_state::account::JournaledAccountTr;
         use revm::context_interface::{Block, Transaction};
+        if !self.invisible_exception.load(Ordering::Relaxed) {
+            // rskj routes the WHOLE tx fee (gasUsed * gasPrice) to REMASC (the
+            // block beneficiary) — RSK never adopted EIP-1559, so no base fee is
+            // burned. revm's default `reward_beneficiary` subtracts the base fee
+            // from the beneficiary reward at LONDON+; the lovell700+ era maps to
+            // SHANGHAI (>= LONDON), so it would burn `minimumGasPrice * gasUsed`
+            // (rustock maps RSK's minimumGasPrice to revm's basefee). Pay the
+            // full effective-gas-price reward instead. For pre-lovell specs
+            // (< LONDON) revm already does this, so the result is identical
+            // there. First observed at lovell700 #7,338,024 (REMASC short by
+            // basefee 23696000 * gasUsed 58749 = 1392116304000 wei).
+            let ctx = evm.ctx();
+            let basefee = ctx.block().basefee() as u128;
+            let gas = exec_result.gas();
+            let billed_gas = (gas.spent() - gas.refunded() as u64) as u128;
+            let fee = ctx.tx().effective_gas_price(basefee) * billed_gas;
+            let beneficiary = ctx.block().beneficiary();
+            ctx.journal_mut()
+                .load_account_mut(beneficiary)
+                .map_err(|e| ERROR::from(e))?
+                .incr_balance(U256::from(fee));
+            return Ok(());
+        }
         let ctx = evm.ctx();
         let basefee = ctx.block().basefee() as u128;
         let gas_limit = ctx.tx().gas_limit();
@@ -212,6 +228,27 @@ where
             .map_err(|e| ERROR::from(e))?
             .incr_balance(U256::from(fee));
         Ok(())
+    }
+
+    /// rskj never adopted EIP-3529: the gas-refund cap stays at gas_used/2
+    /// forever, and the SSTORE-clear refund stays 15,000 (GasCost is
+    /// fork-independent; TransactionExecutor always refunds `min(futureRefund,
+    /// gasUsed/2)`). revm bundles EIP-3529 into LONDON+ and the lovell700+ era
+    /// maps to SHANGHAI (>= LONDON), so revm's default `refund` would cap at
+    /// gas_used/5. Pin it back to gas_used/2 by always passing `is_london =
+    /// false`. For every pre-lovell spec (<= ISTANBUL) revm already passes
+    /// false, so this is behaviour-identical there and only changes lovell700+.
+    /// First observed at the lovell700 activation block #7,338,024 (a tx with
+    /// SSTORE clears whose 19,687 accrued refund fit under gas_used/2 but was
+    /// wrongly trimmed to gas_used/5, inflating gas_used by 4,000).
+    fn refund(
+        &self,
+        _evm: &mut Self::Evm,
+        exec_result: &mut FrameResult,
+        eip7702_refund: i64,
+    ) {
+        exec_result.gas_mut().record_refund(eip7702_refund);
+        exec_result.gas_mut().set_final_refund(false);
     }
 
     /// The mainnet exec loop with two additions:
