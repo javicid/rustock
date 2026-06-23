@@ -2467,7 +2467,11 @@ fn process_funds_migration<CTX: crate::RskContextTr>(
         };
 
         // createMigrationTransaction: target the full balance, halving on
-        // size overflow (pre-RSKIP376 migrations are version 1).
+        // size overflow. rskj ReleaseTransactionBuilder sets version 2 once
+        // RSKIP201 is active (setDefaultTxConfig), but buildMigrationTransaction
+        // forces it back to version 1 until RSKIP376 — from RSKIP376 (arrowhead600)
+        // on, migration txs are version 2 like every other pegout.
+        let migration_tx_version = if hardfork_cfg.has_rskip376(block_number) { 2 } else { 1 };
         let mut target = balance;
         let built = loop {
             let outputs = [super::release_tx::PegoutOutput {
@@ -2480,7 +2484,7 @@ fn process_funds_migration<CTX: crate::RskContextTr>(
                 &active_script,
                 redeem_for,
                 fee_per_kb,
-                1,
+                migration_tx_version,
             ) {
                 Some(b) => break Some(b),
                 None => {
@@ -2493,6 +2497,16 @@ fn process_funds_migration<CTX: crate::RskContextTr>(
         };
 
         if let Some(built) = built {
+            // RSKIP379: settleReleaseRequest indexes every pegout — migrations
+            // included — by the legacy sighash of its first input
+            // (BridgeSupport.savePegoutTxSigHash, BridgeSupport.java:1322,1381).
+            if hardfork_cfg.has_rskip379(block_number) {
+                let sig_hash = {
+                    let redeem0 = redeem_for(&built.used_utxos[0]);
+                    super::release_tx::legacy_sighash_all(&built.tx, 0, redeem0)
+                };
+                save_pegout_tx_sig_hash(ctx, &sig_hash);
+            }
             // rskj processFundsMigration: post-RSKIP146 the entry carries the
             // updateCollections tx hash and logs release_requested with the
             // migrated amount (sum of the selected UTXO values).

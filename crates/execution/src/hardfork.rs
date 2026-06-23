@@ -436,6 +436,15 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Arrowhead600
     }
 
+    /// RSKIP376 (Arrowhead600): segwit-compatible (P2SH-P2WSH) federations. As a
+    /// side effect it also drops the `buildMigrationTransaction` version override:
+    /// once RSKIP201 set the default release-tx version to 2, only migration txs
+    /// were forced back to version 1; from RSKIP376 on they stay version 2 like
+    /// every other pegout (ReleaseTransactionBuilder.buildMigrationTransaction).
+    pub fn has_rskip376(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Arrowhead600
+    }
+
     /// RSKIP427: the RSKIP185 peg-out event amounts (release_request_received,
     /// release_request_rejected) switch from satoshis to full wei (Lovell700).
     pub fn has_rskip427(&self, block_number: u64) -> bool {
@@ -654,6 +663,19 @@ mod tests {
         let cfg = RskHardforkConfig::mainnet();
         assert!(!cfg.has_rskip271(4_598_499));
         assert!(cfg.has_rskip271(4_598_500));
+    }
+
+    /// RSKIP376 activates at Arrowhead600 (mainnet 6_223_700). Migration txs
+    /// switch from version 1 to version 2 at that boundary (the
+    /// buildMigrationTransaction version override is dropped). First mainnet
+    /// migration after the boundary: #7,069,808 (groundtruth txids d2ca62b5… and
+    /// 7befa0dd… are version 2).
+    #[test]
+    fn test_rskip376_mainnet() {
+        let cfg = RskHardforkConfig::mainnet();
+        assert!(!cfg.has_rskip376(6_223_699));
+        assert!(cfg.has_rskip376(6_223_700));
+        assert!(cfg.has_rskip376(7_069_808));
     }
 
     /// RSKIP185 and RSKIP176 activate at Iris300 (mainnet 3_614_800).

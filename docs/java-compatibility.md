@@ -3984,3 +3984,38 @@ Verified: exec-head #6,677,785 → #6,677,787 replays clean; #6,677,786 tx[2] em
 two events with exact state and receipts roots. (Still-latent post-RSKIP379
 evaluatePegin arms — LEGACY_PEGIN_MULTISIG_SENDER and PEGIN_V1_INVALID_PAYLOAD
 refund/no-refund — remain noted in LESSONS.)
+
+## §67 RSKIP376 makes funds-migration txs version 2, and migrations save the pegout sig-hash (#7,069,808)
+
+Two coupled divergences on the first federation funds migration after Arrowhead600.
+
+**(a) Migration tx version.** `ReleaseTransactionBuilder.setDefaultTxConfig`
+(ReleaseTransactionBuilder.java:195-203) sets the BTC tx version to 2 once RSKIP201
+is active. But `buildMigrationTransaction` (:132-140) forces it back to version 1
+**unless RSKIP376 is active** (`if (!activations.isActive(RSKIP376)) sr.tx.setVersion(BTC_TX_VERSION_1);`).
+So from RSKIP376 (Arrowhead600, mainnet #6,223,700) on, migration txs are version 2
+like every other pegout; before, they alone stayed version 1. Regular batched pegouts
+(`buildBatchedPegouts`) never had the override, so they were already version 2 — only
+the migration path was wrong. The version field is part of the BTC tx preimage, so a
+wrong version produces a wrong unsigned migration txid and forks the
+`releaseTransactionSetWithTxHash` entry.
+
+**(b) Migration sig-hash index.** `migrateFunds` (BridgeSupport.java:1322) routes
+through `settleReleaseRequest`, which calls `savePegoutTxSigHash`
+(BridgeSupport.java:1381) for **every** release — migrations included — under RSKIP379.
+rustock had only wired `save_pegout_tx_sig_hash` into the batched-pegout path (§64), so
+each migration tx left a missing `pegoutTxSigHash-<sigHash>` = 0x01 leaf.
+
+mainnet #7,069,808 (updateCollections, two migration txs of 50 and 17 UTXOs): rustock
+built them as version 1 (txids 0de25d8e… / 615921cd…); rskj built version 2
+(7befa0dd… / d2ca62b5…) — confirmed byte-identical except the 4-byte version field
+(flipping rustock's serialization 01→02 reproduces rskj's exact txids). State **and**
+receipts roots both forked (the set entry plus two absent sig-hash leaves).
+
+**rustock**: `bridge::peg::process_funds_migration` now selects
+`migration_tx_version = if has_rskip376 { 2 } else { 1 }` (new `RskHardforkConfig::has_rskip376`,
+Arrowhead600), and, post-RSKIP379, calls `save_pegout_tx_sig_hash` on the built migration
+tx using the legacy sighash of input 0 (`legacy_sighash_all(&built.tx, 0, redeem0)` over
+the now-version-2 tx). Tests: `hardfork::tests::test_rskip376_mainnet`. Verified:
+exec-head #7,069,807 → replay #7,069,808–#7,069,820 all match state and receipts roots
+exactly; both migration txids become 7befa0dd…/d2ca62b5… with the two sig-hash leaves present.
