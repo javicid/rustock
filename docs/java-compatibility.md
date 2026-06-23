@@ -3952,3 +3952,35 @@ nested-CREATE constructor sets-then-clears a slot must cost MORE than a set-only
 constructor — clearing adds 5000 and earns no 15000 refund; without the fix it
 costs ~10000 less). Verified: exec-head #6,362,185 → #6,362,188 replays clean;
 #6,362,186 tx[3] gas_used = 1,197,343 with exact state and receipts roots.
+
+## §66 RSKIP379 evaluatePegin: an undetermined-sender legacy peg-in is rejected with two events (#6,677,786)
+
+Companion to §63. The RSKIP379 (Arrowhead600) `PegUtils.evaluatePegin` refactor
+also changed how a **legacy (v0) peg-in with an undetermined sender** is handled.
+`PegUtils.evaluateLegacyPegin` (PegUtils.java:247) switches on the sender BTC
+address type; the `default` arm — the sender type could not be determined (no
+`BtcLockSender`) — returns `(PeginProcessAction.NO_REFUND,
+RejectedPeginReason.LEGACY_PEGIN_UNDETERMINED_SENDER)`. `BridgeSupport
+.handleNonRefundablePegin` then emits **two** events and credits/refunds nothing:
+`rejected_pegin(LEGACY_PEGIN_UNDETERMINED_SENDER=3)`, then maps it (protocolVersion 0)
+to `NonRefundablePeginReason.LEGACY_PEGIN_UNDETERMINED_SENDER` and emits
+`unrefundable_pegin(…=1)`. It marks the tx processed only when
+`RSKIP459 && !RSKIP551` (not active at Arrowhead600/631). Pre-RSKIP379 the legacy
+path aborted silently when the sender could not be determined (no events).
+
+mainnet #6,677,786 tx[2]: a `registerBtcTransaction` whose peg-in has an
+undetermined sender. rustock's v0 path returned silently (the `sender is None`
+branch), emitting no events; rskj emitted `rejected_pegin(3)` + `unrefundable_pegin(1)`.
+State matched (no credit/refund/processed-marker either way), so it was a
+receipts-only divergence.
+
+**rustock**: `bridge::peg::register_btc_transaction`'s undetermined-sender branch
+(`let Some(sender) = sender else { … }`) now, post-RSKIP379, emits
+`log_rejected_pegin(…, 3)` + `log_unrefundable_pegin(…, 1)` and marks processed only
+via `should_mark_rejected_pegin_as_processed`. Pre-RSKIP379 behavior (silent abort)
+is unchanged. Test:
+`bridge::events::tests::legacy_pegin_undetermined_sender_reasons_mainnet_6677786`.
+Verified: exec-head #6,677,785 → #6,677,787 replays clean; #6,677,786 tx[2] emits the
+two events with exact state and receipts roots. (Still-latent post-RSKIP379
+evaluatePegin arms — LEGACY_PEGIN_MULTISIG_SENDER and PEGIN_V1_INVALID_PAYLOAD
+refund/no-refund — remain noted in LESSONS.)

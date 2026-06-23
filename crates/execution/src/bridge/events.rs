@@ -808,6 +808,35 @@ mod tests {
         );
     }
 
+    /// Groundtruth from mainnet #6,677,786 tx[2]: a legacy peg-in whose sender
+    /// type cannot be determined is rejected post-RSKIP379 via
+    /// `evaluateLegacyPegin`'s default case (NO_REFUND), emitting BOTH
+    /// `rejected_pegin(RejectedPeginReason.LEGACY_PEGIN_UNDETERMINED_SENDER=3)`
+    /// and `unrefundable_pegin(NonRefundablePeginReason.LEGACY_PEGIN_UNDETERMINED_SENDER=1)`.
+    #[test]
+    fn legacy_pegin_undetermined_sender_reasons_mainnet_6677786() {
+        use alloy_primitives::hex;
+        // rejected_pegin reason 3 = RejectedPeginReason.LEGACY_PEGIN_UNDETERMINED_SENDER.
+        assert_eq!(
+            hex::encode(u256_word(alloy_primitives::U256::from(3u64))),
+            "0000000000000000000000000000000000000000000000000000000000000003"
+        );
+        // unrefundable_pegin reason 1 = NonRefundablePeginReason.LEGACY_PEGIN_UNDETERMINED_SENDER.
+        assert_eq!(
+            hex::encode(u256_word(alloy_primitives::U256::from(1u64))),
+            "0000000000000000000000000000000000000000000000000000000000000001"
+        );
+        // Both events share the same two topic0s as the INVALID_AMOUNT case.
+        assert_eq!(
+            hex::encode(solidity_topic("rejected_pegin(bytes32,int256)")),
+            "708ce1ead20561c5894a93be3fee64b326b2ad6c198f8253e4bb56f1626053d6"
+        );
+        assert_eq!(
+            hex::encode(solidity_topic("unrefundable_pegin(bytes32,int256)")),
+            "35be155c87e408cbbcb753dc12f95fc5a242a29460a3d7189e807e63d7c185a7"
+        );
+    }
+
     /// Groundtruth from the mainnet #6,223,964 tx[1] receipt: an amount-0
     /// (empty-fed-output) peg-in rejected post-RSKIP379 emits both
     /// `rejected_pegin(INVALID_AMOUNT=5)` and `unrefundable_pegin(INVALID_AMOUNT=3)`.

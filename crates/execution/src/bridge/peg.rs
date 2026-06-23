@@ -491,6 +491,21 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     // A non-P2PKH sender before RSKIP143 (txIsProcessable) aborts WITHOUT
     // marking the tx as processed (no BtcLockSender or unsupported type).
     let Some(sender) = sender else {
+        // rskj `PegUtils.evaluateLegacyPegin` default case (PegUtils.java:256):
+        // an undetermined sender type (no BtcLockSender) →
+        // (NO_REFUND, LEGACY_PEGIN_UNDETERMINED_SENDER). Post-RSKIP379
+        // `handleNonRefundablePegin` logs rejected_pegin(LEGACY_PEGIN_UNDETERMINED_SENDER=3)
+        // then unrefundable_pegin(NonRefundablePeginReason.LEGACY_PEGIN_UNDETERMINED_SENDER=1),
+        // and marks the tx processed only when RSKIP459 && !RSKIP551. Pre-379 the
+        // legacy path aborts silently (sender could not be determined).
+        if hardfork_cfg.has_rskip379(rsk_height) {
+            let hash = btc_txid_event_bytes(&btc_tx);
+            super::events::log_rejected_pegin(ctx, &hash, 3);
+            super::events::log_unrefundable_pegin(ctx, &hash, 1);
+            if should_mark_rejected_pegin_as_processed(hardfork_cfg, rsk_height) {
+                set_btc_tx_processed(ctx, &legacy_txid, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
+            }
+        }
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     };
     let rskip143 = hardfork_cfg.has_rskip143(rsk_height);
