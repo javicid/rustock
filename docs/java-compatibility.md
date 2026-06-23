@@ -4119,3 +4119,20 @@ through `settleReleaseRequest`). Tests:
 `bridge::events::tests::pegout_transaction_created_topic_and_varint_mainnet_7338403`.
 Verified: exec-head #7,338,402 → replay #7,338,403–#7,342,000 match state and receipts
 roots exactly; 556 tests pass.
+
+## §71 EIP-3529 also zeroed the SELFDESTRUCT refund — RSK keeps 24000 (#7,388,594)
+
+The third EIP-3529 piece, completing §68(c). EIP-3529 (London) made TWO refund changes
+besides the gas_used/5 cap: it reduced the SSTORE-clear refund (handled in §68 by
+pinning `sstore_clearing_slot_refund` = 15000) AND it **zeroed the SELFDESTRUCT
+refund**. revm sets `selfdestruct_refund` = 24000 by default but `= 0` at LONDON+
+(gas_params.rs). lovell700 maps to SHANGHAI (>= LONDON), so rustock's `rsk_selfdestruct`
+recorded a 0 refund. RSK keeps `GasCost.SUICIDE_REFUND` = 24000 at every fork.
+
+mainnet #7,388,594 tx[1] (a contract-creation tx whose constructor SELFDESTRUCTs):
+rskj gas_used 1,078,721, rustock 1,102,721 (+24000 — exactly the unrefunded
+SELFDESTRUCT). `make_cfg_env` now also pins `GasId::selfdestruct_refund()` = 24000
+alongside the SSTORE refund pins. Equals the pre-London default, so a no-op pre-lovell.
+Test: `executor::tests::test_cfg_env_selfdestruct_refund_kept`. Verified: exec-head
+#7,388,593 → replay #7,388,594–#7,390,000 match state and receipts roots exactly; 557
+tests pass.

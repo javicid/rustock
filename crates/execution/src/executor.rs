@@ -737,6 +737,11 @@ fn make_cfg_env(spec_id: SpecId, chain_id: u64, eip3541_active: bool) -> CfgEnv 
         (GasId::sstore_set_refund(), 15_000),
         (GasId::sstore_reset_refund(), 0),
         (GasId::sstore_clearing_slot_refund(), 15_000),
+        // rskj `GasCost.SUICIDE_REFUND` = 24000 at every fork. EIP-3529 (London)
+        // zeroed the SELFDESTRUCT refund, and lovell700 maps to SHANGHAI
+        // (>= LONDON), so revm's param would be 0 — pin it back to 24000. This
+        // equals the pre-London default, so the override is a no-op pre-lovell.
+        (GasId::selfdestruct_refund(), 24_000),
     ]);
     // rskj never adopted EIP-2929 (Berlin warm/cold access lists): SLOAD is a
     // flat 200, BALANCE/EXTCODE*/CALL-family account access a flat 400/static,
@@ -905,6 +910,19 @@ mod tests {
             assert_eq!(cfg.gas_params.cold_account_additional_cost(), 0, "{spec:?}");
             assert_eq!(cfg.gas_params.cold_storage_additional_cost(), 0, "{spec:?}");
             assert_eq!(cfg.gas_params.cold_storage_cost(), 0, "{spec:?}");
+        }
+    }
+
+    /// Regression for #7,388,594 (gas used mismatch 2663446 vs 2639446 — a
+    /// contract-creation tx whose SELFDESTRUCT earned no refund). RSK keeps the
+    /// 24000 SELFDESTRUCT refund (GasCost.SUICIDE_REFUND) at every fork; EIP-3529
+    /// (London) zeroed it and lovell700 maps to SHANGHAI (>= LONDON), so it must
+    /// be pinned back. Equals the pre-London default, so a no-op pre-lovell.
+    #[test]
+    fn test_cfg_env_selfdestruct_refund_kept() {
+        for spec in [SpecId::ISTANBUL, SpecId::SHANGHAI] {
+            let cfg = make_cfg_env(spec, 30, false);
+            assert_eq!(cfg.gas_params.selfdestruct_refund(), 24_000, "{spec:?}");
         }
     }
 
