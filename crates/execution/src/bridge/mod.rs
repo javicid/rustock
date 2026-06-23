@@ -637,6 +637,7 @@ pub fn execute_bridge<CTX: crate::RskContextTr>(
     caller: alloy_primitives::Address,
     call_depth: usize,
     call_kind: BridgeCallKind,
+    call_value: U256,
 ) -> Result<PrecompileOutput, PrecompileError> {
     // Empty input → releaseBtc (legacy behavior matching rskj)
     if input.is_empty() {
@@ -644,7 +645,7 @@ pub fn execute_bridge<CTX: crate::RskContextTr>(
         if gas_limit < gas_cost {
             return Err(insufficient_gas_marker(ctx, gas_limit));
         }
-        return execute_method(ctx, "releaseBtc", &[], gas_cost, config, block_store, use_v2, hardfork_cfg, tx_ctx, caller, call_depth);
+        return execute_method(ctx, "releaseBtc", &[], gas_cost, config, block_store, use_v2, hardfork_cfg, tx_ctx, caller, call_depth, call_value);
     }
 
     // rskj Bridge.parseData: 1-3 byte data, an unknown selector, or a method
@@ -739,7 +740,7 @@ pub fn execute_bridge<CTX: crate::RskContextTr>(
         return Err(marker_with_gas(INTERNAL_BRIDGE_THROW_MARKER, gas_cost));
     }
 
-    let result = execute_method(ctx, method.name, args, gas_cost, config, block_store, use_v2, hardfork_cfg, tx_ctx, caller, call_depth);
+    let result = execute_method(ctx, method.name, args, gas_cost, config, block_store, use_v2, hardfork_cfg, tx_ctx, caller, call_depth, call_value);
     // rskj `Bridge.execute` wraps any method `RuntimeException` in a
     // `VMException`, which `TransactionExecutor.call` / `Program` then handle
     // by spending only `requiredGas` (the `getGasForData` cost) — NOT all the
@@ -866,6 +867,7 @@ fn execute_method<CTX: crate::RskContextTr>(
     tx_ctx: &BridgeTxContext,
     caller: alloy_primitives::Address,
     call_depth: usize,
+    call_value: U256,
 ) -> Result<PrecompileOutput, PrecompileError> {
 
     // rskj `Bridge.activeAndRetiringFederationOnly` authorization. The executor
@@ -917,7 +919,7 @@ fn execute_method<CTX: crate::RskContextTr>(
         "registerFastBridgeBtcTransaction" => peg::register_fast_bridge_btc_transaction(ctx, args, gas_cost, config, hardfork_cfg, tx_ctx, caller, call_depth),
 
         // Phase 5: Peg-out
-        "releaseBtc" => peg::release_btc(ctx, gas_cost, config, hardfork_cfg, tx_ctx),
+        "releaseBtc" => peg::release_btc(ctx, gas_cost, config, hardfork_cfg, tx_ctx, caller, call_depth, call_value),
         "updateCollections" => peg::update_collections(ctx, gas_cost, config, hardfork_cfg, tx_ctx),
         "addSignature" => peg::add_signature(ctx, args, gas_cost, config, hardfork_cfg),
 

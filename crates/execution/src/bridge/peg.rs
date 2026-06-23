@@ -1626,9 +1626,16 @@ pub fn release_btc<CTX: crate::RskContextTr>(
     config: &BridgeConstants,
     hardfork_cfg: &RskHardforkConfig,
     tx_ctx: &BridgeTxContext,
+    caller: alloy_primitives::Address,
+    call_depth: usize,
+    call_value_wei: U256,
 ) -> Result<PrecompileOutput, PrecompileError> {
     let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
-    let call_value_wei = revm::context_interface::Transaction::value(ctx.tx());
+    // rskj `BridgeSupport.releaseBtc` reads `rskTx.getValue()` — the value of
+    // THIS call (the CALL's endowment, `msg.getEndowment()` for an internal
+    // call), NOT the top-level transaction's value. For a contract that forwards
+    // its own RBTC to the Bridge, the endowment differs from the outer tx value
+    // (mainnet #6,223,939 tx[0]: tx value 0, but the contract sends 10000 sat).
 
     // NOTE: do NOT early-return on a zero call value. rskj's
     // `BridgeSupport.releaseBtc` always forwards to `requestRelease`, which
@@ -1641,6 +1648,36 @@ pub fn release_btc<CTX: crate::RskContextTr>(
     let satoshis_per_wei = U256::from(10_000_000_000u64);
     let amount_satoshis_u256 = call_value_wei / satoshis_per_wei;
     let amount_satoshis = amount_satoshis_u256.to::<u64>();
+
+    // rskj `BridgeSupport.releaseBtc` (BridgeSupport.java:891) rejects a peg-out
+    // requested by a CONTRACT before any min-value check, because a BTC address
+    // cannot be derived from a contract. `BridgeUtils.isContractTx` is true when
+    // the Bridge is reached via a CALL from contract code (an InternalTransaction),
+    // i.e. at journal depth > 1; a top-level transaction to the Bridge is depth 1.
+    // The reject sender is the IMMEDIATE caller (`rskTx.getSender()` of the
+    // InternalTransaction = `getOwnerRskAddress()` = the calling contract), and
+    // the value is NOT refunded. Post-RSKIP185 it emits `release_request_rejected`
+    // with CALLER_CONTRACT(2); pre-RSKIP185 it throws OutOfGas (consume all gas).
+    // (mainnet #6,223,900..6,223,933 tx[2]: contract 0x4309efcc CALLs releaseBtc →
+    // CALLER_CONTRACT with sender = the contract, no refund.)
+    if call_depth > 1 {
+        if hardfork_cfg.has_rskip185(block_number) {
+            let event_amount = if hardfork_cfg.has_rskip427(block_number) {
+                call_value_wei
+            } else {
+                U256::from(amount_satoshis)
+            };
+            super::events::log_release_request_rejected(
+                ctx,
+                caller,
+                event_amount,
+                2, // RejectedPegoutReason.CALLER_CONTRACT
+            );
+            return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
+        }
+        // Pre-RSKIP185: rskj throws Program.OutOfGasException (no event, no refund).
+        return Err(PrecompileError::OutOfGas);
+    }
 
     // rskj BridgeSupport.requestRelease: post-RSKIP219 the minimum is INCLUSIVE
     // and is the max of `minimumPegoutTxValue` and a fee-based estimate; the
@@ -5095,8 +5132,6 @@ mod tests {
         assert!(parse_bytes_array(&args, 0).is_empty());
 
         // A within-range but too-large count (> 1000 guard) is also rejected.
-        let mut big = [0u8; 32];
-        big[31] = 0xFF; // 255 is fine; bump to exceed 1000:
         let mut over = [0u8; 32];
         over[30] = 0x10; // 0x1000 = 4096 > 1000
         assert!(parse_bytes_array(&over, 0).is_empty());

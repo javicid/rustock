@@ -3775,3 +3775,50 @@ CALLs in `precompiles.rs`); a future `eth_call`-to-Bridge path would need to mar
 the call local. Test: `bridge::tests::local_call_gating_matches_rskj`. Verified by
 replaying #6,223,900: tx[4] status=true gasUsed=34304, state and receipts roots
 match; exec-head #6,223,703 → #6,223,910 replays clean.
+
+## §62 Bridge releaseBtc: contract caller → CALLER_CONTRACT, and value is the CALL endowment (#6,223,933, #6,223,939)
+
+`BridgeSupport.releaseBtc(Transaction rskTx)` (BridgeSupport.java:882) is the
+Bridge's peg-out entry point (reached by an empty-data call or the `releaseBtc()`
+selector, parseData → `BridgeMethods.RELEASE_BTC`). It has two implementation
+quirks that make consensus depend on the *caller kind* and the *call endowment*,
+not on the top-level transaction:
+
+1. **Contract callers are rejected (CALLER_CONTRACT).** Before any min-value
+   logic, `releaseBtc` checks `BridgeUtils.isContractTx(rskTx)` (BridgeSupport.java:891).
+   `isContractTx` is `rskTx.getClass() == InternalTransaction.class` (BridgeUtils.java:434):
+   true exactly when the Bridge was reached via a CALL from contract code, since
+   `Program.callToPrecompiledAddress` wraps every Bridge invocation in a freshly
+   constructed `InternalTransaction` (Program.java:1530, sender =
+   `getOwnerRskAddress()` = the *immediate calling contract*), whereas a top-level
+   transaction to the Bridge keeps the real signed `Transaction`. A BTC address
+   cannot be derived from a contract, so:
+   - post-RSKIP185 (iris300): `emitRejectEvent(pegoutValueInWeis, senderAddress,
+     CALLER_CONTRACT)` — emits `release_request_rejected(sender, amount, reason=2)`
+     and **returns without refunding** (note: only the LOW_AMOUNT / FEE_ABOVE_VALUE
+     path in `requestRelease` refunds via `refundAndEmitRejectEvent`; the
+     CALLER_CONTRACT path does **not**);
+   - pre-RSKIP185: throws `Program.OutOfGasException` (consume all gas).
+   The reject `senderAddress` is `rskTx.getSender()` = the immediate caller (the
+   contract), **not** the tx origin. `RejectedPegoutReason`: LOW_AMOUNT=1,
+   CALLER_CONTRACT=2, FEE_ABOVE_VALUE=3 (RejectedPegoutReason.java).
+
+2. **The peg-out value is the CALL's endowment, not the tx value.** `releaseBtc`
+   reads `rskTx.getValue()`. For an internal call that is `msg.getEndowment()` —
+   the RBTC the calling contract forwarded to the Bridge in *this* CALL — which
+   can differ from the outer transaction's value. The reject/queue amount and the
+   satoshi conversion all use this per-call value.
+
+**rustock**: `bridge::peg::release_btc` (crates/execution/src/bridge/peg.rs) now (1)
+rejects with CALLER_CONTRACT when the Bridge is reached at journal depth > 1
+(rskj's `isContractTx`; `call_depth = ctx.journal().depth()`, 1 = top-level), using
+the immediate `caller` as the event sender and **not** refunding; and (2) takes the
+actual call value (`CallInputs::call_value()`, threaded `run_bridge → execute_bridge
+→ execute_method → release_btc`) instead of the top-level `ctx.tx().value()`. The
+top-level direct-call path (executor.rs) passes `tx.value` and depth 1, so
+depth-1 behavior is unchanged. Test:
+`bridge::events::tests::solidity_release_request_rejected_caller_contract_mainnet_6223933`.
+Verified: #6,223,933 tx[2] (tx value = endowment = 10000 sat) and #6,223,939 tx[0]
+(tx value 0, endowment 10000 sat) both reject with CALLER_CONTRACT(2), sender =
+contract 0x4309efcc, no refund; exec-head #6,223,932 → #6,223,950 replays clean
+with exact state and receipts roots.

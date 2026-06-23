@@ -652,6 +652,44 @@ mod tests {
         );
     }
 
+    /// Groundtruth from mainnet #6,223,933 tx[2] and #6,223,939 tx[0] (snapshot
+    /// receipts): a CONTRACT (0x4309efcc) CALLs the Bridge's `releaseBtc`, which
+    /// rskj rejects with CALLER_CONTRACT(**2**) — a BTC address cannot be derived
+    /// from a contract (`BridgeSupport.releaseBtc`, BridgeSupport.java:891). Two
+    /// consensus-critical details rustock had wrong:
+    ///   1. the reject SENDER (topic1) is the IMMEDIATE caller (the contract,
+    ///      `rskTx.getSender()` of the InternalTransaction = `getOwnerRskAddress`),
+    ///      NOT the tx origin;
+    ///   2. the amount is the CALL's endowment in satoshis (10000 = 1e14 wei the
+    ///      contract forwards), NOT the top-level tx value (which was 0 at
+    ///      #6,223,939) — and the value is NOT refunded.
+    /// rustock previously fell through to LOW_AMOUNT(1) with the origin as sender
+    /// and a refund — a state + receipts fork.
+    #[test]
+    fn solidity_release_request_rejected_caller_contract_mainnet_6223933() {
+        use alloy_primitives::hex;
+        // The reject sender topic is the calling contract, not the tx origin.
+        let contract: Address = "0x4309efcc0413e2b427ba7a2699278202a9f16c60".parse().unwrap();
+        assert_eq!(
+            hex::encode(address_word(contract)),
+            "0000000000000000000000004309efcc0413e2b427ba7a2699278202a9f16c60"
+        );
+        // CALLER_CONTRACT = 2 (distinct from LOW_AMOUNT = 1). Pre-RSKIP427 the
+        // amount is the satoshi endowment (#6,223,933: 10000 sat).
+        let data = release_request_rejected_data(alloy_primitives::U256::from(10_000u64), 2);
+        assert_eq!(
+            hex::encode(&data),
+            "0000000000000000000000000000000000000000000000000000000000002710\
+             0000000000000000000000000000000000000000000000000000000000000002"
+        );
+        // #6,223,939: tx value 0 but endowment 10000 sat → same amount word;
+        // the CALLER_CONTRACT reason must not collapse to a zero-amount LOW_AMOUNT.
+        assert_ne!(
+            release_request_rejected_data(alloy_primitives::U256::from(10_000u64), 2),
+            release_request_rejected_data(alloy_primitives::U256::ZERO, 1),
+        );
+    }
+
     /// Post-RSKIP427 (lovell700) the `release_request_rejected` amount is the
     /// full wei value, not satoshis. 10,000 sat * 1e10 = 1e14 wei =
     /// 0x5af3107a4000. Signature is unchanged.

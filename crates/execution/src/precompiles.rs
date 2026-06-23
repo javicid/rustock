@@ -1074,7 +1074,7 @@ impl RskPrecompileProvider {
         } else if *addr == BLOCK_HEADER_ADDR {
             self.run_block_header(context, &input_bytes, inputs.gas_limit)
         } else if *addr == BRIDGE_ADDR {
-            self.run_bridge(context, &input_bytes, inputs.gas_limit, inputs.caller, inputs.scheme)
+            self.run_bridge(context, &input_bytes, inputs.gas_limit, inputs.caller, inputs.scheme, inputs.call_value())
         } else {
             self.run_remasc(context, &input_bytes, inputs.gas_limit)
         };
@@ -1377,6 +1377,7 @@ impl RskPrecompileProvider {
         gas_limit: u64,
         caller: Address,
         scheme: revm::interpreter::CallScheme,
+        call_value: revm::primitives::U256,
     ) -> Result<PrecompileOutput, PrecompileError> {
         use revm::context_interface::JournalTr;
         use revm::interpreter::CallScheme;
@@ -1408,6 +1409,7 @@ impl RskPrecompileProvider {
             caller,
             call_depth,
             call_kind,
+            call_value,
         )
     }
 
