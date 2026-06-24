@@ -36,6 +36,9 @@ const CALL_STATIC_GAS: u64 = 700;
 /// rskj `GasCost.EXT_CODE_SIZE` (== revm's pre-Berlin EXTCODESIZE), EIP-150.
 const EXT_CODE_SIZE_GAS: u64 = 700;
 
+/// rskj `GasCost.EXT_CODE_COPY` (== revm's pre-Berlin EXTCODECOPY base), EIP-150.
+const EXT_CODE_COPY_GAS: u64 = 700;
+
 /// rskj `GasCost.SLOAD`: fork-independent (RSK never took EIP-1884's 800).
 const SLOAD_GAS: u64 = 200;
 
@@ -198,6 +201,21 @@ pub fn install<WIRE, HOST>(
     instructions.insert_instruction(
         opcode::EXTCODESIZE,
         Instruction::new(rsk_extcodesize::<WIRE, HOST>, EXT_CODE_SIZE_GAS),
+    );
+    // rskj `GasCost.EXT_CODE_COPY` is a flat 700 at every fork. revm's stock
+    // EXTCODECOPY body charges only the per-word copy cost (3/word) + memory
+    // expansion + a cold-account surcharge (pinned to 0 in make_cfg_env); its
+    // 700 base normally comes from the instruction-table static, which EIP-2929
+    // drops to 0 at BERLIN+. lovell700 maps to SHANGHAI (≥Berlin), so the stock
+    // static would be 0 and EXTCODECOPY would undercharge by 700. Reinstall the
+    // body with an explicit static 700 so it matches rskj at every fork.
+    // (Mainnet #7,515,160.)
+    instructions.insert_instruction(
+        opcode::EXTCODECOPY,
+        Instruction::new(
+            revm::interpreter::instructions::host::extcodecopy::<WIRE, HOST>,
+            EXT_CODE_COPY_GAS,
+        ),
     );
     instructions.insert_instruction(
         opcode::CALL,

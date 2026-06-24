@@ -883,6 +883,66 @@ mod tests {
         );
     }
 
+    /// Regression for mainnet #7,515,160 (gas used mismatch header=1976590 vs
+    /// computed=1975990). rskj `GasCost.EXT_CODE_COPY` is a flat 700 at every
+    /// fork. lovell700 maps to revm's SHANGHAI (>= BERLIN), where revm's stock
+    /// instruction-table static for EXTCODECOPY is WARM_STORAGE_READ_COST (and
+    /// the cold-account surcharge is pinned to 0 in make_cfg_env), so without an
+    /// explicit override EXTCODECOPY would undercharge by 600. `install` pins it
+    /// back to 700. The contract runs `EXTCODECOPY(self, 0, 0, 0)` (length 0 →
+    /// no copy/memory-expansion cost), isolating the flat base:
+    ///   21,000 intrinsic + 9 (3 PUSH1) + 3 (PUSH20) + 700 EXTCODECOPY = 21,712.
+    #[test]
+    fn test_extcodecopy_flat_700_at_lovell700() {
+        assert_eq!(RskHardforkConfig::mainnet().spec_id(7_338_024), SpecId::SHANGHAI);
+
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = TrieNode::empty();
+        let sender = Address::repeat_byte(0xAA);
+        let contract = Address::repeat_byte(0xCC);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+
+        let root = put_account(&root, store.as_ref(), &sender, 0, one_rbtc);
+        let root = put_account(&root, store.as_ref(), &contract, 1, U256::from(1_000));
+        // PUSH1 0 (length) PUSH1 0 (codeOffset) PUSH1 0 (destOffset)
+        // PUSH20 contract  EXTCODECOPY  STOP
+        let mut code = vec![0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x73];
+        code.extend_from_slice(contract.as_slice());
+        code.extend_from_slice(&[0x3c, 0x00]); // EXTCODECOPY, STOP
+        let code_key_bytes = rustock_trie::code_key(&contract);
+        let root = root.put(
+            &TrieKeySlice::from_key(&code_key_bytes),
+            &code,
+            store.as_ref(),
+        );
+
+        let block_store =
+            Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let header = dummy_header(7_338_024);
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::from(0),
+            gas_limit: U256::from(600_000),
+            to: Bytes::copy_from_slice(contract.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::new(),
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+            cached_rlp: None,
+        };
+
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        let result = executor
+            .execute_tx(&header, &tx, sender, &root, store)
+            .expect("execution succeeds");
+        assert!(result.success);
+        assert_eq!(
+            result.gas_used, 21_712,
+            "EXTCODECOPY must charge the flat rskj base of 700 at lovell700/SHANGHAI"
+        );
+    }
+
     /// Regression for mainnet block #1713 (gas used mismatch 26656 vs 24556):
     /// cfg.spec alone leaves the latest-fork gas table in place; the params
     /// must be derived per spec. RSK uses Petersburg-style SSTORE metering at

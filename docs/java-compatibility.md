@@ -4155,3 +4155,31 @@ it is 0 for specs < BERLIN, so this is a no-op pre-lovell. Test extends
 `executor::tests::test_cfg_env_no_eip2929_cold_access_cost` (asserts
 `selfdestruct_cold_cost() == 0`). Verified: exec-head #7,403,648 → replay
 #7,403,649–#7,408,000 match state and receipts roots exactly; 557 tests pass.
+
+## §73 EIP-2929 dropped EXTCODECOPY's flat base — re-pin it to 700 (#7,515,160)
+
+Sibling to §72, but on the *static* side rather than gas_params. rskj
+`GasCost.EXT_CODE_COPY` is a flat **700** at every fork (EIP-150 TANGERINE,
+never repriced). revm builds the EXTCODECOPY base from its
+instruction-table static gas, which `instruction_table_gas_changes_spec`
+(revm-interpreter-34.0.0/src/instructions.rs:101,122) sets to 700 at
+TANGERINE but **drops to `WARM_STORAGE_READ_COST` at BERLIN** — the remainder
+moving into a cold-account surcharge that EIP-2929 charges separately. lovell700
+maps to SHANGHAI (≥ BERLIN), so revm's stock EXTCODECOPY static became
+`WARM_STORAGE_READ_COST` (100) and, with the cold surcharge pinned to 0 by §72,
+EXTCODECOPY undercharged by 600 (700 − 100). Unlike SLOAD/BALANCE/EXTCODESIZE/CALL
+(all explicitly re-installed in `rsk_instructions::install`), EXTCODECOPY had no
+override, so it inherited the spec table.
+
+mainnet #7,515,160 tx[0] (a CREATE/CREATE2 sequence; the deployed contract at
+`0x00000a96386d6ddea78a246abd914e59386aa688` runs EXTCODECOPY at pc 0x1b): header
+gas 1,976,590 vs computed 1,975,990 (−600). `rsk_instructions::install` now
+re-installs `opcode::EXTCODECOPY` with revm's stock `host::extcodecopy` body and
+an explicit static gas of 700 (`EXT_CODE_COPY_GAS`). The body still adds the
+per-word copy cost (3/word) + memory-expansion + cold-account surcharge (0), so
+total = 700 + copy + memexp = rskj's `EXT_CODE_COPY`. Pre-Berlin the stock static
+was already 700, so this is behavior-preserving there too. Test
+`executor::tests::test_extcodecopy_flat_700_at_lovell700` (EXTCODECOPY(self,0,0,0)
+at #7,338,024 = 21,712, isolating the 700 base). Verified: exec-head #7,515,159 →
+replay #7,515,160 + #7,515,161/200, #7,516,000, #7,520,000 match state and receipts
+roots exactly; 558 tests pass.
