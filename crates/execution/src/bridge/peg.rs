@@ -2652,18 +2652,27 @@ fn process_svp_fund_transaction_unsigned<CTX: crate::RskContextTr>(
     });
     store_pegout_confirmation_set(ctx, &waiting, use_tx_hash);
 
-    // savePegoutTxSigHash (RSKIP379): index by the legacy sighash of input 0.
-    // rskj `BitcoinUtils.getFirstInputSigHash` extracts the redeem from the
-    // first input's scriptSig, so a flyover-resolved input uses its flyover
-    // redeem — match that rather than assuming the plain active redeem.
+    // savePegoutTxSigHash (RSKIP379): index by the first-input sighash. rskj
+    // `BitcoinUtils.extractRedeemScriptFromInput` reads the redeem from the
+    // witness (last item) for a segwit (P2SH-P2WSH) input and from the scriptSig
+    // otherwise; `first_input_sig_hash` then takes the segwit-serialized
+    // preimage when the fund tx is segwit (§73) and the plain legacy sighash
+    // otherwise. A segwit active federation makes both apply here.
     if hardfork_cfg.has_rskip379(block_number) {
         let redeem0 = built
             .tx
             .input
             .first()
-            .and_then(|i| super::release_tx::extract_redeem_script(i.script_sig.as_bytes()))
+            .and_then(|i| {
+                if !i.witness.is_empty() {
+                    i.witness.last().map(|r| r.to_vec())
+                } else {
+                    super::release_tx::extract_redeem_script(i.script_sig.as_bytes())
+                }
+            })
             .unwrap_or_else(|| active_redeem.clone());
-        let sig_hash = super::release_tx::legacy_sighash_all(&built.tx, 0, &redeem0);
+        let value0 = built.used_utxos.first().map(|u| u.value_satoshis).unwrap_or(0);
+        let sig_hash = first_input_sig_hash(&built.tx, &redeem0, value0);
         save_pegout_tx_sig_hash(ctx, &sig_hash);
     }
 
@@ -3006,10 +3015,16 @@ fn build_svp_fund_transaction<CTX: crate::RskContextTr>(
     let flyover_script =
         p2sh_output_script(&federation_output_hash160(&flyover_redeem, proposed_format));
 
-    // Active federation: spending wallet + change address.
+    // Active federation: spending wallet + change address. The change goes back
+    // to the active federation's own address, which for a segwit (P2SH-P2WSH,
+    // format ≥ 4000) federation is the witness-program hash, not the plain
+    // redeem hash; the fund tx's inputs/fee are segwit-weighted to match.
     let (_active_keys, active_redeem) =
         active_federation_keys_and_redeem(ctx, config, hardfork_cfg, block_number);
-    let change_script = p2sh_output_script(&redeem_script_hash160(&active_redeem));
+    let active_format = active_federation_format(ctx, config, hardfork_cfg, block_number);
+    let is_segwit = active_format >= 4000;
+    let change_script =
+        p2sh_output_script(&federation_output_hash160(&active_redeem, active_format));
 
     let active_utxo_key = active_federation_utxo_key(ctx, config, hardfork_cfg, block_number);
     let available = load_utxos_at(ctx, active_utxo_key);
@@ -3044,6 +3059,7 @@ fn build_svp_fund_transaction<CTX: crate::RskContextTr>(
         redeem_for,
         fee_per_kb,
         2,
+        is_segwit,
     )
 }
 

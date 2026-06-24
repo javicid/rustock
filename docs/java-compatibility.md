@@ -4156,6 +4156,37 @@ it is 0 for specs < BERLIN, so this is a no-op pre-lovell. Test extends
 `selfdestruct_cold_cost() == 0`). Verified: exec-head #7,403,648 → replay
 #7,403,649–#7,408,000 match state and receipts roots exactly; 557 tests pass.
 
+## §89 RSKIP419 SVP fund tx for a SEGWIT active federation (#8,517,969)
+
+The RSKIP419 SVP fund transaction (`ReleaseTransactionBuilder.buildSvpFundTransaction`,
+`Wallet.completeTx` with `recipientsPayFees=false`) spends the **active** federation's
+UTXOs, pays two fixed outputs (the proposed federation P2SH and its flyover P2SH), and
+sends the change back to the active federation's own address. At the reed800 SVP
+(#8,052,200) the active federation was still pre-segwit, so a legacy build was correct.
+A later powpeg rotation (#8,517,969) runs the SVP while the active federation is itself
+**P2SH-P2WSH (format ≥ 4000)**, which makes three things segwit-dependent that rustock's
+`complete_recipients_dont_pay_fees_tx` / `build_svp_fund_transaction` still did the legacy
+way:
+
+1. **Change address** — must be `federation_output_hash160(activeRedeem, 4000)` (the
+   witness-program hash, `OP_HASH160 hash160(0x0020||sha256(redeem)) OP_EQUAL`), not the
+   plain `hash160(redeem)`. rustock sent change to the legacy P2SH.
+2. **Fee / size** — bitcoinj `calculateTxSize` weights a segwit-compatible send: `baseSize
+   = serialize(emptyScriptSigTx) + inputs*36`, `vsize = (baseSize + signing + 3*baseSize)/4`.
+   rustock used the legacy `baseSize + signing`, charging a larger fee (less change).
+3. **Input placeholders** — segwit inputs carry the witness-program scriptSig + base
+   witness, not the legacy `placeholder_scriptsig`; this changes the serialized fund tx
+   bytes stored in `releaseTransactionSet`.
+4. **`savePegoutTxSigHash` (RSKIP379)** — the redeem for input 0 comes from the **witness**
+   (last item) for a segwit input, and `getSigHashForPegoutIndex` is taken over the
+   segwit serialization (§73), not `legacy_sighash_all` over a scriptSig-extracted redeem.
+
+rustock now mirrors `complete_pegout_tx`'s `is_segwit` handling in
+`complete_recipients_dont_pay_fees_tx`, derives the change script and `is_segwit` from
+the active federation format in `build_svp_fund_transaction`, and computes the fund tx's
+sighash via `first_input_sig_hash` with the witness-borne redeem. Verified: replay
+#8,517,969 matches state+receipts roots exactly; 568 tests pass.
+
 ## §88 Bridge `byte[]` returns ABI-encode even when empty — rskj's 96-byte empty `bytes` (#8,417,579)
 
 `Bridge.execute` always ABI-encodes a method's `byte[]` result via

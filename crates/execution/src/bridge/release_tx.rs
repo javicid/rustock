@@ -353,6 +353,7 @@ pub fn complete_recipients_dont_pay_fees_tx<'r, F>(
     redeem_for: F,
     fee_per_kb: u64,
     version: i32,
+    is_segwit: bool,
 ) -> Option<BuiltPegout>
 where
     F: Fn(&BridgeUtxo) -> &'r [u8],
@@ -430,20 +431,36 @@ where
             output: tx_outputs,
         };
 
-        let base_size = bitcoin::consensus::serialize(&tx).len();
+        // calculateTxSize (bitcoinj Wallet), segwit-weighted exactly as in
+        // `complete_pegout_tx`: a segwit-compatible (P2SH-P2WSH, format ≥ 4000)
+        // active federation adds 36 base bytes per input and the vsize is
+        // `(baseSize + signing + 3*baseSize) / 4`.
+        let base_size = bitcoin::consensus::serialize(&tx).len()
+            + if is_segwit { selected.len() * 36 } else { 0 };
         let signing: usize = selected
             .iter()
             .map(|(_, r)| redeem_script_threshold(r) * SIG_SIZE + r.len())
             .sum();
-        let size = base_size + signing;
+        let size = if is_segwit {
+            (base_size + signing + 3 * base_size) / 4
+        } else {
+            base_size + signing
+        };
 
         let fee_rate = fee_per_kb.max(REFERENCE_DEFAULT_MIN_TX_FEE);
         let fee_needed = fee_rate * size as u64 / 1000;
 
         if fee >= fee_needed {
             for (input, (_, redeem)) in tx.input.iter_mut().zip(&selected) {
-                let scriptsig = placeholder_scriptsig(redeem, redeem_script_threshold(redeem));
-                input.script_sig = ScriptBuf::from_bytes(scriptsig);
+                let threshold = redeem_script_threshold(redeem);
+                if is_segwit {
+                    let (script_sig, witness) = segwit_base_input(redeem, threshold);
+                    input.script_sig = script_sig;
+                    input.witness = witness;
+                } else {
+                    input.script_sig =
+                        ScriptBuf::from_bytes(placeholder_scriptsig(redeem, threshold));
+                }
             }
             if bitcoin::consensus::serialize(&tx).len() > MAX_STANDARD_TX_SIZE {
                 return None;
@@ -1288,6 +1305,7 @@ mod tests {
             |_| redeem.as_slice(),
             5000,
             2,
+            false,
         )
         .expect("build");
         let tx = &built.tx;
@@ -1310,6 +1328,40 @@ mod tests {
                 + tx.input.len() * (threshold * SIG_SIZE + redeem.len())
         };
         assert_eq!(fee, 5000 * size_estimate as u64 / 1000);
+    }
+
+    /// SVP fund tx spending a segwit (P2SH-P2WSH) active federation: inputs
+    /// carry the witness-program scriptSig + base witness (not a legacy
+    /// placeholder scriptSig), and the vsize-weighted fee is strictly smaller
+    /// than the legacy build. Mainnet #8,517,969 forked because rustock built
+    /// this fund tx as legacy (wrong change address + higher fee).
+    #[test]
+    fn recipients_dont_pay_fees_segwit_uses_witness_and_smaller_fee() {
+        let utxos = vec![utxo(1, 0, 255_336_759_550)];
+        let redeem = erp_redeem(2, 3);
+        let outputs = [
+            PegoutOutput { script: p2sh(7), amount_satoshis: 800_000 },
+            PegoutOutput { script: p2sh(9), amount_satoshis: 800_000 },
+        ];
+        let build = |seg| {
+            complete_recipients_dont_pay_fees_tx(
+                &utxos, &outputs, &p2sh(8), |_| redeem.as_slice(), 5000, 2, seg,
+            )
+            .expect("build")
+        };
+        let legacy = build(false);
+        let segwit = build(true);
+
+        // Segwit input: witness-program push scriptSig + non-empty base witness.
+        assert!(!segwit.tx.input[0].witness.is_empty());
+        assert!(legacy.tx.input[0].witness.is_empty());
+        assert_ne!(segwit.tx.input[0].script_sig, legacy.tx.input[0].script_sig);
+
+        // The change output (index 2) absorbs the fee; a smaller (vsize) fee
+        // leaves MORE change.
+        let seg_change = segwit.tx.output[2].value.to_sat();
+        let leg_change = legacy.tx.output[2].value.to_sat();
+        assert!(seg_change > leg_change, "segwit fee must be smaller");
     }
 
     #[test]
