@@ -4156,6 +4156,25 @@ it is 0 for specs < BERLIN, so this is a no-op pre-lovell. Test extends
 `selfdestruct_cold_cost() == 0`). Verified: exec-head #7,403,648 → replay
 #7,403,649–#7,408,000 match state and receipts roots exactly; 557 tests pass.
 
+## §78 RSKIP305 (reed800): P2SH-P2WSH federation address in commit_federation (#8,107,002)
+
+reed800 (RSKIP305) makes a newly committed federation **format 4000
+(P2SH-P2WSH-ERP)** — a segwit federation. The ERP redeem script is unchanged from
+format 3000, but the federation's ADDRESS/output script becomes P2SH-P2WSH:
+`createP2SHP2WSHOutputScript(redeem)` = `createP2SHOutputScript(OP_0 PUSH32
+sha256(redeem))`, i.e. the P2SH hash is `hash160(0x0020 || sha256(redeem))` rather
+than `hash160(redeem)`.
+
+The first federation change after reed800 (#8,107,002) committed a format-4000
+proposed federation. State matched (the stored proposed fed is keys + format-version
+cell), but the `commit_federation` event's NEW-fed address derived a plain P2SH
+address instead of P2SH-P2WSH. `federation_output_hash160(redeem, format)` now
+returns the witness-program hash for format ≥ 4000; the commit event uses it for
+both feds (the retiring fed is still format 3000 → P2SH, unchanged). Verified:
+#8,107,002 matches state+receipts roots exactly. (This is the first slice of the
+broader RSKIP305 segwit-federation feature — the SVP for this proposed fed, and
+later its pegouts, are segwit; tracked in TODO-segwit-fed-rskip305.md.)
+
 ## §77 RSKIP305 (reed800): persist releasesOutpointsValues per settled release (#8,052,418)
 
 reed800 (#8,052,200) activates RSKIP305. In `processReleaseTransactionInfo` —

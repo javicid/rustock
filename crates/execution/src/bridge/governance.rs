@@ -599,8 +599,10 @@ fn commit_pending_federation<CTX: crate::RskContextTr>(
     let new_redeem = super::peg::build_committed_federation_redeem_script(
         &new_keys, config, hardfork_cfg, block_number,
     );
-    let old_hash160 = super::peg::redeem_script_hash160_pub(&old_redeem);
-    let new_hash160 = super::peg::redeem_script_hash160_pub(&new_redeem);
+    // The address hash160 is format-aware: a P2SH-P2WSH (format 4000, RSKIP305)
+    // federation hashes its P2WSH witness program, not the redeem directly.
+    let old_hash160 = super::peg::federation_output_hash160(&old_redeem, old_format);
+    let new_hash160 = super::peg::federation_output_hash160(&new_redeem, new_format);
 
     if hardfork_cfg.has_rskip419(block_number) {
         // RSKIP419: commitFederation no longer rotates the federations; it

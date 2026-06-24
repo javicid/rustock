@@ -4213,6 +4213,22 @@ pub fn redeem_script_hash160_pub(redeem_script: &[u8]) -> [u8; 20] {
     redeem_script_hash160(redeem_script)
 }
 
+/// hash160 of a federation's P2SH output script — the value behind its address
+/// and `p2sh_output_script`. For a P2SH-P2WSH (format ≥ 4000, RSKIP305/reed800)
+/// federation this is `hash160(OP_0 PUSH32 sha256(redeem))` (rskj
+/// `ScriptBuilder.createP2SHP2WSHOutputScript`); otherwise plain
+/// `hash160(redeem)` (P2SH). The ERP redeem script itself is identical for both.
+pub fn federation_output_hash160(redeem_script: &[u8], format_version: u64) -> [u8; 20] {
+    if format_version >= 4000 {
+        use sha2::Digest as Sha2Digest;
+        let mut witness_program = vec![0x00, 0x20]; // OP_0 PUSH32
+        witness_program.extend_from_slice(&sha2::Sha256::digest(redeem_script));
+        redeem_script_hash160(&witness_program)
+    } else {
+        redeem_script_hash160(redeem_script)
+    }
+}
+
 /// P2SH output script program bytes for a script hash160
 /// (`OP_HASH160 <hash160> OP_EQUAL`), matching bitcoinj
 /// `ScriptBuilder.createP2SHOutputScript(...).getProgram()`. Used by the
