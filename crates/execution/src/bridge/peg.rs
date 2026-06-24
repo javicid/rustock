@@ -3152,7 +3152,12 @@ fn process_funds_migration<CTX: crate::RskContextTr>(
             hardfork_cfg,
             block_number,
         );
-        let active_script = p2sh_output_script(&redeem_script_hash160(&new_redeem));
+        // getActiveFederationAddress is format-aware: a P2SH-P2WSH (format 4000,
+        // RSKIP305) active federation receives the migration at its P2SH-P2WSH
+        // address, not a plain P2SH of the redeem. First hit when the first
+        // reed800 segwit federation activates (#8,147,324).
+        let new_format = federation_format_version(ctx, super::storage::NEW_FEDERATION_FORMAT_VERSION_KEY);
+        let active_script = p2sh_output_script(&federation_output_hash160(&new_redeem, new_format));
 
         // rskj getRetiringFederationWallet builds a FlyoverCompatibleBtcWallet:
         // a flyover UTXO in the migration set spends with the flyover redeem

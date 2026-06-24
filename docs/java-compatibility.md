@@ -4156,6 +4156,19 @@ it is 0 for specs < BERLIN, so this is a no-op pre-lovell. Test extends
 `selfdestruct_cold_cost() == 0`). Verified: exec-head #7,403,648 → replay
 #7,403,649–#7,408,000 match state and receipts roots exactly; 557 tests pass.
 
+## §82 RSKIP305 (reed800): migration destination is the segwit active fed's P2SH-P2WSH address (#8,147,324)
+
+~40,320 blocks after its commit (§78), the first reed800 P2SH-P2WSH proposed federation
+**activates** as the new active federation (#8,147,322). `migrateFunds` then sends the
+retiring (old, legacy) federation's funds to `getActiveFederationAddress()`, which for a
+format-4000 federation is its **P2SH-P2WSH** address. The migration tx therefore has
+legacy inputs (spending the old federation) but a P2SH-P2WSH output. rustock derived a
+plain P2SH output (`hash160(redeem)`); fixed to `federation_output_hash160(new_redeem,
+new_format)` with the new federation's stored format version (so format 4000 →
+`hash160(0x0020 ‖ sha256(redeem))`). Verified: replay #8,147,324 matches state+receipts
+roots exactly; 562 tests pass. (Pegouts that *spend* the segwit active federation — segwit
+inputs — will be handled when first hit, once it has spendable UTXOs.)
+
 ## §81 RSKIP305 (reed800): segwit SVP spend-tx signing (BIP143) (#8,117,400)
 
 Federators sign the segwit SVP spend tx via `addSignature` → `addSvpSpendTxSignatures`
