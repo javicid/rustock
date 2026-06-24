@@ -2683,29 +2683,41 @@ fn create_svp_spend_transaction<CTX: crate::RskContextTr>(
         active_federation_keys_and_redeem(ctx, config, hardfork_cfg, block_number);
     let active_script = p2sh_output_script(&redeem_script_hash160(&active_redeem));
 
-    let fees = calculate_svp_spend_tx_fees(ctx, &proposed_redeem, proposed_threshold, config);
+    let fees = calculate_svp_spend_tx_fees(
+        ctx,
+        &proposed_redeem,
+        &proposed_script,
+        proposed_threshold,
+        proposed_format,
+        config,
+    );
     let value_to_send = (value_to_proposed + value_to_flyover).saturating_sub(fees);
 
     let fund_txid = fund_tx.compute_txid();
+    // addSpendingFederationBaseScript: format ≥ 4000 spends via segwit (scriptSig
+    // = the P2WSH program push, redeem + sig placeholders in the witness), else
+    // the legacy placeholder scriptSig with an empty witness.
+    let spend_input = |vout: u32, redeem: &[u8], threshold: usize| -> bitcoin::TxIn {
+        let (script_sig, witness) = if proposed_format >= 4000 {
+            segwit_base_input(redeem, threshold)
+        } else {
+            (
+                bitcoin::ScriptBuf::from_bytes(super::release_tx::placeholder_scriptsig(
+                    redeem, threshold,
+                )),
+                bitcoin::Witness::new(),
+            )
+        };
+        bitcoin::TxIn {
+            previous_output: bitcoin::OutPoint { txid: fund_txid, vout },
+            script_sig,
+            sequence: bitcoin::Sequence::MAX,
+            witness,
+        }
+    };
     let input = vec![
-        bitcoin::TxIn {
-            previous_output: bitcoin::OutPoint { txid: fund_txid, vout: idx0 as u32 },
-            script_sig: bitcoin::ScriptBuf::from_bytes(super::release_tx::placeholder_scriptsig(
-                &proposed_redeem,
-                proposed_threshold,
-            )),
-            sequence: bitcoin::Sequence::MAX,
-            witness: bitcoin::Witness::new(),
-        },
-        bitcoin::TxIn {
-            previous_output: bitcoin::OutPoint { txid: fund_txid, vout: idx1 as u32 },
-            script_sig: bitcoin::ScriptBuf::from_bytes(super::release_tx::placeholder_scriptsig(
-                &flyover_redeem,
-                flyover_threshold,
-            )),
-            sequence: bitcoin::Sequence::MAX,
-            witness: bitcoin::Witness::new(),
-        },
+        spend_input(idx0 as u32, &proposed_redeem, proposed_threshold),
+        spend_input(idx1 as u32, &flyover_redeem, flyover_threshold),
     ];
     Some(BtcTransaction {
         version: bitcoin::transaction::Version(2),
@@ -2724,14 +2736,53 @@ fn create_svp_spend_transaction<CTX: crate::RskContextTr>(
 fn calculate_svp_spend_tx_fees<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     proposed_redeem: &[u8],
+    proposed_script: &bitcoin::ScriptBuf,
     proposed_threshold: usize,
+    proposed_format: u64,
     config: &BridgeConstants,
 ) -> u64 {
-    let proposed_script = p2sh_output_script(&redeem_script_hash160(proposed_redeem));
-    let size = pegout_tx_size_legacy(proposed_redeem, &proposed_script, proposed_threshold, 2, 1);
+    // calculatePegoutTxSize: a P2SH-P2WSH (format ≥ 4000) federation is sized as
+    // a segwit tx (witness-discounted vsize); otherwise as a legacy tx.
+    let size = if proposed_format >= 4000 {
+        pegout_tx_size_segwit(proposed_redeem, proposed_script, proposed_threshold, 2, 1)
+    } else {
+        pegout_tx_size_legacy(proposed_redeem, proposed_script, proposed_threshold, 2, 1)
+    };
     let backed_up_size = size as u64 * 12 / 10;
     let fee_per_kb = get_effective_fee_per_kb(ctx, config);
     fee_per_kb * backed_up_size / 1000
+}
+
+/// rskj `BridgeUtils.calculateSegwitTxSize`: BIP141 weight-based vsize for a
+/// P2SH-P2WSH federation spend — `inputs` segwit inputs (scriptSig = the 36-byte
+/// witness-program push, redeem + sigs in the witness) and `outputs` P2SH
+/// outputs. The witness bytes (redeem + signatures) are quartered.
+fn pegout_tx_size_segwit(
+    redeem: &[u8],
+    fed_script: &bitcoin::ScriptBuf,
+    threshold: usize,
+    inputs: usize,
+    outputs: usize,
+) -> usize {
+    // calculateTxBaseSize: an input-less tx with `outputs` P2SH outputs, plus
+    // SEGWIT_COMPATIBLE_SCRIPT_SIG_SIZE (36) per segwit input.
+    let output: Vec<bitcoin::TxOut> = (0..outputs)
+        .map(|_| bitcoin::TxOut { value: bitcoin::Amount::ZERO, script_pubkey: fed_script.clone() })
+        .collect();
+    let tx = BtcTransaction {
+        version: bitcoin::transaction::Version(1),
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![],
+        output,
+    };
+    // bitcoinj `bitcoinSerialize` writes a witness-less tx in legacy form (no
+    // segwit marker/flag); rust-bitcoin force-tags a 0-input tx as segwit, so
+    // use `base_size` (the witness-stripped length) to match bitcoinj.
+    let base_size = tx.base_size() + inputs * 36;
+    let signing_size = threshold * inputs * 72;
+    let total_size = base_size + signing_size + inputs * redeem.len();
+    let tx_weight = total_size + 3 * base_size;
+    tx_weight / 4
 }
 
 /// rskj `BridgeUtils.calculateLegacyTxSize`: serialize a tx with `inputs`
@@ -3733,6 +3784,29 @@ fn add_svp_spend_tx_signatures<CTX: crate::RskContextTr>(
 
 /// BTC txid in rskj event byte order: bitcoinj `Sha256Hash.getBytes()` keeps
 /// the display (big-endian) order, the reverse of rust-bitcoin's internal one.
+/// rskj `BitcoinUtils.setSpendingBaseScriptSegwit`: for a P2SH-P2WSH ERP input
+/// the scriptSig is just the witness-program push (`buildSegwitScriptSig` =
+/// push of `OP_0 PUSH32 sha256(redeem)`), and the unsigned base witness
+/// (`createBaseWitnessThatSpendsFromErpRedeemScript`) carries the CHECKMULTISIG
+/// dummy, `threshold` empty signature placeholders, the OP_NOTIF default-branch
+/// flag, then the redeem script.
+fn segwit_base_input(redeem: &[u8], threshold: usize) -> (bitcoin::ScriptBuf, bitcoin::Witness) {
+    use sha2::Digest as _;
+    let mut program = vec![0x00, 0x20]; // OP_0 PUSH32
+    program.extend_from_slice(&sha2::Sha256::digest(redeem));
+    let mut script_sig = Vec::with_capacity(1 + program.len());
+    super::release_tx::push_data(&mut script_sig, &program);
+
+    let mut witness = bitcoin::Witness::new();
+    witness.push([] as [u8; 0]); // OP_0 (CHECKMULTISIG bug workaround)
+    for _ in 0..threshold {
+        witness.push([] as [u8; 0]); // empty signature placeholder
+    }
+    witness.push([] as [u8; 0]); // OP_NOTIF default-branch flag
+    witness.push(redeem);
+    (bitcoin::ScriptBuf::from_bytes(script_sig), witness)
+}
+
 fn btc_txid_event_bytes(tx: &BtcTransaction) -> [u8; 32] {
     let mut bytes = *tx.compute_txid().to_raw_hash().as_byte_array();
     bytes.reverse();
@@ -4615,6 +4689,37 @@ pub fn get_estimated_fees_for_pegout_amount<CTX: crate::RskContextTr>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ground truth from mainnet #8,113,398 (the segwit SVP spend tx for the
+    /// first reed800 P2SH-P2WSH proposed federation): a format-4000 spend with
+    /// a 457-byte ERP redeem, threshold 5, 2 inputs / 1 output sizes to 522
+    /// vbytes (`calculateSegwitTxSize`), giving a 5,008-sat fee at 8,000 sat/kB.
+    #[test]
+    fn svp_spend_segwit_tx_size_8113398() {
+        let redeem = vec![0u8; 457];
+        // 23-byte P2SH-P2WSH output script (OP_HASH160 PUSH20 <20> OP_EQUAL).
+        let fed_script = p2sh_output_script(&[0u8; 20]);
+        assert_eq!(pegout_tx_size_segwit(&redeem, &fed_script, 5, 2, 1), 522);
+        let backed_up = 522u64 * 12 / 10;
+        assert_eq!(8000u64 * backed_up / 1000, 5008);
+    }
+
+    /// rskj `setSpendingBaseScriptSegwit`: scriptSig is a single push of the
+    /// witness program `OP_0 PUSH32 sha256(redeem)`; the base witness is the
+    /// CHECKMULTISIG dummy + `threshold` empty sig placeholders + the OP_NOTIF
+    /// flag + the redeem (threshold 5 → 8 stack items).
+    #[test]
+    fn svp_spend_segwit_base_input_layout() {
+        use sha2::Digest as _;
+        let redeem = vec![0xabu8; 100];
+        let (script_sig, witness) = segwit_base_input(&redeem, 5);
+        let mut expected_sig = vec![0x22u8, 0x00, 0x20];
+        expected_sig.extend_from_slice(&sha2::Sha256::digest(&redeem));
+        assert_eq!(script_sig.as_bytes(), expected_sig.as_slice());
+        assert_eq!(witness.len(), 8); // 1 dummy + 5 sigs + 1 OP_NOTIF + redeem
+        assert!(witness.iter().take(7).all(|i| i.is_empty()));
+        assert_eq!(witness.iter().nth(7).unwrap(), redeem.as_slice());
+    }
 
     /// Regression for mainnet #5,967,453: a flyover negative response code must
     /// be ABI-encoded as a FULL 256-bit two's-complement int256 (rskj

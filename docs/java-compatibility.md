@@ -4156,6 +4156,39 @@ it is 0 for specs < BERLIN, so this is a no-op pre-lovell. Test extends
 `selfdestruct_cold_cost() == 0`). Verified: exec-head #7,403,648 → replay
 #7,403,649–#7,408,000 match state and receipts roots exactly; 557 tests pass.
 
+## §80 RSKIP305 (reed800): segwit SVP spend transaction (#8,113,398)
+
+When the proposed federation is format 4000 (P2SH-P2WSH), `createSvpSpendTransaction`
+spends the two SVP fund-tx outputs via **segwit** (rskj `addSpendingFederationBaseScript`
+→ `setSpendingBaseScriptSegwit`):
+
+- **scriptSig** per input = `buildSegwitScriptSig(redeem)` = a single push of the
+  witness program `OP_0 PUSH32 sha256(redeem)` (i.e. `0x22 0x0020 ‖ sha256(redeem)`,
+  35 bytes). NOT the legacy redeem placeholder.
+- **witness** per input = `createBaseWitnessThatSpendsFromErpRedeemScript(redeem)`:
+  the CHECKMULTISIG dummy (empty) + `threshold` empty signature placeholders + the
+  OP_NOTIF default-branch flag (empty) + the redeem script. For threshold 5 that is
+  8 stack items (7 empty + redeem).
+- The tx serializes in segwit form (marker/flag + witnesses); `svpSpendTxHashUnsigned`
+  and the `releasesOutpointsValues` key both use the **witness-stripped** txid
+  (`getMultiSigTransactionHashWithoutSignatures` → `tx.getHash()` for a witness tx),
+  which rust-bitcoin's `compute_txid()` already returns.
+
+The fee uses `calculateSegwitTxSize` (BIP141 weight/4) instead of the legacy size:
+`baseSize = bitcoinSerialize(inputless tx with N P2SH outputs) + inputs*36`,
+`signingSize = threshold*inputs*72`, `totalSize = baseSize + signingSize +
+inputs*redeem.len()`, `txWeight = totalSize + 3*baseSize`, `vsize = txWeight/4`.
+
+**Consensus-critical rust-bitcoin quirk:** bitcoinj's `bitcoinSerialize()` writes a
+witness-less tx in legacy form, but rust-bitcoin force-tags a **0-input** tx with the
+segwit marker/flag (to avoid the parse ambiguity with the marker byte), adding 2
+bytes. `calculateTxBaseSize` builds an input-less tx, so `consensus::serialize(&tx).len()`
+returns 44 where bitcoinj returns 42 — inflating vsize by 2 (522→524) and the fee by
+16 sat. We use `tx.base_size()` (the witness-stripped length, no marker) to match.
+rustock: `pegout_tx_size_segwit` / `segwit_base_input` in peg.rs. Verified: replay
+#8,113,398 matches state+receipts roots exactly; tests
+`svp_spend_segwit_tx_size_8113398`, `svp_spend_segwit_base_input_layout`; 561 tests pass.
+
 ## §79 RSKIP305 (reed800): segwit SVP fund/spend tx outputs + sigHash redeem (#8,107,003)
 
 The block after the format-4000 commit (§78), `updateCollections` builds the SVP
