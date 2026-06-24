@@ -4156,6 +4156,17 @@ it is 0 for specs < BERLIN, so this is a no-op pre-lovell. Test extends
 `selfdestruct_cold_cost() == 0`). Verified: exec-head #7,403,648 → replay
 #7,403,649–#7,408,000 match state and receipts roots exactly; 557 tests pass.
 
+## §85 RSKIP305 (reed800): sign a segwit peg-out via addSignature (#8,157,776)
+
+A federator signing a regular segwit peg-out goes through `addSignature` → `processSigning`
+(not the SVP path). `apply_signatures_to_tx` is already witness-aware, but the regular path
+passed empty `prev_values`, so the BIP-143 sighash used value 0, signature verification
+failed, and no signature was inserted (the tx stayed at its base witness in `rskTxsWaitingFS`).
+The regular path now loads the per-input values from `releasesOutpointsValues` (keyed by the
+peg-out's witness-stripped hash, saved at creation) and passes them through, exactly like the
+SVP signing path. Verified: replay #8,157,776 matches state+receipts roots exactly; 563 tests
+pass.
+
 ## §84 RSKIP305 (reed800): flyover peg-in to the segwit federation (#8,153,938)
 
 A flyover peg-in (`registerFastBridgeBtcTransaction`) to a P2SH-P2WSH active/retiring

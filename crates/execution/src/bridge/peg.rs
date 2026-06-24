@@ -3820,8 +3820,14 @@ pub fn add_signature<CTX: crate::RskContextTr>(
 
     // rskj processSigning: verify every provided signature against its
     // input's sighash before applying any, then insert each at the position
-    // determined by the key order in the redeem script.
-    let applied = apply_signatures_to_tx(&mut btc_tx, &sigs, &compressed_key, &[]);
+    // determined by the key order in the redeem script. A segwit pegout signs
+    // each input with its BIP-143 sighash, whose prevValue comes from the
+    // releasesOutpointsValues entry keyed by the tx's witness-stripped hash.
+    let prev_values = {
+        let txid = btc_txid_event_bytes(&btc_tx);
+        load_release_outpoints_values(ctx, &txid)
+    };
+    let applied = apply_signatures_to_tx(&mut btc_tx, &sigs, &compressed_key, &prev_values);
     if log_only_when_applied && applied {
         emit_add_signature(ctx, &btc_tx);
     }
