@@ -1832,9 +1832,17 @@ pub fn release_btc<CTX: crate::RskContextTr>(
         // release_request_rejected event. Before RSKIP185 the request was
         // silently dropped (value retained by the Bridge).
         if hardfork_cfg.has_rskip185(block_number) {
-            // Pre-RSKIP427 refund value = Coin.fromBitcoin(weis.toBitcoin()),
-            // i.e. the wei amount truncated to satoshi granularity.
-            let refund_wei = amount_satoshis_u256 * U256::from(10_000_000_000u64);
+            // rskj refundAndEmitRejectEvent: from RSKIP427 (lovell700) the refund
+            // is the FULL wei call value; before 427 it was
+            // `Coin.fromBitcoin(weis.toBitcoin())` — the wei truncated to satoshi
+            // granularity, which silently kept the sub-satoshi remainder in the
+            // Bridge (mainnet #8,010,127: a 340,353-sat pegout below the 400,000
+            // minimum, 4,349,191,903 wei of sub-satoshi remainder).
+            let refund_wei = if hardfork_cfg.has_rskip427(block_number) {
+                call_value_wei
+            } else {
+                amount_satoshis_u256 * U256::from(10_000_000_000u64)
+            };
             let _ = ctx
                 .journal_mut()
                 .transfer(BRIDGE_ADDR, tx_ctx.rsk_sender, refund_wei);

@@ -4156,6 +4156,28 @@ it is 0 for specs < BERLIN, so this is a no-op pre-lovell. Test extends
 `selfdestruct_cold_cost() == 0`). Verified: exec-head #7,403,648 → replay
 #7,403,649–#7,408,000 match state and receipts roots exactly; 557 tests pass.
 
+## §76 RSKIP427: rejected peg-out refunds the FULL wei, not satoshi-truncated (#8,010,127)
+
+A peg-out below the minimum is refunded to the sender. rskj
+`refundAndEmitRejectEvent` chooses the refund value by fork:
+```java
+Coin refundValue = activations.isActive(RSKIP427) ?
+    releaseRequestedValueInWeis :                         // full wei (lovell700+)
+    Coin.fromBitcoin(releaseRequestedValueInWeis.toBitcoin()); // satoshi-truncated
+```
+Pre-RSKIP427 the refund was the wei value truncated to satoshi granularity, so the
+sub-satoshi remainder stayed in the Bridge. From RSKIP427 (lovell700) the full wei
+value is refunded. rustock always truncated, so post-lovell700 it kept the
+remainder — a receipts-invisible balance fork (the `release_request_rejected`
+event amount was already correct).
+
+mainnet #8,010,127 tx[0]: a plain value transfer to the Bridge (empty calldata →
+`RELEASE_BTC`) of 3,403,534,349,191,903 wei = 340,353.43… sat, below the 400,000-sat
+minimum → rejected → refund. rustock refunded 340,353×10^10 and kept the
+4,349,191,903-wei (0.43 sat) remainder; rskj refunded the whole amount. Fix: gate
+the refund on `has_rskip427` (full `call_value_wei` post-427, truncated before).
+Verified: #8,010,127 matches state+receipts roots exactly.
+
 ## §74 RSKIP419 SVP — commit→proposed federation + SVP fund tx (#7,740,878, #7,740,882)
 
 RSKIP419 (lovell700) changes the federation-change flow. Pre-419 `commitFederation`
