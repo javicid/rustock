@@ -1253,9 +1253,14 @@ pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
     // address the BTC tx actually paid (mainnet #5,831,167).
     let (_active_keys, fed_redeem) =
         active_federation_keys_and_redeem(ctx, config, hardfork_cfg, block_number);
-    let fed_p2sh_hash = redeem_script_hash160(&fed_redeem);
+    // getFlyoverFederationOutputScript / federation.getP2SHScript(): a P2SH-P2WSH
+    // (format 4000, RSKIP305) federation contributes P2SH-P2WSH output scripts,
+    // so the BTC tx's flyover output is matched (and the fed P2SH stored) using
+    // the witness-program hash, not a plain P2SH.
+    let active_format = active_federation_format(ctx, config, hardfork_cfg, block_number);
+    let fed_p2sh_hash = federation_output_hash160(&fed_redeem, active_format);
     let flyover_redeem = flyover_redeem_script(&flyover_hash, &fed_redeem);
-    let flyover_p2sh_hash = redeem_script_hash160(&flyover_redeem);
+    let flyover_p2sh_hash = federation_output_hash160(&flyover_redeem, active_format);
     let flyover_script = p2sh_output_script(&flyover_p2sh_hash);
 
     // createFlyoverFederationInformation for the RETIRING federation (RSKIP293,
@@ -1265,12 +1270,15 @@ pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
     // gets its ERP flyover redeem. The flyover output script is a plain P2SH for
     // every federation format except P2SH-P2WSH-ERP (`getFlyoverFederationOutputScript`),
     // which rustock does not yet support — feds at hop400 are P2SH-ERP.
+    let retiring_format =
+        federation_format_version(ctx, super::storage::OLD_FEDERATION_FORMAT_VERSION_KEY);
     let retiring_flyover = if hardfork_cfg.has_rskip293(block_number) {
         retiring_federation_keys_and_redeem(ctx, config, hardfork_cfg, block_number).map(
             |(_keys, retiring_redeem)| {
-                let retiring_p2sh_hash = redeem_script_hash160(&retiring_redeem);
+                let retiring_p2sh_hash = federation_output_hash160(&retiring_redeem, retiring_format);
                 let retiring_flyover_redeem = flyover_redeem_script(&flyover_hash, &retiring_redeem);
-                let retiring_flyover_p2sh_hash = redeem_script_hash160(&retiring_flyover_redeem);
+                let retiring_flyover_p2sh_hash =
+                    federation_output_hash160(&retiring_flyover_redeem, retiring_format);
                 let retiring_flyover_script = p2sh_output_script(&retiring_flyover_p2sh_hash);
                 FlyoverFedInfo {
                     fed_p2sh_hash: retiring_p2sh_hash,

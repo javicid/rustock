@@ -4156,6 +4156,19 @@ it is 0 for specs < BERLIN, so this is a no-op pre-lovell. Test extends
 `selfdestruct_cold_cost() == 0`). Verified: exec-head #7,403,648 → replay
 #7,403,649–#7,408,000 match state and receipts roots exactly; 557 tests pass.
 
+## §84 RSKIP305 (reed800): flyover peg-in to the segwit federation (#8,153,938)
+
+A flyover peg-in (`registerFastBridgeBtcTransaction`) to a P2SH-P2WSH active/retiring
+federation pays a P2SH-P2WSH **flyover** address. rskj `createFlyoverFederationInformation`
+stores `federation.getP2SHScript().getPubKeyHash()` and
+`getFlyoverFederationOutputScript(flyoverRedeem, format).getPubKeyHash()`, both of which are
+the witness-program hash for format 4000. rustock derived plain P2SH hashes, so the BTC tx's
+flyover output never matched → zero value sent → the call returned an error and the calling
+contract reverted (computed gas 104,762 vs header 142,571 at #8,153,938). Both the active and
+retiring flyover federation P2SH hashes (and the matched output script) now use
+`federation_output_hash160(redeem, format)`. Verified: replay #8,153,938 matches
+state+receipts roots exactly; 563 tests pass.
+
 ## §83 RSKIP305 (reed800): spend the segwit active federation — segwit pegouts (#8,153,771)
 
 Once the P2SH-P2WSH federation is active and has UTXOs, regular peg-outs spend it with
