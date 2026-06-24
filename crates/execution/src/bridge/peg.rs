@@ -374,17 +374,28 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
         ))
     };
 
+    // rskj `BitcoinUtils.extractRedeemScriptFromInput`: a segwit (P2SH-P2WSH)
+    // input carries its redeem in the witness (last item), not the scriptSig
+    // (which is just the witness-program push) — so classification must read it
+    // from there to recognize a segwit peg-out/migration.
+    let input_redeem = |i: &bitcoin::TxIn| -> Option<Vec<u8>> {
+        if !i.witness.is_empty() {
+            i.witness.last().map(|r| r.to_vec())
+        } else {
+            super::release_tx::extract_redeem_script(i.script_sig.as_bytes())
+        }
+    };
     // (1) txIsFromOldFederation (RSKIP199): any input spends the hardcoded old
     //     federation address — unconditionally a migration.
     let tx_from_old_fed = hardfork_cfg.has_rskip199(rsk_height)
         && btc_tx.input.iter().any(|i| {
-            super::release_tx::extract_redeem_script(i.script_sig.as_bytes())
+            input_redeem(i)
                 .is_some_and(|r| redeem_script_hash160(&r) == config.old_federation_address_hash160)
         });
     // (4) isPegOutTx(liveFeds): an input's standard redeem matches the active
     //     or retiring federation.
     let spends_live_fed = btc_tx.input.iter().any(|i| {
-        super::release_tx::extract_redeem_script(i.script_sig.as_bytes()).is_some_and(|r| {
+        input_redeem(i).is_some_and(|r| {
             let h = std_hash160_of(&r);
             h == active_std_hash160 || retiring_std_hash160 == Some(h)
         })
@@ -393,7 +404,7 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     //     an output funds the active federation (moveFromRetiringOrRetired &&
     //     moveToActive).
     let spends_retired_or_retiring = btc_tx.input.iter().any(|i| {
-        super::release_tx::extract_redeem_script(i.script_sig.as_bytes()).is_some_and(|r| {
+        input_redeem(i).is_some_and(|r| {
             let h = std_hash160_of(&r);
             Some(h) == retired_hash160 || retiring_std_hash160 == Some(h)
         })

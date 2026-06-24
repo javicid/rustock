@@ -4156,6 +4156,18 @@ it is 0 for specs < BERLIN, so this is a no-op pre-lovell. Test extends
 `selfdestruct_cold_cost() == 0`). Verified: exec-head #7,403,648 → replay
 #7,403,649–#7,408,000 match state and receipts roots exactly; 557 tests pass.
 
+## §86 RSKIP305 (reed800): classify a segwit peg-out when registering it (#8,160,027)
+
+When a segwit peg-out tx is later registered (`registerBtcTransaction`), it must be classified
+PEGOUT/MIGRATION so `registerNewUtxos` records its change output (back to the active fed) as a
+new UTXO. rskj `extractRedeemScriptFromInput` reads the input's redeem from the **witness** for
+a segwit input (the scriptSig is only the witness-program push). rustock's classification
+(`isPegOutTx` / `txIsFromOldFederation` / `isMigrationTx`) read the redeem from the scriptSig
+only, so a segwit peg-out's inputs hashed to the program push, not the fed → not classified as a
+peg-out → its change UTXO was never registered (one missing `newFederationBtcUTXOs` entry). The
+three input-redeem checks now read the witness last item for segwit inputs. Verified: replay
+#8,160,027 matches state+receipts roots exactly; 563 tests pass.
+
 ## §85 RSKIP305 (reed800): sign a segwit peg-out via addSignature (#8,157,776)
 
 A federator signing a regular segwit peg-out goes through `addSignature` → `processSigning`
