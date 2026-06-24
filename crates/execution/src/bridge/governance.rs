@@ -513,11 +513,16 @@ pub(crate) fn commit_proposed_federation<CTX: crate::RskContextTr>(
             &old_keys, config, hardfork_cfg, old_block,
         );
         let old_hash160 = super::peg::redeem_script_hash160_pub(&old_redeem);
+        // RSKIP377: getDefaultP2SHScript() = getOutputScript(getDefaultRedeemScript())
+        // — the *default* (standard multisig) redeem, wrapped P2SH-P2WSH for a
+        // segwit (format ≥ 4000) federation and plain P2SH otherwise
+        // (ErpFederation.getOutputScript). `federation_output_hash160` selects
+        // the witness-program hash for ≥ 4000 and the plain hash below it.
         let members_hash160 = if hardfork_cfg.has_rskip377(block_number) && old_format >= 2000 {
-            super::peg::redeem_script_hash160_pub(&super::peg::build_federation_redeem_script(
-                &old_keys,
-                old_keys.len() / 2 + 1,
-            ))
+            super::peg::federation_output_hash160(
+                &super::peg::build_federation_redeem_script(&old_keys, old_keys.len() / 2 + 1),
+                old_format,
+            )
         } else {
             old_hash160
         };
@@ -689,13 +694,18 @@ fn commit_pending_federation<CTX: crate::RskContextTr>(
         // script; for an ERP fed it is the full ERP P2SH before RSKIP377 and the
         // *default* (standard multisig branch) P2SH from RSKIP377 on.
         if hardfork_cfg.has_rskip186(block_number) {
+            // RSKIP377: P2SH-P2WSH-wrap the default redeem for a segwit (format ≥
+            // 4000) federation (ErpFederation.getDefaultP2SHScript →
+            // getOutputScript); `federation_output_hash160` picks the witness-
+            // program hash for ≥ 4000 and the plain hash below it.
             let members_hash160 =
                 if hardfork_cfg.has_rskip377(block_number) && old_format >= 2000 {
-                    super::peg::redeem_script_hash160_pub(
+                    super::peg::federation_output_hash160(
                         &super::peg::build_federation_redeem_script(
                             &old_keys,
                             old_keys.len() / 2 + 1,
                         ),
+                        old_format,
                     )
                 } else {
                     old_hash160

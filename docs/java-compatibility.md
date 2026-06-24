@@ -4156,6 +4156,20 @@ it is 0 for specs < BERLIN, so this is a no-op pre-lovell. Test extends
 `selfdestruct_cold_cost() == 0`). Verified: exec-head #7,403,648 → replay
 #7,403,649–#7,408,000 match state and receipts roots exactly; 557 tests pass.
 
+## §91 `lastRetiredFederationP2SHScript` for a SEGWIT retiring federation (#8,530,373)
+
+When a federation retires, rskj persists `getLastRetiredFederationP2SHScript`. From
+RSKIP377 this is the retiring `ErpFederation.getDefaultP2SHScript()` =
+`getOutputScript(getDefaultRedeemScript())` (ErpFederation.java:113-127): the **default**
+(standard multisig) redeem, wrapped as **P2SH-P2WSH** (`createP2SHP2WSHOutputScript`,
+`OP_HASH160 hash160(OP_0 PUSH32 sha256(redeem)) OP_EQUAL`) when the federation's format is
+P2SH-P2WSH-ERP (4000), and as plain P2SH (`createP2SHOutputScript`) otherwise. rustock
+always took the plain `hash160(defaultRedeem)`, so a retiring segwit federation stored the
+wrong `lastRetiredFedP2SHScript` hash. Fixed both handover sites in `governance.rs` to use
+`federation_output_hash160(defaultRedeem, oldFormat)`, which yields the witness-program
+hash for format ≥ 4000 and the plain hash below it. Verified: replay #8,530,373 matches
+state+receipts roots exactly; 568 tests pass.
+
 ## §90 RSKIP419 SVP spend tx output to a SEGWIT active federation (#8,524,411)
 
 The SVP **spend** transaction (`BridgeSupport.createSvpSpendTransaction`) spends the two
