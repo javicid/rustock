@@ -4156,6 +4156,25 @@ it is 0 for specs < BERLIN, so this is a no-op pre-lovell. Test extends
 `selfdestruct_cold_cost() == 0`). Verified: exec-head #7,403,648 → replay
 #7,403,649–#7,408,000 match state and receipts roots exactly; 557 tests pass.
 
+## §92 Migration/peg-out classification matches a segwit fed in BOTH P2SH forms (#8,569,377)
+
+`registerBtcTransaction`'s peg-out/migration classification recognizes an input as spending
+a federation by comparing the input's STANDARD redeem against each federation's stored P2SH
+hash. rskj `PegUtilsLegacy.isPegOutTx` builds **both** `createP2SHOutputScript(stdRedeem)`
+and (post-RSKIP305) `createP2SHP2WSHOutputScript(stdRedeem)` for the input and matches
+either against each federation's `getFederationStandardP2SHScript` =
+`ErpFederation.getDefaultP2SHScript()` — which is the **P2SH-P2WSH** witness-program script
+for a segwit (format ≥ 4000) federation (§91). rustock only computed the legacy
+`hash160(stdRedeem)`, so a migration spending the **retired segwit federation** (whose
+`lastRetiredFederationP2SHScript` is the witness-program hash after §91) was not recognized
+as a migration — its output to the active federation was never registered as a UTXO
+(`newFederationBtcUTXOs` diverged by one entry). The input is now matched if either its
+legacy hash or its `federation_output_hash160(stdRedeem, 4000)` equals the federation's
+stored hash (gated on RSKIP305); since the input's standard redeem equals the federation's,
+this matches whichever form the federation stored. Applied to the active, retiring, and
+retired comparisons. Verified: replay #8,569,377 matches state+receipts roots exactly; 568
+tests pass.
+
 ## §91 `lastRetiredFederationP2SHScript` for a SEGWIT retiring federation (#8,530,373)
 
 When a federation retires, rskj persists `getLastRetiredFederationP2SHScript`. From

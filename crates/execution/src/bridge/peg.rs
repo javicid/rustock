@@ -367,11 +367,23 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     } else {
         None
     };
-    let std_hash160_of = |full: &[u8]| -> [u8; 20] {
-        redeem_script_hash160(&build_federation_redeem_script(
+    // rskj `PegUtilsLegacy.isPegOutTx` builds BOTH `createP2SHOutputScript` and
+    // (post-RSKIP305) `createP2SHP2WSHOutputScript` of the input's STANDARD
+    // redeem and matches either against each federation's
+    // `getFederationStandardP2SHScript` (`getDefaultP2SHScript`, which is the
+    // P2SH-P2WSH form for a segwit federation). The input's standard redeem is
+    // the same redeem the federation stored, so checking the input's legacy AND
+    // witness-program hashes against a federation's stored hash matches it
+    // whichever form that hash was stored in (a segwit retired/retiring/active
+    // fed stores the witness-program hash; #8,569,377).
+    let has_rskip305 = hardfork_cfg.has_rskip305(rsk_height);
+    let input_matches_fed = |full: &[u8], target: [u8; 20]| -> bool {
+        let std = build_federation_redeem_script(
             &super::release_tx::spending_redeem_keys(full),
             super::release_tx::redeem_script_threshold(full),
-        ))
+        );
+        redeem_script_hash160(&std) == target
+            || (has_rskip305 && federation_output_hash160(&std, 4000) == target)
     };
 
     // rskj `BitcoinUtils.extractRedeemScriptFromInput`: a segwit (P2SH-P2WSH)
@@ -396,8 +408,8 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     //     or retiring federation.
     let spends_live_fed = btc_tx.input.iter().any(|i| {
         input_redeem(i).is_some_and(|r| {
-            let h = std_hash160_of(&r);
-            h == active_std_hash160 || retiring_std_hash160 == Some(h)
+            input_matches_fed(&r, active_std_hash160)
+                || retiring_std_hash160.is_some_and(|t| input_matches_fed(&r, t))
         })
     });
     // (3) isMigrationTx: an input spends the retired or retiring federation AND
@@ -405,8 +417,8 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     //     moveToActive).
     let spends_retired_or_retiring = btc_tx.input.iter().any(|i| {
         input_redeem(i).is_some_and(|r| {
-            let h = std_hash160_of(&r);
-            Some(h) == retired_hash160 || retiring_std_hash160 == Some(h)
+            retired_hash160.is_some_and(|t| input_matches_fed(&r, t))
+                || retiring_std_hash160.is_some_and(|t| input_matches_fed(&r, t))
         })
     });
     let active_output_values: Vec<u64> = btc_tx
