@@ -4156,6 +4156,42 @@ it is 0 for specs < BERLIN, so this is a no-op pre-lovell. Test extends
 `selfdestruct_cold_cost() == 0`). Verified: exec-head #7,403,648 → replay
 #7,403,649–#7,408,000 match state and receipts roots exactly; 557 tests pass.
 
+## §74 RSKIP419 SVP — commit→proposed federation + SVP fund tx (#7,740,878, #7,740,882)
+
+RSKIP419 (lovell700) changes the federation-change flow. Pre-419 `commitFederation`
+immediately rotated the active/retiring federations (`legacyCommitPendingFederation`).
+From 419 it instead stores a **proposed** federation that must pass a Sign Validation
+Protocol (SVP) before promotion. `commit_pending_federation`
+(`bridge/governance.rs`) now branches on `has_rskip419`:
+- **proposed path**: store `proposedFederation` (multikey serialization) +
+  `proposedFederationFormatVersion`; clear the pending federation; leave the
+  active/retiring federations and their UTXOs untouched. The `commit_federation`
+  event is byte-identical to the legacy path (retiring = active fed, voted = built
+  fed, same activation height) — which is why the commit block's *receipts* matched
+  even before the fix; only the *state* (which cells were written) diverged.
+- Creation time: `getFederationCreationTime` switches `Instant.ofEpochMilli` →
+  `ofEpochSecond` at 419, so the proposed fed's stored creation-time (a millis
+  field) is the block timestamp × 1000.
+
+First powpeg rotation after lovell700 was mainnet #7,740,878 (proposed fed format
+3000 = P2SH-ERP), the first place the new flow triggers.
+
+The SVP fund transaction is created on the next `updateCollections` after the
+commit (`updateSvpState` → `processSvpFundTransactionUnsigned`, #7,740,882). It is
+a `recipientsPayFees=false` BTC tx with two fixed outputs of
+`svpFundTxOutputsValue` (= `minimumPegoutTxValue × 2` = 800,000) — one to the
+proposed federation P2SH, one to its flyover variant (flyover prefix = the 32-byte
+value 1) — plus change to the active federation. `complete_recipients_dont_pay_fees_tx`
+(`bridge/release_tx.rs`) replicates bitcoinj `Wallet.completeTx` with fixed
+recipients and the change output absorbing the size fee. Then `settleReleaseRequest`
+runs exactly as for a peg-out (removeSpentUtxos, addPegoutToPegoutsWaitingForConfirmations,
+savePegoutTxSigHash, `release_requested` with amount = 2×outputsValue,
+`pegout_transaction_created`). rskj refs: FederationSupportImpl.java:658-753,
+BridgeSupport.java:1060-1169; ReleaseTransactionBuilder.java:123-130. Verified:
+#7,740,878 and #7,740,882 match state+receipts roots; sync runs 6,400 blocks past.
+(Registration of the signed fund tx, the SVP spend tx, and the proposed-fed
+handover follow in a later change.)
+
 ## §73 EIP-2929 dropped EXTCODECOPY's flat base — re-pin it to 700 (#7,515,160)
 
 Sibling to §72, but on the *static* side rather than gas_params. rskj

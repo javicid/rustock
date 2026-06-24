@@ -2275,7 +2275,268 @@ pub fn update_collections<CTX: crate::RskContextTr>(
         block_number,
     );
 
+    // -----------------------------------------------------------------------
+    // Step 4: drive the RSKIP419 Sign Validation Protocol for a proposed
+    // federation (rskj updateSvpState).
+    // -----------------------------------------------------------------------
+    update_svp_state(ctx, config, hardfork_cfg, block_number, tx_ctx);
+
     Ok(PrecompileOutput::new(gas_cost, Bytes::new()))
+}
+
+/// rskj `BridgeSupport.updateSvpState` (RSKIP419): once a federation has been
+/// committed as *proposed*, drive its Sign Validation Protocol. If the
+/// validation window has elapsed the proposal failed; otherwise create the SVP
+/// fund transaction (when no SVP values are set yet) and, once the fund tx has
+/// been registered as signed, the SVP spend transaction.
+fn update_svp_state<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    config: &BridgeConstants,
+    hardfork_cfg: &RskHardforkConfig,
+    block_number: u64,
+    tx_ctx: &BridgeTxContext,
+) {
+    if !hardfork_cfg.has_rskip419(block_number) {
+        return;
+    }
+    let Some(proposed) = super::federation::load_stored_federation(ctx, PROPOSED_FEDERATION_KEY)
+    else {
+        return;
+    };
+
+    // isSvpOngoing: the proposal is still within its validation window.
+    if block_number >= proposed.creation_block + config.validation_period_duration_in_blocks {
+        process_svp_failure(ctx, &proposed, config, hardfork_cfg, block_number);
+        return;
+    }
+
+    // shouldCreateAndProcessSvpFundTransaction: every SVP value must be clear.
+    let fund_unsigned = bridge_load_bytes_named(ctx, super::storage::SVP_FUND_TX_HASH_UNSIGNED_KEY);
+    let fund_signed = bridge_load_bytes_named(ctx, super::storage::SVP_FUND_TX_SIGNED_KEY);
+    let spend_unsigned =
+        bridge_load_bytes_named(ctx, super::storage::SVP_SPEND_TX_HASH_UNSIGNED_KEY);
+    if fund_unsigned.is_empty() && fund_signed.is_empty() && spend_unsigned.is_empty() {
+        process_svp_fund_transaction_unsigned(
+            ctx,
+            &proposed,
+            config,
+            hardfork_cfg,
+            block_number,
+            tx_ctx,
+        );
+    }
+
+    // Once the fund tx change has been registered (svpFundTxSigned set), build
+    // the SVP spend transaction.
+    let fund_signed = bridge_load_bytes_named(ctx, super::storage::SVP_FUND_TX_SIGNED_KEY);
+    if !fund_signed.is_empty() {
+        process_svp_spend_transaction_unsigned(
+            ctx,
+            &proposed,
+            &fund_signed,
+            config,
+            hardfork_cfg,
+            block_number,
+            tx_ctx,
+        );
+    }
+}
+
+/// rskj `BridgeSupport.processSvpFailure`: the proposed federation did not pass
+/// validation within its window. Log commit_federation_failure and clear the
+/// proposed federation + every SVP value so a new federation election can run.
+fn process_svp_failure<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    proposed: &super::federation::StoredFederation,
+    config: &BridgeConstants,
+    hardfork_cfg: &RskHardforkConfig,
+    block_number: u64,
+) {
+    let proposed_redeem = build_committed_federation_redeem_script(
+        &proposed.btc_keys(),
+        config,
+        hardfork_cfg,
+        proposed.creation_block,
+    );
+    super::events::log_commit_federation_failed(ctx, &proposed_redeem, block_number);
+    clear_proposed_federation(ctx);
+    clear_svp_values(ctx);
+}
+
+/// rskj `FederationSupportImpl.clearProposedFederation` /
+/// `setProposedFederation(null)`: delete the proposed federation and its format
+/// version cell.
+fn clear_proposed_federation<CTX: crate::RskContextTr>(ctx: &mut CTX) {
+    bridge_store_bytes_named(ctx, PROPOSED_FEDERATION_KEY, &[]);
+    bridge_store_bytes_named(ctx, PROPOSED_FEDERATION_FORMAT_VERSION_KEY, &[]);
+}
+
+/// rskj `BridgeStorageProvider.clearSvpValues`: delete every SVP value cell.
+fn clear_svp_values<CTX: crate::RskContextTr>(ctx: &mut CTX) {
+    bridge_store_bytes_named(ctx, super::storage::SVP_FUND_TX_HASH_UNSIGNED_KEY, &[]);
+    bridge_store_bytes_named(ctx, super::storage::SVP_FUND_TX_SIGNED_KEY, &[]);
+    bridge_store_bytes_named(ctx, super::storage::SVP_SPEND_TX_HASH_UNSIGNED_KEY, &[]);
+    bridge_store_bytes_named(ctx, super::storage::SVP_SPEND_TX_WAITING_FOR_SIGNATURES_KEY, &[]);
+}
+
+/// rskj `BridgeSupport.processSvpFundTransactionUnsigned`: build the SVP fund
+/// transaction (two outputs of `svpFundTxOutputsValue` — one to the proposed
+/// federation, one to its flyover variant — plus change to the active
+/// federation), record its unsigned hash, and settle it like a peg-out.
+fn process_svp_fund_transaction_unsigned<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    proposed: &super::federation::StoredFederation,
+    config: &BridgeConstants,
+    hardfork_cfg: &RskHardforkConfig,
+    block_number: u64,
+    tx_ctx: &BridgeTxContext,
+) {
+    let svp_fund_tx_outputs_value = config.minimum_pegout_tx_value * 2;
+    let Some(built) =
+        build_svp_fund_transaction(ctx, proposed, svp_fund_tx_outputs_value, config, hardfork_cfg, block_number)
+    else {
+        return;
+    };
+
+    // setSvpFundTxHashUnsigned(tx.getHash()) = RLP element of the display-order txid.
+    let fund_hash = btc_txid_event_bytes(&built.tx);
+    bridge_store_bytes_named(
+        ctx,
+        super::storage::SVP_FUND_TX_HASH_UNSIGNED_KEY,
+        &super::serialization::rlp_encode_element(&fund_hash),
+    );
+
+    // settleReleaseRequest(activeUtxos, pegouts, fundTx, rskTxHash, 2*outputsValue).
+    let active_utxo_key = active_federation_utxo_key(ctx, config, hardfork_cfg, block_number);
+    let (_active_keys, active_redeem) =
+        active_federation_keys_and_redeem(ctx, config, hardfork_cfg, block_number);
+
+    // removeSpentUtxos.
+    let mut available = load_utxos_at(ctx, active_utxo_key);
+    available.retain(|u| {
+        !built.used_utxos.iter().any(|s| s.tx_hash == u.tx_hash && s.vout == u.vout)
+    });
+    store_utxos_at(ctx, active_utxo_key, &available);
+
+    // addPegoutToPegoutsWaitingForConfirmations (RSKIP146 → with-txhash entry).
+    let use_tx_hash = hardfork_cfg.has_rskip146(block_number);
+    let mut waiting = load_pegout_confirmation_set(ctx, use_tx_hash);
+    waiting.push(PegoutWaitingForConfirmations {
+        btc_tx_raw: btc_serialize(&built.tx),
+        rsk_block_height: block_number,
+        rsk_tx_hash: use_tx_hash.then_some(tx_ctx.rsk_tx_hash),
+    });
+    store_pegout_confirmation_set(ctx, &waiting, use_tx_hash);
+
+    // savePegoutTxSigHash (RSKIP379): index by the legacy sighash of input 0
+    // (spent by the active federation, so its redeem script applies).
+    if hardfork_cfg.has_rskip379(block_number) {
+        let sig_hash = super::release_tx::legacy_sighash_all(&built.tx, 0, &active_redeem);
+        save_pegout_tx_sig_hash(ctx, &sig_hash);
+    }
+
+    // logReleaseRequested + processReleaseTransactionInfo (RSKIP428): the
+    // requested amount is the total sent to the proposed federation.
+    let amount = svp_fund_tx_outputs_value * 2;
+    super::events::log_release_requested(
+        ctx,
+        &tx_ctx.rsk_tx_hash,
+        &fund_hash,
+        amount,
+    );
+    if hardfork_cfg.has_rskip428(block_number) {
+        let outpoint_values: Vec<u64> =
+            built.used_utxos.iter().map(|u| u.value_satoshis).collect();
+        super::events::log_pegout_transaction_created(ctx, &fund_hash, &outpoint_values);
+    }
+}
+
+/// rskj `BridgeSupport.processSvpSpendTransactionUnsigned`: once the SVP fund
+/// transaction's change has been registered (`svpFundTxSigned` set), build the
+/// SVP spend transaction that moves the funds back from the proposed federation
+/// to the active federation, proving the proposed federation can sign.
+/// (Implemented in the SVP registration phase.)
+#[allow(clippy::too_many_arguments)]
+fn process_svp_spend_transaction_unsigned<CTX: crate::RskContextTr>(
+    _ctx: &mut CTX,
+    _proposed: &super::federation::StoredFederation,
+    _svp_fund_tx_signed: &[u8],
+    _config: &BridgeConstants,
+    _hardfork_cfg: &RskHardforkConfig,
+    _block_number: u64,
+    _tx_ctx: &BridgeTxContext,
+) {
+    // TODO(svp-phase-3): create the SVP spend transaction.
+}
+
+/// rskj `ReleaseTransactionBuilder.buildSvpFundTransaction`: two fixed outputs
+/// of `svp_fund_tx_outputs_value` (to the proposed federation P2SH and to its
+/// flyover P2SH, derived with the `proposedFederationFlyoverPrefix` = 1), with
+/// change to the active federation. `recipientsPayFees = false`, version 2.
+fn build_svp_fund_transaction<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    proposed: &super::federation::StoredFederation,
+    svp_fund_tx_outputs_value: u64,
+    config: &BridgeConstants,
+    hardfork_cfg: &RskHardforkConfig,
+    block_number: u64,
+) -> Option<super::release_tx::BuiltPegout> {
+    // Proposed federation redeem + P2SH (its TYPE is keyed on its creation block).
+    let proposed_keys = proposed.btc_keys();
+    let proposed_redeem = build_committed_federation_redeem_script(
+        &proposed_keys,
+        config,
+        hardfork_cfg,
+        proposed.creation_block,
+    );
+    let proposed_script = p2sh_output_script(&redeem_script_hash160(&proposed_redeem));
+
+    // Flyover proposed federation: PUSH32 <prefix=1> OP_DROP <proposedRedeem>,
+    // P2SH of that (proposed format 3000 → plain P2SH output).
+    let mut flyover_prefix = [0u8; 32];
+    flyover_prefix[31] = 1;
+    let flyover_redeem = flyover_redeem_script(&flyover_prefix, &proposed_redeem);
+    let flyover_script = p2sh_output_script(&redeem_script_hash160(&flyover_redeem));
+
+    // Active federation: spending wallet + change address.
+    let (_active_keys, active_redeem) =
+        active_federation_keys_and_redeem(ctx, config, hardfork_cfg, block_number);
+    let change_script = p2sh_output_script(&redeem_script_hash160(&active_redeem));
+
+    let active_utxo_key = active_federation_utxo_key(ctx, config, hardfork_cfg, block_number);
+    let available = load_utxos_at(ctx, active_utxo_key);
+    let fee_per_kb = get_effective_fee_per_kb(ctx, config);
+
+    // rskj getActiveFederationWallet is flyover-compatible; resolve a flyover
+    // input's redeem per UTXO (same as the pegout path), else the plain redeem.
+    let candidate_fed_redeems = vec![active_redeem.clone()];
+    let flyover_overrides =
+        resolve_flyover_input_redeems(ctx, &available, &candidate_fed_redeems);
+    let redeem_for = |u: &BridgeUtxo| -> &[u8] {
+        flyover_overrides
+            .get(&(u.tx_hash, u.vout))
+            .map(|r| r.as_slice())
+            .unwrap_or(active_redeem.as_slice())
+    };
+
+    let outputs = [
+        super::release_tx::PegoutOutput {
+            script: proposed_script,
+            amount_satoshis: svp_fund_tx_outputs_value,
+        },
+        super::release_tx::PegoutOutput {
+            script: flyover_script,
+            amount_satoshis: svp_fund_tx_outputs_value,
+        },
+    ];
+    super::release_tx::complete_recipients_dont_pay_fees_tx(
+        &available,
+        &outputs,
+        &change_script,
+        redeem_for,
+        fee_per_kb,
+        2,
+    )
 }
 
 /// rskj `PegoutsWaitingForConfirmations.getNextPegoutWithEnoughConfirmations`:

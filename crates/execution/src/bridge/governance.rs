@@ -441,10 +441,14 @@ pub(crate) fn update_federation_creation_block_heights<CTX: crate::RskContextTr>
     bridge_store_bytes_named(ctx, NEXT_FEDERATION_CREATION_BLOCK_HEIGHT_KEY, &[]);
 }
 
-/// rskj legacyCommitPendingFederation: build the federation from the pending
-/// keys, move the active federation's UTXOs to the old-federation set, store
-/// active as old / built as new, wipe the pending federation, and log the
-/// legacy commit_federation event.
+/// rskj `commitPendingFederationAccordingToActivations`: build the federation
+/// from the pending keys, wipe the pending federation, and log the
+/// commit_federation event. Pre-RSKIP419 (`legacyCommitPendingFederation`) this
+/// immediately hands over to the new federation (moves the active fed's UTXOs to
+/// the old set, stores active as old / built as new, persists the retiring P2SH
+/// + next creation height). From RSKIP419 (`commitPendingFederation`) it instead
+/// stores a *proposed* federation that must pass the SVP before being promoted
+/// by `commit_proposed_federation`; the existing federations are left untouched.
 fn commit_pending_federation<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     pending_members: &[StoredMember],
@@ -456,18 +460,13 @@ fn commit_pending_federation<CTX: crate::RskContextTr>(
     let timestamp = ctx.block().timestamp().to::<u64>();
     let multikey = hardfork_cfg.has_rskip123(block_number);
 
-    // Built federation: the pending members, creation time = block timestamp
-    // (raw seconds value stored through Instant.ofEpochMilli pre-RSKIP419),
-    // creation block = this block.
+    // Built federation: the pending members, creation block = this block.
     let mut new_keys: Vec<[u8; 33]> = pending_members.iter().map(|m| m.btc).collect();
     new_keys.sort();
 
-    // Move active-federation UTXOs to the old set.
-    let active_utxos = load_federation_utxos(ctx);
-    store_federation_utxos(ctx, &[]);
-    super::storage::store_old_federation_utxos(ctx, &active_utxos);
-
-    // Current ACTIVE federation becomes the old one (genesis when none).
+    // Current ACTIVE federation (= "new") is the one being retired (genesis
+    // when none). Loaded BEFORE any rotation so the event/last-retired data is
+    // the pre-handover active fed in both paths.
     let active = super::federation::load_stored_federation(ctx, NEW_FEDERATION_KEY);
     let (old_members, old_time, old_block) = match &active {
         Some(fed) => (fed.members.clone(), fed.creation_time_millis, fed.creation_block),
@@ -482,110 +481,141 @@ fn commit_pending_federation<CTX: crate::RskContextTr>(
     };
     let old_keys: Vec<[u8; 33]> = old_members.iter().map(|m| m.btc).collect();
 
-    // rskj saveOldFederation/saveNewFederation: post-RSKIP123 both store the
-    // multikey member format plus their format-version cells. The format
-    // version encodes the federation TYPE (FederationFormatVersion): 1000
-    // standard multisig, 2000 non-standard ERP, 3000 P2SH-ERP. The old fed's
-    // type is fixed by its creation block; the new fed's by this block.
+    // Format version encodes the federation TYPE (FederationFormatVersion):
+    // 1000 standard multisig, 2000 non-standard ERP, 3000 P2SH-ERP, 4000
+    // P2SH-P2WSH-ERP. The old fed's type is fixed by its creation block; the
+    // built fed's by this block.
     let old_format = federation_format_version(hardfork_cfg, old_block);
     let new_format = federation_format_version(hardfork_cfg, block_number);
-    if multikey {
-        bridge_store_bytes_named(
-            ctx,
-            OLD_FEDERATION_FORMAT_VERSION_KEY,
-            &serialization::rlp_encode_u64(old_format),
-        );
-        bridge_store_bytes_named(
-            ctx,
-            OLD_FEDERATION_KEY,
-            &super::federation::serialize_federation_multikey(&old_members, old_time, old_block),
-        );
-        bridge_store_bytes_named(
-            ctx,
-            NEW_FEDERATION_FORMAT_VERSION_KEY,
-            &serialization::rlp_encode_u64(new_format),
-        );
-        bridge_store_bytes_named(
-            ctx,
-            NEW_FEDERATION_KEY,
-            &super::federation::serialize_federation_multikey(
-                pending_members,
-                timestamp,
-                block_number,
-            ),
-        );
-    } else {
-        bridge_store_bytes_named(
-            ctx,
-            OLD_FEDERATION_KEY,
-            &super::federation::serialize_federation_only_btc_keys(&old_keys, old_time, old_block),
-        );
-        bridge_store_bytes_named(
-            ctx,
-            NEW_FEDERATION_KEY,
-            &super::federation::serialize_federation_only_btc_keys(
-                &new_keys,
-                timestamp,
-                block_number,
-            ),
-        );
-    }
-    store_pending_federation(ctx, None, multikey);
 
-    // The retiring (old) federation's redeem script must be rebuilt as the
-    // type it was created with: a standard multisig (created pre-RSKIP201) or
-    // an ERP federation (created at/after iris300). Reuse the same activation
-    // selection keyed on its CREATION block — `lastRetiredFederationP2SHScript`
-    // is its getP2SHScript() and the event logs its getAddress().
+    // Redeem scripts / hash160s: needed for the commit_federation event in BOTH
+    // paths, and for the retiring fed's lastRetiredFederationP2SHScript in the
+    // legacy handover. The retiring fed's redeem is rebuilt as the type it was
+    // CREATED with (keyed on its creation block); the built fed's by THIS
+    // block's activations (rskj PendingFederation.buildFederation).
     let old_redeem = super::peg::build_committed_federation_redeem_script(
         &old_keys, config, hardfork_cfg, old_block,
     );
-    // The newly committed federation's redeem script is selected by THIS
-    // block's activations (rskj PendingFederation.buildFederation): standard,
-    // non-standard ERP (RSKIP201, !RSKIP353), or P2SH-ERP (RSKIP353).
     let new_redeem = super::peg::build_committed_federation_redeem_script(
         &new_keys, config, hardfork_cfg, block_number,
     );
     let old_hash160 = super::peg::redeem_script_hash160_pub(&old_redeem);
     let new_hash160 = super::peg::redeem_script_hash160_pub(&new_redeem);
 
-    // rskj handoverToNewFederation (RSKIP186): persist the retiring federation's
-    // members P2SH script and the new federation's creation block height. After
-    // setOldAndNewFederations, getActiveFederation() still resolves to the OLD
-    // (retiring) federation because the new federation's age (0) is below the
-    // activation age, so lastRetiredFederationP2SHScript is the OLD fed's P2SH
-    // script (FederationSupportImpl.saveLastRetiredFederationScript +
-    // setNextFederationCreationBlockHeight). For a standard multisig the members
-    // P2SH script equals its P2SH output script; for an ERP federation it is the
-    // full ERP P2SH before RSKIP377 and the *default* (standard multisig branch)
-    // P2SH from RSKIP377 on (FederationSupportImpl.getFederationMembersP2SHScript).
-    if hardfork_cfg.has_rskip186(block_number) {
-        // RSKIP377: an ERP retiring federation (stored format >= 2000)
-        // contributes its default/standard-branch P2SH, not the full ERP P2SH.
-        let members_hash160 = if hardfork_cfg.has_rskip377(block_number) && old_format >= 2000 {
-            super::peg::redeem_script_hash160_pub(
-                &super::peg::build_federation_redeem_script(&old_keys, old_keys.len() / 2 + 1),
-            )
+    if hardfork_cfg.has_rskip419(block_number) {
+        // RSKIP419: commitFederation no longer rotates the federations; it
+        // stores a PROPOSED federation (always multikey post-RSKIP123) that must
+        // pass the SVP before commit_proposed_federation promotes it. The active
+        // and retiring federations and their UTXOs are left untouched.
+        // getFederationCreationTime switches Instant.ofEpochMilli ->
+        // ofEpochSecond, so the stored creation-time (millis) is timestamp*1000.
+        let creation_time_millis = timestamp.saturating_mul(1000);
+        bridge_store_bytes_named(
+            ctx,
+            PROPOSED_FEDERATION_FORMAT_VERSION_KEY,
+            &serialization::rlp_encode_u64(new_format),
+        );
+        bridge_store_bytes_named(
+            ctx,
+            PROPOSED_FEDERATION_KEY,
+            &super::federation::serialize_federation_multikey(
+                pending_members,
+                creation_time_millis,
+                block_number,
+            ),
+        );
+        store_pending_federation(ctx, None, multikey);
+    } else {
+        // Legacy handover. Move active-federation UTXOs to the old set.
+        let active_utxos = load_federation_utxos(ctx);
+        store_federation_utxos(ctx, &[]);
+        super::storage::store_old_federation_utxos(ctx, &active_utxos);
+
+        // rskj saveOldFederation/saveNewFederation: post-RSKIP123 store the
+        // multikey member format plus format-version cells; pre-123 only-btc.
+        if multikey {
+            bridge_store_bytes_named(
+                ctx,
+                OLD_FEDERATION_FORMAT_VERSION_KEY,
+                &serialization::rlp_encode_u64(old_format),
+            );
+            bridge_store_bytes_named(
+                ctx,
+                OLD_FEDERATION_KEY,
+                &super::federation::serialize_federation_multikey(&old_members, old_time, old_block),
+            );
+            bridge_store_bytes_named(
+                ctx,
+                NEW_FEDERATION_FORMAT_VERSION_KEY,
+                &serialization::rlp_encode_u64(new_format),
+            );
+            bridge_store_bytes_named(
+                ctx,
+                NEW_FEDERATION_KEY,
+                &super::federation::serialize_federation_multikey(
+                    pending_members,
+                    timestamp,
+                    block_number,
+                ),
+            );
         } else {
-            old_hash160
-        };
-        let last_retired_script =
-            super::peg::p2sh_output_script_program(&members_hash160);
-        bridge_store_bytes_named(
-            ctx,
-            LAST_RETIRED_FEDERATION_P2SH_SCRIPT_KEY,
-            &serialization::rlp_encode_list(&[serialization::rlp_encode_element(
-                &last_retired_script,
-            )]),
-        );
-        bridge_store_bytes_named(
-            ctx,
-            NEXT_FEDERATION_CREATION_BLOCK_HEIGHT_KEY,
-            &serialization::rlp_encode_u64(block_number),
-        );
+            bridge_store_bytes_named(
+                ctx,
+                OLD_FEDERATION_KEY,
+                &super::federation::serialize_federation_only_btc_keys(
+                    &old_keys, old_time, old_block,
+                ),
+            );
+            bridge_store_bytes_named(
+                ctx,
+                NEW_FEDERATION_KEY,
+                &super::federation::serialize_federation_only_btc_keys(
+                    &new_keys,
+                    timestamp,
+                    block_number,
+                ),
+            );
+        }
+        store_pending_federation(ctx, None, multikey);
+
+        // rskj handoverToNewFederation (RSKIP186): persist the retiring fed's
+        // members P2SH script + the new fed's creation block height. After
+        // setOldAndNewFederations, getActiveFederation() still resolves to the
+        // OLD (retiring) fed (the new fed's age 0 is below the activation age),
+        // so lastRetiredFederationP2SHScript is the OLD fed's P2SH script. For a
+        // standard multisig the members P2SH script equals its P2SH output
+        // script; for an ERP fed it is the full ERP P2SH before RSKIP377 and the
+        // *default* (standard multisig branch) P2SH from RSKIP377 on.
+        if hardfork_cfg.has_rskip186(block_number) {
+            let members_hash160 =
+                if hardfork_cfg.has_rskip377(block_number) && old_format >= 2000 {
+                    super::peg::redeem_script_hash160_pub(
+                        &super::peg::build_federation_redeem_script(
+                            &old_keys,
+                            old_keys.len() / 2 + 1,
+                        ),
+                    )
+                } else {
+                    old_hash160
+                };
+            let last_retired_script = super::peg::p2sh_output_script_program(&members_hash160);
+            bridge_store_bytes_named(
+                ctx,
+                LAST_RETIRED_FEDERATION_P2SH_SCRIPT_KEY,
+                &serialization::rlp_encode_list(&[serialization::rlp_encode_element(
+                    &last_retired_script,
+                )]),
+            );
+            bridge_store_bytes_named(
+                ctx,
+                NEXT_FEDERATION_CREATION_BLOCK_HEIGHT_KEY,
+                &serialization::rlp_encode_u64(block_number),
+            );
+        }
     }
 
-    // commit_federation event: Solidity format from RSKIP146, legacy before.
+    // commit_federation event (identical in both paths: retiring = active fed,
+    // voted = built/proposed fed). Solidity format from RSKIP146, legacy before.
     let activation =
         block_number + federation_activation_age(config, hardfork_cfg, block_number);
     if hardfork_cfg.has_rskip146(block_number) {

@@ -436,6 +436,32 @@ pub fn log_pegout_transaction_created<CTX: crate::RskContextTr>(
     );
 }
 
+/// `commit_federation_failed(bytes proposedFederationRedeemScript, int256
+/// blockNumber)` — rskj `logCommitFederationFailure` (RSKIP419). No indexed
+/// params: both fields are in the data. The redeem script is the proposed
+/// federation's `getRedeemScript().getProgram()`.
+pub fn log_commit_federation_failed<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    proposed_federation_redeem_script: &[u8],
+    block_number: u64,
+) {
+    // ABI (bytes, int256): head = [offset=0x40, blockNumber]; tail = bytes.
+    let mut data = Vec::new();
+    data.extend_from_slice(&u256_word(alloy_primitives::U256::from(64u64)));
+    data.extend_from_slice(&u256_word(alloy_primitives::U256::from(block_number)));
+    data.extend_from_slice(&u256_word(alloy_primitives::U256::from(
+        proposed_federation_redeem_script.len() as u64,
+    )));
+    data.extend_from_slice(proposed_federation_redeem_script);
+    let pad = data.len().next_multiple_of(32);
+    data.resize(pad, 0);
+    emit_topics(
+        ctx,
+        vec![solidity_topic("commit_federation_failed(bytes,int256)")],
+        data,
+    );
+}
+
 /// `release_request_rejected(address indexed sender, uint256 amount, int256
 /// reason)` — rskj `logReleaseBtcRequestRejected`. The signature is identical in
 /// every era; only the `amount` encoding changes: pre-RSKIP427 (lovell700) it is

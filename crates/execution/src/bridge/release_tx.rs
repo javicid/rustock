@@ -301,6 +301,121 @@ where
     }
 }
 
+/// Replica of `Wallet.completeTx` with `SendRequest.recipientsPayFees = false`
+/// (rskj's `ReleaseTransactionBuilder.buildSvpFundTransaction`): the recipient
+/// outputs are FIXED and the change output to `change_script` (the active
+/// federation) absorbs the size-based fee. Selection target is `value + fee`;
+/// the fee grows until it covers the tx size. A dusty change output is dropped
+/// into the fee (no change output) — bitcoinj `Wallet.completeTx`.
+pub fn complete_recipients_dont_pay_fees_tx<'r, F>(
+    available_utxos: &[BridgeUtxo],
+    outputs: &[PegoutOutput],
+    change_script: &ScriptBuf,
+    redeem_for: F,
+    fee_per_kb: u64,
+    version: i32,
+) -> Option<BuiltPegout>
+where
+    F: Fn(&BridgeUtxo) -> &'r [u8],
+{
+    if outputs.is_empty() {
+        return None;
+    }
+    // completeTx: dusty sends are rejected up front (DustySendRequested).
+    for output in outputs {
+        if output.amount_satoshis < min_non_dust_value(&output.script) {
+            return None;
+        }
+    }
+
+    // Same RskAllowUnconfirmedCoinSelector ordering as the pegout path.
+    let mut candidates: Vec<(&BridgeUtxo, &[u8])> =
+        available_utxos.iter().map(|u| (u, redeem_for(u))).collect();
+    candidates.sort_by(|a, b| a.0.tx_hash.cmp(&b.0.tx_hash).then(a.0.vout.cmp(&b.0.vout)));
+    if candidates.iter().any(|(_, r)| redeem_script_threshold(r) == 0) {
+        return None;
+    }
+
+    let value: u64 = outputs.iter().map(|o| o.amount_satoshis).sum();
+    let mut fee: u64 = 0;
+    loop {
+        // recipientsPayFees = false: the selection target carries the fee.
+        let target = value + fee;
+        let mut gathered: u64 = 0;
+        let mut selected: Vec<(&BridgeUtxo, &[u8])> = Vec::new();
+        for &(utxo, redeem) in &candidates {
+            if gathered >= target {
+                break;
+            }
+            selected.push((utxo, redeem));
+            gathered += utxo.value_satoshis;
+        }
+        if gathered < target {
+            return None;
+        }
+
+        // Recipient outputs are unchanged; the change output absorbs the fee.
+        let mut tx_outputs: Vec<TxOut> = outputs
+            .iter()
+            .map(|o| TxOut {
+                value: Amount::from_sat(o.amount_satoshis),
+                script_pubkey: o.script.clone(),
+            })
+            .collect();
+        let change = gathered - target;
+        if change > 0 && change >= min_non_dust_value(change_script) {
+            tx_outputs.push(TxOut {
+                value: Amount::from_sat(change),
+                script_pubkey: change_script.clone(),
+            });
+        }
+        // (A dusty change is dropped into the fee, leaving no change output.)
+
+        let inputs: Vec<TxIn> = selected
+            .iter()
+            .map(|(u, _)| TxIn {
+                previous_output: OutPoint {
+                    txid: txid_from_stored_hash(&u.tx_hash),
+                    vout: u.vout,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            })
+            .collect();
+
+        let mut tx = BtcTransaction {
+            version: Version(version),
+            lock_time: LockTime::ZERO,
+            input: inputs,
+            output: tx_outputs,
+        };
+
+        let base_size = bitcoin::consensus::serialize(&tx).len();
+        let signing: usize = selected
+            .iter()
+            .map(|(_, r)| redeem_script_threshold(r) * SIG_SIZE + r.len())
+            .sum();
+        let size = base_size + signing;
+
+        let fee_rate = fee_per_kb.max(REFERENCE_DEFAULT_MIN_TX_FEE);
+        let fee_needed = fee_rate * size as u64 / 1000;
+
+        if fee >= fee_needed {
+            for (input, (_, redeem)) in tx.input.iter_mut().zip(&selected) {
+                let scriptsig = placeholder_scriptsig(redeem, redeem_script_threshold(redeem));
+                input.script_sig = ScriptBuf::from_bytes(scriptsig);
+            }
+            if bitcoin::consensus::serialize(&tx).len() > MAX_STANDARD_TX_SIZE {
+                return None;
+            }
+            let used_utxos = selected.into_iter().map(|(u, _)| u.clone()).collect();
+            return Some(BuiltPegout { tx, used_utxos });
+        }
+        fee = fee_needed;
+    }
+}
+
 /// Replica of `Wallet.completeTx` with `SendRequest.emptyWallet = true`, as
 /// used by rskj's `ReleaseTransactionBuilder.buildEmptyWalletTo` for peg-in
 /// rejection refunds: spend ALL the given UTXOs (in provider order — the
@@ -900,6 +1015,46 @@ mod tests {
             tx.input[0].script_sig.as_bytes(),
             placeholder_scriptsig(&redeem, threshold).as_slice()
         );
+    }
+
+    #[test]
+    fn recipients_dont_pay_fees_change_absorbs_fee() {
+        // Models the SVP fund tx: two fixed 800k outputs + change to the
+        // federation, recipientsPayFees=false. One large UTXO covers it.
+        let utxos = vec![utxo(1, 0, 255_336_759_550)];
+        let redeem = test_redeem(2, 3);
+        let built = complete_recipients_dont_pay_fees_tx(
+            &utxos,
+            &[
+                PegoutOutput { script: p2sh(7), amount_satoshis: 800_000 },
+                PegoutOutput { script: p2sh(9), amount_satoshis: 800_000 },
+            ],
+            &p2sh(8),
+            |_| redeem.as_slice(),
+            5000,
+            2,
+        )
+        .expect("build");
+        let tx = &built.tx;
+        assert_eq!(tx.version.0, 2);
+        assert_eq!(tx.input.len(), 1);
+        // Three outputs: the two FIXED recipients (unchanged) + change.
+        assert_eq!(tx.output.len(), 3);
+        assert_eq!(tx.output[0].value.to_sat(), 800_000);
+        assert_eq!(tx.output[1].value.to_sat(), 800_000);
+        let change = tx.output[2].value.to_sat();
+        let fee = 255_336_759_550 - 1_600_000 - change;
+        // The change (not the recipients) carries the size-based fee.
+        let threshold = 2;
+        let size_estimate = {
+            let mut unsigned = tx.clone();
+            for input in &mut unsigned.input {
+                input.script_sig = ScriptBuf::new();
+            }
+            bitcoin::consensus::serialize(&unsigned).len()
+                + tx.input.len() * (threshold * SIG_SIZE + redeem.len())
+        };
+        assert_eq!(fee, 5000 * size_estimate as u64 / 1000);
     }
 
     #[test]

@@ -106,6 +106,11 @@ pub struct BridgeConstants {
     pub federation_activation_age_legacy: u64,
     /// Post-RSKIP383 activation age.
     pub federation_activation_age: u64,
+    /// RSKIP419 SVP validation window, in RSK blocks: a proposed federation
+    /// must pass the Sign Validation Protocol within this many blocks of its
+    /// creation or the proposal is discarded (rskj FederationConstants
+    /// .validationPeriodDurationInBlocks — mainnet 20_000).
+    pub validation_period_duration_in_blocks: u64,
     /// rskj fundsMigrationAgeSinceActivationBegin.
     pub funds_migration_age_begin: u64,
     /// rskj fundsMigrationAgeSinceActivationEnd (non-special-case).
@@ -233,6 +238,7 @@ impl BridgeConstants {
             ],
             federation_activation_age_legacy: 18_500,
             federation_activation_age: 40_320,
+            validation_period_duration_in_blocks: 20_000,
             funds_migration_age_begin: 0,
             funds_migration_age_end: 10_585,
             special_case_funds_migration_age_end: 172_800,
@@ -327,6 +333,7 @@ impl BridgeConstants {
             ],
             federation_activation_age_legacy: 60,
             federation_activation_age: 2_400,
+            validation_period_duration_in_blocks: 2_000,
             funds_migration_age_begin: 60,
             funds_migration_age_end: 900,
             special_case_funds_migration_age_end: 900,
@@ -401,6 +408,7 @@ impl BridgeConstants {
             ],
             federation_activation_age_legacy: 10,
             federation_activation_age: 150,
+            validation_period_duration_in_blocks: 125,
             funds_migration_age_begin: 15,
             funds_migration_age_end: 150,
             special_case_funds_migration_age_end: 150,
