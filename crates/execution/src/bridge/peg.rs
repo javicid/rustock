@@ -1647,9 +1647,16 @@ fn resolve_flyover_input_redeems<CTX: crate::RskContextTr>(
         let flyover = p2sh_script_hash160(&u.script)
             .and_then(|h| get_flyover_federation_information(ctx, &h))
             .and_then(|(derivation, fed_hash)| {
+                // The stored fedRedeemScriptHash is `federation.getP2SHScript()
+                // .getPubKeyHash()` — a plain-P2SH hash for a legacy fed, but a
+                // P2SH-P2WSH (witness-program) hash for a format-4000 segwit fed.
+                // Match a candidate by either form.
                 candidate_fed_redeems
                     .iter()
-                    .find(|r| redeem_script_hash160(r) == fed_hash)
+                    .find(|r| {
+                        redeem_script_hash160(r) == fed_hash
+                            || federation_output_hash160(r, 4000) == fed_hash
+                    })
                     .map(|fed_redeem| flyover_redeem_script(&derivation, fed_redeem))
             });
         if let Some(redeem) = flyover {

@@ -4156,6 +4156,18 @@ it is 0 for specs < BERLIN, so this is a no-op pre-lovell. Test extends
 `selfdestruct_cold_cost() == 0`). Verified: exec-head #7,403,648 → replay
 #7,403,649–#7,408,000 match state and receipts roots exactly; 557 tests pass.
 
+## §87 RSKIP305 (reed800): resolve flyover redeem for a segwit fed's UTXOs (#8,160,028)
+
+A peg-out spending a segwit federation may mix plain and **flyover** UTXOs. To spend a flyover
+UTXO each input needs its flyover redeem (`PUSH32 <derivationHash> OP_DROP <fedRedeem>`), found
+by matching the stored `fedRedeemScriptHash` against the destination federation. That stored
+hash is `federation.getP2SHScript().getPubKeyHash()` — the **P2SH-P2WSH** witness-program hash
+for a format-4000 fed — but `resolve_flyover_input_redeems` compared it only to the candidate's
+plain `redeem_script_hash160`, so segwit flyover UTXOs failed to resolve and were spent with the
+plain active redeem (wrong witness-program scriptSig + witness redeem). The match now accepts
+either the plain P2SH hash or `federation_output_hash160(r, 4000)`. Verified: replay #8,160,028
+matches state+receipts roots exactly; 563 tests pass.
+
 ## §86 RSKIP305 (reed800): classify a segwit peg-out when registering it (#8,160,027)
 
 When a segwit peg-out tx is later registered (`registerBtcTransaction`), it must be classified
