@@ -391,7 +391,7 @@ pub fn log_batch_pegout_created<CTX: crate::RskContextTr>(
 
 /// bitcoinj `VarInt.encode`: 1 byte for < 0xFD, else a 0xFD/0xFE/0xFF tag
 /// followed by 2/4/8 little-endian bytes.
-fn encode_varint(value: u64) -> Vec<u8> {
+pub(crate) fn encode_varint(value: u64) -> Vec<u8> {
     if value < 0xFD {
         vec![value as u8]
     } else if value <= 0xFFFF {

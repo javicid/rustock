@@ -1445,6 +1445,32 @@ fn save_pegout_tx_sig_hash<CTX: crate::RskContextTr>(ctx: &mut CTX, sig_hash: &[
     super::storage::bridge_store_raw(ctx, key, Some(vec![1]));
 }
 
+/// rskj `BridgeStorageProvider.setReleaseOutpointsValues` (RSKIP305, reed800):
+/// inside `processReleaseTransactionInfo`, right after the RSKIP428
+/// `pegout_transaction_created` event, every settled release also persists its
+/// spent-input values (bitcoinj VarInt concatenation, `serializeOutpointsValues`)
+/// keyed by `releasesOutpointsValues-<btcTxHash>` (display-order hex). No-op
+/// before reed800. (Mainnet #8,052,418.)
+fn save_release_outpoints_values<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    btc_tx_hash_display: &[u8; 32],
+    outpoint_values: &[u64],
+    hardfork_cfg: &RskHardforkConfig,
+    block_number: u64,
+) {
+    if !hardfork_cfg.has_rskip305(block_number) {
+        return;
+    }
+    let serialized: Vec<u8> =
+        outpoint_values.iter().flat_map(|&v| super::events::encode_varint(v)).collect();
+    let key = compound_key(
+        super::storage::RELEASES_OUTPOINTS_VALUES_KEY,
+        "-",
+        &to_hex(btc_tx_hash_display),
+    );
+    super::storage::bridge_store_raw(ctx, key, Some(serialized));
+}
+
 /// rskj `getStorageKeyForFlyoverHash`:
 /// `fastBridgeHashUsedInBtcTx-` + `Sha256Hash.toString()` (display order) +
 /// `Keccak256.toString()` (forward order).
@@ -2107,10 +2133,18 @@ pub fn update_collections<CTX: crate::RskContextTr>(
                     if hardfork_cfg.has_rskip428(block_number) {
                         let outpoint_values: Vec<u64> =
                             built.used_utxos.iter().map(|u| u.value_satoshis).collect();
+                        let txid = btc_txid_event_bytes(&built.tx);
                         super::events::log_pegout_transaction_created(
                             ctx,
-                            &btc_txid_event_bytes(&built.tx),
+                            &txid,
                             &outpoint_values,
+                        );
+                        save_release_outpoints_values(
+                            ctx,
+                            &txid,
+                            &outpoint_values,
+                            hardfork_cfg,
+                            block_number,
                         );
                     }
                     // rskj BridgeSupport.adjustBalancesIfChangeOutputWasDust
@@ -2524,6 +2558,7 @@ fn process_svp_fund_transaction_unsigned<CTX: crate::RskContextTr>(
         let outpoint_values: Vec<u64> =
             built.used_utxos.iter().map(|u| u.value_satoshis).collect();
         super::events::log_pegout_transaction_created(ctx, &fund_hash, &outpoint_values);
+        save_release_outpoints_values(ctx, &fund_hash, &outpoint_values, hardfork_cfg, block_number);
     }
 }
 
@@ -2590,6 +2625,7 @@ fn process_svp_spend_transaction_unsigned<CTX: crate::RskContextTr>(
             })
             .collect();
         super::events::log_pegout_transaction_created(ctx, &spend_hash, &outpoint_values);
+        save_release_outpoints_values(ctx, &spend_hash, &outpoint_values, hardfork_cfg, block_number);
     }
 }
 
@@ -3094,10 +3130,14 @@ fn process_funds_migration<CTX: crate::RskContextTr>(
             if hardfork_cfg.has_rskip428(block_number) {
                 let outpoint_values: Vec<u64> =
                     built.used_utxos.iter().map(|u| u.value_satoshis).collect();
-                super::events::log_pegout_transaction_created(
+                let txid = btc_txid_event_bytes(&built.tx);
+                super::events::log_pegout_transaction_created(ctx, &txid, &outpoint_values);
+                save_release_outpoints_values(
                     ctx,
-                    &btc_txid_event_bytes(&built.tx),
+                    &txid,
                     &outpoint_values,
+                    hardfork_cfg,
+                    block_number,
                 );
             }
             store_pegout_confirmation_set(ctx, &waiting, use_tx_hash);

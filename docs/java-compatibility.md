@@ -4156,6 +4156,26 @@ it is 0 for specs < BERLIN, so this is a no-op pre-lovell. Test extends
 `selfdestruct_cold_cost() == 0`). Verified: exec-head #7,403,648 → replay
 #7,403,649–#7,408,000 match state and receipts roots exactly; 557 tests pass.
 
+## §77 RSKIP305 (reed800): persist releasesOutpointsValues per settled release (#8,052,418)
+
+reed800 (#8,052,200) activates RSKIP305. In `processReleaseTransactionInfo` —
+called from `settleReleaseRequest` for every settled release (batched/individual
+pegout, migration, SVP fund, SVP spend) — right after the RSKIP428
+`pegout_transaction_created` event, rskj now also persists the release's spent-input
+values: `provider.setReleaseOutpointsValues(btcTxHash, outpointsValues)`. The cell
+key is `releasesOutpointsValues-<btcTxHash>` (display-order hex,
+`Sha256Hash.toString()`); the value is the bitcoinj VarInt concatenation
+(`serializeOutpointsValues` = `UtxoUtils.encodeOutpointValues`, the SAME bytes the
+`pegout_transaction_created` event carries as its dynamic `bytes`). This is a pure,
+receipts-invisible state write — rustock emitted the event but never wrote the cell,
+so from reed800 on every settled release left a missing leaf.
+
+mainnet #8,052,418: a settled release wrote `releasesOutpointsValues-<hash>` =
+`fe55cb0700fefa949800` (two VarInt outpoint values). `save_release_outpoints_values`
+(gated on `has_rskip305`) is now called right after each
+`log_pegout_transaction_created`. Verified: #8,052,418 matches state+receipts roots
+exactly; 559 tests pass.
+
 ## §76 RSKIP427: rejected peg-out refunds the FULL wei, not satoshi-truncated (#8,010,127)
 
 A peg-out below the minimum is refunded to the sender. rskj
