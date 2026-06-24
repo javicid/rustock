@@ -2802,9 +2802,14 @@ fn create_svp_spend_transaction<CTX: crate::RskContextTr>(
     let value_to_proposed = out0.value.to_sat();
     let value_to_flyover = out1.value.to_sat();
 
+    // The single output pays the active federation's own address, which for a
+    // segwit (P2SH-P2WSH, format ≥ 4000) federation is the witness-program
+    // hash, not the plain redeem hash.
     let (_active_keys, active_redeem) =
         active_federation_keys_and_redeem(ctx, config, hardfork_cfg, block_number);
-    let active_script = p2sh_output_script(&redeem_script_hash160(&active_redeem));
+    let active_format = active_federation_format(ctx, config, hardfork_cfg, block_number);
+    let active_script =
+        p2sh_output_script(&federation_output_hash160(&active_redeem, active_format));
 
     let fees = calculate_svp_spend_tx_fees(
         ctx,

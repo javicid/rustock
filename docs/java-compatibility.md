@@ -4156,6 +4156,22 @@ it is 0 for specs < BERLIN, so this is a no-op pre-lovell. Test extends
 `selfdestruct_cold_cost() == 0`). Verified: exec-head #7,403,648 → replay
 #7,403,649–#7,408,000 match state and receipts roots exactly; 557 tests pass.
 
+## §90 RSKIP419 SVP spend tx output to a SEGWIT active federation (#8,524,411)
+
+The SVP **spend** transaction (`BridgeSupport.createSvpSpendTransaction`) spends the two
+fund-tx outputs (proposed federation P2SH + flyover P2SH) into a single output paying the
+**active** federation. Its inputs were already built segwit-aware (the proposed federation
+is P2SH-P2WSH, so `addSpendingFederationBaseScript` uses the witness-program scriptSig +
+base witness for format ≥ 4000), but the single output still used the legacy
+`hash160(activeRedeem)` for the active federation script. When the active federation is
+itself segwit (the rotation in progress at this height), that output must be the
+witness-program hash `federation_output_hash160(activeRedeem, 4000)`. The wrong output
+script changed the unsigned spend-tx bytes, so `svpSpendTxHashUnsigned`,
+`svpSpendTxWaitingForSignatures`, and the derived `pegoutTxSigHash` / outpoint-values all
+diverged. Fixed `create_svp_spend_transaction` to derive the active-federation output
+script from its format (same one-liner as §89's change address). Verified: replay
+#8,524,411 matches state+receipts roots exactly; 568 tests pass.
+
 ## §89 RSKIP419 SVP fund tx for a SEGWIT active federation (#8,517,969)
 
 The RSKIP419 SVP fund transaction (`ReleaseTransactionBuilder.buildSvpFundTransaction`,
