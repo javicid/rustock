@@ -266,7 +266,12 @@ fn abi_encode_bool(value: bool) -> Bytes {
 }
 
 fn abi_encode_bytes(data: &[u8]) -> Vec<u8> {
-    let mut output = Vec::with_capacity(64 + ((data.len() + 31) / 32) * 32);
+    // rskj's `SolidityType.BytesType.encode` sizes the data section as
+    // `((len - 1) / 32 + 1) * 32` with Java's truncating division, so an EMPTY
+    // `bytes` still emits one 32-byte zero word (-1/32 == 0 → 1 word): empty
+    // encodes to 96 bytes, not 64. Rust's `/` truncates the same way.
+    let data_section = (((data.len() as i64 - 1) / 32 + 1) * 32) as usize;
+    let mut output = Vec::with_capacity(64 + data_section);
     // offset to data (always 32 for single bytes param)
     let mut offset = [0u8; 32];
     offset[28..32].copy_from_slice(&32u32.to_be_bytes());
@@ -275,10 +280,9 @@ fn abi_encode_bytes(data: &[u8]) -> Vec<u8> {
     let mut len_word = [0u8; 32];
     len_word[28..32].copy_from_slice(&(data.len() as u32).to_be_bytes());
     output.extend_from_slice(&len_word);
-    // data (padded to 32 bytes)
+    // data (padded per rskj's BytesType formula)
     output.extend_from_slice(data);
-    let padding = (32 - (data.len() % 32)) % 32;
-    output.extend(std::iter::repeat(0u8).take(padding));
+    output.resize(64 + data_section, 0);
     output
 }
 
@@ -328,4 +332,29 @@ fn decode_federation_keys(data: &[u8]) -> Vec<Vec<u8>> {
         }
     }
     Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::abi_encode_bytes;
+
+    /// rskj's `SolidityType.BytesType.encode` emits one zero word even for an
+    /// empty array (`-1 / 32 == 0` → 1 word), so empty `bytes` returns are 96
+    /// bytes, not 64. See `btc_chain::encode_abi_bytes` (mainnet #8,417,579).
+    #[test]
+    fn abi_encode_bytes_empty_is_96_bytes() {
+        let out = abi_encode_bytes(&[]);
+        assert_eq!(out.len(), 96);
+        assert_eq!(out[31], 32); // offset
+        assert!(out[32..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn abi_encode_bytes_nonempty_layout() {
+        let out = abi_encode_bytes(&[0xAA; 33]);
+        assert_eq!(out.len(), 64 + 64);
+        assert_eq!(out[31], 32); // offset
+        assert_eq!(out[63], 33); // length
+        assert_eq!(out[64], 0xAA);
+    }
 }

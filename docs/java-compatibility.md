@@ -4156,6 +4156,39 @@ it is 0 for specs < BERLIN, so this is a no-op pre-lovell. Test extends
 `selfdestruct_cold_cost() == 0`). Verified: exec-head #7,403,648 → replay
 #7,403,649–#7,408,000 match state and receipts roots exactly; 557 tests pass.
 
+## §88 Bridge `byte[]` returns ABI-encode even when empty — rskj's 96-byte empty `bytes` (#8,417,579)
+
+`Bridge.execute` always ABI-encodes a method's `byte[]` result via
+`encodeOutputs` (`Bridge.java:418`). The encoder is
+`SolidityType.BytesType.encode` (`SolidityType.java:296`), which sizes the data
+section as `new byte[((bb.length - 1) / 32 + 1) * 32]` using Java's truncating
+integer division. For an **empty** array `(0 - 1) / 32 == -1 / 32 == 0` (Java
+truncates toward zero), so `+ 1` still allocates **one** 32-byte zero word: an
+empty `bytes` return is `offset(0x20) + length(0) + one zero word` = **96
+bytes**, not 64.
+
+`getBtcBlockchainBlockHeaderByHeight(height)` for a height above the BTC chain
+head makes `getStoredBlockAtMainChainHeight` throw (`depth < 0`); `Bridge`
+catches it (`Bridge.java:1434-1437`) and returns `EMPTY_BYTE_ARRAY`, which then
+goes through the 96-byte encoding above. rustock had two bugs here: the
+not-found path returned zero-length data (`Bytes::new()`) instead of an
+ABI-encoded empty `bytes`, and its `encode_abi_bytes` padded an empty array to
+64 bytes. Both forked the **caller** at mainnet #8,417,579: contract
+`0xba5666…` STATICCALLs the Bridge, copies the reply with `RETURNDATACOPY`, and
+its ABI bounds-check (`SLT`) reverts on a 0-byte reply but proceeds on the
+64-byte data section — changing `RETURNDATASIZE` and downstream memory
+expansion (tx[0] gas 34401 vs 34912).
+
+rustock (`bridge/btc_chain.rs` `get_block_header_by_height` /
+`get_parent_block_header_by_hash` now always `encode_abi_bytes` their result;
+`encode_abi_bytes` sizes the data section with the same `((len-1)/32+1)*32`
+truncating expression). The identical quirk was already handled in
+`precompiles.rs::abi_encode_bytes` (getCoinbaseAddress, #1,669,062) but had not
+been propagated to the sibling encoders `bridge/getters.rs::abi_encode_bytes`
+and `bridge/events.rs::abi_single_dynamic`, both fixed here for the same latent
+divergence. Verified: replay #8,417,579 matches state+receipts roots exactly;
+567 tests pass.
+
 ## §87 RSKIP305 (reed800): resolve flyover redeem for a segwit fed's UTXOs (#8,160,028)
 
 A peg-out spending a segwit federation may mix plain and **flyover** UTXOs. To spend a flyover

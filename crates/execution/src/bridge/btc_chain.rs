@@ -515,20 +515,21 @@ pub fn get_block_header_by_height<CTX: crate::RskContextTr>(
     let height_u256 = U256::from_be_slice(&args[..32]);
     let height = height_u256.to::<u32>();
 
-    // Look up hash by height, then get the block
+    // Look up hash by height, then get the block.
+    //
+    // rskj returns `EMPTY_BYTE_ARRAY` when the block is absent (or
+    // `getStoredBlockAtMainChainHeight` throws and `Bridge` catches it), but
+    // `Bridge.execute` always ABI-encodes the `byte[]` result via
+    // `encodeOutputs` (Bridge.java:418), so an empty result is returned as the
+    // ABI encoding of an empty `bytes` (offset `0x20` + length `0x00` = 64
+    // bytes), NOT as zero-length return data.
     let hash_b256 = super::storage::bridge_load_btc_block_hash_by_height(ctx, height);
-    let hash = match hash_b256 {
-        Some(h) => b256_to_bitcoin_hash(&h),
-        None => return Ok(PrecompileOutput::new(gas_cost, Bytes::new())),
-    };
-
-    match get_stored_block(ctx, &hash) {
-        Some(block) => {
-            let header_bytes = serialize(&block.header);
-            Ok(PrecompileOutput::new(gas_cost, encode_abi_bytes(&header_bytes).into()))
-        }
-        None => Ok(PrecompileOutput::new(gas_cost, Bytes::new())),
-    }
+    let header_bytes = hash_b256
+        .map(|h| b256_to_bitcoin_hash(&h))
+        .and_then(|hash| get_stored_block(ctx, &hash))
+        .map(|block| serialize(&block.header))
+        .unwrap_or_default();
+    Ok(PrecompileOutput::new(gas_cost, encode_abi_bytes(&header_bytes).into()))
 }
 
 /// `getBtcBlockchainParentBlockHeaderByHash(bytes32)` → bytes
@@ -543,17 +544,13 @@ pub fn get_parent_block_header_by_hash<CTX: crate::RskContextTr>(
 
     let hash = b256_to_bitcoin_hash(&alloy_primitives::B256::from_slice(&args[..32]));
 
-    let block = match get_stored_block(ctx, &hash) {
-        Some(b) => b,
-        None => return Ok(PrecompileOutput::new(gas_cost, Bytes::new())),
-    };
-
-    let parent = match get_stored_block(ctx, &block.header.prev_blockhash) {
-        Some(p) => p,
-        None => return Ok(PrecompileOutput::new(gas_cost, Bytes::new())),
-    };
-
-    let header_bytes = serialize(&parent.header);
+    // As in `get_block_header_by_height`, an absent block yields rskj's
+    // `EMPTY_BYTE_ARRAY`, which `Bridge.execute` still ABI-encodes as an empty
+    // `bytes` (64 bytes), not zero-length return data.
+    let header_bytes = get_stored_block(ctx, &hash)
+        .and_then(|block| get_stored_block(ctx, &block.header.prev_blockhash))
+        .map(|parent| serialize(&parent.header))
+        .unwrap_or_default();
     Ok(PrecompileOutput::new(gas_cost, encode_abi_bytes(&header_bytes).into()))
 }
 
@@ -622,7 +619,18 @@ fn decode_abi_bytes_array(data: &[u8]) -> Option<Vec<Vec<u8>>> {
 
 /// ABI-encode a `bytes` return value.
 fn encode_abi_bytes(data: &[u8]) -> Vec<u8> {
-    let mut result = Vec::with_capacity(64 + data.len().div_ceil(32) * 32);
+    // rskj's `SolidityType.BytesType.encode` sizes the data section as
+    // `((len - 1) / 32 + 1) * 32` using Java's truncating integer division
+    // (SolidityType.java:296). For a non-empty array this is the usual
+    // `ceil(len/32)*32`, but for an EMPTY array `(0 - 1) / 32 == -1 / 32 == 0`
+    // in Java, so `+ 1` yields one 32-byte zero word rather than zero words:
+    // empty `bytes` encodes to offset(0x20) + length(0) + one zero word = 96
+    // bytes, not 64. Rust's `/` truncates toward zero just like Java's, so the
+    // same expression reproduces the quirk exactly. This is consensus-critical:
+    // the extra word changes RETURNDATASIZE (and downstream memory expansion)
+    // in callers that copy the bridge's return data.
+    let data_section = (((data.len() as i64 - 1) / 32 + 1) * 32) as usize;
+    let mut result = Vec::with_capacity(64 + data_section);
     // Offset
     let mut offset = [0u8; 32];
     offset[31] = 0x20;
@@ -630,10 +638,9 @@ fn encode_abi_bytes(data: &[u8]) -> Vec<u8> {
     // Length
     let len = U256::from(data.len());
     result.extend_from_slice(&len.to_be_bytes::<32>());
-    // Data (padded to 32 bytes)
+    // Data (padded per rskj's BytesType formula)
     result.extend_from_slice(data);
-    let pad_len = (32 - data.len() % 32) % 32;
-    result.extend(std::iter::repeat_n(0u8, pad_len));
+    result.resize(64 + data_section, 0);
     result
 }
 
@@ -834,6 +841,26 @@ mod tests {
         let encoded = encode_abi_bytes(&data);
         let decoded = decode_abi_bytes(&encoded).unwrap();
         assert_eq!(decoded, data);
+        // 80 bytes → offset + length + ceil(80/32)*32 = 32 + 32 + 96 = 160.
+        assert_eq!(encoded.len(), 160);
+    }
+
+    /// Ground truth: rskj `SolidityType.BytesType.encode` allocates
+    /// `((len - 1) / 32 + 1) * 32` data bytes with Java's truncating division.
+    /// For an EMPTY `byte[]`, `-1 / 32 == 0`, so it still emits one 32-byte zero
+    /// word — empty `bytes` encodes to 96 bytes (offset + length + one word),
+    /// not 64. `getBtcBlockchainBlockHeaderByHeight` for an out-of-range height
+    /// returns rskj's `EMPTY_BYTE_ARRAY`, which `Bridge.execute` ABI-encodes
+    /// this way; the extra word changed RETURNDATASIZE and forked the caller at
+    /// mainnet #8,417,579 (tx[0], 34912 vs 34401 gas).
+    #[test]
+    fn abi_bytes_empty_matches_rskj_96_bytes() {
+        let encoded = encode_abi_bytes(&[]);
+        assert_eq!(encoded.len(), 96, "empty bytes must encode to 96, not 64");
+        // offset 0x20, length 0, one zero word.
+        assert_eq!(encoded[31], 0x20);
+        assert!(encoded[32..].iter().all(|&b| b == 0));
+        assert_eq!(decode_abi_bytes(&encoded).unwrap(), Vec::<u8>::new());
     }
 
     #[test]

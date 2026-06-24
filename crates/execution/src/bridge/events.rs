@@ -121,11 +121,16 @@ fn u256_word(value: alloy_primitives::U256) -> [u8; 32] {
 
 /// ABI-encode a single dynamic `bytes`/`string` parameter as event data.
 fn abi_single_dynamic(data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(64 + data.len().div_ceil(32) * 32);
+    // rskj's `SolidityType.BytesType.encode` sizes the data section as
+    // `((len - 1) / 32 + 1) * 32` with Java's truncating division, so an EMPTY
+    // `bytes`/`string` still emits one 32-byte zero word (-1/32 == 0 → 1 word):
+    // empty event data encodes to 96 bytes, not 64. Rust's `/` truncates alike.
+    let data_section = (((data.len() as i64 - 1) / 32 + 1) * 32) as usize;
+    let mut out = Vec::with_capacity(64 + data_section);
     out.extend_from_slice(&u256_word(alloy_primitives::U256::from(32u64)));
     out.extend_from_slice(&u256_word(alloy_primitives::U256::from(data.len() as u64)));
     out.extend_from_slice(data);
-    out.resize(out.len().next_multiple_of(32).max(64), 0);
+    out.resize(64 + data_section, 0);
     out
 }
 
@@ -1013,5 +1018,16 @@ mod tests {
         assert_eq!(out[64], 0xAA);
         assert_eq!(out[96], 0xAA);
         assert_eq!(out[97], 0x00); // padding
+    }
+
+    /// rskj's `SolidityType.BytesType.encode` emits one zero word even for an
+    /// empty array (`-1 / 32 == 0` → 1 word), so empty event data is 96 bytes,
+    /// not 64. See `btc_chain::encode_abi_bytes` (mainnet #8,417,579).
+    #[test]
+    fn abi_single_dynamic_empty_is_96_bytes() {
+        let out = abi_single_dynamic(&[]);
+        assert_eq!(out.len(), 96);
+        assert_eq!(out[31], 32); // offset
+        assert!(out[32..].iter().all(|&b| b == 0));
     }
 }
