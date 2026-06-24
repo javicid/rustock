@@ -3427,6 +3427,28 @@ pub fn add_signature<CTX: crate::RskContextTr>(
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     }
 
+    // RSKIP419: if the SVP is ongoing and this RSK tx hash is the one that
+    // created the SVP spend transaction, sign that (with the PROPOSED
+    // federation) instead of a peg-out (rskj addSignature → addSvpSpendTxSignatures).
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    if hardfork_cfg.has_rskip419(block_number) && svp_is_ongoing(ctx, config, block_number) {
+        let wfs_raw =
+            bridge_load_bytes_named(ctx, super::storage::SVP_SPEND_TX_WAITING_FOR_SIGNATURES_KEY);
+        if let Some(items) = rlp_decode_list(&wfs_raw) {
+            if items.len() == 2 && items[0] == rsk_tx_hash {
+                return add_svp_spend_tx_signatures(
+                    ctx,
+                    &fed_key,
+                    &sigs,
+                    &rsk_tx_hash,
+                    &items[1],
+                    block_number,
+                    gas_cost,
+                );
+            }
+        }
+    }
+
     // Load the waiting-for-signatures map
     let wfs_key = bridge_storage_key(PEGOUTS_WAITING_FOR_SIGNATURES_KEY);
     let wfs_data = bridge_load_bytes(ctx, wfs_key);
@@ -3573,6 +3595,71 @@ pub fn add_signature<CTX: crate::RskContextTr>(
         wfs.insert(rsk_tx_hash, updated_raw);
         let updated = serialize_rsk_txs_waiting_for_signatures(&wfs);
         bridge_store_bytes(ctx, wfs_key, &updated);
+    }
+
+    Ok(PrecompileOutput::new(gas_cost, Bytes::new()))
+}
+
+/// rskj `BridgeSupport.addSvpSpendTxSignatures`: apply a proposed-federation
+/// member's signatures to the SVP spend transaction. The signing federation is
+/// the PROPOSED federation (not active/retiring); the event's federatorRskAddress
+/// derives from the proposed member's RSK key. The updated tx is always stored
+/// back to `svpSpendTxWaitingForSignatures`; once fully signed, release_btc is
+/// logged and the entry cleared. (lovell700 >> RSKIP146/326/415, so the modern
+/// Solidity / log-after-applied / RSK-key paths always apply.)
+#[allow(clippy::too_many_arguments)]
+fn add_svp_spend_tx_signatures<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    fed_key: &[u8],
+    sigs: &[Vec<u8>],
+    rsk_tx_hash: &[u8; 32],
+    spend_tx_bytes: &[u8],
+    _block_number: u64,
+    gas_cost: u64,
+) -> Result<PrecompileOutput, PrecompileError> {
+    let empty = || Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
+
+    let Some(proposed) = super::federation::load_stored_federation(ctx, PROPOSED_FEDERATION_KEY)
+    else {
+        return empty();
+    };
+    let Some(compressed_key) = compress_pubkey(fed_key) else {
+        return empty();
+    };
+    // The federator must belong to the proposed federation.
+    let Some(member_rsk) =
+        proposed.members.iter().find(|m| m.btc == compressed_key).map(|m| m.rsk)
+    else {
+        return empty();
+    };
+    let mut spend_tx: BtcTransaction = match deserialize(spend_tx_bytes) {
+        Ok(tx) => tx,
+        Err(_) => return empty(),
+    };
+    // areSignaturesEnoughToSignAllTxInputs: one signature per input.
+    if sigs.len() != spend_tx.input.len() {
+        return empty();
+    }
+
+    // processSigning: apply the signatures, then (RSKIP326) log add_signature.
+    let applied = apply_signatures_to_tx(&mut spend_tx, sigs, &compressed_key);
+    if applied {
+        if let Some(addr) = super::federation::rsk_address_from_public_key(&member_rsk) {
+            super::events::log_solidity_add_signature(ctx, rsk_tx_hash, addr, fed_key);
+        }
+    }
+
+    // setSvpSpendTxWaitingForSignatures(updated entry) — always.
+    let wfs = super::serialization::rlp_encode_list(&[
+        super::serialization::rlp_encode_element(rsk_tx_hash),
+        super::serialization::rlp_encode_element(&btc_serialize(&spend_tx)),
+    ]);
+    bridge_store_bytes_named(ctx, super::storage::SVP_SPEND_TX_WAITING_FOR_SIGNATURES_KEY, &wfs);
+
+    // Once fully signed: log release_btc and clear the waiting entry.
+    if super::release_tx::has_enough_signatures(&spend_tx) {
+        super::events::log_solidity_release_btc(ctx, rsk_tx_hash, &btc_serialize(&spend_tx));
+        bridge_store_bytes_named(ctx, super::storage::SVP_SPEND_TX_WAITING_FOR_SIGNATURES_KEY, &[]);
     }
 
     Ok(PrecompileOutput::new(gas_cost, Bytes::new()))
