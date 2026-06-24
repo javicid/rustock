@@ -4156,6 +4156,38 @@ it is 0 for specs < BERLIN, so this is a no-op pre-lovell. Test extends
 `selfdestruct_cold_cost() == 0`). Verified: exec-head #7,403,648 → replay
 #7,403,649–#7,408,000 match state and receipts roots exactly; 557 tests pass.
 
+## §83 RSKIP305 (reed800): spend the segwit active federation — segwit pegouts (#8,153,771)
+
+Once the P2SH-P2WSH federation is active and has UTXOs, regular peg-outs spend it with
+**segwit** inputs. Four pieces had to become format-aware:
+
+1. **UTXO registration / peg-in matching** (`registerNewUtxos`, `register_btc_transaction`):
+   the active/retiring federation is recognized at its **P2SH-P2WSH** address
+   (`getActiveFederationAddress` is format-aware), so the output-script used to match
+   funding outputs is `federation_output_hash160(redeem, format)`. Without this the
+   migrated UTXO is never registered (the symptom at #8,153,771: the migration UTXO is
+   registered *and* spent within the same block, so the UTXO-set leaf still matched while
+   the peg-out was silently never built).
+2. **Change output**: peg-out change returns to the active federation's P2SH-P2WSH address.
+3. **Segwit inputs + fee** (`complete_pegout_tx`, `is_segwit`): each input's scriptSig is
+   the witness-program push and the redeem + sig placeholders go in the witness
+   (`segwit_base_input`); the fee uses bitcoinj `Wallet.calculateTxSize`'s segwit branch
+   `vsize = (baseSize + signing + 3*baseSize)/4` with `baseSize += inputs*36`. The migration
+   path is segwit when the *retiring* federation is format 4000.
+4. **pegoutTxSigHash** — see below.
+
+**Consensus-critical rskj quirk (`getSigHashForPegoutIndex`).** The peg-out is indexed by
+`hashForSignature(0, redeem, ALL, false)` of the signatures-stripped tx. For a *segwit*
+peg-out this is NOT a witness-stripped legacy sighash: bitcoinj clears the input scriptSigs
+(input 0 → redeem) but leaves the base **witnesses** in place, and
+`BtcTransaction.bitcoinSerializeToStream` emits the witness bytes whenever `hasWitness()`.
+So the sighash preimage is the **segwit serialization** (marker/flag + witnesses) + the
+4-byte LE SIGHASH_ALL, double-SHA256 — a non-standard "legacy hash over segwit bytes".
+rust-bitcoin's `legacy_signature_hash` strips the witness, so `first_input_sig_hash` builds
+the preimage manually for witness-bearing txs. Verified: replay #8,153,771 matches
+state+receipts roots exactly; test `segwit_pegout_uses_witness_inputs_and_smaller_fee`;
+563 tests pass.
+
 ## §82 RSKIP305 (reed800): migration destination is the segwit active fed's P2SH-P2WSH address (#8,147,324)
 
 ~40,320 blocks after its commit (§78), the first reed800 P2SH-P2WSH proposed federation

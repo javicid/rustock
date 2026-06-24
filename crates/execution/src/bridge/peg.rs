@@ -245,15 +245,21 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     // getRetiringFederation → Federation.getRedeemScript()).
     let (federation_keys, fed_redeem) =
         active_federation_keys_and_redeem(ctx, config, hardfork_cfg, block_number_now);
-    let fed_script = p2sh_output_script(&redeem_script_hash160(&fed_redeem));
+    // getActiveFederationAddress is format-aware: a P2SH-P2WSH (format 4000,
+    // RSKIP305) federation is recognized at its P2SH-P2WSH address, so peg-in /
+    // UTXO-registration output matching must use that script, not a plain P2SH.
+    let active_format = active_federation_format(ctx, config, hardfork_cfg, block_number_now);
+    let fed_script = p2sh_output_script(&federation_output_hash160(&fed_redeem, active_format));
     // rskj isPegOutTx compares against each federation's STANDARD redeem script
     // (getStandardRedeemScript) — for an ERP federation this is the default
     // multisig branch only, not the full ERP/flyover-wrapped redeem.
     let fed_standard_redeem =
         build_federation_redeem_script(&federation_keys, federation_keys.len() / 2 + 1);
+    let retiring_format =
+        federation_format_version(ctx, super::storage::OLD_FEDERATION_FORMAT_VERSION_KEY);
     let retiring = retiring_federation_keys_and_redeem(ctx, config, hardfork_cfg, block_number_now)
         .map(|(_keys, redeem)| {
-            let script = p2sh_output_script(&redeem_script_hash160(&redeem));
+            let script = p2sh_output_script(&federation_output_hash160(&redeem, retiring_format));
             (redeem, script)
         });
     let retiring_standard_redeem = retiring_federation_keys(ctx, config, hardfork_cfg, block_number_now)
@@ -1445,6 +1451,36 @@ fn save_pegout_tx_sig_hash<CTX: crate::RskContextTr>(ctx: &mut CTX, sig_hash: &[
     super::storage::bridge_store_raw(ctx, key, Some(vec![1]));
 }
 
+/// rskj `BitcoinUtils.getSigHashForPegoutIndex`: index a created pegout by the
+/// `hashForSignature(0, redeemScript, ALL, false)` of its signatures-stripped tx.
+///
+/// **Consensus-critical rskj quirk:** for a *segwit* pegout this is NOT the
+/// standard legacy sighash. bitcoinj's `hashForSignature` clears the input
+/// scriptSigs and sets input 0's to the redeem, but leaves the (base) witnesses
+/// in place, and `BtcTransaction.bitcoinSerializeToStream` writes the witness
+/// bytes whenever `hasWitness()` — so the preimage is the **segwit**
+/// serialization (marker/flag + witnesses), not a witness-stripped legacy one.
+/// We reproduce that byte-for-byte: clear scriptSigs (input 0 → redeem), keep the
+/// witnesses, segwit-serialize, append the 4-byte LE SIGHASH_ALL, double-SHA256.
+/// A legacy pegout (no witness) takes the ordinary legacy sighash.
+fn first_input_sig_hash(tx: &BtcTransaction, redeem0: &[u8], _value0: u64) -> [u8; 32] {
+    if tx.input.iter().all(|i| i.witness.is_empty()) {
+        return super::release_tx::legacy_sighash_all(tx, 0, redeem0);
+    }
+    use bitcoin::hashes::Hash;
+    let mut copy = tx.clone();
+    for (i, input) in copy.input.iter_mut().enumerate() {
+        input.script_sig = if i == 0 {
+            bitcoin::ScriptBuf::from_bytes(redeem0.to_vec())
+        } else {
+            bitcoin::ScriptBuf::new()
+        };
+    }
+    let mut preimage = bitcoin::consensus::serialize(&copy);
+    preimage.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // SIGHASH_ALL, 4-byte LE
+    *bitcoin::hashes::sha256d::Hash::hash(&preimage).as_byte_array()
+}
+
 /// rskj `BridgeStorageProvider.setReleaseOutpointsValues` (RSKIP305, reed800):
 /// inside `processReleaseTransactionInfo`, right after the RSKIP428
 /// `pegout_transaction_created` event, every settled release also persists its
@@ -2106,7 +2142,14 @@ pub fn update_collections<CTX: crate::RskContextTr>(
             let (federation_keys, redeem_script) =
                 active_federation_keys_and_redeem(ctx, config, hardfork_cfg, block_number);
             if !federation_keys.is_empty() {
-                let change_script = p2sh_output_script(&redeem_script_hash160(&redeem_script));
+                // getActiveFederationAddress / isSegwitCompatible: a P2SH-P2WSH
+                // (format 4000, RSKIP305) active federation pays change to its
+                // P2SH-P2WSH address and is spent with segwit inputs.
+                let active_format =
+                    active_federation_format(ctx, config, hardfork_cfg, block_number);
+                let is_segwit = active_format >= 4000;
+                let change_script =
+                    p2sh_output_script(&federation_output_hash160(&redeem_script, active_format));
                 let fee_per_kb = get_effective_fee_per_kb(ctx, config);
                 let tx_version = if hardfork_cfg.has_rskip201(block_number) { 2 } else { 1 };
 
@@ -2240,6 +2283,7 @@ pub fn update_collections<CTX: crate::RskContextTr>(
                             redeem_for,
                             fee_per_kb,
                             tx_version,
+                            is_segwit,
                         ) {
                             Some(built) => {
                                 settle(
@@ -2280,6 +2324,7 @@ pub fn update_collections<CTX: crate::RskContextTr>(
                         redeem_for,
                         fee_per_kb,
                         tx_version,
+                        is_segwit,
                     ) {
                         let total: u64 = pending.iter().map(|r| r.amount_satoshis).sum();
                         // rskj logBatchPegoutCreated needs the batch BTC tx hash
@@ -2298,7 +2343,11 @@ pub fn update_collections<CTX: crate::RskContextTr>(
                         if hardfork_cfg.has_rskip379(block_number) {
                             let sig_hash = {
                                 let redeem0 = redeem_for(&built.used_utxos[0]);
-                                super::release_tx::legacy_sighash_all(&built.tx, 0, redeem0)
+                                first_input_sig_hash(
+                                    &built.tx,
+                                    redeem0,
+                                    built.used_utxos[0].value_satoshis,
+                                )
                             };
                             save_pegout_tx_sig_hash(ctx, &sig_hash);
                         }
@@ -2738,7 +2787,7 @@ fn create_svp_spend_transaction<CTX: crate::RskContextTr>(
     // the legacy placeholder scriptSig with an empty witness.
     let spend_input = |vout: u32, redeem: &[u8], threshold: usize| -> bitcoin::TxIn {
         let (script_sig, witness) = if proposed_format >= 4000 {
-            segwit_base_input(redeem, threshold)
+            super::release_tx::segwit_base_input(redeem, threshold)
         } else {
             (
                 bitcoin::ScriptBuf::from_bytes(super::release_tx::placeholder_scriptsig(
@@ -3159,6 +3208,11 @@ fn process_funds_migration<CTX: crate::RskContextTr>(
         let new_format = federation_format_version(ctx, super::storage::NEW_FEDERATION_FORMAT_VERSION_KEY);
         let active_script = p2sh_output_script(&federation_output_hash160(&new_redeem, new_format));
 
+        // The migration spends the retiring (OLD) federation; a P2SH-P2WSH
+        // retiring federation is spent with segwit inputs (isSegwitCompatible).
+        let retiring_is_segwit =
+            federation_format_version(ctx, super::storage::OLD_FEDERATION_FORMAT_VERSION_KEY) >= 4000;
+
         // rskj getRetiringFederationWallet builds a FlyoverCompatibleBtcWallet:
         // a flyover UTXO in the migration set spends with the flyover redeem
         // (PUSH32 <derivationHash> OP_DROP <fedRedeem>) of its destination
@@ -3196,6 +3250,7 @@ fn process_funds_migration<CTX: crate::RskContextTr>(
                 redeem_for,
                 fee_per_kb,
                 migration_tx_version,
+                retiring_is_segwit,
             ) {
                 Some(b) => break Some(b),
                 None => {
@@ -3209,12 +3264,12 @@ fn process_funds_migration<CTX: crate::RskContextTr>(
 
         if let Some(built) = built {
             // RSKIP379: settleReleaseRequest indexes every pegout — migrations
-            // included — by the legacy sighash of its first input
-            // (BridgeSupport.savePegoutTxSigHash, BridgeSupport.java:1322,1381).
+            // included — by the first-input sighash (segwit BIP-143 when the
+            // retiring federation is P2SH-P2WSH; BridgeSupport.savePegoutTxSigHash).
             if hardfork_cfg.has_rskip379(block_number) {
                 let sig_hash = {
                     let redeem0 = redeem_for(&built.used_utxos[0]);
-                    super::release_tx::legacy_sighash_all(&built.tx, 0, redeem0)
+                    first_input_sig_hash(&built.tx, redeem0, built.used_utxos[0].value_satoshis)
                 };
                 save_pegout_tx_sig_hash(ctx, &sig_hash);
             }
@@ -3414,6 +3469,32 @@ fn active_federation_keys_and_redeem<CTX: crate::RskContextTr>(
     let version = federation_format_version(ctx, format_key);
     let redeem = federation_redeem_for_format(&keys, version, config);
     (keys, redeem)
+}
+
+/// Stored format version of whichever federation is currently active (the same
+/// new/old selection as `active_federation_keys_and_redeem`). Used to decide the
+/// active federation's output type (P2SH vs P2SH-P2WSH) and segwit spending.
+fn active_federation_format<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    config: &BridgeConstants,
+    hardfork_cfg: &RskHardforkConfig,
+    block_number: u64,
+) -> u64 {
+    let new = super::federation::load_stored_federation(ctx, NEW_FEDERATION_KEY);
+    let old = super::federation::load_stored_federation(ctx, OLD_FEDERATION_KEY);
+    let age = super::governance::federation_activation_age(config, hardfork_cfg, block_number);
+    let format_key = match (new, old) {
+        (Some(n), Some(_)) => {
+            if block_number >= n.creation_block + age {
+                super::storage::NEW_FEDERATION_FORMAT_VERSION_KEY
+            } else {
+                super::storage::OLD_FEDERATION_FORMAT_VERSION_KEY
+            }
+        }
+        (Some(_), None) => super::storage::NEW_FEDERATION_FORMAT_VERSION_KEY,
+        (None, _) => return 1000, // genesis federation: plain multisig
+    };
+    federation_format_version(ctx, format_key)
 }
 
 /// Retiring federation keys + redeem (rskj `getRetiringFederation().getRedeemScript()`).
@@ -3834,29 +3915,6 @@ fn add_svp_spend_tx_signatures<CTX: crate::RskContextTr>(
 
 /// BTC txid in rskj event byte order: bitcoinj `Sha256Hash.getBytes()` keeps
 /// the display (big-endian) order, the reverse of rust-bitcoin's internal one.
-/// rskj `BitcoinUtils.setSpendingBaseScriptSegwit`: for a P2SH-P2WSH ERP input
-/// the scriptSig is just the witness-program push (`buildSegwitScriptSig` =
-/// push of `OP_0 PUSH32 sha256(redeem)`), and the unsigned base witness
-/// (`createBaseWitnessThatSpendsFromErpRedeemScript`) carries the CHECKMULTISIG
-/// dummy, `threshold` empty signature placeholders, the OP_NOTIF default-branch
-/// flag, then the redeem script.
-fn segwit_base_input(redeem: &[u8], threshold: usize) -> (bitcoin::ScriptBuf, bitcoin::Witness) {
-    use sha2::Digest as _;
-    let mut program = vec![0x00, 0x20]; // OP_0 PUSH32
-    program.extend_from_slice(&sha2::Sha256::digest(redeem));
-    let mut script_sig = Vec::with_capacity(1 + program.len());
-    super::release_tx::push_data(&mut script_sig, &program);
-
-    let mut witness = bitcoin::Witness::new();
-    witness.push([] as [u8; 0]); // OP_0 (CHECKMULTISIG bug workaround)
-    for _ in 0..threshold {
-        witness.push([] as [u8; 0]); // empty signature placeholder
-    }
-    witness.push([] as [u8; 0]); // OP_NOTIF default-branch flag
-    witness.push(redeem);
-    (bitcoin::ScriptBuf::from_bytes(script_sig), witness)
-}
-
 fn btc_txid_event_bytes(tx: &BtcTransaction) -> [u8; 32] {
     let mut bytes = *tx.compute_txid().to_raw_hash().as_byte_array();
     bytes.reverse();
@@ -4794,7 +4852,7 @@ mod tests {
     fn svp_spend_segwit_base_input_layout() {
         use sha2::Digest as _;
         let redeem = vec![0xabu8; 100];
-        let (script_sig, witness) = segwit_base_input(&redeem, 5);
+        let (script_sig, witness) = super::super::release_tx::segwit_base_input(&redeem, 5);
         let mut expected_sig = vec![0x22u8, 0x00, 0x20];
         expected_sig.extend_from_slice(&sha2::Sha256::digest(&redeem));
         assert_eq!(script_sig.as_bytes(), expected_sig.as_slice());

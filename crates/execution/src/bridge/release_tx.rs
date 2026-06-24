@@ -103,6 +103,29 @@ pub fn placeholder_scriptsig(redeem_script: &[u8], threshold: usize) -> Vec<u8> 
     script
 }
 
+/// rskj `BitcoinUtils.setSpendingBaseScriptSegwit`: for a P2SH-P2WSH ERP input
+/// the scriptSig is the witness-program push (`buildSegwitScriptSig` = push of
+/// `OP_0 PUSH32 sha256(redeem)`), and the unsigned base witness
+/// (`createBaseWitnessThatSpendsFromErpRedeemScript`) carries the CHECKMULTISIG
+/// dummy, `threshold` empty signature placeholders, the OP_NOTIF default-branch
+/// flag, then the redeem script.
+pub fn segwit_base_input(redeem: &[u8], threshold: usize) -> (ScriptBuf, Witness) {
+    use sha2::Digest as _;
+    let mut program = vec![0x00, 0x20]; // OP_0 PUSH32
+    program.extend_from_slice(&sha2::Sha256::digest(redeem));
+    let mut script_sig = Vec::with_capacity(1 + program.len());
+    push_data(&mut script_sig, &program);
+
+    let mut witness = Witness::new();
+    witness.push([] as [u8; 0]); // OP_0 (CHECKMULTISIG bug workaround)
+    for _ in 0..threshold {
+        witness.push([] as [u8; 0]); // empty signature placeholder
+    }
+    witness.push([] as [u8; 0]); // OP_NOTIF default-branch flag
+    witness.push(redeem);
+    (ScriptBuf::from_bytes(script_sig), witness)
+}
+
 /// Append a minimal data push to a script (bitcoinj `ScriptBuilder.data`).
 pub fn push_data(script: &mut Vec<u8>, data: &[u8]) {
     let len = data.len();
@@ -159,6 +182,7 @@ pub fn complete_pegout_tx<'r, F>(
     redeem_for: F,
     fee_per_kb: u64,
     version: i32,
+    is_segwit: bool,
 ) -> Option<BuiltPegout>
 where
     F: Fn(&BridgeUtxo) -> &'r [u8],
@@ -271,25 +295,40 @@ where
             output: tx_outputs,
         };
 
-        // calculateTxSize: empty-scriptSig serialization plus the estimated
-        // signing bytes per P2SH input — sized with that input's own redeem
-        // script (flyover inputs cost 34 extra bytes).
-        let base_size = bitcoin::consensus::serialize(&tx).len();
+        // calculateTxSize (bitcoinj Wallet): base size = empty-scriptSig
+        // serialization (+36 per input for a segwit-compatible tx), plus the
+        // estimated signing bytes per P2SH input (this input's own redeem; a
+        // flyover input costs 34 extra bytes). A segwit tx is then weighted:
+        // vsize = (baseSize + signing + 3*baseSize) / 4.
+        let base_size = bitcoin::consensus::serialize(&tx).len()
+            + if is_segwit { selected.len() * 36 } else { 0 };
         let signing: usize = selected
             .iter()
             .map(|(_, r)| redeem_script_threshold(r) * SIG_SIZE + r.len())
             .sum();
-        let size = base_size + signing;
+        let size = if is_segwit {
+            (base_size + signing + 3 * base_size) / 4
+        } else {
+            base_size + signing
+        };
 
         let fee_rate = fee_per_kb.max(REFERENCE_DEFAULT_MIN_TX_FEE);
         let fee_needed = fee_rate * size as u64 / 1000;
 
         if fee >= fee_needed {
-            // Done: fill in the USE_OP_ZERO placeholder scriptSigs (per-input
-            // redeem, so a flyover input embeds the flyover redeem).
+            // Done: fill the per-input spending scripts. A segwit input carries
+            // the witness-program scriptSig + base witness; a legacy input the
+            // USE_OP_ZERO placeholder scriptSig (per-input redeem, so a flyover
+            // input embeds the flyover redeem).
             for (input, (_, redeem)) in tx.input.iter_mut().zip(&selected) {
-                let scriptsig = placeholder_scriptsig(redeem, redeem_script_threshold(redeem));
-                input.script_sig = ScriptBuf::from_bytes(scriptsig);
+                let threshold = redeem_script_threshold(redeem);
+                if is_segwit {
+                    let (script_sig, witness) = segwit_base_input(redeem, threshold);
+                    input.script_sig = script_sig;
+                    input.witness = witness;
+                } else {
+                    input.script_sig = ScriptBuf::from_bytes(placeholder_scriptsig(redeem, threshold));
+                }
             }
             if bitcoin::consensus::serialize(&tx).len() > MAX_STANDARD_TX_SIZE {
                 return None;
@@ -1139,6 +1178,7 @@ mod tests {
             |_| redeem.as_slice(),
             5000,
             1,
+            false,
         )
         .expect("build");
         // Selection order: hash 01 vout 0, hash 01 vout 1 (covers 100k > 60k).
@@ -1147,6 +1187,47 @@ mod tests {
         assert_eq!(built.used_utxos[0].vout, 0);
         assert_eq!(built.used_utxos[1].vout, 1);
         assert_eq!(built.tx.version.0, 1);
+    }
+
+    #[test]
+    fn segwit_pegout_uses_witness_inputs_and_smaller_fee() {
+        // A P2SH-P2WSH (format ≥ 4000) federation is spent with segwit inputs and
+        // a witness-discounted fee. Use an ERP redeem so the base witness has the
+        // OP_NOTIF flag (threshold 5 → 8 witness items).
+        let redeem = {
+            let mut r = vec![0x64u8]; // OP_NOTIF
+            r.extend_from_slice(&test_redeem(5, 9));
+            r.push(0x67); // OP_ELSE
+            r.push(0x68); // OP_ENDIF
+            r
+        };
+        let utxos = vec![utxo(1, 0, 1_000_000)];
+        let build = |segwit| {
+            complete_pegout_tx(
+                &utxos,
+                &[PegoutOutput { script: p2pkh(7), amount_satoshis: 200_000 }],
+                &p2sh(8),
+                |_| redeem.as_slice(),
+                100_000,
+                2,
+                segwit,
+            )
+            .expect("build")
+        };
+        let seg = build(true);
+        let leg = build(false);
+
+        // Segwit input: scriptSig is the 35-byte witness-program push, the redeem
+        // lives in the witness (8 items for threshold 5).
+        let sig = seg.tx.input[0].script_sig.as_bytes();
+        assert_eq!(sig.len(), 35);
+        assert_eq!(&sig[0..3], &[0x22, 0x00, 0x20]);
+        assert_eq!(seg.tx.input[0].witness.len(), 8);
+        assert_eq!(seg.tx.input[0].witness.iter().last().unwrap(), redeem.as_slice());
+
+        // Witness discount: the segwit fee is strictly smaller, so the recipient
+        // keeps more (recipientsPayFees).
+        assert!(seg.tx.output[0].value.to_sat() > leg.tx.output[0].value.to_sat());
     }
 
     #[test]
@@ -1160,6 +1241,7 @@ mod tests {
             |_| redeem.as_slice(),
             5000,
             1,
+            false,
         )
         .expect("build");
         let tx = &built.tx;
@@ -1241,6 +1323,7 @@ mod tests {
             |_| redeem.as_slice(),
             5000,
             1,
+            false,
         )
         .is_none());
     }
@@ -1256,6 +1339,7 @@ mod tests {
             |_| redeem.as_slice(),
             5000,
             1,
+            false,
         )
         .is_none());
     }
@@ -1274,6 +1358,7 @@ mod tests {
             |_| redeem.as_slice(),
             5000,
             1,
+            false,
         )
         .expect("build");
         let tx = &built.tx;
@@ -1314,6 +1399,7 @@ mod tests {
             redeem_for,
             5000,
             1,
+            false,
         )
         .expect("build");
         let tx = &built.tx;
