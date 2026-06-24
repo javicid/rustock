@@ -1471,6 +1471,45 @@ fn save_release_outpoints_values<CTX: crate::RskContextTr>(
     super::storage::bridge_store_raw(ctx, key, Some(serialized));
 }
 
+/// rskj `BridgeStorageProvider.getReleaseOutpointsValues`: the per-input spent
+/// values stored when a release tx is created, keyed by its witness-stripped
+/// hash. Decodes the bitcoinj `VarInt` concatenation (`UtxoUtils`).
+fn load_release_outpoints_values<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    btc_tx_hash_display: &[u8; 32],
+) -> Vec<u64> {
+    let key = compound_key(
+        super::storage::RELEASES_OUTPOINTS_VALUES_KEY,
+        "-",
+        &to_hex(btc_tx_hash_display),
+    );
+    let Some(bytes) = super::storage::bridge_load_raw(ctx, key) else {
+        return Vec::new();
+    };
+    let mut values = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let (v, consumed) = match bytes[i] {
+            0xFF => (
+                u64::from_le_bytes(bytes.get(i + 1..i + 9).and_then(|s| s.try_into().ok()).unwrap_or([0; 8])),
+                9,
+            ),
+            0xFE => (
+                u32::from_le_bytes(bytes.get(i + 1..i + 5).and_then(|s| s.try_into().ok()).unwrap_or([0; 4])) as u64,
+                5,
+            ),
+            0xFD => (
+                u16::from_le_bytes(bytes.get(i + 1..i + 3).and_then(|s| s.try_into().ok()).unwrap_or([0; 2])) as u64,
+                3,
+            ),
+            b => (b as u64, 1),
+        };
+        values.push(v);
+        i += consumed;
+    }
+    values
+}
+
 /// rskj `getStorageKeyForFlyoverHash`:
 /// `fastBridgeHashUsedInBtcTx-` + `Sha256Hash.toString()` (display order) +
 /// `Keccak256.toString()` (forward order).
@@ -3688,7 +3727,7 @@ pub fn add_signature<CTX: crate::RskContextTr>(
     // rskj processSigning: verify every provided signature against its
     // input's sighash before applying any, then insert each at the position
     // determined by the key order in the redeem script.
-    let applied = apply_signatures_to_tx(&mut btc_tx, &sigs, &compressed_key);
+    let applied = apply_signatures_to_tx(&mut btc_tx, &sigs, &compressed_key, &[]);
     if log_only_when_applied && applied {
         emit_add_signature(ctx, &btc_tx);
     }
@@ -3758,8 +3797,14 @@ fn add_svp_spend_tx_signatures<CTX: crate::RskContextTr>(
         return empty();
     }
 
+    // generateInputSigHash (segwit): the per-input prevValue comes from the
+    // releasesOutpointsValues entry keyed by the spend tx's witness-stripped
+    // hash, saved when the spend tx was created (processReleaseTransactionInfo).
+    let spend_hash = btc_txid_event_bytes(&spend_tx);
+    let prev_values = load_release_outpoints_values(ctx, &spend_hash);
+
     // processSigning: apply the signatures, then (RSKIP326) log add_signature.
-    let applied = apply_signatures_to_tx(&mut spend_tx, sigs, &compressed_key);
+    let applied = apply_signatures_to_tx(&mut spend_tx, sigs, &compressed_key, &prev_values);
     if applied {
         if let Some(addr) = super::federation::rsk_address_from_public_key(&member_rsk) {
             super::events::log_solidity_add_signature(ctx, rsk_tx_hash, addr, fed_key);
@@ -4464,20 +4509,36 @@ fn apply_signatures_to_tx(
     tx: &mut BtcTransaction,
     sigs: &[Vec<u8>],
     fed_key: &[u8; 33],
+    prev_values: &[u64],
 ) -> bool {
     use super::release_tx::{
-        extract_redeem_script, input_signed_by, legacy_sighash_all, sig_insertion_index,
-        update_script_with_signature, verify_der_signature,
+        extract_redeem_script, input_signed_by, legacy_sighash_all, segwit_sighash_all,
+        sig_insertion_index, update_script_with_signature, verify_der_signature,
+        witness_input_signed_by, witness_sig_insertion_index, witness_update_with_signature,
     };
 
     let n = tx.input.len();
+    // generateInputSigHash: a segwit input takes a BIP-143 sighash with the
+    // value from releasesOutpointsValues and the redeem from its witness; a
+    // legacy input takes the redeem from its scriptSig and a legacy sighash.
+    let is_witness: Vec<bool> = (0..n).map(|i| !tx.input[i].witness.is_empty()).collect();
     let mut redeems = Vec::with_capacity(n);
     let mut sighashes = Vec::with_capacity(n);
     for i in 0..n {
-        let Some(redeem) = extract_redeem_script(tx.input[i].script_sig.as_bytes()) else {
+        let redeem = if is_witness[i] {
+            tx.input[i].witness.last().map(|r| r.to_vec())
+        } else {
+            extract_redeem_script(tx.input[i].script_sig.as_bytes())
+        };
+        let Some(redeem) = redeem else {
             return false;
         };
-        sighashes.push(legacy_sighash_all(tx, i, &redeem));
+        let sighash = if is_witness[i] {
+            segwit_sighash_all(tx, i, &redeem, prev_values.get(i).copied().unwrap_or(0))
+        } else {
+            legacy_sighash_all(tx, i, &redeem)
+        };
+        sighashes.push(sighash);
         redeems.push(redeem);
     }
 
@@ -4492,7 +4553,13 @@ fn apply_signatures_to_tx(
     // sign(): stop at the first input already signed by this federator.
     let mut signed = false;
     for i in 0..n {
-        if input_signed_by(tx, i, fed_key, &sighashes[i]) {
+        let already = if is_witness[i] {
+            let pushes: Vec<Vec<u8>> = tx.input[i].witness.iter().map(|p| p.to_vec()).collect();
+            witness_input_signed_by(&pushes, fed_key, &sighashes[i])
+        } else {
+            input_signed_by(tx, i, fed_key, &sighashes[i])
+        };
+        if already {
             break;
         }
         // rskj getSigInsertionIndex -> findKeyInRedeem throws when the
@@ -4507,12 +4574,22 @@ fn apply_signatures_to_tx(
         }
         let mut encoded = sigs[i].clone();
         encoded.push(0x01); // SIGHASH_ALL
-        let script_sig = tx.input[i].script_sig.as_bytes().to_vec();
-        let index = sig_insertion_index(&script_sig, &sighashes[i], fed_key, &redeems[i]);
-        let Some(updated) = update_script_with_signature(&script_sig, &encoded, index) else {
-            return false; // no placeholder left (bitcoinj throws)
-        };
-        tx.input[i].script_sig = bitcoin::ScriptBuf::from_bytes(updated);
+        if is_witness[i] {
+            let pushes: Vec<Vec<u8>> = tx.input[i].witness.iter().map(|p| p.to_vec()).collect();
+            let index =
+                witness_sig_insertion_index(&pushes, &sighashes[i], fed_key, &redeems[i]);
+            let Some(updated) = witness_update_with_signature(&pushes, &encoded, index) else {
+                return false; // no placeholder left (bitcoinj throws)
+            };
+            tx.input[i].witness = bitcoin::Witness::from_slice(&updated);
+        } else {
+            let script_sig = tx.input[i].script_sig.as_bytes().to_vec();
+            let index = sig_insertion_index(&script_sig, &sighashes[i], fed_key, &redeems[i]);
+            let Some(updated) = update_script_with_signature(&script_sig, &encoded, index) else {
+                return false; // no placeholder left (bitcoinj throws)
+            };
+            tx.input[i].script_sig = bitcoin::ScriptBuf::from_bytes(updated);
+        }
         signed = true;
     }
     signed
@@ -4872,11 +4949,11 @@ mod tests {
 
         // Outsider: verifies against its own key but is not in the redeem.
         let before = tx.input[0].script_sig.clone();
-        assert!(!apply_signatures_to_tx(&mut tx, &[sign(&outsider_sk)], &outsider_pk));
+        assert!(!apply_signatures_to_tx(&mut tx, &[sign(&outsider_sk)], &outsider_pk, &[]));
         assert_eq!(tx.input[0].script_sig, before, "script must be untouched");
 
         // Member: applied normally.
-        assert!(apply_signatures_to_tx(&mut tx, &[sign(&members[0].0)], &members[0].1));
+        assert!(apply_signatures_to_tx(&mut tx, &[sign(&members[0].0)], &members[0].1, &[]));
         assert_ne!(tx.input[0].script_sig, before);
     }
 

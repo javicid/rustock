@@ -4156,6 +4156,35 @@ it is 0 for specs < BERLIN, so this is a no-op pre-lovell. Test extends
 `selfdestruct_cold_cost() == 0`). Verified: exec-head #7,403,648 → replay
 #7,403,649–#7,408,000 match state and receipts roots exactly; 557 tests pass.
 
+## §81 RSKIP305 (reed800): segwit SVP spend-tx signing (BIP143) (#8,117,400)
+
+Federators sign the segwit SVP spend tx via `addSignature` → `addSvpSpendTxSignatures`
+→ `processSigning`. For a P2SH-P2WSH (witness) input rskj diverges from the legacy path:
+
+- **sigHash** (`generateInputSigHash`): a witness input uses the BIP-143 segwit v0
+  sighash (`hashForWitnessSignature`) with the redeem as the witness script and the
+  spent value taken from `releaseOutpointsValues(tx.getHash())[i]` — the per-input
+  values we persisted when the spend tx was created. rust-bitcoin's
+  `SighashCache::p2wsh_signature_hash(i, redeem, value, All)`.
+- **redeem extraction**: from the **witness** (last push), not the scriptSig (which
+  is just the witness-program push).
+- **signature insertion** (`signInput` → `updateWitnessWithSignature`): the signature
+  goes into the **witness** stack, not the scriptSig. The base ERP witness is
+  `[dummy, ε×threshold, OP_NOTIF-flag, redeem]`; a signature is inserted among the
+  `threshold` sig slots in redeem-key order, exactly as the legacy
+  `getScriptSigWithSignature` does on scriptSig chunks (mirrored as
+  `witness_update_with_signature` / `witness_sig_insertion_index` /
+  `witness_input_signed_by`, with the redeem + ERP flag as a 2-item suffix).
+- **fully-signed check** (`countMissingSignatures` / `has_enough_signatures`): a witness
+  input is complete when every sig slot between the dummy and the flag+redeem suffix is
+  filled.
+
+rustock: `apply_signatures_to_tx` now branches per input on `!witness.is_empty()`;
+`segwit_sighash_all`, `load_release_outpoints_values`, and the `witness_*` helpers in
+release_tx.rs. Verified: replay #8,117,400 (first federator's signature) matches
+state+receipts roots exactly; tests `witness_update_with_signature_erp_first_sig`; 562
+tests pass.
+
 ## §80 RSKIP305 (reed800): segwit SVP spend transaction (#8,113,398)
 
 When the proposed federation is format 4000 (P2SH-P2WSH), `createSvpSpendTransaction`

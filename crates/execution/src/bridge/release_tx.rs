@@ -763,6 +763,15 @@ pub fn legacy_sighash_all(tx: &BtcTransaction, input_index: usize, redeem_script
 /// OP_0 placeholder left in its signature slots.
 pub fn has_enough_signatures(tx: &BtcTransaction) -> bool {
     for input in &tx.input {
+        // A segwit (P2SH-P2WSH) input carries its signatures in the witness, not
+        // the scriptSig (which is just the witness-program push).
+        if !input.witness.is_empty() {
+            let pushes: Vec<Vec<u8>> = input.witness.iter().map(|p| p.to_vec()).collect();
+            if !witness_input_fully_signed(&pushes) {
+                return false;
+            }
+            continue;
+        }
         let Some(chunks) = parse_chunks(input.script_sig.as_bytes()) else {
             return false;
         };
@@ -783,6 +792,135 @@ pub fn has_enough_signatures(tx: &BtcTransaction) -> bool {
         }
     }
     !tx.input.is_empty()
+}
+
+/// Witness equivalent of the per-input check in `has_enough_signatures`: every
+/// signature slot (between the CHECKMULTISIG dummy and the ERP OP_NOTIF flag +
+/// redeem suffix) is filled.
+fn witness_input_fully_signed(pushes: &[Vec<u8>]) -> bool {
+    let total = pushes.len();
+    if total < 3 {
+        return false;
+    }
+    let suffix = if witness_redeem_is_erp(pushes) { 2 } else { 1 };
+    if total < 1 + suffix {
+        return false;
+    }
+    !pushes[1..total - suffix].iter().any(|p| p.is_empty())
+}
+
+/// Whether a segwit input's redeem (its last witness push) is ERP-typed.
+fn witness_redeem_is_erp(pushes: &[Vec<u8>]) -> bool {
+    pushes.last().map(|d| is_erp_redeem(d)).unwrap_or(false)
+}
+
+/// BIP-143 (segwit v0) signature hash with the redeem script as the witness
+/// script, SIGHASH_ALL — rskj `BtcTransaction.hashForWitnessSignature` /
+/// `BitcoinUtils.generateSigHashForSegwitTransactionInput`. `value` is the
+/// satoshi value of the output being spent (from `releasesOutpointsValues`).
+pub fn segwit_sighash_all(
+    tx: &BtcTransaction,
+    input_index: usize,
+    redeem_script: &[u8],
+    value: u64,
+) -> [u8; 32] {
+    use bitcoin::hashes::Hash;
+    let mut cache = bitcoin::sighash::SighashCache::new(tx);
+    let script = ScriptBuf::from_bytes(redeem_script.to_vec());
+    let hash = cache
+        .p2wsh_signature_hash(
+            input_index,
+            &script,
+            bitcoin::Amount::from_sat(value),
+            bitcoin::EcdsaSighashType::All,
+        )
+        .expect("p2wsh sighash never fails for valid input index");
+    hash.to_byte_array()
+}
+
+/// Witness equivalent of `update_script_with_signature`: insert `signature` at
+/// `target_index` among the witness signature slots (an empty push is the OP_0
+/// placeholder), reserving the redeem (+ ERP OP_NOTIF flag) suffix. Returns
+/// `None` when no placeholder is left (bitcoinj throws).
+pub fn witness_update_with_signature(
+    pushes: &[Vec<u8>],
+    signature: &[u8],
+    target_index: usize,
+) -> Option<Vec<Vec<u8>>> {
+    let total = pushes.len();
+    let suffix = if witness_redeem_is_erp(pushes) { 2 } else { 1 };
+    if total < 2 + suffix {
+        return None;
+    }
+    if !pushes[total - 1 - suffix].is_empty() {
+        return None;
+    }
+    let mut result: Vec<Vec<u8>> = Vec::with_capacity(total + 1);
+    result.push(pushes[0].clone()); // CHECKMULTISIG dummy
+    let middle = &pushes[1..total - suffix];
+    let mut pos = 0;
+    for item in middle {
+        if pos == target_index {
+            result.push(signature.to_vec());
+            pos += 1;
+        }
+        if !item.is_empty() {
+            result.push(item.clone());
+            pos += 1;
+        }
+    }
+    while pos < middle.len() {
+        if pos == target_index {
+            result.push(signature.to_vec());
+        } else {
+            result.push(Vec::new());
+        }
+        pos += 1;
+    }
+    result.extend_from_slice(&pushes[total - suffix..]); // [ERP flag] + redeem
+    Some(result)
+}
+
+/// Witness equivalent of `sig_insertion_index`.
+pub fn witness_sig_insertion_index(
+    pushes: &[Vec<u8>],
+    sighash: &[u8; 32],
+    signing_key: &[u8; 33],
+    redeem_script: &[u8],
+) -> usize {
+    let keys = spending_redeem_keys(redeem_script);
+    let my_index = keys.iter().position(|k| k == signing_key).unwrap_or(usize::MAX);
+    let total = pushes.len();
+    let suffix = if witness_redeem_is_erp(pushes) { 2 } else { 1 };
+    if total < 1 + suffix {
+        return 0;
+    }
+    let mut sig_index = 0;
+    for item in &pushes[1..total - suffix] {
+        if !item.is_empty() {
+            let sig_key_index = find_sig_key_index(item, sighash, &keys);
+            if my_index < sig_key_index {
+                return sig_index;
+            }
+            sig_index += 1;
+        }
+    }
+    sig_index
+}
+
+/// Witness equivalent of `input_signed_by`.
+pub fn witness_input_signed_by(
+    pushes: &[Vec<u8>],
+    pubkey: &[u8; 33],
+    sighash: &[u8; 32],
+) -> bool {
+    let total = pushes.len();
+    if total < 3 {
+        return false;
+    }
+    pushes[1..total - 1].iter().any(|sig| {
+        sig.len() > 1 && verify_der_signature(&sig[..sig.len() - 1], sighash, pubkey)
+    })
 }
 
 /// rskj `BridgeUtils.isInputSignedByThisFederator`: one of the input's
@@ -834,6 +972,41 @@ mod tests {
         s.extend_from_slice(&[script_byte; 20]);
         s.push(0x87);
         ScriptBuf::from_bytes(s)
+    }
+
+    /// Ground truth from mainnet #8,117,400 (the first federator signing the
+    /// segwit SVP spend tx): inserting one signature into the base ERP witness
+    /// [dummy, e×5, flag, redeem] (threshold 5) puts the sig in slot 1 and
+    /// leaves the remaining sig slots + the OP_NOTIF flag + redeem suffix.
+    #[test]
+    fn witness_update_with_signature_erp_first_sig() {
+        let redeem = erp_redeem(5, 9);
+        let mut pushes: Vec<Vec<u8>> = vec![Vec::new()]; // dummy
+        for _ in 0..5 {
+            pushes.push(Vec::new()); // empty sig placeholders
+        }
+        pushes.push(Vec::new()); // OP_NOTIF flag
+        pushes.push(redeem.clone());
+
+        let sig = vec![0x30u8, 0x44, 0xAA, 0x01]; // dummy DER-ish + sighash byte
+        let updated = witness_update_with_signature(&pushes, &sig, 0).unwrap();
+        assert_eq!(updated.len(), 8); // unchanged item count
+        assert!(updated[0].is_empty()); // dummy
+        assert_eq!(updated[1], sig); // signature in slot 1
+        assert!(updated[2..6].iter().all(|p| p.is_empty())); // 4 empty sig slots
+        assert!(updated[6].is_empty()); // OP_NOTIF flag
+        assert_eq!(updated[7], redeem); // redeem
+        assert!(!witness_input_fully_signed(&updated)); // 1/5 signatures
+    }
+
+    /// An ERP redeem: `OP_NOTIF <std multisig> OP_ELSE <csv> <emergency
+    /// multisig> OP_ENDIF` — enough for `is_erp_redeem` / threshold parsing.
+    fn erp_redeem(threshold: usize, n: usize) -> Vec<u8> {
+        let mut script = vec![0x64]; // OP_NOTIF
+        script.extend_from_slice(&test_redeem(threshold, n));
+        script.push(0x67); // OP_ELSE
+        script.push(0x68); // OP_ENDIF
+        script
     }
 
     fn test_redeem(threshold: usize, n: usize) -> Vec<u8> {
