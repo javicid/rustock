@@ -4192,6 +4192,43 @@ BridgeSupport.java:1060-1169; ReleaseTransactionBuilder.java:123-130. Verified:
 (Registration of the signed fund tx, the SVP spend tx, and the proposed-fed
 handover follow in a later change.)
 
+## §75 RSKIP419 SVP — fund-tx registration + spend-tx creation (#7,747,283)
+
+Continuation of §74. Once the signed SVP fund tx is mined and registered, three
+things happen — two of them in the SAME block (#7,747,283):
+- **registerSvpFundTx** (in `register_btc_transaction`): rskj's
+  `PegUtils.getTransactionType` checks the SVP cases BEFORE the pegin/pegout
+  classification — a tx whose *signature-stripped* txid (each input's scriptSig
+  rebuilt as the redeem placeholder, `getMultiSigTransactionHashWithoutSignatures`)
+  equals `svpFundTxHashUnsigned`. The matched tx is handled by `registerNewUtxos`
+  (register the change UTXO to the active fed — identical to rustock's existing
+  pegout path) plus, if the SVP window is still open, `setSvpFundTxSigned` +
+  `clearSvpFundTxHashUnsigned`. **Consensus quirk**: the active federation here is
+  an *ERP* federation, so the fund-tx input redeem ends in OP_ENDIF, not
+  OP_CHECKMULTISIG. rskj's signature-stripping still accepts it and rebuilds the
+  ERP placeholder (the extra OP_0 selecting the OP_NOTIF default branch) — so the
+  classifier must NOT reject ERP inputs (an early version did and missed the
+  match). `multisig_txid_without_signatures` rebuilds the placeholder for whatever
+  redeem each input carries (`placeholder_scriptsig` handles the ERP OP_0).
+- **processSvpSpendTransactionUnsigned** (in the same block's `updateCollections`,
+  since `svpFundTxSigned` is now set): build the spend tx (version 2, two inputs
+  spending the fund tx's proposed-fed and flyover-proposed-fed outputs with their
+  redeem placeholders, one output to the active fed worth `2*outputsValue - fees`),
+  store `svpSpendTxHashUnsigned` + `svpSpendTxWaitingForSignatures`
+  (RLP[rskTxHash, btcTx]), clear `svpFundTxSigned`, and log `release_requested`
+  (amount = output[0]) + `pegout_transaction_created`. The fee is
+  `calculatePegoutTxSize(proposed, 2 in, 1 out) * 12/10 * feePerKb / 1000`
+  (`calculateLegacyTxSize`: serialized tx with the federation redeem as each input
+  scriptSig + `threshold * inputs * 72` signing bytes).
+
+Storage formats: `svpFundTxSigned`/`svpSpendTxWaitingForSignatures` values use
+`serializeBtcTransaction` = `RLP.encodeElement(tx.bitcoinSerialize())`;
+`svpSpendTxHashUnsigned` = `RLP.encodeElement(hash.getBytes())` (display order).
+rskj refs: BridgeSupport.java:436-464, 1171-1242; PegUtils.java:118-198;
+BitcoinUtils.java:158-243. `commit_proposed_federation` (bridge/governance.rs) is
+the handover invoked when the spend tx is later registered (registerSvpSpendTx).
+Verified: #7,747,283 matches state+receipts roots exactly; 559 tests pass.
+
 ## §73 EIP-2929 dropped EXTCODECOPY's flat base — re-pin it to 700 (#7,515,160)
 
 Sibling to §72, but on the *static* side rather than gas_params. rskj

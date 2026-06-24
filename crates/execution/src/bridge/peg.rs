@@ -263,6 +263,74 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     // (BridgeSupport.markTxAsProcessed), not the BTC block height.
     let rsk_height = revm::context_interface::Block::number(ctx.block()).to::<u64>();
 
+    // RSKIP419: an SVP fund/spend transaction is recognized by its
+    // signature-stripped txid matching the stored unsigned hash. rskj's
+    // PegUtils.getTransactionType checks this BEFORE the pegin/pegout
+    // classification; the matched tx is handled by registerSvpFundTx /
+    // registerSvpSpendTx (= registerNewUtxos + the SVP state transition) and
+    // nothing else.
+    if hardfork_cfg.has_rskip419(rsk_height) {
+        if let Some(without_sigs) = multisig_txid_without_signatures(&btc_tx) {
+            let fund_hash = super::serialization::rlp_decode_element(&bridge_load_bytes_named(
+                ctx,
+                super::storage::SVP_FUND_TX_HASH_UNSIGNED_KEY,
+            ));
+            let spend_hash = super::serialization::rlp_decode_element(&bridge_load_bytes_named(
+                ctx,
+                super::storage::SVP_SPEND_TX_HASH_UNSIGNED_KEY,
+            ));
+            let is_fund = fund_hash.as_deref() == Some(&without_sigs[..]);
+            let is_spend = spend_hash.as_deref() == Some(&without_sigs[..]);
+            if is_fund || is_spend {
+                // registerNewUtxos: register outputs paying the active (and
+                // retiring) federation, then mark the tx processed.
+                let active_utxo_key =
+                    active_federation_utxo_key(ctx, config, hardfork_cfg, rsk_height);
+                register_federation_outputs(ctx, &btc_tx, &fed_script, active_utxo_key);
+                if let Some((_, retiring_script)) = &retiring {
+                    register_federation_outputs(
+                        ctx,
+                        &btc_tx,
+                        retiring_script,
+                        super::storage::OLD_FEDERATION_BTC_UTXOS_KEY,
+                    );
+                }
+                if is_fund {
+                    // registerSvpFundTx: if the SVP window is still open, record
+                    // the signed fund tx and clear its unsigned hash.
+                    if svp_is_ongoing(ctx, config, rsk_height) {
+                        bridge_store_bytes_named(
+                            ctx,
+                            super::storage::SVP_FUND_TX_SIGNED_KEY,
+                            &super::serialization::rlp_encode_element(&btc_serialize(&btc_tx)),
+                        );
+                        bridge_store_bytes_named(
+                            ctx,
+                            super::storage::SVP_FUND_TX_HASH_UNSIGNED_KEY,
+                            &[],
+                        );
+                    }
+                } else {
+                    // registerSvpSpendTx: clear the spend hash and commit the
+                    // proposed federation (the real handover).
+                    bridge_store_bytes_named(
+                        ctx,
+                        super::storage::SVP_SPEND_TX_HASH_UNSIGNED_KEY,
+                        &[],
+                    );
+                    super::governance::commit_proposed_federation(ctx, config, hardfork_cfg);
+                }
+                set_btc_tx_processed(
+                    ctx,
+                    &legacy_txid,
+                    rsk_height,
+                    hardfork_cfg.has_rskip134(rsk_height),
+                );
+                return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
+            }
+        }
+    }
+
     // Minimum peg-in value (legacy until RSKIP219, strictly-below comparison
     // per PegUtilsLegacy.isValidPegInTx). Needed both for the migration
     // moveToActive check below and the peg-in value gate further down.
@@ -2453,20 +2521,233 @@ fn process_svp_fund_transaction_unsigned<CTX: crate::RskContextTr>(
 
 /// rskj `BridgeSupport.processSvpSpendTransactionUnsigned`: once the SVP fund
 /// transaction's change has been registered (`svpFundTxSigned` set), build the
-/// SVP spend transaction that moves the funds back from the proposed federation
-/// to the active federation, proving the proposed federation can sign.
-/// (Implemented in the SVP registration phase.)
+/// SVP spend transaction (move the proposed-fed + flyover-proposed-fed outputs
+/// back to the active federation), record its unsigned hash and the
+/// waiting-for-signatures entry, clear `svpFundTxSigned`, and log
+/// release_requested + pegout_transaction_created.
 #[allow(clippy::too_many_arguments)]
 fn process_svp_spend_transaction_unsigned<CTX: crate::RskContextTr>(
-    _ctx: &mut CTX,
-    _proposed: &super::federation::StoredFederation,
-    _svp_fund_tx_signed: &[u8],
-    _config: &BridgeConstants,
-    _hardfork_cfg: &RskHardforkConfig,
-    _block_number: u64,
-    _tx_ctx: &BridgeTxContext,
+    ctx: &mut CTX,
+    proposed: &super::federation::StoredFederation,
+    svp_fund_tx_signed: &[u8],
+    config: &BridgeConstants,
+    hardfork_cfg: &RskHardforkConfig,
+    block_number: u64,
+    tx_ctx: &BridgeTxContext,
 ) {
-    // TODO(svp-phase-3): create the SVP spend transaction.
+    // svpFundTxSigned is stored as RLP.encodeElement(bitcoinSerialize).
+    let Some(fund_tx_bytes) = super::serialization::rlp_decode_element(svp_fund_tx_signed) else {
+        return;
+    };
+    let Ok(fund_tx) = deserialize::<BtcTransaction>(&fund_tx_bytes) else {
+        return;
+    };
+
+    let Some(spend) =
+        create_svp_spend_transaction(ctx, &fund_tx, proposed, config, hardfork_cfg, block_number)
+    else {
+        return;
+    };
+
+    // updateSvpSpendTransactionValues: set the unsigned hash + waiting-for-
+    // signatures entry (RLP[rskTxHash, btcTx]), and clear svpFundTxSigned.
+    let spend_hash = btc_txid_event_bytes(&spend);
+    bridge_store_bytes_named(
+        ctx,
+        super::storage::SVP_SPEND_TX_HASH_UNSIGNED_KEY,
+        &super::serialization::rlp_encode_element(&spend_hash),
+    );
+    let wfs = super::serialization::rlp_encode_list(&[
+        super::serialization::rlp_encode_element(&tx_ctx.rsk_tx_hash),
+        super::serialization::rlp_encode_element(&btc_serialize(&spend)),
+    ]);
+    bridge_store_bytes_named(ctx, super::storage::SVP_SPEND_TX_WAITING_FOR_SIGNATURES_KEY, &wfs);
+    bridge_store_bytes_named(ctx, super::storage::SVP_FUND_TX_SIGNED_KEY, &[]);
+
+    // logReleaseRequested(amount = output[0] value) + processReleaseTransactionInfo.
+    let amount = spend.output[0].value.to_sat();
+    super::events::log_release_requested(ctx, &tx_ctx.rsk_tx_hash, &spend_hash, amount);
+    if hardfork_cfg.has_rskip428(block_number) {
+        // extractOutpointValues: each input's connected value = the fund tx
+        // output it spends (the two svpFundTxOutputsValue outputs).
+        let outpoint_values: Vec<u64> = spend
+            .input
+            .iter()
+            .map(|i| {
+                fund_tx
+                    .output
+                    .get(i.previous_output.vout as usize)
+                    .map(|o| o.value.to_sat())
+                    .unwrap_or(0)
+            })
+            .collect();
+        super::events::log_pegout_transaction_created(ctx, &spend_hash, &outpoint_values);
+    }
+}
+
+/// rskj `BridgeSupport.createSvpSpendTransaction`: a version-2 BTC tx spending
+/// the fund tx's two outputs (the one paying the proposed federation P2SH and
+/// the one paying its flyover P2SH) into a single output to the active
+/// federation worth `2*outputsValue - fees`. Each input carries the legacy
+/// placeholder scriptSig of its redeem (proposed redeem / flyover-proposed
+/// redeem), so the unsigned txid matches `svpSpendTxHashUnsigned`.
+fn create_svp_spend_transaction<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    fund_tx: &BtcTransaction,
+    proposed: &super::federation::StoredFederation,
+    config: &BridgeConstants,
+    hardfork_cfg: &RskHardforkConfig,
+    block_number: u64,
+) -> Option<BtcTransaction> {
+    let proposed_keys = proposed.btc_keys();
+    let proposed_redeem = build_committed_federation_redeem_script(
+        &proposed_keys,
+        config,
+        hardfork_cfg,
+        proposed.creation_block,
+    );
+    let proposed_threshold = super::release_tx::redeem_script_threshold(&proposed_redeem);
+    let proposed_script = p2sh_output_script(&redeem_script_hash160(&proposed_redeem));
+
+    let mut flyover_prefix = [0u8; 32];
+    flyover_prefix[31] = 1;
+    let flyover_redeem = flyover_redeem_script(&flyover_prefix, &proposed_redeem);
+    let flyover_threshold = super::release_tx::redeem_script_threshold(&flyover_redeem);
+    let flyover_script = p2sh_output_script(&redeem_script_hash160(&flyover_redeem));
+
+    // searchForOutput: the fund tx outputs paying the proposed fed / flyover fed.
+    let (idx0, out0) =
+        fund_tx.output.iter().enumerate().find(|(_, o)| o.script_pubkey == proposed_script)?;
+    let (idx1, out1) =
+        fund_tx.output.iter().enumerate().find(|(_, o)| o.script_pubkey == flyover_script)?;
+    let value_to_proposed = out0.value.to_sat();
+    let value_to_flyover = out1.value.to_sat();
+
+    let (_active_keys, active_redeem) =
+        active_federation_keys_and_redeem(ctx, config, hardfork_cfg, block_number);
+    let active_script = p2sh_output_script(&redeem_script_hash160(&active_redeem));
+
+    let fees = calculate_svp_spend_tx_fees(ctx, &proposed_redeem, proposed_threshold, config);
+    let value_to_send = (value_to_proposed + value_to_flyover).saturating_sub(fees);
+
+    let fund_txid = fund_tx.compute_txid();
+    let input = vec![
+        bitcoin::TxIn {
+            previous_output: bitcoin::OutPoint { txid: fund_txid, vout: idx0 as u32 },
+            script_sig: bitcoin::ScriptBuf::from_bytes(super::release_tx::placeholder_scriptsig(
+                &proposed_redeem,
+                proposed_threshold,
+            )),
+            sequence: bitcoin::Sequence::MAX,
+            witness: bitcoin::Witness::new(),
+        },
+        bitcoin::TxIn {
+            previous_output: bitcoin::OutPoint { txid: fund_txid, vout: idx1 as u32 },
+            script_sig: bitcoin::ScriptBuf::from_bytes(super::release_tx::placeholder_scriptsig(
+                &flyover_redeem,
+                flyover_threshold,
+            )),
+            sequence: bitcoin::Sequence::MAX,
+            witness: bitcoin::Witness::new(),
+        },
+    ];
+    Some(BtcTransaction {
+        version: bitcoin::transaction::Version(2),
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input,
+        output: vec![bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(value_to_send),
+            script_pubkey: active_script,
+        }],
+    })
+}
+
+/// rskj `BridgeSupport.calculateSvpSpendTxFees`: size the spend tx as a peg-out
+/// of the proposed federation with 2 inputs / 1 output (`calculatePegoutTxSize`),
+/// inflate by 12/10, and apply the fee-per-kB.
+fn calculate_svp_spend_tx_fees<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    proposed_redeem: &[u8],
+    proposed_threshold: usize,
+    config: &BridgeConstants,
+) -> u64 {
+    let proposed_script = p2sh_output_script(&redeem_script_hash160(proposed_redeem));
+    let size = pegout_tx_size_legacy(proposed_redeem, &proposed_script, proposed_threshold, 2, 1);
+    let backed_up_size = size as u64 * 12 / 10;
+    let fee_per_kb = get_effective_fee_per_kb(ctx, config);
+    fee_per_kb * backed_up_size / 1000
+}
+
+/// rskj `BridgeUtils.calculateLegacyTxSize`: serialize a tx with `inputs`
+/// inputs whose scriptSig is the federation redeem script and `outputs` P2SH
+/// outputs, then add `threshold * inputs * 72` signing bytes.
+fn pegout_tx_size_legacy(
+    redeem: &[u8],
+    fed_script: &bitcoin::ScriptBuf,
+    threshold: usize,
+    inputs: usize,
+    outputs: usize,
+) -> usize {
+    let input: Vec<bitcoin::TxIn> = (0..inputs)
+        .map(|_| bitcoin::TxIn {
+            previous_output: bitcoin::OutPoint {
+                txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::all_zeros()),
+                vout: 0,
+            },
+            script_sig: bitcoin::ScriptBuf::from_bytes(redeem.to_vec()),
+            sequence: bitcoin::Sequence::MAX,
+            witness: bitcoin::Witness::new(),
+        })
+        .collect();
+    let output: Vec<bitcoin::TxOut> = (0..outputs)
+        .map(|_| bitcoin::TxOut { value: bitcoin::Amount::ZERO, script_pubkey: fed_script.clone() })
+        .collect();
+    let tx = BtcTransaction {
+        version: bitcoin::transaction::Version(1),
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input,
+        output,
+    };
+    bitcoin::consensus::serialize(&tx).len() + threshold * inputs * 72
+}
+
+/// rskj `BridgeSupport.isSvpOngoing`: a proposed federation exists and the
+/// current block is still within its `validationPeriodDurationInBlocks` window.
+fn svp_is_ongoing<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    config: &BridgeConstants,
+    block_number: u64,
+) -> bool {
+    super::federation::load_stored_federation(ctx, PROPOSED_FEDERATION_KEY)
+        .is_some_and(|p| block_number < p.creation_block + config.validation_period_duration_in_blocks)
+}
+
+/// rskj `BitcoinUtils.getMultiSigTransactionHashWithoutSignatures`: the txid a
+/// signed multisig tx would have with its signatures stripped (each input's
+/// scriptSig rebuilt as the redeem placeholder). Returns the display-order hash,
+/// or `None` if any input is not a standard P2SH multisig (rskj throws → not an
+/// SVP tx). Witness txs use the plain txid.
+fn multisig_txid_without_signatures(tx: &BtcTransaction) -> Option<[u8; 32]> {
+    // Witness txs use the plain txid (rskj getMultiSigTransactionHashWithoutSignatures).
+    if tx.input.iter().any(|i| !i.witness.is_empty()) {
+        return Some(btc_txid_event_bytes(tx));
+    }
+    let mut copy = tx.clone();
+    for input in &mut copy.input {
+        // Each input must be a P2SH multisig (standard or ERP): extract its
+        // redeem and rebuild the placeholder scriptSig. `placeholder_scriptsig`
+        // adds the extra OP_0 for the ERP OP_NOTIF branch, matching bitcoinj
+        // `createEmptyInputScript`. A non-multisig input (no redeem push, or
+        // threshold 0) is not an SVP tx (rskj throws → caught → false).
+        let redeem = super::release_tx::extract_redeem_script(input.script_sig.as_bytes())?;
+        let threshold = super::release_tx::redeem_script_threshold(&redeem);
+        if threshold == 0 {
+            return None;
+        }
+        input.script_sig =
+            bitcoin::ScriptBuf::from_bytes(super::release_tx::placeholder_scriptsig(&redeem, threshold));
+    }
+    Some(btc_txid_event_bytes(&copy))
 }
 
 /// rskj `ReleaseTransactionBuilder.buildSvpFundTransaction`: two fixed outputs

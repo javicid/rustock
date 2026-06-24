@@ -45,6 +45,26 @@ pub fn rlp_encode_element(data: &[u8]) -> Vec<u8> {
     }
 }
 
+/// Decode a single RLP string element (the inverse of [`rlp_encode_element`]):
+/// returns the payload bytes. `None` for a list header or malformed input.
+pub fn rlp_decode_element(data: &[u8]) -> Option<Vec<u8>> {
+    let first = *data.first()?;
+    if first < OFFSET_SHORT_ITEM {
+        return Some(vec![first]);
+    }
+    if first < 0xb8 {
+        let len = (first - OFFSET_SHORT_ITEM) as usize;
+        return data.get(1..1 + len).map(|s| s.to_vec());
+    }
+    if first < OFFSET_SHORT_LIST {
+        let len_len = (first - 0xb7) as usize;
+        let len_bytes = data.get(1..1 + len_len)?;
+        let len = len_bytes.iter().fold(0usize, |acc, &b| (acc << 8) | b as usize);
+        return data.get(1 + len_len..1 + len_len + len).map(|s| s.to_vec());
+    }
+    None
+}
+
 /// RLP-encode a list of already-encoded items.
 ///
 /// Matches rskj's `RLP.encodeList(byte[]...)`.
