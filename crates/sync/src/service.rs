@@ -915,7 +915,7 @@ impl SyncService {
     /// and need to switch back to skeleton sync.
     pub(crate) async fn check_follow_gap(&mut self) {
         let best_peer = self.peer_store.best_peer().await;
-        let (_, metadata) = match best_peer {
+        let (peer_id, metadata) = match best_peer {
             Some(p) => p,
             None => return,
         };
@@ -940,6 +940,22 @@ impl SyncService {
             );
             self.state = SyncState::Idle;
             self.try_start_sync().await;
+        } else if metadata.best_number > our_height {
+            // Small gap: a peer's tip is ahead but not far enough for skeleton
+            // sync. Peers may only advertise their tip via STATUS (updating
+            // best_number) without pushing a NewBlockHashes, so pull the
+            // missing headers proactively instead of waiting for an
+            // announcement — otherwise the node stalls forever in follow mode.
+            // Re-issued each tick; harmless (idempotent store) and doubles as a
+            // retry if a response is dropped.
+            let count = (metadata.best_number - our_height) as u32;
+            debug!(
+                target: "rustock::sync",
+                "Follow gap of {} blocks, requesting headers up to #{}",
+                count, metadata.best_number
+            );
+            let msg = self.manager.create_headers_request(metadata.best_hash, count);
+            self.peer_store.send_to_peer(&peer_id, msg).await;
         }
     }
 

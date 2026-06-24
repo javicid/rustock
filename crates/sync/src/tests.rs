@@ -1171,6 +1171,56 @@ async fn test_following_stays_when_gap_small() {
 }
 
 #[tokio::test]
+async fn test_following_small_gap_requests_missing_headers() {
+    use rustock_networking::protocol::{P2pMessage, RskMessage, RskSubMessage};
+
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    // Our head is #1; peer is at #5 (gap of 4, < LONG_SYNC_LIMIT).
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    let genesis_hash = genesis.hash();
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let b1 = dummy_header(1, genesis_hash, U256::from(1));
+    store.put_header(&b1).unwrap();
+    store.put_total_difficulty(b1.hash(), U256::from(2)).unwrap();
+    store.update_head(&b1, U256::from(2)).unwrap();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+
+    let peer_id = B512::repeat_byte(0x01);
+    let peer_best_hash = B256::repeat_byte(0x05);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    peer_store.add_peer(peer_id, tx).await;
+    peer_store.update_metadata(&peer_id, rustock_networking::peers::PeerMetadata {
+        best_number: 5,
+        best_hash: peer_best_hash,
+        total_difficulty: U256::from(5),
+        ..Default::default()
+    }).await;
+
+    let manager = Arc::new(SyncManager::new(store, verifier, peer_store.clone()));
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store, event_rx);
+    service.state = SyncState::Following;
+
+    service.check_follow_gap().await;
+
+    // Stays in Following, but must proactively request the 4 missing headers
+    // (ending at the peer's best hash) rather than stalling.
+    assert!(matches!(service.state, SyncState::Following),
+        "Expected Following to persist, got {:?}", service.state);
+    match rx.try_recv().expect("expected a headers request to be sent on a small gap") {
+        P2pMessage::RskMessage(RskMessage { sub_message: RskSubMessage::BlockHeadersRequest(req), .. }) => {
+            assert_eq!(req.query.hash, peer_best_hash);
+            assert_eq!(req.query.count, 4, "should request exactly the gap (5 - 1)");
+        }
+        other => panic!("Expected BlockHeadersRequest, got {:?}", other),
+    }
+}
+
+#[tokio::test]
 async fn test_handler_forwards_new_block_hashes() {
     use rustock_networking::protocol::{P2pMessage, RskMessage, RskSubMessage};
     use rustock_networking::protocol::P2pHandler;
