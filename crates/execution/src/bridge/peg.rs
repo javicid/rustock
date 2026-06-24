@@ -2538,10 +2538,18 @@ fn process_svp_fund_transaction_unsigned<CTX: crate::RskContextTr>(
     });
     store_pegout_confirmation_set(ctx, &waiting, use_tx_hash);
 
-    // savePegoutTxSigHash (RSKIP379): index by the legacy sighash of input 0
-    // (spent by the active federation, so its redeem script applies).
+    // savePegoutTxSigHash (RSKIP379): index by the legacy sighash of input 0.
+    // rskj `BitcoinUtils.getFirstInputSigHash` extracts the redeem from the
+    // first input's scriptSig, so a flyover-resolved input uses its flyover
+    // redeem — match that rather than assuming the plain active redeem.
     if hardfork_cfg.has_rskip379(block_number) {
-        let sig_hash = super::release_tx::legacy_sighash_all(&built.tx, 0, &active_redeem);
+        let redeem0 = built
+            .tx
+            .input
+            .first()
+            .and_then(|i| super::release_tx::extract_redeem_script(i.script_sig.as_bytes()))
+            .unwrap_or_else(|| active_redeem.clone());
+        let sig_hash = super::release_tx::legacy_sighash_all(&built.tx, 0, &redeem0);
         save_pegout_tx_sig_hash(ctx, &sig_hash);
     }
 
@@ -2651,13 +2659,17 @@ fn create_svp_spend_transaction<CTX: crate::RskContextTr>(
         proposed.creation_block,
     );
     let proposed_threshold = super::release_tx::redeem_script_threshold(&proposed_redeem);
-    let proposed_script = p2sh_output_script(&redeem_script_hash160(&proposed_redeem));
+    let proposed_format =
+        super::governance::federation_format_version(hardfork_cfg, proposed.creation_block);
+    let proposed_script =
+        p2sh_output_script(&federation_output_hash160(&proposed_redeem, proposed_format));
 
     let mut flyover_prefix = [0u8; 32];
     flyover_prefix[31] = 1;
     let flyover_redeem = flyover_redeem_script(&flyover_prefix, &proposed_redeem);
     let flyover_threshold = super::release_tx::redeem_script_threshold(&flyover_redeem);
-    let flyover_script = p2sh_output_script(&redeem_script_hash160(&flyover_redeem));
+    let flyover_script =
+        p2sh_output_script(&federation_output_hash160(&flyover_redeem, proposed_format));
 
     // searchForOutput: the fund tx outputs paying the proposed fed / flyover fed.
     let (idx0, out0) =
@@ -2814,14 +2826,20 @@ fn build_svp_fund_transaction<CTX: crate::RskContextTr>(
         hardfork_cfg,
         proposed.creation_block,
     );
-    let proposed_script = p2sh_output_script(&redeem_script_hash160(&proposed_redeem));
+    // Proposed federation format keys its output type: format ≥ 4000 (RSKIP305)
+    // pays P2SH-P2WSH, else plain P2SH.
+    let proposed_format =
+        super::governance::federation_format_version(hardfork_cfg, proposed.creation_block);
+    let proposed_script =
+        p2sh_output_script(&federation_output_hash160(&proposed_redeem, proposed_format));
 
     // Flyover proposed federation: PUSH32 <prefix=1> OP_DROP <proposedRedeem>,
-    // P2SH of that (proposed format 3000 → plain P2SH output).
+    // P2SH-P2WSH of that for format ≥ 4000, else plain P2SH.
     let mut flyover_prefix = [0u8; 32];
     flyover_prefix[31] = 1;
     let flyover_redeem = flyover_redeem_script(&flyover_prefix, &proposed_redeem);
-    let flyover_script = p2sh_output_script(&redeem_script_hash160(&flyover_redeem));
+    let flyover_script =
+        p2sh_output_script(&federation_output_hash160(&flyover_redeem, proposed_format));
 
     // Active federation: spending wallet + change address.
     let (_active_keys, active_redeem) =

@@ -4156,6 +4156,33 @@ it is 0 for specs < BERLIN, so this is a no-op pre-lovell. Test extends
 `selfdestruct_cold_cost() == 0`). Verified: exec-head #7,403,648 → replay
 #7,403,649–#7,408,000 match state and receipts roots exactly; 557 tests pass.
 
+## §79 RSKIP305 (reed800): segwit SVP fund/spend tx outputs + sigHash redeem (#8,107,003)
+
+The block after the format-4000 commit (§78), `updateCollections` builds the SVP
+fund transaction for the proposed federation. Two divergences from the pre-reed800
+SVP path, both because the proposed fed is now segwit (format 4000):
+
+1. **Output scripts.** The fund tx pays the proposed fed and its flyover variant.
+   rskj derives those outputs from `PegUtils.getFlyoverFederationOutputScript` /
+   the proposed fed's own output script, which for format 4000 is P2SH-P2WSH. We
+   now compute `federation_output_hash160(redeem, proposed_format)` (proposed_format
+   from `governance::federation_format_version(creation_block)` = 4000) in both
+   `build_svp_fund_transaction` and `create_svp_spend_transaction`. The ERP redeem
+   itself is identical to format 3000; only the output hash160 (witness program)
+   changes.
+
+2. **pegoutTxSigHash redeem.** `savePegoutTxSigHash` (RSKIP379) indexes the release
+   by the legacy sighash of input 0. rskj's `BitcoinUtils.getFirstInputSigHash`
+   extracts the redeem **from the first input's scriptSig**, so a flyover-resolved
+   input is sighashed with its flyover redeem — not the plain active-fed redeem.
+   The pre-segwit SVP path hard-coded `active_redeem`; it now extracts the redeem
+   from `built.tx.input[0].script_sig` (falling back to the active redeem), matching
+   the regular migration/pegout path. (The fund tx still spends the legacy format-3000
+   active fed, so the sighash is legacy; only the redeem selection was wrong.)
+
+Verified: exec-head #8,107,002 → replay #8,107,003 matches state and receipts roots
+exactly; 559 tests pass.
+
 ## §78 RSKIP305 (reed800): P2SH-P2WSH federation address in commit_federation (#8,107,002)
 
 reed800 (RSKIP305) makes a newly committed federation **format 4000

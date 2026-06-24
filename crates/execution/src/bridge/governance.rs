@@ -365,7 +365,7 @@ fn execute_federation_change<CTX: crate::RskContextTr>(
 /// (PendingFederation.buildFederation): 1000 standard multisig (pre-RSKIP201),
 /// 2000 non-standard ERP (RSKIP201, !RSKIP353), 3000 P2SH-ERP (RSKIP353,
 /// !RSKIP305), 4000 P2SH-P2WSH-ERP (RSKIP305).
-fn federation_format_version(
+pub(crate) fn federation_format_version(
     hardfork_cfg: &crate::hardfork::RskHardforkConfig,
     block_number: u64,
 ) -> u64 {
