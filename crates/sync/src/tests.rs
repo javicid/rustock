@@ -882,6 +882,15 @@ fn test_tracker_disconnect_clears_stall_tracking() {
     let peer = B512::repeat_byte(0x0A);
 
     tracker.record_sent(peer, 1);
+    // Backdate the wait so the stall check is deterministic: stalled_peers uses
+    // `elapsed() > timeout`, and elapsed() right after record_sent can be 0ns on
+    // a fast machine, making the ZERO-timeout boundary race under load.
+    tracker.waiting_since.insert(
+        peer,
+        std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("system uptime > 1s"),
+    );
     assert_eq!(tracker.stalled_peers(std::time::Duration::ZERO), vec![peer]);
 
     tracker.handle_peer_disconnect(&peer);
@@ -1287,6 +1296,111 @@ async fn test_headers_response_in_following_mode() {
     // Header should be stored
     assert!(store.header(b1_hash).unwrap().is_some());
     assert_eq!(store.head().unwrap(), Some(b1_hash));
+}
+
+#[tokio::test]
+async fn test_follow_mode_buffers_out_of_order_body() {
+    // A follow-mode gap-pull fires several body requests at once; responses can
+    // land out of order. A block whose parent is NOT our executed head must be
+    // buffered, never executed against the wrong parent state.
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    // Executed head is #100; #101 is missing, #102 arrives first.
+    let h100 = dummy_header(100, B256::repeat_byte(0xaa), U256::from(100));
+    let h100_hash = h100.hash();
+    store.put_header(&h100).unwrap();
+    store.set_exec_head(h100_hash, B256::ZERO).unwrap();
+
+    let h101 = dummy_header(101, h100_hash, U256::from(101));
+    let h102 = dummy_header(102, h101.hash(), U256::from(102));
+    let h102_hash = h102.hash();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store, event_rx);
+    service.state = SyncState::Following;
+
+    // Body for #102 arrives while #101 is still missing.
+    let req_id = 42u64;
+    service.pending_follow_bodies.insert(req_id, (h102_hash, h102));
+    service.on_body_response(req_id, vec![], vec![]).await;
+
+    // #102 must remain buffered (parent #101 is not our head), not executed.
+    assert!(service.follow_buffer.contains_key(&102),
+        "out-of-order block #102 should be buffered, not executed against #100");
+    assert_eq!(service.follow_buffer.len(), 1);
+    // exec head must not have advanced past #100.
+    assert_eq!(store.exec_head().unwrap().map(|(h, _)| h), Some(h100_hash));
+    let _ = h101; // #101 intentionally never delivered in this test
+}
+
+#[tokio::test]
+async fn test_reconcile_rolls_back_orphaned_exec_head() {
+    // A 1-block tip reorg. We executed #2 = a2 (now orphaned). The canonical
+    // chain is b2(#2) <- b3(#3). The reorg can't be seen via canonical_hash(2)
+    // (sync never re-fetches the block at our own head); it's seen via the
+    // canonical child #3, whose parent is b2, not a2. Exec head must roll back
+    // one block to the common ancestor #1.
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    // Common chain: genesis(#0) <- b1(#1).
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    let genesis_hash = genesis.hash();
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let b1 = dummy_header(1, genesis_hash, U256::from(1));
+    let b1_hash = b1.hash();
+    store.update_head(&b1, U256::from(2)).unwrap();
+
+    // Orphan fork: a2 on top of b1 (what we executed).
+    let mut a2 = dummy_header(2, b1_hash, U256::from(1));
+    a2.extra_data = vec![0xAA].into();
+    let a2_hash = a2.hash();
+    store.put_header(&a2).unwrap();
+    store.put_total_difficulty(a2_hash, U256::from(3)).unwrap();
+
+    // Canonical fork: b2(#2) <- b3(#3), the heavier chain.
+    let mut b2 = dummy_header(2, b1_hash, U256::from(5));
+    b2.extra_data = vec![0xBB].into();
+    let b2_hash = b2.hash();
+    store.put_header(&b2).unwrap();
+    store.put_total_difficulty(b2_hash, U256::from(7)).unwrap();
+    let b3 = dummy_header(3, b2_hash, U256::from(5));
+    store.update_head(&b3, U256::from(12)).unwrap(); // canonical chain head
+
+    assert_eq!(store.canonical_hash(3).unwrap(), Some(b3.hash()),
+        "b3 should be the canonical child");
+
+    // The rollback reloads the ancestor's state root from the trie store; make
+    // b1's state_root resolve to a node there.
+    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
+    let empty = rustock_trie::TrieNode::empty();
+    trie.put(b1.state_root.as_slice(), &empty.to_message(trie.as_ref()));
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let processor = rustock_execution::BlockProcessor::new(
+        rustock_execution::RskHardforkConfig::mainnet(),
+        store.clone(),
+    );
+    let mut service = SyncService::new(manager, peer_store, event_rx)
+        .with_block_processor(processor, trie, empty);
+    // We (wrongly) executed the orphan a2; point the exec head there.
+    store.set_exec_head(a2_hash, a2.state_root).unwrap();
+
+    service.reconcile_exec_head_with_canonical().await;
+
+    // Exec head must have rolled back to the common ancestor #1.
+    let (rolled_hash, _) = store.exec_head().unwrap().unwrap();
+    assert_eq!(rolled_hash, b1_hash,
+        "exec head should roll back to common ancestor b1, got {:?}", rolled_hash);
+    assert_eq!(service.last_body_height_for_test(), 1,
+        "body cursor should follow the rolled-back head");
 }
 
 // -- Peer serving tests (BlockHeadersRequest, BlockHashRequest, SkeletonRequest) --

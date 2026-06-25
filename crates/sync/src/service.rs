@@ -14,7 +14,7 @@ use rustock_networking::protocol::{
 use rustock_storage::BlockStore;
 use rustock_trie::{TrieNode, TrieStore};
 use alloy_primitives::{B256, B512};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -132,7 +132,13 @@ pub struct SyncService {
     /// processor is attached; tests may override it to control timing/outcome.
     exec_fn: Option<ExecFn>,
     last_body_height: u64,
-    pending_follow_bodies: HashMap<u64, (B256, Header)>,
+    pub(crate) pending_follow_bodies: HashMap<u64, (B256, Header)>,
+    /// Follow-mode blocks whose bodies have arrived, keyed by block number so
+    /// they execute in strict order. Body responses for the several headers a
+    /// gap-pull requests can land out of order; executing them as they arrive
+    /// would run a block against the wrong parent state. Buffer here and drain
+    /// only consecutive, parent-linked blocks from the executed head.
+    pub(crate) follow_buffer: BTreeMap<u64, (B256, Header, Vec<Transaction>, Vec<Header>)>,
     tx_pool: Option<Arc<crate::TransactionPool>>,
     blocks_since_flush: u64,
     /// Peers excluded from header-chunk assignment (stalled mid-round),
@@ -167,6 +173,7 @@ impl SyncService {
             exec_fn: None,
             last_body_height: 0,
             pending_follow_bodies: HashMap::new(),
+            follow_buffer: BTreeMap::new(),
             tx_pool: None,
             blocks_since_flush: 0,
             sidelined: HashMap::new(),
@@ -384,12 +391,109 @@ impl SyncService {
     /// If we're behind the best peer, initiate sync.
     /// Small gaps (<= LONG_SYNC_LIMIT) enter Following mode;
     /// large gaps use skeleton sync.
+    /// If the executed head was orphaned by a tip reorg, roll it back one block
+    /// so the next round re-downloads and re-executes the canonical chain from
+    /// there instead of wedging on a lineage mismatch.
+    ///
+    /// Detection can't use `canonical_hash(exec_head.number)`: skeleton sync
+    /// starts *forward* from the executed head and never re-fetches the block
+    /// at its own height, so that pointer keeps naming the orphan. The reliable
+    /// signal is the canonical child at N+1 — if it exists and its parent isn't
+    /// our executed head, our head is on an abandoned fork. Rolling back one
+    /// block (then re-syncing, which re-fetches block N and lets the heavier
+    /// canonical header win the fork choice) converges to the common ancestor;
+    /// a deeper reorg simply trips this again on the next round.
+    pub(crate) async fn reconcile_exec_head_with_canonical(&mut self) {
+        if self.block_processor.is_none() {
+            return;
+        }
+        let store = &self.manager.store;
+        let exec_hash = match store.exec_head().ok().flatten() {
+            Some((h, _)) => h,
+            None => return,
+        };
+        let header = match store.header(exec_hash).ok().flatten() {
+            Some(h) => h,
+            None => return,
+        };
+        // Is there a canonical child, and does it build on our executed head?
+        let child_hash = match store.canonical_hash(header.number + 1).ok().flatten() {
+            Some(h) => h,
+            None => return, // at the tip — nothing to reconcile
+        };
+        let child = match store.header(child_hash).ok().flatten() {
+            Some(h) => h,
+            None => return,
+        };
+        if child.parent_hash == exec_hash {
+            return; // executed head is on the canonical chain
+        }
+        // The canonical child names a different block at our head's height
+        // (`child.parent_hash`) as its parent. A reorg whose canonical walk was
+        // truncated by a late-arriving header can leave that pointer stale
+        // (still naming our orphan); repair the lineage so the next round
+        // downloads and executes the true canonical block at this height.
+        if let Err(e) = store.ensure_canonical_lineage(child.parent_hash) {
+            warn!(target: "rustock::sync", "Reorg: canonical lineage repair failed: {:?}", e);
+        }
+        // Orphaned: roll back to the executed head's parent.
+        let parent_hash = header.parent_hash;
+        let parent = match store.header(parent_hash).ok().flatten() {
+            Some(h) => h,
+            None => {
+                warn!(
+                    target: "rustock::sync",
+                    "Reorg rollback: parent {:?} of orphaned head #{} missing; cannot reconcile",
+                    parent_hash, header.number
+                );
+                return;
+            }
+        };
+        // Post-RSKIP126 the header's state_root is the committed unitrie root.
+        let state_root = parent.state_root;
+        let trie_store = match &self.trie_store {
+            Some(ts) => ts.clone(),
+            None => return,
+        };
+        let root_node = match trie_store.get(state_root.as_slice()) {
+            Some(data) => TrieNode::from_message(&data, trie_store.as_ref()),
+            None => {
+                warn!(
+                    target: "rustock::sync",
+                    "Reorg rollback: state root {:?} for #{} not in trie store; cannot reconcile",
+                    state_root, parent.number
+                );
+                return;
+            }
+        };
+        if let Err(e) = store.set_exec_head(parent_hash, state_root) {
+            error!(target: "rustock::sync", "Reorg rollback: set_exec_head failed: {:?}", e);
+            return;
+        }
+        self.current_state_root = Some(root_node);
+        self.last_body_height = parent.number;
+        self.follow_buffer.clear();
+        warn!(
+            target: "rustock::sync",
+            "Reorg: executed head #{} ({:?}) orphaned (canonical child #{} builds on {:?}); \
+             rolled executed head back to #{} ({:?})",
+            header.number, exec_hash, child.number, child.parent_hash, parent.number, parent_hash
+        );
+    }
+
     pub(crate) async fn try_start_sync(&mut self) {
         let best_peer = self.peer_store.best_peer().await;
         let (peer_id, metadata) = match best_peer {
             Some(p) => p,
             None => return,
         };
+
+        // A tip reorg can orphan the block we last executed: the storage
+        // layer's fork choice has already moved the canonical pointers to the
+        // heavier chain, but exec_head still points at the abandoned block.
+        // Reconcile before downloading so the round resumes from a canonical
+        // ancestor instead of wedging on a lineage mismatch.
+        self.reconcile_exec_head_with_canonical().await;
 
         // A full node syncs from its EXECUTED head: blocks past it are
         // downloaded but have no state, so execution must resume there.
@@ -1385,7 +1489,13 @@ impl SyncService {
                         "Stored body for block #{} ({} txs) in follow mode",
                         header.number, transactions.len()
                     );
-                    self.process_single_block(hash, &header, transactions, uncles).await;
+                    // Buffer by number and execute only consecutive,
+                    // parent-linked blocks: bodies for a multi-block gap can
+                    // arrive out of order, and running one against the wrong
+                    // parent state forks our trie from the network.
+                    self.follow_buffer
+                        .insert(header.number, (hash, header, transactions, uncles));
+                    self.drain_follow_buffer().await;
                 }
             }
             other => {
@@ -1394,14 +1504,46 @@ impl SyncService {
         }
     }
 
-    /// Process a single block received in follow mode.
+    /// Execute buffered follow-mode blocks in strict block-number order,
+    /// starting from the executed head. Stops at the first gap (a buffered
+    /// block whose parent isn't our current head — its predecessor hasn't
+    /// arrived yet) or the first execution failure.
+    async fn drain_follow_buffer(&mut self) {
+        loop {
+            let head_hash = match self.manager.store.exec_head().ok().flatten() {
+                Some((hash, _)) => hash,
+                None => return,
+            };
+            let next_num = match self.follow_buffer.keys().next().copied() {
+                Some(n) => n,
+                None => return,
+            };
+            // Only execute the lowest buffered block if it builds directly on
+            // our executed head; otherwise a lower block is still missing.
+            let links = self
+                .follow_buffer
+                .get(&next_num)
+                .is_some_and(|(_, header, _, _)| header.parent_hash == head_hash);
+            if !links {
+                return;
+            }
+            let (hash, header, txs, uncles) = self.follow_buffer.remove(&next_num).unwrap();
+            if !self.process_single_block(hash, &header, txs, uncles).await {
+                // Real divergence: head didn't advance, so looping would spin.
+                return;
+            }
+        }
+    }
+
+    /// Process a single block received in follow mode. Returns `true` if it
+    /// executed and committed (advancing the executed head), `false` otherwise.
     async fn process_single_block(
         &mut self,
-        _hash: B256,
+        hash: B256,
         header: &Header,
         transactions: Vec<Transaction>,
         ommers: Vec<Header>,
-    ) {
+    ) -> bool {
         if let Some(pool) = &self.tx_pool {
             pool.remove_mined(&transactions);
             pool.evict_outdated(header.number);
@@ -1413,7 +1555,7 @@ impl SyncService {
             &self.current_state_root,
         ) {
             (Some(p), Some(ts), Some(sr)) => (p, ts.clone(), sr.clone()),
-            _ => return,
+            _ => return false,
         };
 
         let block = Block {
@@ -1425,18 +1567,21 @@ impl SyncService {
         match processor.process_and_commit(&block, &state_root, trie_store.clone()) {
             Ok(result) => {
                 trie_store.flush();
+                let _ = self.manager.store.set_exec_head(hash, result.state_root_hash);
                 info!(
                     target: "rustock::sync",
                     "Executed block #{}, state root: {:?}",
                     header.number, result.state_root_hash
                 );
                 self.current_state_root = Some(result.new_state_root);
+                true
             }
             Err(e) => {
                 warn!(
                     target: "rustock::sync",
                     "Block #{} execution failed: {}", header.number, e
                 );
+                false
             }
         }
     }
