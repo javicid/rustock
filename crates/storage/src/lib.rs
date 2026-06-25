@@ -93,8 +93,14 @@ impl BlockStore {
     pub fn canonical_hash(&self, number: u64) -> Result<Option<B256>> {
         let bytes = self.db.get_cf(self.cf(CF_NUMBERS)?, number.to_be_bytes())
             .context("Failed to read canonical hash")?;
-            
+
         Ok(bytes.map(|b| B256::from_slice(&b)))
+    }
+
+    /// Removes the canonical `number → hash` mapping for a block height.
+    pub fn delete_canonical_hash(&self, number: u64) -> Result<()> {
+        self.db.delete_cf(self.cf(CF_NUMBERS)?, number.to_be_bytes())
+            .context("Failed to delete canonical hash")
     }
 
     // --- Total Difficulty Operations ---
@@ -817,6 +823,19 @@ mod tests {
         // Old fork A headers should still be retrievable by hash
         assert!(store.header(chain_a[1].0.hash()).unwrap().is_some());
         assert!(store.header(chain_a[2].0.hash()).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_delete_canonical_hash() {
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        let h = B256::repeat_byte(0x7);
+        store.put_canonical_hash(42, h).unwrap();
+        assert_eq!(store.canonical_hash(42).unwrap(), Some(h));
+        store.delete_canonical_hash(42).unwrap();
+        assert_eq!(store.canonical_hash(42).unwrap(), None);
+        // Deleting an absent mapping is a no-op.
+        store.delete_canonical_hash(42).unwrap();
     }
 
     #[test]
