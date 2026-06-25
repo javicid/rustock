@@ -235,43 +235,22 @@ impl BlockStore {
     }
 
     /// Walks backward from `new_head` using `parent_hash` links, updating
-    /// canonical `number → hash` mappings until reaching a block that is
-    /// already canonical (the fork point).  Also sets `KEY_HEAD`.
+    /// canonical `number → hash` mappings until the chain below is already
+    /// consistent (the fork point).  Also sets `KEY_HEAD`.
     ///
     /// Handles both direct extensions (walk stops after 1 step) and reorgs
     /// (walk continues through the fork chain to the common ancestor).
+    ///
+    /// Stopping at the first already-canonical block is *not* sufficient: a
+    /// prior walk truncated by a not-yet-downloaded parent header can leave a
+    /// lower block stale while this one is canonical (skeleton sync delivers
+    /// headers out of order). The canonical pointer at #N-1 would then keep
+    /// naming an orphan even though #N points at the new fork — an internally
+    /// inconsistent chain that wedges execution. So only stop once the
+    /// canonical block at the parent's height actually *is* this block's
+    /// parent; otherwise keep walking to repair the hole.
     pub fn update_canonical_chain(&self, new_head: B256) -> Result<()> {
-        let mut hash = new_head;
-        let mut depth: u64 = 0;
-
-        loop {
-            let header = match self.header(hash)? {
-                Some(h) => h,
-                None => break, // parent not in store (e.g. pruned or pre-genesis)
-            };
-
-            let existing = self.canonical_hash(header.number)?;
-            if existing == Some(hash) {
-                break;
-            }
-
-            self.put_canonical_hash(header.number, hash)?;
-            depth += 1;
-
-            if header.number == 0 || depth >= MAX_REORG_DEPTH {
-                if depth >= MAX_REORG_DEPTH {
-                    warn!(
-                        target: "rustock::storage",
-                        "Canonical chain update reached MAX_REORG_DEPTH ({}) at block #{}",
-                        MAX_REORG_DEPTH, header.number
-                    );
-                }
-                break;
-            }
-
-            hash = header.parent_hash;
-        }
-
+        let depth = self.ensure_canonical_lineage(new_head)?;
         self.set_head(new_head)?;
 
         if depth > 1 {
@@ -283,6 +262,58 @@ impl BlockStore {
         }
 
         Ok(())
+    }
+
+    /// Repair canonical `number → hash` pointers by walking back from `hash`
+    /// (via `parent_hash`) until the chain below is already consistent, WITHOUT
+    /// touching the head. Returns the number of pointers rewritten.
+    ///
+    /// Used both by `update_canonical_chain` (for a new head) and to repair a
+    /// buried hole left by an earlier walk that truncated at a then-missing
+    /// parent header — a tip-extension's walk stops at the top and never
+    /// revisits such a hole, so it must be repaired explicitly at the block
+    /// that exposes it.
+    pub fn ensure_canonical_lineage(&self, hash: B256) -> Result<u64> {
+        let mut hash = hash;
+        let mut depth: u64 = 0;
+
+        loop {
+            let header = match self.header(hash)? {
+                Some(h) => h,
+                None => break, // parent not in store (e.g. pruned or pre-genesis)
+            };
+
+            let already_canonical = self.canonical_hash(header.number)? == Some(hash);
+            if !already_canonical {
+                self.put_canonical_hash(header.number, hash)?;
+            }
+
+            if header.number == 0 {
+                break;
+            }
+
+            // Stop only when the chain below is already consistent: this block
+            // is canonical AND #N-1's canonical hash is this block's parent.
+            if already_canonical
+                && self.canonical_hash(header.number - 1)? == Some(header.parent_hash)
+            {
+                break;
+            }
+
+            depth += 1;
+            if depth >= MAX_REORG_DEPTH {
+                warn!(
+                    target: "rustock::storage",
+                    "Canonical chain update reached MAX_REORG_DEPTH ({}) at block #{}",
+                    MAX_REORG_DEPTH, header.number
+                );
+                break;
+            }
+
+            hash = header.parent_hash;
+        }
+
+        Ok(depth)
     }
 }
 
@@ -786,6 +817,52 @@ mod tests {
         // Old fork A headers should still be retrievable by hash
         assert!(store.header(chain_a[1].0.hash()).unwrap().is_some());
         assert!(store.header(chain_a[2].0.hash()).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_canonical_walk_repairs_truncated_reorg_hole() {
+        // Reproduces a real wedge: skeleton sync delivers a fork's child header
+        // before the fork block itself, so an earlier canonical walk truncates
+        // at the missing parent and leaves a hole (canonical #2 still names the
+        // orphan while #3 builds on the fork). A later head update must repair
+        // the hole, not stop at the first already-canonical block.
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+
+        // Canonical chain A: genesis(#0) <- a1(#1) <- a2(#2).
+        let chain_a = build_and_store_chain(&store, 3, 10, 0xAA);
+        let a1_hash = chain_a[1].0.hash();
+        let a2_hash = chain_a[2].0.hash();
+
+        // Fork B at #2: b2 <- b3 <- b4, all built on a1.
+        let b2 = make_chain_header(2, a1_hash, 20, 0xBB);
+        let b3 = make_chain_header(3, b2.hash(), 20, 0xBB);
+        let b4 = make_chain_header(4, b3.hash(), 20, 0xBB);
+        for h in [&b2, &b3, &b4] {
+            store.put_header(h).unwrap();
+            store.put_total_difficulty(h.hash(), U256::from(100)).unwrap();
+        }
+
+        // Simulate the truncated walk: #3 was made canonical (and head), but
+        // #2 was never repaired — it still names the orphan a2.
+        store.put_canonical_hash(3, b3.hash()).unwrap();
+        store.set_head(b3.hash()).unwrap();
+        assert_eq!(store.canonical_hash(2).unwrap(), Some(a2_hash), "hole precondition");
+        assert_eq!(store.canonical_hash(3).unwrap(), Some(b3.hash()));
+
+        // A new head (b4) triggers a canonical update. The walk must continue
+        // past the already-canonical #3 to repair stale #2.
+        store.update_canonical_chain(b4.hash()).unwrap();
+
+        assert_eq!(store.canonical_hash(4).unwrap(), Some(b4.hash()));
+        assert_eq!(store.canonical_hash(3).unwrap(), Some(b3.hash()));
+        assert_eq!(store.canonical_hash(2).unwrap(), Some(b2.hash()),
+            "hole at #2 must be repaired to the fork block");
+        assert_eq!(store.canonical_hash(1).unwrap(), Some(a1_hash), "common ancestor intact");
+        // Chain is now internally consistent: each canonical child's parent is
+        // the canonical block below it.
+        let c3 = store.header(store.canonical_hash(3).unwrap().unwrap()).unwrap().unwrap();
+        assert_eq!(c3.parent_hash, store.canonical_hash(2).unwrap().unwrap());
     }
 
     #[test]
