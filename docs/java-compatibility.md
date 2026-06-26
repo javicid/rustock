@@ -1566,41 +1566,44 @@ last four bytes of the **display-order** hash read big-endian
 arithmetic, but the bucket index is a bitwise AND so unsigned `u32` with wrapping
 arithmetic reproduces the exact bit pattern.
 
-**Table capacity is the incremental-insertion history, NOT a pre-size from the
-final count.** rskj does NOT build the set with `new HashSet<>(collection)`.
-`BridgeStorageProvider.getPegoutsWaitingForConfirmations` does
-`Set entries = new HashSet<>(deser(legacyCell).getEntries())` (post-RSKIP146 the
-legacy cell is `0xc0`, so this is the empty collection → capacity 16) then
-`entries.addAll(deser(withTxHashCell).getEntries())` and caches `entries`
-directly. `HashSet.addAll` is `AbstractCollection.addAll`, i.e. one `add` per
-element; `deserializePegoutsWaitingForConfirmations` likewise adds one-by-one to
-a `new HashSet<>()`. So the table starts at capacity 16 and doubles whenever
-`size > capacity * 0.75` (`HashMap.putVal`: `if (++size > threshold) resize()`,
-`threshold = (int)(cap * 0.75)`). After `n` insertions the capacity is the
-smallest power of two `>= 16` with `n <= floor(cap * 0.75)`:
+**Table capacity is the `new HashSet<>(collection)` PRE-SIZE from the final
+count, NOT an incremental-insertion history.** The set that
+`getNextPegoutWithEnoughConfirmations` iterates is the cached
+`this.entries` field of the `PegoutsWaitingForConfirmations` object. The LAST
+step of `BridgeStorageProvider.getPegoutsWaitingForConfirmations` is
+`pegoutsWaitingForConfirmations = new PegoutsWaitingForConfirmations(entries)`,
+and that constructor is
 
-| n        | 0–12 | 13–24 | 25–48 | 49–96 |
+```java
+public PegoutsWaitingForConfirmations(Set<Entry> entries) {
+    this.entries = new HashSet<>(entries);   // collection constructor → PRE-SIZE
+}
+```
+
+`HashSet(Collection c)` calls `this(Math.max((int)(c.size()/.75f)+1, 16))`, and
+`HashMap(int initialCapacity)` stores `threshold = tableSizeFor(initialCapacity)`
+which the first `resize()` adopts as the table length. So for `n` final entries
+the table capacity is the next power of two `>= max((int)(n/0.75)+1, 16)`:
+
+| n        | 0–11 | 12–23 | 24–47 | 48–95 |
 |----------|------|-------|-------|-------|
 | capacity | 16   | 32    | 64    | 128   |
 
-This differs from the `new HashSet<>(collection)` pre-size formula
-`tableSizeFor(max((int)(n/0.75)+1, 16))` exactly at the resize boundaries: at
-`n = 12` the pre-size formula gives 32 but the incremental capacity is 16; at
-`n = 24` it gives 64 vs 32. A wrong capacity reshuffles every bucket index and
-forks the selection. (The #3,345,557 case had `n = 13`, where both formulas give
-32, which is why the original pre-size code happened to pass.)
+(The intermediate `new HashSet<>(legacyCell)` / `addAll(withTxHashCell)` steps
+ARE incremental, but their result is then handed to the collection constructor,
+which re-buckets everything into the pre-sized table — so only the final
+constructor's sizing is observable to `getNextPegoutWithEnoughConfirmations`.)
 
-The insertion order into the set is the deserialization order = the stored
-`BTC_TX_COMPARATOR` order, which only matters for the intra-bucket tiebreak.
-**Latent edge (TODO):** in rskj the SAME cached set object survives the in-block
-`add()`s done earlier in the same `updateCollections` (migration/pegout
-creation), so its real insertion order is "pre-block entries (deser order) then
-in-block adds (add order)". rustock reloads the set from storage between the add
-and select steps, re-sorting by `BTC_TX_COMPARATOR`. The final *capacity* is
-identical (it depends only on the total count, not the order), so this only
-diverges if 2+ entries that confirm on the same block land in the *same* bucket
-AND were added in-block in an order differing from `BTC_TX_COMPARATOR` — left
-unfixed, logged.
+This pre-size is one doubling LARGER than an incremental default-16 fill of the
+same `n` at the boundaries: at `n = 12` the pre-size gives 32 but an incremental
+fill stays at 16; at `n = 24` it gives 64 vs 32. A wrong capacity reshuffles
+every bucket index and forks the selection. The #3,345,557 case had `n = 13`,
+where both 16-incremental-then-resize and pre-size give 32, which is why an
+incremental model happened to pass that ground truth while still being wrong.
+
+The insertion order into the final set is the iteration order of the
+intermediate `HashSet` it is copied from, which only matters for the intra-bucket
+tiebreak.
 
 **Consensus-load-bearing:** which BTC pegout transaction is promoted to be
 signed (and which is left in the confirmation set) is pure Bridge state — gas
@@ -1616,6 +1619,17 @@ the bucket-9 tx; rustock previously promoted the lexicographically-smaller
 bucket-20 tx, producing a one-leaf diff in both `releaseTransactionSetWithTxHash`
 and `rskTxsWaitingFS`.
 
+**Capacity-boundary trigger**: mainnet #3,344,303. The confirmation set has
+exactly `n = 12` entries, of which the two created at height 3,340,302 both reach
+4000 confirmations here. With the correct PRE-SIZE capacity 32 they land in
+buckets 15 (txid `20806dad…`, rskTxHash `2ad6d4c3…`) and 21 (txid `415c147f…`,
+rskTxHash `ca7dcb44…`), so rskj promotes the bucket-15 `20806dad…` tx. An
+incremental capacity 16 puts them in buckets 15 and 5, promoting the wrong
+`415c147f…` tx — forking both `releaseTransactionSetWithTxHash` and
+`rskTxsWaitingFS` (computed root `0x62047bea…` vs header `0x0d4bed56…`). This is
+the boundary the incorrect incremental model got wrong even though #3,345,557
+(n=13) still passed.
+
 **rskj source**:
 `co.rsk.peg.PegoutsWaitingForConfirmations.getNextPegoutWithEnoughConfirmations`
 and `Entry.hashCode`; `co.rsk.bitcoinj.core.BtcTransaction.hashCode` /
@@ -1624,12 +1638,14 @@ and `Entry.hashCode`; `co.rsk.bitcoinj.core.BtcTransaction.hashCode` /
 
 **rustock**: `crates/execution/src/bridge/peg.rs`
 `next_pegout_with_enough_confirmations` / `pegout_entry_hash` (replicate the
-bucket order) + `java_hashset_capacity` (incremental-insertion capacity), called
-from `process_confirmed_pegouts` (Step 2 of `update_collections`). Tests:
+bucket order) + `java_hashset_capacity` (the `HashSet(Collection)` pre-size
+capacity `tableSizeFor(max((int)(n/0.75)+1, 16))`), called from Step 2 of
+`update_collections`. Tests:
 `rskj_next_pegout_hashset_iteration_order_groundtruth` (block #3,345,557 ground
-truth), `java_hashset_capacity_resize_boundaries` and
-`pegout_selection_at_16_to_32_resize_boundary` (the n=12/13/24/25 capacity
-boundaries).
+truth), `java_hashset_capacity_resize_boundaries` (the n=11/12/23/24/47/48
+capacity boundaries), `pegout_selection_at_16_to_32_resize_boundary` (n=13), and
+`pegout_selection_n12_presize_picks_rskj_entry` (the #3,344,303 n=12 boundary
+regression).
 
 ---
 
