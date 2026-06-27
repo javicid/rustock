@@ -122,6 +122,12 @@ struct Args {
     /// peers — reusing an existing local chain instead of re-downloading.
     #[arg(long)]
     import_blocks_db: Option<String>,
+
+    /// Target number of outbound peer connections to maintain (rskj's
+    /// `maxActivePeers` default is 30). Higher values give more headroom to
+    /// absorb dead/unreachable nodes and recover faster after a network blip.
+    #[arg(long, default_value_t = 25)]
+    max_peers: usize,
 }
 
 #[tokio::main]
@@ -231,6 +237,7 @@ async fn main() -> Result<()> {
         discovery_port: args.port + 1,
         data_dir: args.data_dir.clone(),
         external_ip: args.external_ip,
+        max_outbound_peers: args.max_peers,
     };
 
     let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());

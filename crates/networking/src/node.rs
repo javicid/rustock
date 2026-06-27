@@ -32,6 +32,9 @@ pub struct NodeConfig {
     pub discovery_port: u16,
     pub data_dir: String,
     pub external_ip: Option<IpAddr>,
+    /// Target number of outbound peer connections to maintain (rskj's
+    /// `maxActivePeers`). The outbound connector dials toward this count.
+    pub max_outbound_peers: usize,
 }
 
 impl Node {
@@ -170,7 +173,7 @@ impl Node {
             table.clone(),
             self.peer_store.clone(),
             all_handlers.clone(),
-            10,
+            self.config.max_outbound_peers,
         );
         tokio::spawn(outbound.start());
 
@@ -274,6 +277,7 @@ mod tests {
             discovery_port: 0,
             data_dir: ".".to_string(),
             external_ip: None,
+            max_outbound_peers: 10,
         };
         
         let node2_config = NodeConfig {
@@ -291,6 +295,7 @@ mod tests {
             discovery_port: 0,
             data_dir: ".".to_string(),
             external_ip: None,
+            max_outbound_peers: 10,
         };
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
