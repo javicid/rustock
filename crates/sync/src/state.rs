@@ -1,8 +1,20 @@
+use std::time::Instant;
+
 use alloy_primitives::{B256, B512};
 use rustock_core::Header;
 use rustock_networking::protocol::BlockIdentifier;
 
 use crate::tracker::PeerChunkTracker;
+
+/// An outstanding body request for one block: the request id we're currently
+/// waiting on, and when it was last (re)sent. The send time drives the
+/// per-request timeout, so only the individually-stalled requests get
+/// re-sent rather than re-blasting the whole in-flight window.
+#[derive(Debug, Clone)]
+pub struct InFlightBody {
+    pub req_id: u64,
+    pub sent: Instant,
+}
 
 /// The state machine for skeleton-based forward sync.
 #[derive(Debug, Default)]
@@ -39,8 +51,15 @@ pub enum SyncState {
         pending_headers: Vec<(B256, Header)>,
         /// Index of the next header to request a body for.
         next_request: usize,
-        /// Map of in-flight request IDs to header indices.
-        in_flight: std::collections::HashMap<u64, usize>,
+        /// Outstanding blocks (requested but not yet stored), keyed by header
+        /// index — exactly one entry per block, holding its current request id
+        /// and last-sent time for the per-request timeout.
+        in_flight: std::collections::HashMap<usize, InFlightBody>,
+        /// Every request id ever sent (current or superseded by a retry) → its
+        /// header index, so a late response to an old id still applies its body
+        /// instead of being discarded as "unknown". Entries are pruned as the
+        /// matching blocks are stored.
+        id_index: std::collections::HashMap<u64, usize>,
     },
     /// At or near the chain tip — listening for NewBlockHashes announcements
     /// and fetching individual headers as they arrive.

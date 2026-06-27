@@ -1,7 +1,7 @@
 use crate::events::SyncEvent;
 use crate::manager::{SyncManager, MAX_SKELETON_CHUNKS};
 use crate::progress::SyncProgress;
-use crate::state::SyncState;
+use crate::state::{InFlightBody, SyncState};
 use crate::tracker::PeerChunkTracker;
 use rustock_core::types::header::Header;
 use rustock_core::types::transaction::Transaction;
@@ -111,10 +111,6 @@ pub struct SyncService {
     event_rx: mpsc::UnboundedReceiver<SyncEvent>,
     pub(crate) state: SyncState,
     pub(crate) last_progress: Instant,
-    /// Last time a BODY response arrived; drives the stalled-body retry.
-    /// Separate from `last_progress`, which any response resets (skeleton
-    /// pre-fetches were starving the retry path for minutes).
-    last_body_progress: Instant,
     /// Rotating offset for assigning retried body requests to peers. Bumped
     /// once per retry round so a lone straggler is re-sent to a *different*
     /// peer each round instead of forever re-hitting `peers[0]` (a single
@@ -168,7 +164,6 @@ impl SyncService {
             event_rx,
             state: SyncState::Idle,
             last_progress: Instant::now(),
-            last_body_progress: Instant::now(),
             body_retry_rotation: 0,
             progress: SyncProgress::new(),
             block_processor: None,
@@ -327,16 +322,11 @@ impl SyncService {
                 self.check_follow_gap().await;
             }
             SyncState::DownloadingBodies { .. } => {
-                if self.last_body_progress.elapsed() > REQUEST_TIMEOUT {
-                    warn!(
-                        target: "rustock::sync",
-                        "Body download timed out, retrying stalled requests"
-                    );
-                    self.retry_body_requests().await;
-                    self.last_body_progress = Instant::now();
-                } else {
-                    self.log_progress().await;
-                }
+                // Per-request timeout: re-send only the individually-stalled
+                // requests (older than REQUEST_TIMEOUT), each to a rotated
+                // peer — never re-blast the whole in-flight window.
+                self.retry_stale_body_requests().await;
+                self.log_progress().await;
             }
             _ => {
                 if self.last_progress.elapsed() > REQUEST_TIMEOUT {
@@ -1136,6 +1126,7 @@ impl SyncService {
             pending_headers: pending,
             next_request: 0,
             in_flight: HashMap::new(),
+            id_index: HashMap::new(),
         };
         self.last_progress = Instant::now();
         self.send_body_requests().await;
@@ -1318,6 +1309,7 @@ impl SyncService {
             pending_headers,
             next_request,
             in_flight,
+            id_index,
             ..
         } = &mut self.state
         {
@@ -1330,14 +1322,15 @@ impl SyncService {
             let max_in_flight = (peers.len() * 8).clamp(8, 96);
             let mut sent = 0u32;
             while in_flight.len() < max_in_flight && *next_request < pending_headers.len() {
-                let (hash, _header) = &pending_headers[*next_request];
+                let idx = *next_request;
+                let (hash, _header) = &pending_headers[idx];
                 // Bodies already in the store don't need a request.
                 if matches!(self.manager.store.body(*hash), Ok(Some(_))) {
                     *next_request += 1;
                     continue;
                 }
                 let (req_id, msg) = create_body_request(*hash);
-                let peer = &peers[*next_request % peers.len()];
+                let peer = &peers[idx % peers.len()];
                 if self.peer_store.send_to_peer(peer, msg).await {
                     sent += 1;
                 } else {
@@ -1348,10 +1341,11 @@ impl SyncService {
                     );
                 }
                 // Track the request even if the send failed (peer may have just
-                // disconnected): the stalled-request retry re-sends everything
-                // in flight. Dropping it here would orphan the block — nothing
-                // would ever request it again and the batch could never finish.
-                in_flight.insert(req_id, *next_request);
+                // disconnected): the per-request timeout re-sends it. Dropping it
+                // here would orphan the block — nothing would ever request it
+                // again and the batch could never finish.
+                in_flight.insert(idx, InFlightBody { req_id, sent: Instant::now() });
+                id_index.insert(req_id, idx);
                 *next_request += 1;
             }
             if sent > 0 {
@@ -1365,27 +1359,40 @@ impl SyncService {
         }
     }
 
-    /// Re-send all in-flight body requests (they timed out without response).
-    pub(crate) async fn retry_body_requests(&mut self) {
-        // Bump the rotation each round so a lone straggler lands on a different
-        // peer every retry rather than forever re-hitting peers[0].
+    /// Per-request timeout: re-send only the body requests that have been
+    /// outstanding longer than `REQUEST_TIMEOUT`, each with a fresh id and a
+    /// rotated peer. The old id stays mapped in `id_index`, so a late response
+    /// to the superseded request still applies its body rather than being
+    /// discarded. This replaces the old "global timeout re-blasts everything"
+    /// behaviour, which wasted bandwidth re-fetching in-transit bodies.
+    pub(crate) async fn retry_stale_body_requests(&mut self) {
         let rotation = self.body_retry_rotation;
-        self.body_retry_rotation = self.body_retry_rotation.wrapping_add(1);
         if let SyncState::DownloadingBodies {
             pending_headers,
             in_flight,
+            id_index,
             ..
         } = &mut self.state
         {
+            // Collect the indices whose current request has timed out.
+            let stale: Vec<usize> = in_flight
+                .iter()
+                .filter(|(_, req)| req.sent.elapsed() > REQUEST_TIMEOUT)
+                .map(|(idx, _)| *idx)
+                .collect();
+            if stale.is_empty() {
+                return;
+            }
+
             let peers = self.peer_store.peers().await;
             if peers.is_empty() {
                 warn!(target: "rustock::sync", "No peers for body retry");
                 return;
             }
+            self.body_retry_rotation = self.body_retry_rotation.wrapping_add(1);
 
-            let stalled: Vec<(u64, usize)> = in_flight.drain().collect();
-            let count = stalled.len();
-            for (i, (_old_id, idx)) in stalled.into_iter().enumerate() {
+            let count = stale.len();
+            for (i, idx) in stale.into_iter().enumerate() {
                 let (hash, header) = &pending_headers[idx];
                 debug!(
                     target: "rustock::sync",
@@ -1394,10 +1401,11 @@ impl SyncService {
                 );
                 let (req_id, msg) = create_body_request(*hash);
                 let peer = &peers[(i + rotation) % peers.len()];
-                // Keep the request tracked even on send failure so the next
-                // retry round re-attempts it (see send_body_requests).
                 let _ = self.peer_store.send_to_peer(peer, msg).await;
-                in_flight.insert(req_id, idx);
+                // Point this block at the new request, but keep the old id in
+                // `id_index` so a late response to it still lands.
+                in_flight.insert(idx, InFlightBody { req_id, sent: Instant::now() });
+                id_index.insert(req_id, idx);
             }
             info!(
                 target: "rustock::sync",
@@ -1413,7 +1421,6 @@ impl SyncService {
         transactions: Vec<Transaction>,
         uncles: Vec<Header>,
     ) {
-        self.last_body_progress = Instant::now();
         let old = std::mem::take(&mut self.state);
         match old {
             SyncState::DownloadingBodies {
@@ -1421,39 +1428,52 @@ impl SyncService {
                 pending_headers,
                 next_request,
                 mut in_flight,
+                mut id_index,
             } => {
-                let idx = match in_flight.remove(&request_id) {
+                // Route via id_index, which keeps superseded request ids mapped
+                // so a late response to a retried request still applies.
+                let idx = match id_index.remove(&request_id) {
                     Some(i) => i,
                     None => {
-                        let known_ids: Vec<u64> = in_flight.keys().copied().collect();
-                        warn!(
+                        debug!(
                             target: "rustock::sync",
-                            "Received body response for unknown request {}. In-flight IDs: {:?}",
-                            request_id, known_ids
+                            "Body response for unknown request {} (already received or foreign); ignoring",
+                            request_id
                         );
                         self.state = SyncState::DownloadingBodies {
                             peer_best,
                             pending_headers,
                             next_request,
                             in_flight,
+                            id_index,
                         };
                         return;
                     }
                 };
 
-                let (hash, _header) = &pending_headers[idx];
-                if let Err(e) = self.manager.store.put_body(*hash, &transactions, &uncles) {
-                    error!(
+                // First body to arrive for this block (still outstanding) → store
+                // it. Otherwise it's a duplicate of an already-stored block (an
+                // earlier retry already landed) → drop silently, no re-fetch.
+                if in_flight.remove(&idx).is_some() {
+                    let (hash, _header) = &pending_headers[idx];
+                    if let Err(e) = self.manager.store.put_body(*hash, &transactions, &uncles) {
+                        error!(
+                            target: "rustock::sync",
+                            "Failed to store body for {:?}: {:?}", hash, e
+                        );
+                    }
+                    trace!(
                         target: "rustock::sync",
-                        "Failed to store body for {:?}: {:?}", hash, e
+                        "Stored body for block {:?} ({} txs, {} uncles)",
+                        hash, transactions.len(), uncles.len()
+                    );
+                } else {
+                    trace!(
+                        target: "rustock::sync",
+                        "Duplicate body for already-stored block (req {}); ignoring",
+                        request_id
                     );
                 }
-
-                trace!(
-                    target: "rustock::sync",
-                    "Stored body for block {:?} ({} txs, {} uncles)",
-                    hash, transactions.len(), uncles.len()
-                );
 
                 // Advance past entries whose bodies are already stored, then
                 // check whether the whole batch is downloaded.
@@ -1480,6 +1500,7 @@ impl SyncService {
                         pending_headers,
                         next_request,
                         in_flight,
+                        id_index,
                     };
                     self.send_body_requests().await;
                 }

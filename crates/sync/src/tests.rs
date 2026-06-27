@@ -608,8 +608,8 @@ async fn test_skeleton_round_transitions_to_next_skeleton() {
     }
 
     // Simulate body responses to complete the phase
-    if let SyncState::DownloadingBodies { in_flight, .. } = &service.state {
-        let req_ids: Vec<u64> = in_flight.keys().copied().collect();
+    if let SyncState::DownloadingBodies { id_index, .. } = &service.state {
+        let req_ids: Vec<u64> = id_index.keys().copied().collect();
         for req_id in req_ids {
             service.on_body_response(req_id, vec![], vec![]).await;
         }
@@ -651,12 +651,15 @@ async fn test_failed_body_send_stays_tracked_for_retry() {
     drop(rx);
 
     let mut in_flight = std::collections::HashMap::new();
-    in_flight.insert(7u64, 0usize); // b1's body request in flight
+    in_flight.insert(0usize, InFlightBody { req_id: 7, sent: Instant::now() }); // b1 in flight
+    let mut id_index = std::collections::HashMap::new();
+    id_index.insert(7u64, 0usize);
     service.state = SyncState::DownloadingBodies {
         peer_best: 10,
         pending_headers: vec![(b1.hash(), b1.clone()), (b2.hash(), b2.clone())],
         next_request: 1,
         in_flight,
+        id_index,
     };
 
     // b1's body arrives; the service tops up with a request for b2, whose
@@ -707,12 +710,26 @@ async fn test_stalled_body_retry_rotates_across_peers() {
 
     // One straggler in flight (b1's body), the batch can't finish without it.
     let mut in_flight = std::collections::HashMap::new();
-    in_flight.insert(7u64, 0usize);
+    in_flight.insert(0usize, InFlightBody { req_id: 7, sent: Instant::now() });
+    let mut id_index = std::collections::HashMap::new();
+    id_index.insert(7u64, 0usize);
     service.state = SyncState::DownloadingBodies {
         peer_best: 10,
         pending_headers: vec![(b1.hash(), b1.clone())],
         next_request: 1,
         in_flight,
+        id_index,
+    };
+
+    // Backdate the lone request so the per-request timeout considers it stale.
+    let force_stale = |service: &mut SyncService| {
+        if let SyncState::DownloadingBodies { in_flight, .. } = &mut service.state {
+            for req in in_flight.values_mut() {
+                req.sent = Instant::now()
+                    .checked_sub(Duration::from_secs(120))
+                    .expect("monotonic clock far enough from origin");
+            }
+        }
     };
 
     // Identify which peer received the single retried request this round.
@@ -728,16 +745,94 @@ async fn test_stalled_body_retry_rotates_across_peers() {
     };
 
     // Three consecutive rounds must each hit a distinct peer (offset 0,1,2).
-    service.retry_body_requests().await;
+    force_stale(&mut service);
+    service.retry_stale_body_requests().await;
     let first = receiver_of_round(&mut rxs);
-    service.retry_body_requests().await;
+    force_stale(&mut service);
+    service.retry_stale_body_requests().await;
     let second = receiver_of_round(&mut rxs);
-    service.retry_body_requests().await;
+    force_stale(&mut service);
+    service.retry_stale_body_requests().await;
     let third = receiver_of_round(&mut rxs);
 
     assert_ne!(first, second, "retry must rotate to a different peer");
     assert_ne!(second, third, "retry must keep rotating");
     assert_ne!(first, third, "all three rounds hit distinct peers");
+}
+
+#[tokio::test]
+async fn test_late_body_response_on_superseded_id_still_applies() {
+    // After a request is retried (new id), a late response to the *original*
+    // id must still store the body instead of being discarded as "unknown" —
+    // and a second (duplicate) response must be ignored without re-fetching.
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let b1 = dummy_header(1, genesis.hash(), U256::from(1));
+    let b2 = dummy_header(2, b1.hash(), U256::from(1));
+    store.put_header(&b1).unwrap();
+    store.put_header(&b2).unwrap();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store.clone(), event_rx);
+
+    let peer = B512::repeat_byte(0x01);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    peer_store.add_peer(peer, tx).await;
+
+    // b1 (idx 0) outstanding on id 7 and already stale; b2 (idx 1) on id 8, fresh.
+    let stale = Instant::now().checked_sub(Duration::from_secs(120)).unwrap();
+    let mut in_flight = std::collections::HashMap::new();
+    in_flight.insert(0usize, InFlightBody { req_id: 7, sent: stale });
+    in_flight.insert(1usize, InFlightBody { req_id: 8, sent: Instant::now() });
+    let mut id_index = std::collections::HashMap::new();
+    id_index.insert(7u64, 0usize);
+    id_index.insert(8u64, 1usize);
+    service.state = SyncState::DownloadingBodies {
+        peer_best: 10,
+        pending_headers: vec![(b1.hash(), b1.clone()), (b2.hash(), b2.clone())],
+        next_request: 2,
+        in_flight,
+        id_index,
+    };
+
+    // Retry: only b1 is stale, so it gets a fresh id; id 7 stays mapped.
+    service.retry_stale_body_requests().await;
+    let new_id = match &service.state {
+        SyncState::DownloadingBodies { in_flight, .. } => in_flight[&0].req_id,
+        other => panic!("Expected DownloadingBodies, got {:?}", other),
+    };
+    assert_ne!(new_id, 7, "retry must issue a fresh request id");
+
+    // Late response on the SUPERSEDED id 7 must still store b1.
+    service.on_body_response(7, vec![], vec![]).await;
+    assert!(
+        store.body(b1.hash()).unwrap().is_some(),
+        "late response on a superseded id must still apply its body"
+    );
+    match &service.state {
+        SyncState::DownloadingBodies { in_flight, .. } => {
+            assert!(!in_flight.contains_key(&0), "b1 no longer outstanding");
+            assert!(in_flight.contains_key(&1), "b2 still outstanding");
+        }
+        other => panic!("Expected DownloadingBodies, got {:?}", other),
+    }
+
+    // Duplicate: the retried id now arrives too — must be ignored, no panic,
+    // batch state unchanged (b2 still the only thing outstanding).
+    service.on_body_response(new_id, vec![], vec![]).await;
+    match &service.state {
+        SyncState::DownloadingBodies { in_flight, .. } => {
+            assert!(!in_flight.contains_key(&0));
+            assert!(in_flight.contains_key(&1), "duplicate must not disturb b2");
+        }
+        other => panic!("Expected DownloadingBodies, got {:?}", other),
+    }
 }
 
 // -- PeerChunkTracker tests -----------------------------------------------
@@ -2215,8 +2310,8 @@ async fn test_body_download_state_machine() {
     }
 
     // Simulate receiving the body response
-    if let SyncState::DownloadingBodies { in_flight, .. } = &service.state {
-        let req_id = *in_flight.keys().next().unwrap();
+    if let SyncState::DownloadingBodies { id_index, .. } = &service.state {
+        let req_id = *id_index.keys().next().unwrap();
         service.on_body_response(req_id, vec![], vec![]).await;
     }
 
