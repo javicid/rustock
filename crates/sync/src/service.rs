@@ -24,6 +24,20 @@ use tracing::{info, debug, trace, warn, error};
 /// Timeout for pending requests before resetting to Idle.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Faster reclaim for body requests: a body not back within this window is
+/// re-sent to another peer. Shorter than REQUEST_TIMEOUT because idempotent
+/// application makes a duplicate harmless, so reclaiming a slot stuck on a
+/// slow/dead peer quickly is pure upside.
+const BODY_RECLAIM_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// Cap on concurrent body requests to a single peer, so a fast peer can
+/// pipeline deeply without the whole window piling onto one slow peer.
+const MAX_BODY_REQUESTS_PER_PEER: usize = 16;
+
+/// A peer is skipped for new body assignments after this many of its requests
+/// time out; reset to zero whenever it answers one. Keeps work off dead peers.
+const BODY_PEER_STRIKE_LIMIT: u32 = 8;
+
 /// Per-peer stall timeout during header download: a peer holding chunks
 /// that hasn't responded within this window gets its chunks reassigned
 /// and is sidelined (rskj punishes TIMEOUT_MESSAGE peers via peer scoring;
@@ -64,6 +78,48 @@ fn create_skeleton_request(start_number: u64) -> P2pMessage {
         start_number,
     };
     P2pMessage::RskMessage(RskMessage::new(RskSubMessage::SkeletonRequest(req)))
+}
+
+/// Current count of in-flight body requests per connected peer.
+fn peer_body_load(
+    peers: &[B512],
+    in_flight: &HashMap<usize, InFlightBody>,
+) -> HashMap<B512, usize> {
+    let mut load: HashMap<B512, usize> = peers.iter().map(|p| (*p, 0)).collect();
+    for req in in_flight.values() {
+        if let Some(c) = load.get_mut(&req.peer) {
+            *c += 1;
+        }
+    }
+    load
+}
+
+/// Pick the least-loaded peer for a body request, preferring responsive peers
+/// (under the strike limit) and never exceeding the per-peer cap. `exclude`
+/// (the peer a request just timed out on) is avoided when an alternative
+/// exists. Relaxes through fallbacks so a request is still placed while any
+/// peer has spare capacity.
+fn pick_body_peer(
+    load: &HashMap<B512, usize>,
+    strikes: &HashMap<B512, u32>,
+    exclude: Option<B512>,
+) -> Option<B512> {
+    let pick = |require_fresh: bool, honor_exclude: bool| -> Option<B512> {
+        load.iter()
+            .filter(|(p, &c)| {
+                c < MAX_BODY_REQUESTS_PER_PEER
+                    && (!honor_exclude || Some(**p) != exclude)
+                    && (!require_fresh
+                        || strikes.get(*p).copied().unwrap_or(0) < BODY_PEER_STRIKE_LIMIT)
+            })
+            .min_by_key(|(_, &c)| c)
+            .map(|(p, _)| *p)
+    };
+    // 1) responsive and not the excluded peer; 2) responsive (any);
+    // 3) any peer under cap.
+    pick(true, true)
+        .or_else(|| pick(true, false))
+        .or_else(|| pick(false, false))
 }
 
 /// An external, local source of block bodies — e.g. a synced rskj LevelDB —
@@ -111,11 +167,11 @@ pub struct SyncService {
     event_rx: mpsc::UnboundedReceiver<SyncEvent>,
     pub(crate) state: SyncState,
     pub(crate) last_progress: Instant,
-    /// Rotating offset for assigning retried body requests to peers. Bumped
-    /// once per retry round so a lone straggler is re-sent to a *different*
-    /// peer each round instead of forever re-hitting `peers[0]` (a single
-    /// unresponsive peer would otherwise wedge the whole batch).
-    body_retry_rotation: usize,
+    /// Per-peer body-request timeout strikes: incremented when a request to a
+    /// peer is reclaimed (timed out), reset to zero when the peer answers. A
+    /// peer over BODY_PEER_STRIKE_LIMIT is skipped for new assignments so dead
+    /// or slow peers stop receiving work.
+    pub(crate) body_peer_strikes: HashMap<B512, u32>,
     progress: SyncProgress,
     block_processor: Option<Arc<BlockProcessor>>,
     trie_store: Option<Arc<dyn TrieStore>>,
@@ -164,7 +220,7 @@ impl SyncService {
             event_rx,
             state: SyncState::Idle,
             last_progress: Instant::now(),
-            body_retry_rotation: 0,
+            body_peer_strikes: HashMap::new(),
             progress: SyncProgress::new(),
             block_processor: None,
             trie_store: None,
@@ -1300,119 +1356,135 @@ impl SyncService {
         }
     }
 
-    /// Send body requests for pending headers, keeping a window of requests
-    /// in flight scaled to the connected peer count. The RSK wire protocol
-    /// is one body per request, so throughput comes from pipelining:
-    /// ~8 outstanding requests per peer, bounded.
-    async fn send_body_requests(&mut self) {
-        if let SyncState::DownloadingBodies {
+    /// Send body requests for pending headers up to a bounded window, assigning
+    /// each to the least-loaded responsive peer. RSK is one body per request,
+    /// so throughput comes from pipelining many in flight — concentrated on the
+    /// peers that actually answer rather than spread evenly onto slow ones.
+    pub(crate) async fn send_body_requests(&mut self) {
+        let peers = self.peer_store.peers().await;
+        if peers.is_empty() {
+            debug!(target: "rustock::sync", "No connected peers for body requests");
+            return;
+        }
+        let SyncService { state, body_peer_strikes, peer_store, manager, .. } = self;
+        let SyncState::DownloadingBodies {
             pending_headers,
             next_request,
             in_flight,
             id_index,
             ..
-        } = &mut self.state
-        {
-            let peers = self.peer_store.peers().await;
-            if peers.is_empty() {
-                debug!(target: "rustock::sync", "No connected peers for body requests");
-                return;
-            }
+        } = state
+        else {
+            return;
+        };
 
-            let max_in_flight = (peers.len() * 8).clamp(8, 96);
-            let mut sent = 0u32;
-            while in_flight.len() < max_in_flight && *next_request < pending_headers.len() {
-                let idx = *next_request;
-                let (hash, _header) = &pending_headers[idx];
-                // Bodies already in the store don't need a request.
-                if matches!(self.manager.store.body(*hash), Ok(Some(_))) {
-                    *next_request += 1;
-                    continue;
-                }
-                let (req_id, msg) = create_body_request(*hash);
-                let peer = &peers[idx % peers.len()];
-                if self.peer_store.send_to_peer(peer, msg).await {
-                    sent += 1;
-                } else {
-                    debug!(
-                        target: "rustock::sync",
-                        "Failed to send body request to peer {:?}, leaving for retry",
-                        &peer.0[..4]
-                    );
-                }
-                // Track the request even if the send failed (peer may have just
-                // disconnected): the per-request timeout re-sends it. Dropping it
-                // here would orphan the block — nothing would ever request it
-                // again and the batch could never finish.
-                in_flight.insert(idx, InFlightBody { req_id, sent: Instant::now() });
-                id_index.insert(req_id, idx);
+        let max_in_flight = (peers.len() * 8).clamp(8, 96);
+        let mut load = peer_body_load(&peers, in_flight);
+        let mut sent = 0u32;
+        while in_flight.len() < max_in_flight && *next_request < pending_headers.len() {
+            let idx = *next_request;
+            let (hash, _header) = &pending_headers[idx];
+            // Bodies already in the store don't need a request.
+            if matches!(manager.store.body(*hash), Ok(Some(_))) {
                 *next_request += 1;
+                continue;
             }
-            if sent > 0 {
+            let Some(peer) = pick_body_peer(&load, body_peer_strikes, None) else {
+                // Every peer is at its per-peer cap; stop topping up and let
+                // responses free slots before sending more.
+                break;
+            };
+            let (req_id, msg) = create_body_request(*hash);
+            if !peer_store.send_to_peer(&peer, msg).await {
                 debug!(
                     target: "rustock::sync",
-                    "Sent {sent} body requests ({} in-flight, {} pending)",
-                    in_flight.len(),
-                    pending_headers.len().saturating_sub(*next_request)
+                    "Failed to send body request to peer {:?}, leaving for retry",
+                    &peer.0[..4]
                 );
+            } else {
+                sent += 1;
             }
+            // Track the request even if the send failed (peer may have just
+            // disconnected): the reclaim timeout re-sends it. Dropping it here
+            // would orphan the block and the batch could never finish.
+            in_flight.insert(idx, InFlightBody { req_id, sent: Instant::now(), peer });
+            id_index.insert(req_id, idx);
+            *load.entry(peer).or_default() += 1;
+            *next_request += 1;
+        }
+        if sent > 0 {
+            debug!(
+                target: "rustock::sync",
+                "Sent {sent} body requests ({} in-flight, {} pending)",
+                in_flight.len(),
+                pending_headers.len().saturating_sub(*next_request)
+            );
         }
     }
 
-    /// Per-request timeout: re-send only the body requests that have been
-    /// outstanding longer than `REQUEST_TIMEOUT`, each with a fresh id and a
-    /// rotated peer. The old id stays mapped in `id_index`, so a late response
-    /// to the superseded request still applies its body rather than being
-    /// discarded. This replaces the old "global timeout re-blasts everything"
-    /// behaviour, which wasted bandwidth re-fetching in-transit bodies.
+    /// Reclaim body requests outstanding past `BODY_RECLAIM_TIMEOUT`: re-send
+    /// each to a different, responsive peer with a fresh id (the old id stays
+    /// mapped in `id_index`, so a late response still applies). The peer a
+    /// request timed out on takes a strike, so dead peers stop receiving work.
     pub(crate) async fn retry_stale_body_requests(&mut self) {
-        let rotation = self.body_retry_rotation;
-        if let SyncState::DownloadingBodies {
-            pending_headers,
-            in_flight,
-            id_index,
-            ..
-        } = &mut self.state
-        {
-            // Collect the indices whose current request has timed out.
-            let stale: Vec<usize> = in_flight
+        // Find timed-out requests first (cheap, no await) and bail if none.
+        let stale: Vec<usize> = match &self.state {
+            SyncState::DownloadingBodies { in_flight, .. } => in_flight
                 .iter()
-                .filter(|(_, req)| req.sent.elapsed() > REQUEST_TIMEOUT)
+                .filter(|(_, req)| req.sent.elapsed() > BODY_RECLAIM_TIMEOUT)
                 .map(|(idx, _)| *idx)
-                .collect();
-            if stale.is_empty() {
-                return;
-            }
-
-            let peers = self.peer_store.peers().await;
-            if peers.is_empty() {
-                warn!(target: "rustock::sync", "No peers for body retry");
-                return;
-            }
-            self.body_retry_rotation = self.body_retry_rotation.wrapping_add(1);
-
-            let count = stale.len();
-            for (i, idx) in stale.into_iter().enumerate() {
-                let (hash, header) = &pending_headers[idx];
-                debug!(
-                    target: "rustock::sync",
-                    "Stalled body request: block #{} hash {:?}",
-                    header.number, hash
-                );
-                let (req_id, msg) = create_body_request(*hash);
-                let peer = &peers[(i + rotation) % peers.len()];
-                let _ = self.peer_store.send_to_peer(peer, msg).await;
-                // Point this block at the new request, but keep the old id in
-                // `id_index` so a late response to it still lands.
-                in_flight.insert(idx, InFlightBody { req_id, sent: Instant::now() });
-                id_index.insert(req_id, idx);
-            }
-            info!(
-                target: "rustock::sync",
-                "Retried {count} stalled body requests across {} peers",
-                peers.len()
-            );
+                .collect(),
+            _ => return,
+        };
+        if stale.is_empty() {
+            return;
         }
+
+        let peers = self.peer_store.peers().await;
+        if peers.is_empty() {
+            warn!(target: "rustock::sync", "No peers for body retry");
+            return;
+        }
+
+        let SyncService { state, body_peer_strikes, peer_store, .. } = self;
+        let SyncState::DownloadingBodies { pending_headers, in_flight, id_index, .. } = state
+        else {
+            return;
+        };
+
+        let mut load = peer_body_load(&peers, in_flight);
+        let count = stale.len();
+        for idx in stale {
+            // Free the timed-out peer's slot and give it a strike.
+            let old_peer = in_flight.get(&idx).map(|r| r.peer);
+            if let Some(p) = old_peer {
+                *body_peer_strikes.entry(p).or_default() += 1;
+                if let Some(c) = load.get_mut(&p) {
+                    *c = c.saturating_sub(1);
+                }
+            }
+            let Some(peer) = pick_body_peer(&load, body_peer_strikes, old_peer) else {
+                break;
+            };
+            let (hash, header) = &pending_headers[idx];
+            debug!(
+                target: "rustock::sync",
+                "Stalled body request: block #{} hash {:?}",
+                header.number, hash
+            );
+            let (req_id, msg) = create_body_request(*hash);
+            let _ = peer_store.send_to_peer(&peer, msg).await;
+            // Point this block at the new request, but keep the old id in
+            // `id_index` so a late response to it still lands.
+            in_flight.insert(idx, InFlightBody { req_id, sent: Instant::now(), peer });
+            id_index.insert(req_id, idx);
+            *load.entry(peer).or_default() += 1;
+        }
+        info!(
+            target: "rustock::sync",
+            "Retried {count} stalled body requests across {} peers",
+            peers.len()
+        );
     }
 
     pub(crate) async fn on_body_response(
@@ -1454,7 +1526,9 @@ impl SyncService {
                 // First body to arrive for this block (still outstanding) → store
                 // it. Otherwise it's a duplicate of an already-stored block (an
                 // earlier retry already landed) → drop silently, no re-fetch.
-                if in_flight.remove(&idx).is_some() {
+                if let Some(req) = in_flight.remove(&idx) {
+                    // The peer answered → it's responsive, clear its strikes.
+                    self.body_peer_strikes.remove(&req.peer);
                     let (hash, _header) = &pending_headers[idx];
                     if let Err(e) = self.manager.store.put_body(*hash, &transactions, &uncles) {
                         error!(

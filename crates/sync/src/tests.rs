@@ -651,7 +651,7 @@ async fn test_failed_body_send_stays_tracked_for_retry() {
     drop(rx);
 
     let mut in_flight = std::collections::HashMap::new();
-    in_flight.insert(0usize, InFlightBody { req_id: 7, sent: Instant::now() }); // b1 in flight
+    in_flight.insert(0usize, InFlightBody { req_id: 7, sent: Instant::now(), peer }); // b1 in flight
     let mut id_index = std::collections::HashMap::new();
     id_index.insert(7u64, 0usize);
     service.state = SyncState::DownloadingBodies {
@@ -710,7 +710,10 @@ async fn test_stalled_body_retry_rotates_across_peers() {
 
     // One straggler in flight (b1's body), the batch can't finish without it.
     let mut in_flight = std::collections::HashMap::new();
-    in_flight.insert(0usize, InFlightBody { req_id: 7, sent: Instant::now() });
+    in_flight.insert(
+        0usize,
+        InFlightBody { req_id: 7, sent: Instant::now(), peer: B512::repeat_byte(1) },
+    );
     let mut id_index = std::collections::HashMap::new();
     id_index.insert(7u64, 0usize);
     service.state = SyncState::DownloadingBodies {
@@ -744,7 +747,8 @@ async fn test_stalled_body_retry_rotates_across_peers() {
         hit.expect("some peer must receive the retried request")
     };
 
-    // Three consecutive rounds must each hit a distinct peer (offset 0,1,2).
+    // Each reclaim must move the straggler off the peer it just timed out on,
+    // so consecutive rounds always hit a different peer (never pinning).
     force_stale(&mut service);
     service.retry_stale_body_requests().await;
     let first = receiver_of_round(&mut rxs);
@@ -755,9 +759,70 @@ async fn test_stalled_body_retry_rotates_across_peers() {
     service.retry_stale_body_requests().await;
     let third = receiver_of_round(&mut rxs);
 
-    assert_ne!(first, second, "retry must rotate to a different peer");
-    assert_ne!(second, third, "retry must keep rotating");
-    assert_ne!(first, third, "all three rounds hit distinct peers");
+    assert_ne!(first, second, "retry must move off the timed-out peer");
+    assert_ne!(second, third, "retry must keep moving off the timed-out peer");
+}
+
+#[tokio::test]
+async fn test_body_requests_skip_struck_peers_and_balance() {
+    // New body requests must avoid peers over the strike limit (dead/slow) and
+    // spread evenly across the responsive ones (least-outstanding assignment).
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let mut headers = Vec::new();
+    let mut parent = genesis.hash();
+    for n in 1..=6u64 {
+        let h = dummy_header(n, parent, U256::from(1));
+        store.put_header(&h).unwrap();
+        parent = h.hash();
+        headers.push((h.hash(), h));
+    }
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store.clone(), event_rx);
+
+    // Two good peers and one "dead" peer marked over the strike limit.
+    let good_a = B512::repeat_byte(0x0a);
+    let good_b = B512::repeat_byte(0x0b);
+    let dead = B512::repeat_byte(0x0d);
+    let mut rxs = std::collections::HashMap::new();
+    for id in [good_a, good_b, dead] {
+        let (tx, rx) = mpsc::unbounded_channel();
+        peer_store.add_peer(id, tx).await;
+        rxs.insert(id, rx);
+    }
+    service.body_peer_strikes.insert(dead, 100);
+
+    service.state = SyncState::DownloadingBodies {
+        peer_best: 10,
+        pending_headers: headers,
+        next_request: 0,
+        in_flight: std::collections::HashMap::new(),
+        id_index: std::collections::HashMap::new(),
+    };
+
+    service.send_body_requests().await;
+
+    let count = |id: &B512, rxs: &mut std::collections::HashMap<B512, mpsc::UnboundedReceiver<_>>| {
+        let rx = rxs.get_mut(id).unwrap();
+        let mut n = 0;
+        while rx.try_recv().is_ok() {
+            n += 1;
+        }
+        n
+    };
+    assert_eq!(count(&dead, &mut rxs), 0, "struck peer must receive no requests");
+    let a = count(&good_a, &mut rxs);
+    let b = count(&good_b, &mut rxs);
+    assert_eq!(a + b, 6, "all six bodies requested from the responsive peers");
+    assert_eq!(a, 3, "load balanced evenly across responsive peers");
+    assert_eq!(b, 3, "load balanced evenly across responsive peers");
 }
 
 #[tokio::test]
@@ -788,8 +853,8 @@ async fn test_late_body_response_on_superseded_id_still_applies() {
     // b1 (idx 0) outstanding on id 7 and already stale; b2 (idx 1) on id 8, fresh.
     let stale = Instant::now().checked_sub(Duration::from_secs(120)).unwrap();
     let mut in_flight = std::collections::HashMap::new();
-    in_flight.insert(0usize, InFlightBody { req_id: 7, sent: stale });
-    in_flight.insert(1usize, InFlightBody { req_id: 8, sent: Instant::now() });
+    in_flight.insert(0usize, InFlightBody { req_id: 7, sent: stale, peer });
+    in_flight.insert(1usize, InFlightBody { req_id: 8, sent: Instant::now(), peer });
     let mut id_index = std::collections::HashMap::new();
     id_index.insert(7u64, 0usize);
     id_index.insert(8u64, 1usize);

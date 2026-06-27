@@ -7,13 +7,15 @@ use rustock_networking::protocol::BlockIdentifier;
 use crate::tracker::PeerChunkTracker;
 
 /// An outstanding body request for one block: the request id we're currently
-/// waiting on, and when it was last (re)sent. The send time drives the
-/// per-request timeout, so only the individually-stalled requests get
-/// re-sent rather than re-blasting the whole in-flight window.
+/// waiting on, when it was last (re)sent, and which peer it went to. The send
+/// time drives the per-request timeout (only the individually-stalled requests
+/// get re-sent); the peer lets us track per-peer load and responsiveness so
+/// work concentrates on fast peers.
 #[derive(Debug, Clone)]
 pub struct InFlightBody {
     pub req_id: u64,
     pub sent: Instant,
+    pub peer: B512,
 }
 
 /// The state machine for skeleton-based forward sync.
