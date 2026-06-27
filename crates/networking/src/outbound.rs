@@ -1,4 +1,4 @@
-use crate::node::{NodeConfig, register_and_run_session};
+use crate::node::{NodeConfig, register_and_run_session, HANDSHAKE_TIMEOUT};
 use crate::discovery::table::NodeTable;
 use crate::protocol::P2pHandler;
 use crate::handshake::Handshake;
@@ -6,10 +6,22 @@ use crate::peers::PeerStore;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{sleep, Duration};
 use tracing::{info, trace, warn, debug};
 use tokio::net::TcpStream;
+
+/// Cumulative outbound-dial outcome counters, surfaced by the peer heartbeat to
+/// make peer-replenishment problems diagnosable without per-dial debug logging.
+#[derive(Default)]
+struct DialStats {
+    attempts: AtomicU64,
+    successes: AtomicU64,
+    handshake_failed: AtomicU64,
+    handshake_timeout: AtomicU64,
+    connect_failed: AtomicU64,
+}
 
 /// Service that proactively initiates connections to peers discovered in the network.
 pub struct OutboundConnector {
@@ -22,10 +34,10 @@ pub struct OutboundConnector {
 
 impl OutboundConnector {
     pub fn new(
-        config: NodeConfig, 
-        table: Arc<RwLock<NodeTable>>, 
+        config: NodeConfig,
+        table: Arc<RwLock<NodeTable>>,
         peer_store: Arc<PeerStore>,
-        handlers: Vec<Arc<dyn P2pHandler>>, 
+        handlers: Vec<Arc<dyn P2pHandler>>,
         max_outbound: usize
     ) -> Self {
         Self { config, table, peer_store, handlers, max_outbound }
@@ -42,12 +54,29 @@ impl OutboundConnector {
         const ACTIVE_INTERVAL: Duration = Duration::from_secs(10);
         const IDLE_INTERVAL: Duration = Duration::from_secs(60);
         const FAIL_COOLDOWN: Duration = Duration::from_secs(120);
+        const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
         // Track recently failed addresses with the time they failed
         let failed: Arc<Mutex<HashSet<SocketAddr>>> = Arc::new(Mutex::new(HashSet::new()));
+        let stats = Arc::new(DialStats::default());
 
         loop {
             let current_count = self.peer_store.count().await;
+            let table_size = self.table.read().await.len();
+
+            // Heartbeat: peers vs. discovered-node pool vs. cumulative dial
+            // outcomes. Logged every cycle (60s when healthy, 10s when below
+            // target) so a stuck-below-target state is visible in INFO logs.
+            info!(
+                target: "rustock::net",
+                "Peer heartbeat: {}/{} peers | {} nodes in table | dials: {} ok / {} hs-fail / {} hs-timeout / {} conn-fail ({} attempts)",
+                current_count, self.max_outbound, table_size,
+                stats.successes.load(Ordering::Relaxed),
+                stats.handshake_failed.load(Ordering::Relaxed),
+                stats.handshake_timeout.load(Ordering::Relaxed),
+                stats.connect_failed.load(Ordering::Relaxed),
+                stats.attempts.load(Ordering::Relaxed),
+            );
 
             if current_count >= self.max_outbound {
                 sleep(IDLE_INTERVAL).await;
@@ -56,7 +85,6 @@ impl OutboundConnector {
 
             let needed = self.max_outbound - current_count;
             let nodes = self.table.read().await.all_nodes();
-            let table_size = nodes.len();
 
             // Try more candidates than needed since many will fail.
             // Attempt up to 3x needed, capped at available nodes.
@@ -93,17 +121,20 @@ impl OutboundConnector {
                     let peer_store = self.peer_store.clone();
                     let remote_id = node.id;
                     let failed_ref = failed.clone();
-                    
+                    let stats = stats.clone();
+
                     tokio::spawn(async move {
+                        stats.attempts.fetch_add(1, Ordering::Relaxed);
                         match tokio::time::timeout(
-                            Duration::from_secs(5),
+                            CONNECT_TIMEOUT,
                             TcpStream::connect(addr),
                         ).await {
                             Ok(Ok(stream)) => {
                                 trace!(target: "rustock::net", "TCP connected to outbound peer: {}", addr);
                                 let handshake = Handshake::new(stream, config, Some(remote_id));
-                                match tokio::time::timeout(Duration::from_secs(5), handshake.run()).await {
+                                match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake.run()).await {
                                     Ok(Ok((peer_id, rsk_status, framed))) => {
+                                        stats.successes.fetch_add(1, Ordering::Relaxed);
                                         debug!(target: "rustock::net", "Outbound handshake successful: {:?}", &peer_id.as_slice()[..4]);
                                         let _ = register_and_run_session(
                                             peer_id, rsk_status, framed, handlers, peer_store,
@@ -112,26 +143,30 @@ impl OutboundConnector {
                                         // it was a valid peer that may accept again later
                                     }
                                     Ok(Err(e)) => {
+                                        stats.handshake_failed.fetch_add(1, Ordering::Relaxed);
                                         debug!(target: "rustock::net", "Outbound handshake failed for {}: {:?}", addr, e);
                                         failed_ref.lock().await.insert(addr);
                                     }
                                     Err(_) => {
+                                        stats.handshake_timeout.fetch_add(1, Ordering::Relaxed);
                                         debug!(target: "rustock::net", "Outbound handshake timed out for {}", addr);
                                         failed_ref.lock().await.insert(addr);
                                     }
                                 }
                             }
                             Ok(Err(e)) => {
+                                stats.connect_failed.fetch_add(1, Ordering::Relaxed);
                                 debug!(target: "rustock::net", "Failed to connect to outbound peer {}: {:?}", addr, e);
                                 failed_ref.lock().await.insert(addr);
                             }
                             Err(_) => {
+                                stats.connect_failed.fetch_add(1, Ordering::Relaxed);
                                 trace!(target: "rustock::net", "TCP connect timed out for {}", addr);
                                 failed_ref.lock().await.insert(addr);
                             }
                         }
                     });
-                    
+
                     attempted += 1;
                 }
             }

@@ -52,6 +52,15 @@ impl NodeTable {
         self.buckets.iter().flat_map(|b| b.iter().cloned()).collect()
     }
 
+    /// Total number of nodes across all buckets (without cloning).
+    pub fn len(&self) -> usize {
+        self.buckets.iter().map(|b| b.len()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Serializes the table to RLP bytes.
     pub fn encode(&self) -> Vec<u8> {
         use alloy_rlp::Encodable;

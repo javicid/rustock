@@ -230,15 +230,24 @@ pub(crate) async fn register_and_run_session(
     res
 }
 
+/// Maximum time allowed for a connection handshake (RLPx + p2p Hello + status)
+/// to complete. Without this, a peer that opens a TCP connection and never
+/// speaks would pin a task and socket forever (rskj relies on Netty's
+/// `ReadTimeoutHandler` at the front of the pipeline for the same protection).
+/// The outbound path already enforces this; the inbound path did not.
+pub(crate) const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Handles an incoming connection by performing a handshake and starting a session.
 pub async fn handle_incoming(
-    stream: TcpStream, 
-    config: NodeConfig, 
+    stream: TcpStream,
+    config: NodeConfig,
     handlers: Vec<Arc<dyn P2pHandler>>,
     peer_store: Arc<PeerStore>,
 ) -> Result<()> {
     let handshake = Handshake::new(stream, config, None);
-    let (peer_id, rsk_status, framed) = handshake.run().await?;
+    let (peer_id, rsk_status, framed) = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake.run())
+        .await
+        .context("Inbound handshake timed out")??;
     register_and_run_session(peer_id, rsk_status, framed, handlers, peer_store).await
 }
 
