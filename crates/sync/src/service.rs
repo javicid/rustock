@@ -115,6 +115,11 @@ pub struct SyncService {
     /// Separate from `last_progress`, which any response resets (skeleton
     /// pre-fetches were starving the retry path for minutes).
     last_body_progress: Instant,
+    /// Rotating offset for assigning retried body requests to peers. Bumped
+    /// once per retry round so a lone straggler is re-sent to a *different*
+    /// peer each round instead of forever re-hitting `peers[0]` (a single
+    /// unresponsive peer would otherwise wedge the whole batch).
+    body_retry_rotation: usize,
     progress: SyncProgress,
     block_processor: Option<Arc<BlockProcessor>>,
     trie_store: Option<Arc<dyn TrieStore>>,
@@ -164,6 +169,7 @@ impl SyncService {
             state: SyncState::Idle,
             last_progress: Instant::now(),
             last_body_progress: Instant::now(),
+            body_retry_rotation: 0,
             progress: SyncProgress::new(),
             block_processor: None,
             trie_store: None,
@@ -1360,7 +1366,11 @@ impl SyncService {
     }
 
     /// Re-send all in-flight body requests (they timed out without response).
-    async fn retry_body_requests(&mut self) {
+    pub(crate) async fn retry_body_requests(&mut self) {
+        // Bump the rotation each round so a lone straggler lands on a different
+        // peer every retry rather than forever re-hitting peers[0].
+        let rotation = self.body_retry_rotation;
+        self.body_retry_rotation = self.body_retry_rotation.wrapping_add(1);
         if let SyncState::DownloadingBodies {
             pending_headers,
             in_flight,
@@ -1383,7 +1393,7 @@ impl SyncService {
                     header.number, hash
                 );
                 let (req_id, msg) = create_body_request(*hash);
-                let peer = &peers[i % peers.len()];
+                let peer = &peers[(i + rotation) % peers.len()];
                 // Keep the request tracked even on send failure so the next
                 // retry round re-attempts it (see send_body_requests).
                 let _ = self.peer_store.send_to_peer(peer, msg).await;

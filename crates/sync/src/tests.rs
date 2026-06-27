@@ -677,6 +677,69 @@ async fn test_failed_body_send_stays_tracked_for_retry() {
     }
 }
 
+#[tokio::test]
+async fn test_stalled_body_retry_rotates_across_peers() {
+    // A lone stalled body must not be re-sent to the same peer every round:
+    // if peers[0] is unresponsive, pinning to it wedges the whole batch. Each
+    // retry round should target a different peer.
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    let b1 = dummy_header(1, genesis.hash(), U256::from(1));
+    store.put_header(&b1).unwrap();
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store.clone(), event_rx);
+
+    // Three live peers; keep their receivers so we can see who got the request.
+    let mut rxs = std::collections::HashMap::new();
+    for i in 0u8..3 {
+        let id = B512::repeat_byte(i + 1);
+        let (tx, rx) = mpsc::unbounded_channel();
+        peer_store.add_peer(id, tx).await;
+        rxs.insert(id, rx);
+    }
+
+    // One straggler in flight (b1's body), the batch can't finish without it.
+    let mut in_flight = std::collections::HashMap::new();
+    in_flight.insert(7u64, 0usize);
+    service.state = SyncState::DownloadingBodies {
+        peer_best: 10,
+        pending_headers: vec![(b1.hash(), b1.clone())],
+        next_request: 1,
+        in_flight,
+    };
+
+    // Identify which peer received the single retried request this round.
+    let receiver_of_round = |rxs: &mut std::collections::HashMap<B512, mpsc::UnboundedReceiver<_>>| {
+        let mut hit = None;
+        for (id, rx) in rxs.iter_mut() {
+            if rx.try_recv().is_ok() {
+                assert!(hit.is_none(), "exactly one peer should get the lone straggler");
+                hit = Some(*id);
+            }
+        }
+        hit.expect("some peer must receive the retried request")
+    };
+
+    // Three consecutive rounds must each hit a distinct peer (offset 0,1,2).
+    service.retry_body_requests().await;
+    let first = receiver_of_round(&mut rxs);
+    service.retry_body_requests().await;
+    let second = receiver_of_round(&mut rxs);
+    service.retry_body_requests().await;
+    let third = receiver_of_round(&mut rxs);
+
+    assert_ne!(first, second, "retry must rotate to a different peer");
+    assert_ne!(second, third, "retry must keep rotating");
+    assert_ne!(first, third, "all three rounds hit distinct peers");
+}
+
 // -- PeerChunkTracker tests -----------------------------------------------
 
 #[test]
