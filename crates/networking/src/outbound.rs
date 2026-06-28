@@ -119,8 +119,8 @@ impl OutboundConnector {
 
             // Heartbeat: peers vs. discovered-node pool vs. cumulative dial
             // outcomes. Logged every cycle (60s when healthy, 10s when below
-            // target) so a stuck-below-target state is visible in INFO logs.
-            info!(
+            // target) so a stuck-below-target state is visible at DEBUG.
+            debug!(
                 target: "rustock::net",
                 "Peer heartbeat: {}/{} peers | {} nodes ({} pending, {} backoff) | dials: {} ok / {} hs-fail / {} hs-timeout / {} conn-fail ({} attempts)",
                 current_count, self.max_outbound, table_size, pending_count, backoff_count,

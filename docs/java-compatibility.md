@@ -4628,3 +4628,27 @@ was already 700, so this is behavior-preserving there too. Test
 at #7,338,024 = 21,712, isolating the 700 base). Verified: exec-head #7,515,159 →
 replay #7,515,160 + #7,515,161/200, #7,516,000, #7,520,000 match state and receipts
 roots exactly; 558 tests pass.
+
+## Discovery NodeTable eviction (liveness, non-consensus)
+
+rskj's Kademlia bucket is full at `KademliaOptions.BUCKET_SIZE = 16`. When a new
+node would overflow a bucket, `Bucket.addNode` returns the least-recently-seen
+entry (`getOldestEntry`, ordered by `BucketEntry.lastSeenTime`) as an eviction
+*candidate* rather than dropping it; `PeerExplorer.addConnection` then opens a
+`NodeChallenge` that pings the candidate. If the candidate pongs, the challenge
+is cancelled and the newcomer is discarded (live peers are kept); if it stays
+silent until the ping request expires, `removeConnection` evicts it
+(`PeerExplorer.java` lines ~553–562, `removeConnections`/`removeConnection`).
+
+rustock does not replicate the asynchronous challenge machinery. Instead
+`NodeTable` (`crates/networking/src/discovery/table.rs`) stores a `last_seen`
+`Instant` per entry (mirroring `BucketEntry.lastSeenTime`) and, on a full-bucket
+insert, evicts the least-recently-seen entry **only if** it has gone stale
+(`EVICTION_STALENESS = 90s`); otherwise the newcomer is rejected. This is
+behavior-equivalent because rustock's discovery loop already pings every table
+node every 15s, so an entry whose `last_seen` is older than several ping rounds
+is precisely a node that failed its "challenge". A bucket of still-responsive
+nodes is left intact, matching rskj's bias toward known-good peers. `last_seen`
+is liveness-only and is never serialized — the wire/disk `DiscoveryNode` is
+unchanged. This subsystem is **not consensus-critical** (it only affects which
+peers we talk to, never state), so exact replication is unnecessary.

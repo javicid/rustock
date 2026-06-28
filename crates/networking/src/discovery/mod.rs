@@ -7,13 +7,30 @@ mod tests;
 use tokio::net::UdpSocket;
 use message::{DiscoveryPacket, DiscoveryPayload, PongMessage, DiscoveryEndpoint, DiscoveryNode};
 use table::NodeTable;
+use crate::peers::PeerStore;
 use alloy_primitives::B512;
 use k256::ecdsa::SigningKey;
 use anyhow::Result;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{info, debug, trace, warn, error};
+
+/// Normal interval between discovery rounds (ping + FindNode sweep).
+const DISCOVERY_INTERVAL: Duration = Duration::from_secs(15);
+/// Faster interval used while we're below `LOW_PEER_FLOOR` active peers, to
+/// re-seed the node table quickly instead of waiting a full round.
+const DISCOVERY_INTERVAL_LOW: Duration = Duration::from_secs(5);
+/// Active-peer count below which discovery switches to aggressive re-bootstrap:
+/// it re-pings every bootstrap address (not just unknown ones) and polls on the
+/// shorter interval. This self-heals the isolation that previously needed a
+/// manual restart. Not present in rskj (whose Netty/SyncPool stack recovers
+/// differently); a rustock improvement.
+const LOW_PEER_FLOOR: usize = 4;
+/// Backoff after a UDP socket receive error, so a persistently failing socket
+/// can't hot-spin the recv loop and flood the logs.
+const RECV_ERROR_BACKOFF: Duration = Duration::from_millis(500);
 
 /// Service for node discovery using UDP based on RSK protocol.
 ///
@@ -40,6 +57,9 @@ pub struct DiscoveryService {
     /// Bootstrap peer addresses (rskj `peer.discovery.ip.list`). Node IDs are
     /// unknown upfront; we ping these and learn IDs from their signed pongs.
     bootstrap_addrs: Vec<std::net::SocketAddr>,
+    /// Active peer connections, used to detect when we're isolated and should
+    /// re-bootstrap aggressively.
+    peer_store: Arc<PeerStore>,
 }
 
 impl DiscoveryService {
@@ -50,6 +70,7 @@ impl DiscoveryService {
         network_id: u32,
         local_node: DiscoveryNode,
         bootstrap_addrs: Vec<std::net::SocketAddr>,
+        peer_store: Arc<PeerStore>,
     ) -> Result<Self> {
         let socket = UdpSocket::bind(listen_addr).await?;
         Ok(Self {
@@ -60,6 +81,7 @@ impl DiscoveryService {
             network_id,
             local_node,
             bootstrap_addrs,
+            peer_store,
         })
     }
 
@@ -79,7 +101,11 @@ impl DiscoveryService {
                         }
                     }
                     Err(e) => {
+                        // A persistent socket error must not hot-spin the loop
+                        // (rskj's Netty stack handles this for us); back off so
+                        // we don't peg a core and flood the logs.
                         error!(target: "rustock::discovery", "UDP socket error: {:?}", e);
+                        tokio::time::sleep(RECV_ERROR_BACKOFF).await;
                     }
                 }
             }
@@ -88,9 +114,13 @@ impl DiscoveryService {
         // Background discovery loop
         loop {
             let nodes = self.table.read().await.all_nodes();
+            let peer_count = self.peer_store.count().await;
+            let low_peers = peer_count < LOW_PEER_FLOOR;
 
             // Ping bootstrap addresses we don't know yet (no node ID in the
-            // table for their address); their pongs/pings get them added.
+            // table for their address); their pongs/pings get them added. When
+            // peers are low, re-ping *every* bootstrap to aggressively re-seed
+            // discovery and recover from isolation.
             let known_addrs: HashSet<std::net::SocketAddr> = nodes
                 .iter()
                 .filter_map(|n| {
@@ -99,7 +129,7 @@ impl DiscoveryService {
                 })
                 .collect();
             for addr in &self.bootstrap_addrs {
-                if !known_addrs.contains(addr) {
+                if low_peers || !known_addrs.contains(addr) {
                     let _ = self.send_ping(*addr).await;
                 }
             }
@@ -108,9 +138,11 @@ impl DiscoveryService {
 
             trace!(
                 target: "rustock::discovery",
-                "Discovery loop: {} nodes in table, {} bonded",
+                "Discovery loop: {} nodes in table, {} bonded, {} active peers{}",
                 nodes.len(),
-                bonded.len()
+                bonded.len(),
+                peer_count,
+                if low_peers { " (low — re-bootstrapping)" } else { "" }
             );
 
             for node in &nodes {
@@ -124,10 +156,11 @@ impl DiscoveryService {
             }
             drop(bonded);
 
-            // Use 15s interval to keep the node table fresh. The bonding
-            // and FindNode flow needs multiple rounds: first we Ping, then
-            // they Ping us back, then we send FindNode on the next cycle.
-            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            // Keep the node table fresh. The bonding and FindNode flow needs
+            // multiple rounds: first we Ping, then they Ping us back, then we
+            // send FindNode on the next cycle. Poll faster while peers are low.
+            let interval = if low_peers { DISCOVERY_INTERVAL_LOW } else { DISCOVERY_INTERVAL };
+            tokio::time::sleep(interval).await;
         }
     }
 

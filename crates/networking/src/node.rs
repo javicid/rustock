@@ -130,6 +130,7 @@ impl Node {
             self.config.network_id as u32,
             local_node,
             bootstrap_addrs,
+            self.peer_store.clone(),
         ).await?);
 
         tokio::spawn(discovery.start());

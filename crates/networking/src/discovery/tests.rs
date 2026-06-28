@@ -17,7 +17,7 @@ async fn test_discovery_service_interaction() {
         id: id1,
     };
     let service1 = Arc::new(
-        DiscoveryService::new("127.0.0.1:0", key1, table1.clone(), 33, local_node1, vec![])
+        DiscoveryService::new("127.0.0.1:0", key1, table1.clone(), 33, local_node1, vec![], Arc::new(crate::peers::PeerStore::new()))
             .await
             .unwrap(),
     );
@@ -43,7 +43,7 @@ async fn test_discovery_service_interaction() {
         id: id2,
     };
     let service2 = Arc::new(
-        DiscoveryService::new("127.0.0.1:0", key2, table2.clone(), 33, local_node2, vec![])
+        DiscoveryService::new("127.0.0.1:0", key2, table2.clone(), 33, local_node2, vec![], Arc::new(crate::peers::PeerStore::new()))
             .await
             .unwrap(),
     );
