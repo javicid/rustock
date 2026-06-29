@@ -22,6 +22,8 @@ Thumbs.db
 
 # Project specific
 *.log
+*.log.gz
+logs/
 logs*.txt
 data-*/
 tmp/
