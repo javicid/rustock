@@ -12,7 +12,7 @@ pub const NUM_BUCKETS: usize = 256;
 /// discovery loop already pings every table node every 15s, so a stale
 /// `last_seen` is the equivalent "lost challenge" signal. A bucket of
 /// still-responsive nodes is left intact, matching rskj's bias toward keeping
-/// known-good peers over unverified newcomers. See docs/java-compatibility.md.
+/// known-good peers over unverified newcomers. See docs/wire-protocol.md.
 const EVICTION_STALENESS: Duration = Duration::from_secs(90);
 
 /// A table slot: the discovered node plus when we last heard from it (mirrors

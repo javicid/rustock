@@ -3,8 +3,10 @@
 Log of RSKIP-specified features ported to rustock to keep the RSK Mainnet sync
 advancing from genesis to tip: bridge peg-in/peg-out handling, federation
 lifecycle, SVP, segwit (reed800), Bridge event emissions, and hardfork opcode
-installs. Unlike the pure implementation-quirk catalogue in
-[`java-compatibility.md`](./java-compatibility.md), these document behavior an
+installs. Unlike the implementation-quirk catalogue (indexed in
+[`java-compatibility.md`](./java-compatibility.md), split by quirk nature into
+`quirks-java-artifacts.md`, `quirks-frozen-bugs.md`, `design-divergences.md`,
+and `wire-protocol.md`), these document behavior an
 RSKIP *specifies* — a from-scratch client reading the RSKIP would implement them
 the same way. Each entry cites the rskj source, names where rustock matches it,
 and records the mainnet block where it first mattered plus the replay
